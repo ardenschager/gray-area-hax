@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <script src="https://aframe.io/releases/1.3.0/aframe.min.js"></script>
+    <!-- <script src="https://wizgrav.github.io/aframe-effects/dist/aframe-effects.min.js"></script> -->
+    <script src="scripts/stomach.js"></script>
+    <script src="scripts/shell.js"></script>
+    <script src="scripts/lift.js"></script>
+    <script src="scripts/wireRock.js"></script>
+    <title>Digestion</title>
+</head>
+<body>
+    <a-scene light="defaultLightsEnabled: false">
+        <a-assets>
+            <a-asset-item id="weird-tree" src="models/weirdTree.glb"></a-asset-item>
+            <a-asset-item id="lift-scan" src="models/liftScan.glb"></a-asset-item>
+            <a-asset-item id="wire-rock" src="models/wireRock.glb"></a-asset-item>
+            <a-asset-item id="wire-frame" src="models/wireframe.glb"></a-asset-item>
+            <!-- <a-asset-item id="shell-1" src="models/shell1.glb"></a-asset-item>
+            <a-asset-item id="stomach" src="models/stomach.glb"></a-asset-item>
+            <a-asset-item id="lining" src="models/stomachLining.glb"></a-asset-item> -->
+        </a-assets>
+
+        <!-- Using the asset management system. -->
+        <!-- <a-entity gltf-model="shell-0"></a-entity>
+         -->
+
+
+        <a-entity 
+            gltf-model="#weird-tree"
+            scale="1.5 2 1.5"
+            position="0 -2 0"
+            rotation="0 0 0"
+            shell>
+        </a-entity>
+
+        <a-entity 
+            gltf-model="#wire-frame"
+            scale="40 10 40"
+            position="0 0 0"
+            rotation="0 0 0"
+            wire-rock>
+        </a-entity>
+
+        <a-entity 
+            gltf-model="#lift-scan"
+            scale="8 8 8"
+            position="24 5.1 45"
+            rotation="0 -37 17"
+            lift>
+        </a-entity>
+
+        <a-entity 
+            gltf-model="#wire-rock"
+            scale="1 0.5 1"
+            position="0 45 0"
+            rotation="0 0 0"
+            wire-rock>
+        </a-entity>
+
+        <!-- <a-entity 
+            gltf-model="#stomach"
+            scale="1.1 1.1 1.1"
+            position="-131 4 25"
+            rotation="0 0 0"
+            stomach
+            >
+            <a-entity 
+                gltf-model="#lining"
+                scale="0.9 0.9 0.9"
+                position="0 0 0"
+                rotation="0 0 0"
+                shell>
+            </a-entity>
+            <a-entity 
+                gltf-model="#shell-0"
+                scale="3 3 3"
+                position="125 0 0"
+                rotation="0 0 0"
+                shell>
+            </a-entity>
+            <a-entity 
+                gltf-model="#shell-1"
+                scale="2.5 2.5 2.5"
+                position="200 0 0"
+                rotation="0 180 0"
+                shell>
+            </a-entity>
+            <a-entity 
+                light="type: point; intensity: 3; distance: 400; decay: 0.2"
+                position="0 0 0">
+            </a-entity>
+        </a-entity> -->
+        <a-sky color="#050311"></a-sky>
+        <!-- Textured plane parallel to ground. -->
+        <!-- <a-plane height="100" width="100" rotation="-90 0 0"></a-plane> -->
+
+        <!-- CAMERA & LIGHTS -->
+        <a-entity camera="active: true" position="-5.369 5 45"  look-controls="" wasd-controls="acceleration:  60" id="camera1"></a-entity>
+        <a-entity light="type: directional; color: #FFF; intensity: 1.2" position="-0.5 1 1"></a-entity>
+
+    </a-scene>
+</body>
+</html>
