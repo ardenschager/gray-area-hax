@@ -125,7 +125,7 @@ const liftFrag = `
         vec4 strangeColor = pow(vec4(finalRGB, 0.5), vec4(1.25)) * 1.2;
         vec4 albedoColor = texture2D(u_AlbedoTex, v_UV);
         vec4 finalColor = mix(albedoColor, strangeColor, 0.02);
-        gl_FragColor = albedoColor;
+        gl_FragColor = albedoColor * vec4(1.3, 0.7, 0.7, 0.8);
     }
 `;
 

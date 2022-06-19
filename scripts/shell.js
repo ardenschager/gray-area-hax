@@ -119,7 +119,7 @@ const shellFrag = `
         finalRGB *= vec3(0.8, 1., 0.3);
         finalRGB *= 1.5;
         finalRGB += 0.2;
-        finalRGB.r = sin((v_VertPos.y + 13.) * 0.1);
+        finalRGB.r = sin((v_VertPos.y + v_Pos.y + 13.) * 0.1);
         gl_FragColor = pow(vec4(finalRGB, 0.5), vec4(1.25)) * 1.4 + 0.45;
         gl_FragColor.a *= 0.9;
     }

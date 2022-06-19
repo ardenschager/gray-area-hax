@@ -117,6 +117,7 @@ const wireRockFrag = `
         albedoCol.rg *= albedoVal * uvVal;
         albedoCol.rg += 0.3;
         albedoCol.rg = min(vec2(1.), albedoCol.rg);
+        albedoCol.r += 0.1;
         albedoCol.b = min(1., albedoCol.b * 0.6 + 0.8);
         albedoCol.rgb -= 0.5 * sin(v_VertPos.y * 0.05 + 10.) + 0.5;
         gl_FragColor = vec4(albedoCol.rgb, 0.9);
