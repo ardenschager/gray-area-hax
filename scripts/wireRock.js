@@ -158,7 +158,6 @@ AFRAME.registerComponent('wire-rock', {
     },
 
     tick: function (t, dt) {
-        console.log("asdf", "asdf");
         // Have to get the mesh every tick, sometimes this.material gets unset
         const mesh = this.el.getObject3D('mesh');
         if (!mesh) return;
