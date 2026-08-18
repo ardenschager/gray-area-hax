@@ -1,0 +1,6 @@
+/target
+.chromagrain-cache/
+chromagrain-export.*
+demo-out.*
+youtube-grains.*
+*.chromagrain-tmp.wav

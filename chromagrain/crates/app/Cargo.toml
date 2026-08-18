@@ -1,0 +1,16 @@
+[package]
+name = "chromagrain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Audiovisual granular sampling compositor / sequencer"
+
+[dependencies]
+chromagrain-core = { path = "../core" }
+eframe = { version = "0.32", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
+cpal = "0.15"
