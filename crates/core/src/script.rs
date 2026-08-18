@@ -80,6 +80,30 @@ fn rt_err(msg: impl Into<String>) -> Box<EvalAltResult> {
     Box::<EvalAltResult>::from(msg.into())
 }
 
+/// Shared grain-parameter setter (clips and sequencer rows). Returns
+/// false when the key is not a grain parameter.
+fn set_grain_param(g: &mut crate::grain::GrainSettings, key: &str, value: f64) -> bool {
+    let x = value as f32;
+    match key {
+        "density" => g.density = x.clamp(0.1, 500.0),
+        "duration" => g.duration = x.clamp(0.005, 5.0),
+        "duration_jitter" => g.duration_jitter = x.clamp(0.0, 1.0),
+        "position" => g.position = x.clamp(0.0, 1.0),
+        "spray" => g.spray = x.max(0.0),
+        "scan_speed" => g.scan_speed = x,
+        "pitch" => g.pitch = x.clamp(-48.0, 48.0),
+        "pitch_jitter" => g.pitch_jitter = x.clamp(0.0, 48.0),
+        "gain" => g.gain = x.clamp(0.0, 4.0),
+        "pan" => g.pan = x.clamp(-1.0, 1.0),
+        "pan_spread" => g.pan_spread = x.clamp(0.0, 1.0),
+        "envelope" => g.envelope = x.clamp(0.01, 1.0),
+        "reverse_prob" => g.reverse_prob = x.clamp(0.0, 1.0),
+        "seed" => g.seed = value as u64,
+        _ => return false,
+    }
+    true
+}
+
 /// Build a rhai engine with the chromagrain API registered. `log` collects
 /// script `print` output.
 pub fn build_engine(session: Session, log: Arc<Mutex<String>>) -> Engine {
@@ -124,8 +148,8 @@ pub fn build_engine(session: Session, log: Arc<Mutex<String>>) -> Engine {
         let sr = p.sample_rate;
         let src = Source {
             name: "demo saw+pattern".into(),
-            audio: Some(AudioClip::saw_stack(110.0, 4.0, sr)),
-            video: Some(VideoClip::test_pattern(240, 136, 12.0, 4.0)),
+            audio: Some(std::sync::Arc::new(AudioClip::saw_stack(110.0, 4.0, sr))),
+            video: Some(std::sync::Arc::new(VideoClip::test_pattern(240, 136, 12.0, 4.0))),
             base_hz: 110.0,
         };
         p.add_source(src) as i64
@@ -138,7 +162,7 @@ pub fn build_engine(session: Session, log: Arc<Mutex<String>>) -> Engine {
             let sr = p.sample_rate;
             let src = Source {
                 name: format!("sine {freq:.0}Hz"),
-                audio: Some(AudioClip::sine(freq as f32, secs as f32, sr)),
+                audio: Some(std::sync::Arc::new(AudioClip::sine(freq as f32, secs as f32, sr))),
                 video: None,
                 base_hz: freq as f32,
             };
@@ -249,24 +273,12 @@ pub fn build_engine(session: Session, log: Arc<Mutex<String>>) -> Engine {
         |s: &mut Session, c: ClipRef, prop: &str, value: f64| -> ScriptResult<()> {
             let key = prop.to_ascii_lowercase().replace([' ', '-'], "_");
             s.with_clip(c, |clip| -> Result<(), String> {
-                let g = &mut clip.grains;
+                if set_grain_param(&mut clip.grains, &key, value) {
+                    return Ok(());
+                }
                 let v = &mut clip.visual;
                 let x = value as f32;
                 match key.as_str() {
-                    "density" => g.density = x.clamp(0.1, 500.0),
-                    "duration" => g.duration = x.clamp(0.005, 5.0),
-                    "duration_jitter" => g.duration_jitter = x.clamp(0.0, 1.0),
-                    "position" => g.position = x.clamp(0.0, 1.0),
-                    "spray" => g.spray = x.max(0.0),
-                    "scan_speed" => g.scan_speed = x,
-                    "pitch" => g.pitch = x.clamp(-48.0, 48.0),
-                    "pitch_jitter" => g.pitch_jitter = x.clamp(0.0, 48.0),
-                    "gain" => g.gain = x.clamp(0.0, 4.0),
-                    "pan_spread" => g.pan_spread = x.clamp(0.0, 1.0),
-                    "envelope" => g.envelope = x.clamp(0.01, 1.0),
-                    "reverse_prob" => g.reverse_prob = x.clamp(0.0, 1.0),
-                    "seed" => g.seed = value as u64,
-                    "pan" => g.pan = x.clamp(-1.0, 1.0),
                     "size_scale" => v.size_scale = x.max(0.0),
                     "min_size" => v.min_size = x.clamp(0.01, 1.0),
                     "max_size" => v.max_size = x.clamp(0.01, 1.0),
@@ -345,6 +357,186 @@ pub fn build_engine(session: Session, log: Arc<Mutex<String>>) -> Engine {
         "no_color_filter",
         |s: &mut Session, c: ClipRef| -> ScriptResult<()> {
             s.with_clip(c, |clip| clip.color_filter = None)
+        },
+    );
+
+    // ---------------------------------------------------- tracks (mixer)
+    engine.register_fn("track_level", |s: &mut Session, track: i64, level: f64| {
+        if let Some(t) = s.project.lock().unwrap().tracks.get_mut(track as usize) {
+            t.level = (level as f32).clamp(0.0, 2.0);
+        }
+    });
+    engine.register_fn(
+        "track_opacity_link",
+        |s: &mut Session, track: i64, v: f64| {
+            if let Some(t) = s.project.lock().unwrap().tracks.get_mut(track as usize) {
+                t.level_to_opacity = (v as f32).clamp(0.0, 1.0);
+            }
+        },
+    );
+    engine.register_fn("track_mute", |s: &mut Session, track: i64, mute: bool| {
+        if let Some(t) = s.project.lock().unwrap().tracks.get_mut(track as usize) {
+            t.muted = mute;
+        }
+    });
+    engine.register_fn(
+        "track_effect",
+        |s: &mut Session, track: i64, kind: &str| -> ScriptResult<i64> {
+            let kind = EffectKind::parse(kind)
+                .ok_or_else(|| rt_err(format!("unknown effect '{kind}'")))?;
+            let mut p = s.project.lock().unwrap();
+            let t = p
+                .tracks
+                .get_mut(track as usize)
+                .ok_or_else(|| rt_err(format!("no track {track}")))?;
+            t.effects.push(AvEffect::new(kind));
+            Ok((t.effects.len() - 1) as i64)
+        },
+    );
+    engine.register_fn(
+        "track_fx",
+        |s: &mut Session, track: i64, idx: i64, param: &str, value: f64| -> ScriptResult<()> {
+            let mut p = s.project.lock().unwrap();
+            let fx = p
+                .tracks
+                .get_mut(track as usize)
+                .and_then(|t| t.effects.get_mut(idx as usize))
+                .ok_or_else(|| rt_err(format!("no effect {idx} on track {track}")))?;
+            fx.set_param(param, value as f32).map_err(rt_err)
+        },
+    );
+
+    // ------------------------------------------------- step sequencer
+    engine.register_fn("quantize", |s: &mut Session, div: f64| {
+        s.project.lock().unwrap().quantize = div.clamp(0.0625, 4.0);
+    });
+    engine.register_fn("pattern", |s: &mut Session, name: &str| -> i64 {
+        s.project
+            .lock()
+            .unwrap()
+            .add_pattern(crate::seq::StepPattern::new(name)) as i64
+    });
+    engine.register_fn(
+        "pattern_grid",
+        |s: &mut Session, pid: i64, length_beats: f64, steps_per_beat: i64| -> ScriptResult<()> {
+            let mut p = s.project.lock().unwrap();
+            let pat = p
+                .patterns
+                .get_mut(pid as usize)
+                .ok_or_else(|| rt_err(format!("no pattern {pid}")))?;
+            pat.set_grid(length_beats, steps_per_beat as u32);
+            Ok(())
+        },
+    );
+    engine.register_fn(
+        "row",
+        |s: &mut Session, pid: i64, source: i64| -> ScriptResult<i64> {
+            let mut p = s.project.lock().unwrap();
+            if source as usize >= p.sources.len() {
+                return Err(rt_err(format!("no source {source}")));
+            }
+            let pat = p
+                .patterns
+                .get_mut(pid as usize)
+                .ok_or_else(|| rt_err(format!("no pattern {pid}")))?;
+            Ok(pat.add_row(source as usize) as i64)
+        },
+    );
+    fn with_row<T>(
+        s: &mut Session,
+        pid: i64,
+        row: i64,
+        f: impl FnOnce(&mut crate::seq::SeqRow) -> T,
+    ) -> ScriptResult<T> {
+        let mut p = s.project.lock().unwrap();
+        let r = p
+            .patterns
+            .get_mut(pid as usize)
+            .and_then(|pat| pat.rows.get_mut(row as usize))
+            .ok_or_else(|| rt_err(format!("no pattern {pid} row {row}")))?;
+        Ok(f(r))
+    }
+    engine.register_fn(
+        "row_set",
+        |s: &mut Session, pid: i64, row: i64, prop: &str, value: f64| -> ScriptResult<()> {
+            let key = prop.to_ascii_lowercase().replace([' ', '-'], "_");
+            with_row(s, pid, row, |r| set_grain_param(&mut r.grains, &key, value))?
+                .then_some(())
+                .ok_or_else(|| rt_err(format!("unknown row parameter '{prop}'")))
+        },
+    );
+    engine.register_fn(
+        "row_key",
+        |s: &mut Session, pid: i64, row: i64, root: &str, scale: &str| -> ScriptResult<()> {
+            let key = Key::parse(root, scale)
+                .ok_or_else(|| rt_err(format!("bad key: {root} {scale}")))?;
+            with_row(s, pid, row, |r| r.key = Some(key))
+        },
+    );
+    engine.register_fn(
+        "step",
+        |s: &mut Session, pid: i64, row: i64, idx: i64, on: bool| -> ScriptResult<()> {
+            with_row(s, pid, row, |r| -> Result<(), String> {
+                let st = r
+                    .steps
+                    .get_mut(idx as usize)
+                    .ok_or_else(|| format!("no step {idx}"))?;
+                st.on = on;
+                Ok(())
+            })?
+            .map_err(rt_err)
+        },
+    );
+    engine.register_fn(
+        "step_pitch",
+        |s: &mut Session, pid: i64, row: i64, idx: i64, semitones: f64| -> ScriptResult<()> {
+            with_row(s, pid, row, |r| -> Result<(), String> {
+                let st = r
+                    .steps
+                    .get_mut(idx as usize)
+                    .ok_or_else(|| format!("no step {idx}"))?;
+                st.pitch = (semitones as f32).clamp(-48.0, 48.0);
+                Ok(())
+            })?
+            .map_err(rt_err)
+        },
+    );
+    engine.register_fn(
+        "step_gain",
+        |s: &mut Session, pid: i64, row: i64, idx: i64, gain: f64| -> ScriptResult<()> {
+            with_row(s, pid, row, |r| -> Result<(), String> {
+                let st = r
+                    .steps
+                    .get_mut(idx as usize)
+                    .ok_or_else(|| format!("no step {idx}"))?;
+                st.gain = (gain as f32).clamp(0.0, 2.0);
+                Ok(())
+            })?
+            .map_err(rt_err)
+        },
+    );
+    engine.register_fn(
+        "pattern_clip",
+        |s: &mut Session,
+         track: i64,
+         pattern: i64,
+         start_beat: f64,
+         length_beats: f64|
+         -> ScriptResult<ClipRef> {
+            let mut p = s.project.lock().unwrap();
+            if pattern as usize >= p.patterns.len() {
+                return Err(rt_err(format!("no pattern {pattern}")));
+            }
+            let t = p
+                .tracks
+                .get_mut(track as usize)
+                .ok_or_else(|| rt_err(format!("no track {track}")))?;
+            t.clips.push(Clip::new_pattern(
+                pattern as usize,
+                start_beat,
+                length_beats.max(0.001),
+            ));
+            Ok(ClipRef { track, index: (t.clips.len() - 1) as i64 })
         },
     );
 
@@ -591,6 +783,50 @@ mod tests {
         "#;
         let err = run_script(fresh(), Path::new("/tmp"), bad).unwrap_err();
         assert!(err.contains("no effect"), "err: {err}");
+    }
+
+    #[test]
+    fn script_tracks_and_patterns() {
+        let project = fresh();
+        let script = r#"
+            let s = session(120.0);
+            let src = s.demo_source();
+            let t = s.track("seq");
+            s.track_level(t, 0.7);
+            s.track_opacity_link(t, 0.5);
+            let d = s.track_effect(t, "delay");
+            s.track_fx(t, d, "time", 0.25);
+            s.quantize(0.5);
+
+            let p = s.pattern("hits");
+            s.pattern_grid(p, 4.0, 4);
+            let r = s.row(p, src);
+            s.row_set(p, r, "duration", 0.3);
+            s.row_key(p, r, "A", "minor_pentatonic");
+            s.step(p, r, 0, true);
+            s.step(p, r, 8, true);
+            s.step_pitch(p, r, 8, 12.0);
+            s.step_gain(p, r, 8, 0.5);
+            let c = s.pattern_clip(t, p, 0.0, 8.0);
+        "#;
+        run_script(project.clone(), Path::new("/tmp"), script).unwrap();
+
+        let p = project.lock().unwrap();
+        assert_eq!(p.quantize, 0.5);
+        let t = &p.tracks[0];
+        assert_eq!(t.level, 0.7);
+        assert_eq!(t.level_to_opacity, 0.5);
+        assert_eq!(t.effects.len(), 1);
+        let pat = &p.patterns[0];
+        assert_eq!(pat.rows.len(), 1);
+        assert!(pat.rows[0].steps[0].on && pat.rows[0].steps[8].on);
+        assert_eq!(pat.rows[0].steps[8].pitch, 12.0);
+        assert_eq!(pat.rows[0].steps[8].gain, 0.5);
+        assert!(pat.rows[0].key.is_some());
+        assert!(matches!(
+            t.clips[0].kind,
+            crate::timeline::ClipKind::Pattern(0)
+        ));
     }
 
     #[test]

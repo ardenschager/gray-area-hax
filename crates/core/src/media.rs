@@ -266,7 +266,12 @@ pub fn load_source(path: &Path, sample_rate: u32) -> MediaResult<Source> {
         .and_then(|a| crate::dsp::detect_pitch(&a.samples, a.sample_rate))
         .unwrap_or(0.0);
 
-    Ok(Source { name, audio, video, base_hz })
+    Ok(Source {
+        name,
+        audio: audio.map(std::sync::Arc::new),
+        video: video.map(std::sync::Arc::new),
+        base_hz,
+    })
 }
 
 /// Mux rendered frames + audio into a video file via ffmpeg.

@@ -162,7 +162,9 @@ pub fn render_grains_audio(
     let out_len = out.len() as i64;
 
     for ev in events {
-        let start_sample = ((ev.onset - t0) * out_sr).round() as i64;
+        // Rounded independently so block-wise rendering at t0 = k/sr is
+        // sample-exact against a single full render at t0 = 0.
+        let start_sample = (ev.onset * out_sr).round() as i64 - (t0 * out_sr).round() as i64;
         let n = (ev.duration as f64 * out_sr) as i64;
         if n <= 0 || start_sample + n < 0 || start_sample >= out_len {
             continue;

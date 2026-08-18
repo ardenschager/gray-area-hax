@@ -130,70 +130,137 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
 }
 
 // ======================================================================
-// AUDIO SIDE
+// AUDIO SIDE — stateful, block-safe processors. The same chain code
+// serves offline rendering (one big block) and realtime performance
+// playback (a stream of small blocks): state persists across blocks.
 // ======================================================================
 
-/// Apply a whole chain to a stereo buffer, in order.
-pub fn apply_audio_chain(buf: &mut StereoBuffer, chain: &[AvEffect]) {
-    for fx in chain {
+/// Persistent state for one audio effect instance.
+pub enum AudioFxState {
+    Crush { hold: [f32; 2], phase: [f32; 2] },
+    Delay { ring: [Vec<f32>; 2], pos: usize },
+    Reverb { channels: [ReverbChannel; 2] },
+    Compress { channels: [SpectralState; 2] },
+}
+
+/// Build fresh states for a chain. Rebuild whenever the chain's shape or
+/// its time-structuring params (delay time, reverb size) change.
+pub fn audio_chain_states(chain: &[AvEffect], sample_rate: u32) -> Vec<AudioFxState> {
+    chain
+        .iter()
+        .map(|fx| match fx.kind {
+            EffectKind::Crush { .. } => {
+                AudioFxState::Crush { hold: [0.0; 2], phase: [0.0; 2] }
+            }
+            EffectKind::Delay { time, .. } => {
+                let d = ((time * sample_rate as f32) as usize).max(1);
+                AudioFxState::Delay { ring: [vec![0.0; d], vec![0.0; d]], pos: 0 }
+            }
+            EffectKind::Reverb { size, damp, .. } => AudioFxState::Reverb {
+                channels: [
+                    ReverbChannel::new(sample_rate, size, damp, 0.0),
+                    ReverbChannel::new(sample_rate, size, damp, 23.0),
+                ],
+            },
+            EffectKind::Compress { .. } => AudioFxState::Compress {
+                channels: [SpectralState::new(), SpectralState::new()],
+            },
+        })
+        .collect()
+}
+
+/// Samples of latency the chain introduces (spectral compression is
+/// windowed and cannot be zero-latency in a stream).
+pub fn audio_chain_latency(chain: &[AvEffect]) -> usize {
+    chain
+        .iter()
+        .filter(|fx| {
+            matches!(fx.kind, EffectKind::Compress { quality } if quality < 0.999)
+                && fx.audio > 0.001
+        })
+        .count()
+        * SPECTRAL_N
+}
+
+/// Process one stereo block through the chain, streaming. Call repeatedly
+/// with consecutive blocks and the same `states`.
+pub fn process_audio_chain(
+    left: &mut [f32],
+    right: &mut [f32],
+    chain: &[AvEffect],
+    states: &mut [AudioFxState],
+) {
+    for (fx, state) in chain.iter().zip(states.iter_mut()) {
         if fx.audio <= 0.001 {
             continue;
         }
-        match fx.kind {
-            EffectKind::Crush { downsample, bits } => {
-                let factor = lerp(1.0, downsample, fx.audio);
+        match (fx.kind, state) {
+            (EffectKind::Crush { downsample, bits }, AudioFxState::Crush { hold, phase }) => {
+                let factor = lerp(1.0, downsample, fx.audio).max(1.0);
                 let bits = lerp(16.0, bits, fx.audio);
-                for ch in [&mut buf.left, &mut buf.right] {
-                    audio_crush(ch, factor, bits);
+                let levels = 2.0_f32.powf(bits.clamp(1.0, 16.0) - 1.0);
+                for (c, ch) in [&mut *left, &mut *right].into_iter().enumerate() {
+                    for s in ch.iter_mut() {
+                        phase[c] += 1.0;
+                        if phase[c] >= factor {
+                            phase[c] -= factor;
+                            hold[c] = (*s * levels).round() / levels;
+                        }
+                        *s = hold[c];
+                    }
                 }
             }
-            EffectKind::Delay { time, feedback, mix, .. } => {
+            (EffectKind::Delay { feedback, mix, .. }, AudioFxState::Delay { ring, pos }) => {
                 let mix = mix * fx.audio;
-                let d = ((time * buf.sample_rate as f32) as usize).max(1);
-                for ch in [&mut buf.left, &mut buf.right] {
-                    audio_delay(ch, d, feedback, mix);
+                let len = ring[0].len();
+                let mut p = *pos;
+                for i in 0..left.len() {
+                    for (c, s) in [&mut left[i], &mut right[i]].into_iter().enumerate() {
+                        let wet = ring[c][p];
+                        ring[c][p] = *s + wet * feedback;
+                        *s += wet * mix;
+                    }
+                    p = (p + 1) % len;
+                }
+                *pos = p;
+            }
+            (EffectKind::Reverb { mix, .. }, AudioFxState::Reverb { channels }) => {
+                let mix = mix * fx.audio;
+                for (c, ch) in [&mut *left, &mut *right].into_iter().enumerate() {
+                    channels[c].process(ch, mix);
                 }
             }
-            EffectKind::Reverb { size, damp, mix } => {
-                let mix = mix * fx.audio;
-                audio_reverb(buf, size, damp, mix);
-            }
-            EffectKind::Compress { quality } => {
+            (EffectKind::Compress { quality }, AudioFxState::Compress { channels }) => {
                 let q = lerp(1.0, quality, fx.audio);
-                for ch in [&mut buf.left, &mut buf.right] {
-                    spectral_crush(ch, q);
+                if q >= 0.999 {
+                    continue;
                 }
+                channels[0].process(left, q);
+                channels[1].process(right, q);
             }
+            _ => debug_assert!(false, "chain/state mismatch — rebuild states"),
         }
     }
 }
 
-/// Zero-order-hold decimation + bit depth reduction.
-fn audio_crush(samples: &mut [f32], factor: f32, bits: f32) {
-    let factor = factor.max(1.0);
-    let levels = 2.0_f32.powf(bits.clamp(1.0, 16.0) - 1.0);
-    let mut hold = 0.0f32;
-    let mut phase = 0.0f32;
-    for s in samples.iter_mut() {
-        phase += 1.0;
-        if phase >= factor {
-            phase -= factor;
-            hold = (*s * levels).round() / levels;
-        }
-        *s = hold;
+/// One-shot convenience: process a whole buffer, compensating for any
+/// chain latency so offline renders stay time-aligned.
+pub fn apply_audio_chain(buf: &mut StereoBuffer, chain: &[AvEffect]) {
+    let mut states = audio_chain_states(chain, buf.sample_rate);
+    let latency = audio_chain_latency(chain);
+    let n = buf.len();
+    if latency == 0 {
+        let (l, r) = (&mut buf.left, &mut buf.right);
+        process_audio_chain(l, r, chain, &mut states);
+        return;
     }
-}
-
-/// Classic feedback delay: wet[t] = x[t-d] + feedback*wet[t-d].
-fn audio_delay(samples: &mut [f32], delay: usize, feedback: f32, mix: f32) {
-    let mut ring = vec![0.0f32; delay];
-    let mut i = 0usize;
-    for s in samples.iter_mut() {
-        let wet = ring[i];
-        ring[i] = *s + wet * feedback;
-        *s += wet * mix;
-        i = (i + 1) % delay;
-    }
+    let mut l = buf.left.clone();
+    let mut r = buf.right.clone();
+    l.resize(n + latency + SPECTRAL_N, 0.0);
+    r.resize(n + latency + SPECTRAL_N, 0.0);
+    process_audio_chain(&mut l, &mut r, chain, &mut states);
+    buf.left.copy_from_slice(&l[latency..latency + n]);
+    buf.right.copy_from_slice(&r[latency..latency + n]);
 }
 
 struct Comb {
@@ -237,27 +304,34 @@ impl AllPass {
     }
 }
 
-/// Freeverb-style reverb (4 combs + 2 allpasses per channel).
-fn audio_reverb(buf: &mut StereoBuffer, size: f32, damp: f32, mix: f32) {
-    let sr_scale = buf.sample_rate as f32 / 44100.0;
-    let comb_tunings = [1116.0f32, 1188.0, 1277.0, 1356.0];
-    let ap_tunings = [556.0f32, 441.0];
-    let feedback = 0.7 + 0.28 * size.clamp(0.0, 1.0);
-    let damp = damp.clamp(0.0, 1.0) * 0.8;
+/// Freeverb-style reverb tank for one channel (4 combs + 2 allpasses).
+pub struct ReverbChannel {
+    combs: Vec<Comb>,
+    aps: Vec<AllPass>,
+}
 
-    for (ch, offset) in [(&mut buf.left, 0.0f32), (&mut buf.right, 23.0)] {
-        let mut combs: Vec<Comb> = comb_tunings
-            .iter()
-            .map(|t| Comb::new(((t + offset) * sr_scale) as usize, feedback, damp))
-            .collect();
-        let mut aps: Vec<AllPass> = ap_tunings
-            .iter()
-            .map(|t| AllPass::new(((t + offset) * sr_scale) as usize))
-            .collect();
-        for s in ch.iter_mut() {
+impl ReverbChannel {
+    fn new(sample_rate: u32, size: f32, damp: f32, offset: f32) -> ReverbChannel {
+        let sr_scale = sample_rate as f32 / 44100.0;
+        let feedback = 0.7 + 0.28 * size.clamp(0.0, 1.0);
+        let damp = damp.clamp(0.0, 1.0) * 0.8;
+        ReverbChannel {
+            combs: [1116.0f32, 1188.0, 1277.0, 1356.0]
+                .iter()
+                .map(|t| Comb::new(((t + offset) * sr_scale) as usize, feedback, damp))
+                .collect(),
+            aps: [556.0f32, 441.0]
+                .iter()
+                .map(|t| AllPass::new(((t + offset) * sr_scale) as usize))
+                .collect(),
+        }
+    }
+
+    fn process(&mut self, samples: &mut [f32], mix: f32) {
+        for s in samples.iter_mut() {
             let input = *s * 0.25;
-            let mut wet: f32 = combs.iter_mut().map(|c| c.process(input)).sum();
-            for ap in aps.iter_mut() {
+            let mut wet: f32 = self.combs.iter_mut().map(|c| c.process(input)).sum();
+            for ap in self.aps.iter_mut() {
                 wet = ap.process(wet);
             }
             *s += wet * mix;
@@ -321,65 +395,120 @@ pub fn fft(re: &mut [f32], im: &mut [f32], inverse: bool) {
     }
 }
 
-const SPECTRAL_N: usize = 1024;
+pub const SPECTRAL_N: usize = 1024;
+const SPECTRAL_HOP: usize = SPECTRAL_N / 2;
 
-/// Transform-domain audio crunch: FFT blocks, throw away / quantize weak
-/// coefficients (exactly what lossy codecs do), overlap-add back.
-fn spectral_crush(samples: &mut [f32], quality: f32) {
-    let quality = quality.clamp(0.0, 1.0);
-    if quality >= 0.999 || samples.len() < SPECTRAL_N * 2 {
-        return;
+fn spectral_window() -> &'static [f32; SPECTRAL_N] {
+    use std::sync::OnceLock;
+    static W: OnceLock<[f32; SPECTRAL_N]> = OnceLock::new();
+    W.get_or_init(|| {
+        // Periodic Hann; hop = n/2 makes overlapping windows sum to 1.
+        let mut w = [0.0f32; SPECTRAL_N];
+        for (i, v) in w.iter_mut().enumerate() {
+            *v = 0.5
+                - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / SPECTRAL_N as f32).cos();
+        }
+        w
+    })
+}
+
+/// Streaming transform-domain audio crunch for one channel: FFT windows,
+/// throw away / quantize weak coefficients (what lossy codecs do),
+/// overlap-add back. Emits 1:1 samples with SPECTRAL_HOP latency.
+pub struct SpectralState {
+    /// Input samples not yet fully consumed by window starts.
+    buf: Vec<f32>,
+    /// OLA accumulator aligned with buf[0].
+    acc: Vec<f32>,
+    /// Next window start, relative to buf[0].
+    next_window: usize,
+    /// Output FIFO of finalized samples, primed with SPECTRAL_N zeros so
+    /// the stream latency is exactly SPECTRAL_N for any block size.
+    out: std::collections::VecDeque<f32>,
+}
+
+impl SpectralState {
+    pub fn new() -> SpectralState {
+        SpectralState {
+            buf: Vec::new(),
+            acc: Vec::new(),
+            next_window: 0,
+            out: std::iter::repeat(0.0).take(SPECTRAL_N).collect(),
+        }
     }
-    let n = SPECTRAL_N;
-    let hop = n / 2;
-    // Periodic Hann window; hop = n/2 makes windows sum to 1 for OLA.
-    let window: Vec<f32> = (0..n)
-        .map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / n as f32).cos())
-        .collect();
 
-    let src = samples.to_vec();
-    samples.iter_mut().for_each(|s| *s = 0.0);
-    let keep = ((n / 2) as f32 * (0.02 + 0.98 * quality * quality)) as usize;
-    let mag_levels = lerp(6.0, 256.0, quality);
+    /// Process a block in place (output delayed by SPECTRAL_HOP samples).
+    pub fn process(&mut self, samples: &mut [f32], quality: f32) {
+        let quality = quality.clamp(0.0, 1.0);
+        let n = SPECTRAL_N;
+        let window = spectral_window();
+        let keep = ((n / 2) as f32 * (0.02 + 0.98 * quality * quality)) as usize;
+        let mag_levels = lerp(6.0, 256.0, quality);
 
-    let mut start = 0usize;
-    while start + n <= src.len() {
-        let mut re: Vec<f32> = (0..n).map(|i| src[start + i] * window[i]).collect();
-        let mut im = vec![0.0f32; n];
-        fft(&mut re, &mut im, false);
+        self.buf.extend_from_slice(samples);
+        if self.acc.len() < self.buf.len() {
+            self.acc.resize(self.buf.len(), 0.0);
+        }
 
-        // Sort bin magnitudes to find the keep-threshold.
-        let mut mags: Vec<f32> = (0..n / 2)
-            .map(|i| (re[i] * re[i] + im[i] * im[i]).sqrt())
-            .collect();
-        mags.sort_by(|a, b| b.partial_cmp(a).unwrap());
-        let threshold = mags.get(keep.min(mags.len() - 1)).copied().unwrap_or(0.0);
-        let max_mag = mags[0].max(1e-9);
+        while self.next_window + n <= self.buf.len() {
+            let start = self.next_window;
+            let mut re: Vec<f32> =
+                (0..n).map(|i| self.buf[start + i] * window[i]).collect();
+            let mut im = vec![0.0f32; n];
+            fft(&mut re, &mut im, false);
 
-        for i in 0..=n / 2 {
-            let (r, ii) = (re[i], im[i]);
-            let mag = (r * r + ii * ii).sqrt();
-            let new_mag = if mag < threshold {
-                0.0
-            } else {
-                // Quantize surviving magnitudes -> codec "birdies".
-                (mag / max_mag * mag_levels).round() / mag_levels * max_mag
-            };
-            let scale = if mag > 1e-9 { new_mag / mag } else { 0.0 };
-            re[i] *= scale;
-            im[i] *= scale;
-            // Mirror for the conjugate half.
-            if i > 0 && i < n / 2 {
-                re[n - i] *= scale;
-                im[n - i] *= scale;
+            let mut mags: Vec<f32> = (0..n / 2)
+                .map(|i| (re[i] * re[i] + im[i] * im[i]).sqrt())
+                .collect();
+            mags.sort_by(|a, b| b.partial_cmp(a).unwrap());
+            let threshold =
+                mags.get(keep.min(mags.len() - 1)).copied().unwrap_or(0.0);
+            let max_mag = mags[0].max(1e-9);
+
+            for i in 0..=n / 2 {
+                let (r, ii) = (re[i], im[i]);
+                let mag = (r * r + ii * ii).sqrt();
+                let new_mag = if mag < threshold {
+                    0.0
+                } else {
+                    // Quantize surviving magnitudes -> codec "birdies".
+                    (mag / max_mag * mag_levels).round() / mag_levels * max_mag
+                };
+                let scale = if mag > 1e-9 { new_mag / mag } else { 0.0 };
+                re[i] *= scale;
+                im[i] *= scale;
+                if i > 0 && i < n / 2 {
+                    re[n - i] *= scale;
+                    im[n - i] *= scale;
+                }
             }
+
+            fft(&mut re, &mut im, true);
+            for i in 0..n {
+                self.acc[start + i] += re[i];
+            }
+            self.next_window += SPECTRAL_HOP;
         }
 
-        fft(&mut re, &mut im, true);
-        for i in 0..n {
-            samples[start + i] += re[i];
+        // Samples before the next window start are final: emit and drain.
+        let final_n = self.next_window;
+        self.out.extend(self.acc[..final_n].iter());
+        self.buf.drain(..final_n);
+        self.acc.drain(..final_n);
+        self.next_window = 0;
+
+        // Fill the block from the FIFO (never underruns: the FIFO holds
+        // N zeros + all finalized samples, and a sample is finalized at
+        // most N inputs after it arrived).
+        for s in samples.iter_mut() {
+            *s = self.out.pop_front().unwrap_or(0.0);
         }
-        start += hop;
+    }
+}
+
+impl Default for SpectralState {
+    fn default() -> Self {
+        SpectralState::new()
     }
 }
 
@@ -766,7 +895,7 @@ mod tests {
     /// black (mean_luma alone ignores the alpha channel).
     fn luma_on_black(f: &Frame) -> f32 {
         let mut black = Frame::black(f.width, f.height);
-        crate::video::blend_layer(&mut black, f, 0.0);
+        crate::video::blend_layer(&mut black, f, 0.0, 1.0);
         black.mean_luma()
     }
 
@@ -881,6 +1010,94 @@ mod tests {
             .sum::<f32>()
             / orig.len() as f32;
         assert!(diff1 < 1e-3, "quality 1 ~ transparent, diff {diff1}");
+    }
+
+    #[test]
+    fn chunked_streaming_matches_one_shot() {
+        // The same chain processed as one big block vs ragged small blocks
+        // must produce identical output — this is what makes realtime
+        // performance playback equal to the offline render.
+        let sr = 48000;
+        let len = sr as usize; // 1s
+        let src: Vec<f32> = (0..len)
+            .map(|i| {
+                let t = i as f32 / sr as f32;
+                0.4 * (2.0 * std::f32::consts::PI * 220.0 * t).sin()
+                    + 0.2 * (2.0 * std::f32::consts::PI * 3130.0 * t).sin()
+            })
+            .collect();
+        let chain = [
+            AvEffect::new(EffectKind::Crush { downsample: 5.0, bits: 6.0 }),
+            AvEffect::new(EffectKind::Delay {
+                time: 0.13,
+                feedback: 0.4,
+                mix: 0.6,
+                shift_x: 0.0,
+                shift_y: 0.0,
+            }),
+            AvEffect::new(EffectKind::Reverb { size: 0.6, damp: 0.3, mix: 0.4 }),
+            AvEffect::new(EffectKind::Compress { quality: 0.3 }),
+        ];
+
+        // One shot.
+        let mut one_l = src.clone();
+        let mut one_r = src.clone();
+        let mut st1 = audio_chain_states(&chain, sr);
+        process_audio_chain(&mut one_l, &mut one_r, &chain, &mut st1);
+
+        // Ragged blocks (including sizes around the spectral hop).
+        let mut str_l = src.clone();
+        let mut str_r = src.clone();
+        let mut st2 = audio_chain_states(&chain, sr);
+        let sizes = [64usize, 480, 1024, 333, 4096, 100, 2048];
+        let mut pos = 0;
+        let mut k = 0;
+        while pos < len {
+            let b = sizes[k % sizes.len()].min(len - pos);
+            let (l, r) = (&mut str_l[pos..pos + b], &mut str_r[pos..pos + b]);
+            process_audio_chain(l, r, &chain, &mut st2);
+            pos += b;
+            k += 1;
+        }
+
+        for i in 0..len {
+            assert!(
+                (one_l[i] - str_l[i]).abs() < 1e-5,
+                "left diverged at {i}: {} vs {}",
+                one_l[i],
+                str_l[i]
+            );
+            assert!((one_r[i] - str_r[i]).abs() < 1e-5);
+        }
+        // And it's not silence.
+        let rms: f32 =
+            (str_l.iter().map(|s| s * s).sum::<f32>() / len as f32).sqrt();
+        assert!(rms > 0.05, "rms {rms}");
+    }
+
+    #[test]
+    fn offline_wrapper_compensates_compress_latency() {
+        // apply_audio_chain with a Compress must keep the signal aligned:
+        // an impulse at sample k stays near sample k, not k + latency.
+        let sr = 48000;
+        let mut buf = StereoBuffer::new(0.5, sr);
+        let k = 12000usize;
+        buf.left[k] = 1.0;
+        buf.right[k] = 1.0;
+        let fx = AvEffect::new(EffectKind::Compress { quality: 0.6 });
+        apply_audio_chain(&mut buf, &[fx]);
+        // Energy should be concentrated around k (windowed smear allowed).
+        let around: f32 = buf.left[k.saturating_sub(SPECTRAL_N)..k + SPECTRAL_N]
+            .iter()
+            .map(|s| s * s)
+            .sum();
+        let total: f32 = buf.left.iter().map(|s| s * s).sum();
+        assert!(total > 1e-6, "impulse survived");
+        assert!(
+            around / total > 0.8,
+            "energy centered on the impulse: {}",
+            around / total
+        );
     }
 
     #[test]

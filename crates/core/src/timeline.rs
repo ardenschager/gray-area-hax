@@ -10,11 +10,13 @@ use crate::video::{AvLink, ColorFilter, VideoClip, VisualGrainStyle};
 pub type SourceId = usize;
 
 /// An imported piece of media (file, YouTube rip, or procedural source).
+/// Media is Arc'd so cloning a Project (performance snapshots, workers)
+/// costs refcounts, not sample/frame copies.
 #[derive(Debug, Clone, Default)]
 pub struct Source {
     pub name: String,
-    pub audio: Option<AudioClip>,
-    pub video: Option<VideoClip>,
+    pub audio: Option<std::sync::Arc<AudioClip>>,
+    pub video: Option<std::sync::Arc<VideoClip>>,
     /// Estimated fundamental (Hz) used for key quantization. 0 = unknown,
     /// in which case A440 relative quantization is used.
     pub base_hz: f32,
@@ -46,6 +48,9 @@ pub enum ClipKind {
     /// correspondence machinery (gain->opacity, pitch->rate/hue, pan->x)
     /// applies to plain snippets too.
     Snippet,
+    /// A step-sequencer pattern (index into `Project::patterns`), looping
+    /// to fill the clip. Each triggered step is one grain event.
+    Pattern(usize),
 }
 
 /// A clip placed on the timeline (positions in beats).
@@ -98,16 +103,50 @@ impl Clip {
         c
     }
 
+    pub fn new_pattern(pattern: usize, start_beat: f64, length_beats: f64) -> Clip {
+        let mut c = Clip::new(0, start_beat, length_beats);
+        c.kind = ClipKind::Pattern(pattern);
+        c
+    }
+
     pub fn end_beat(&self) -> f64 {
         self.start_beat + self.length_beats
     }
 }
 
-#[derive(Debug, Clone, Default)]
+/// A track: clips, a level fader, and its own AV effect chain. Track order
+/// is also the video compositing order — later tracks render ON TOP.
+#[derive(Debug, Clone)]
 pub struct Track {
     pub name: String,
     pub clips: Vec<Clip>,
     pub muted: bool,
+    /// Track AV effect chain (e.g. "this whole track has a lot of delay").
+    pub effects: Vec<AvEffect>,
+    /// Level fader: audio gain, and (via `level_to_opacity`) video opacity.
+    pub level: f32,
+    /// How strongly the level drives video opacity (correspondence dial).
+    pub level_to_opacity: f32,
+}
+
+impl Default for Track {
+    fn default() -> Self {
+        Track {
+            name: String::new(),
+            clips: Vec::new(),
+            muted: false,
+            effects: Vec::new(),
+            level: 1.0,
+            level_to_opacity: 1.0,
+        }
+    }
+}
+
+impl Track {
+    /// Video opacity implied by the level fader and its link dial.
+    pub fn opacity(&self) -> f32 {
+        (1.0 + (self.level.min(1.5) - 1.0) * self.level_to_opacity).clamp(0.0, 1.0)
+    }
 }
 
 /// A whole chromagrain project.
@@ -121,8 +160,12 @@ pub struct Project {
     pub fps: f32,
     pub sources: Vec<Source>,
     pub tracks: Vec<Track>,
+    /// Step-sequencer patterns, referenced by pattern clips.
+    pub patterns: Vec<crate::seq::StepPattern>,
     /// Master AV effect chain applied to the final mix and final frames.
     pub master_effects: Vec<AvEffect>,
+    /// UI snap grid in beats (0.25 = sixteenths at x/4).
+    pub quantize: f64,
 }
 
 impl Default for Project {
@@ -135,7 +178,9 @@ impl Default for Project {
             fps: 24.0,
             sources: Vec::new(),
             tracks: Vec::new(),
+            patterns: Vec::new(),
             master_effects: Vec::new(),
+            quantize: 0.25,
         }
     }
 }
@@ -159,6 +204,11 @@ impl Project {
         self.tracks.len() - 1
     }
 
+    pub fn add_pattern(&mut self, pattern: crate::seq::StepPattern) -> usize {
+        self.patterns.push(pattern);
+        self.patterns.len() - 1
+    }
+
     /// Last beat covered by any clip.
     pub fn end_beat(&self) -> f64 {
         self.tracks
@@ -176,8 +226,8 @@ impl Project {
 
         let tone = Source {
             name: "saw stack (A2)".into(),
-            audio: Some(AudioClip::saw_stack(110.0, 4.0, p.sample_rate)),
-            video: Some(VideoClip::test_pattern(240, 136, 12.0, 4.0)),
+            audio: Some(std::sync::Arc::new(AudioClip::saw_stack(110.0, 4.0, p.sample_rate))),
+            video: Some(std::sync::Arc::new(VideoClip::test_pattern(240, 136, 12.0, 4.0))),
             base_hz: 110.0,
         };
         let sid = p.add_source(tone);
@@ -227,6 +277,39 @@ impl Project {
         c2.grains.pitch = -12.0;
         c2.grains.gain = 0.35;
         p.tracks[t2].clips.push(c2);
+        // Snippet bed sits at the bottom of the stack: move it first.
+        p.tracks.rotate_right(1);
+
+        // A step pattern: low hits on the beat, answered up an octave.
+        let mut pat = crate::seq::StepPattern::new("hits");
+        let r0 = pat.add_row(sid);
+        pat.rows[r0].grains.pitch = -12.0;
+        pat.rows[r0].grains.duration = 0.3;
+        pat.rows[r0].key = Some(Key::new(9, ScaleKind::MinorPentatonic));
+        for i in (0..16).step_by(4) {
+            pat.rows[r0].steps[i].on = true;
+        }
+        let r1 = pat.add_row(sid);
+        pat.rows[r1].grains.pitch = 12.0;
+        pat.rows[r1].grains.duration = 0.12;
+        pat.rows[r1].grains.gain = 0.5;
+        pat.rows[r1].key = Some(Key::new(9, ScaleKind::MinorPentatonic));
+        for i in [6usize, 10, 14] {
+            pat.rows[r1].steps[i].on = true;
+        }
+        let pid = p.add_pattern(pat);
+        let t3 = p.add_track("seq");
+        p.tracks[t3].clips.push(Clip::new_pattern(pid, 0.0, 8.0));
+        // The whole seq track echoes: a track-level AV delay.
+        p.tracks[t3].effects.push(crate::fx::AvEffect::new(
+            crate::fx::EffectKind::Delay {
+                time: 0.45,
+                feedback: 0.45,
+                mix: 0.5,
+                shift_x: 0.04,
+                shift_y: 0.02,
+            },
+        ));
 
         // Gentle master smear ties it together.
         p.master_effects.push(AvEffect {

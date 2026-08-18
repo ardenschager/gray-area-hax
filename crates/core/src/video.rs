@@ -343,6 +343,76 @@ fn hash01(x: u64) -> f32 {
     (z >> 40) as f32 / (1u64 << 24) as f32
 }
 
+/// Geometry + shading for one visual grain at output time `t`, mirroring
+/// the CPU compositor's math — used by GPU previews to draw each grain as
+/// a textured quad. Keep in sync with [`composite_grains_frame`].
+#[derive(Debug, Clone, Copy)]
+pub struct GrainDraw {
+    /// Destination rect, normalized 0..1 (x, y, w, h), y-down.
+    pub dest: [f32; 4],
+    /// Source patch rect, normalized 0..1 in the source frame.
+    pub patch: [f32; 4],
+    /// Source video time to sample (seconds; wrap at source duration).
+    pub src_time: f64,
+    pub alpha: f32,
+    pub hue_shift: f32,
+}
+
+/// Compute the draw list for all events active at `t`.
+pub fn grain_draws(
+    events: &[GrainEvent],
+    style: &VisualGrainStyle,
+    link: &AvLink,
+    source_duration: f64,
+    t: f64,
+) -> Vec<GrainDraw> {
+    let mut out = Vec::new();
+    for ev in events {
+        if t < ev.onset || t >= ev.end() {
+            continue;
+        }
+        let phase = ((t - ev.onset) / ev.duration as f64) as f32;
+        let env_part = 1.0 + (grain_env(phase, ev.envelope) - 1.0) * link.envelope_to_opacity;
+        let gain_part = 1.0 + (ev.gain.min(1.5) - 1.0) * link.gain_to_opacity;
+        let alpha = (env_part * gain_part).clamp(0.0, 1.0);
+        if alpha <= 0.003 {
+            continue;
+        }
+        let visual_rate = 1.0 + (ev.pitch_ratio - 1.0) * link.pitch_to_rate;
+        let local = (t - ev.onset) * visual_rate as f64;
+        let reverse = ev.reverse && link.reverse_video;
+        let src_time = if reverse {
+            ev.source_pos + ev.duration as f64 * visual_rate as f64 - local
+        } else {
+            ev.source_pos + local
+        };
+
+        let size = (ev.duration * style.size_scale).clamp(style.min_size, style.max_size);
+        let cx = 0.5 + 0.45 * ev.pan * link.pan_to_x;
+        let jy = (hash01(ev.id) - 0.5) * style.scatter_y;
+        let cy = 0.5 + jy;
+
+        let src_frac = if source_duration > 0.0 {
+            (ev.source_pos / source_duration).fract() as f32
+        } else {
+            0.0
+        };
+        let patch_size = size.clamp(0.05, 1.0);
+        let sx0 = (src_frac * (1.0 - patch_size)).clamp(0.0, (1.0 - patch_size).max(0.0));
+        let sy0 = ((0.5 + jy * 0.5) * (1.0 - patch_size))
+            .clamp(0.0, (1.0 - patch_size).max(0.0));
+
+        out.push(GrainDraw {
+            dest: [cx - size / 2.0, cy - size / 2.0, size, size],
+            patch: [sx0, sy0, patch_size, patch_size],
+            src_time,
+            alpha,
+            hue_shift: ev.semitones() * link.pitch_to_hue,
+        });
+    }
+    out
+}
+
 /// Composite every grain active at output time `t` (timeline seconds) onto
 /// `out` — a transparent layer with straight-alpha accumulation. Call once
 /// per output frame, then blend the layer onto the master with
@@ -468,14 +538,19 @@ pub fn composite_grains_frame(
     }
 }
 
-/// Blend a (possibly effect-processed) clip layer onto an opaque master
-/// frame. `additive` mixes between alpha-over and additive glow.
-pub fn blend_layer(dst: &mut Frame, layer: &Frame, additive: f32) {
+/// Blend a (possibly effect-processed) layer onto an opaque master frame.
+/// `additive` mixes between alpha-over and additive glow; `opacity` scales
+/// the whole layer (track level -> opacity correspondence).
+pub fn blend_layer(dst: &mut Frame, layer: &Frame, additive: f32, opacity: f32) {
     debug_assert_eq!(dst.width, layer.width);
     debug_assert_eq!(dst.height, layer.height);
     let add = additive.clamp(0.0, 1.0);
+    let opacity = opacity.clamp(0.0, 1.0);
+    if opacity <= 0.002 {
+        return;
+    }
     for (d, s) in dst.data.chunks_exact_mut(4).zip(layer.data.chunks_exact(4)) {
-        let la = s[3] as f32 / 255.0;
+        let la = s[3] as f32 / 255.0 * opacity;
         if la <= 0.002 {
             continue;
         }
@@ -485,6 +560,28 @@ pub fn blend_layer(dst: &mut Frame, layer: &Frame, additive: f32) {
             d[c] = (over * (1.0 - add) + additive_v * add) as u8;
         }
         d[3] = 255;
+    }
+}
+
+/// Blend one transparent layer OVER another transparent layer (straight
+/// alpha), used to stack clip layers into a track layer.
+pub fn blend_layer_over(dst: &mut Frame, src: &Frame, additive: f32) {
+    debug_assert_eq!(dst.width, src.width);
+    debug_assert_eq!(dst.height, src.height);
+    let add = additive.clamp(0.0, 1.0);
+    for (d, s) in dst.data.chunks_exact_mut(4).zip(src.data.chunks_exact(4)) {
+        let sa = s[3] as f32 / 255.0;
+        if sa <= 0.002 {
+            continue;
+        }
+        let da = d[3] as f32 / 255.0;
+        let out_a = (sa + da * (1.0 - sa)).max(1e-6);
+        for c in 0..3 {
+            let over = (s[c] as f32 * sa + d[c] as f32 * da * (1.0 - sa)) / out_a;
+            let additive_v = (d[c] as f32 * da + s[c] as f32 * sa).min(255.0);
+            d[c] = (over * (1.0 - add) + additive_v * add) as u8;
+        }
+        d[3] = (out_a * 255.0) as u8;
     }
 }
 
@@ -540,7 +637,7 @@ mod tests {
         let mut layer = Frame::transparent(96, 72);
         composite_grains_frame(clip, events, style, link, cf, &mut layer, t);
         let mut out = Frame::black(96, 72);
-        blend_layer(&mut out, &layer, style.additive);
+        blend_layer(&mut out, &layer, style.additive, 1.0);
         out
     }
 

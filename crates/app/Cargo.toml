@@ -14,3 +14,4 @@ eframe = { version = "0.32", default-features = false, features = [
     "x11",
 ] }
 cpal = "0.15"
+rtrb = "0.3"

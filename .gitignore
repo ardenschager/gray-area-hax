@@ -5,3 +5,5 @@ demo-out.*
 youtube-grains.*
 *.chromagrain-tmp.wav
 crunchy-out.*
+sequencer-out.*
+seq-out.*

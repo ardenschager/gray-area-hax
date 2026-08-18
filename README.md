@@ -46,6 +46,25 @@ Each effect has independent `audio` and `video` amount dials — that's the
 per-effect correspondence control (video 0 = audio-only effect, and vice
 versa). It will be crunchy.
 
+## Sequencing & performance
+
+- **Step sequencer** (Koala / Nanoloop energy): patterns of rows, each row
+  a sampler pad (source + hit preset + key), each step a beat-quantized
+  trigger with optional per-step pitch/gain. Patterns sit ON the timeline
+  as pattern clips and loop to fill them — the tool stays timeline-first,
+  with the sequencer panel editing whatever pattern clip is selected.
+- **Performance playback**: play is live — a streaming engine renders the
+  project in blocks (verified sample-identical to the offline render) into
+  the audio device while a **GPU shader pipeline** (grain quads, effect
+  passes, track compositing) draws the video in real time. Loop a region,
+  tweak grains/effects/steps mid-playback, hear and see it immediately.
+- **Track mixer**: every track has its own AV effect chain ("this whole
+  track has a lot of delay"), a level fader that ducks audio gain AND
+  video opacity (unlinkable, like everything else), mute, and reorder —
+  track order is the video compositing z-order.
+- **Render button**: the deterministic CPU renderer bounces the
+  arrangement to mp4/wav for output; the GPU path is for performing.
+
 ## Features
 
 - **Granular engine** — density, duration, spray, scan speed, pitch ±
@@ -119,6 +138,18 @@ s.fx(c, fx, "video", 0.5);               // per-effect correspondence dial
 let m = s.master_effect("compress");     // master bus crunch
 s.master_fx(m, "quality", 0.3);
 
+let d = s.track_effect(t, "delay");      // track-level chains
+s.track_fx(t, d, "feedback", 0.6);
+s.track_level(t, 0.8);                   // audio gain AND video opacity
+
+let p = s.pattern("hits");               // step sequencer
+s.pattern_grid(p, 4.0, 4);               // 4 beats, 16th steps
+let r = s.row(p, src);
+s.row_key(p, r, "A", "minor_pentatonic");
+s.step(p, r, 0, true);
+s.step_pitch(p, r, 8, 12.0);
+s.pattern_clip(t, p, 0.0, 16.0);         // loops on the timeline
+
 s.render(0.0, 16.0, "out.mp4");          // .mp4 / .wav / .png
 ```
 
@@ -145,14 +176,19 @@ crates/core        chromagrain-core (headless, fully tested)
   grain.rs         GrainSettings -> [GrainEvent]  (the shared AV events)
   audio.rs         AudioClip, granular audio renderer, stereo bus + soft clip
   video.rs         Frame/VideoClip, HSV, ColorFilter, AvLink, grain compositor
-  fx.rs            AV effects: crush/delay/reverb/compress, FFT + 8x8 DCT
-  timeline.rs      Source / Clip (granular|snippet) / Track / Project
-  render.rs        offline renderer: per-clip buses & layers -> master chain
+  fx.rs            AV effects: crush/delay/reverb/compress, streaming audio
+                   states (block == offline, exactly), FFT + 8x8 DCT
+  seq.rs           step sequencer: StepPattern/SeqRow/Step -> grain events
+  timeline.rs      Source / Clip (granular|snippet|pattern) / Track / Project
+  render.rs        offline renderer: clip -> track -> master, z-ordered
+  realtime.rs      streaming performance engine (loop region, live edits)
   media.rs         wav/png IO, ffmpeg decode/encode, yt-dlp fetch
   script.rs        rhai bindings over all of the above
 crates/app         chromagrain (desktop app)
-  main.rs          eframe GUI: timeline, preview, inspector, script console
-  playback.rs      cpal playback of bounced audio
+  main.rs          eframe GUI: preview, timeline, sequencer, inspector
+  gpu.rs           glow/OpenGL realtime pipeline: grain quads + effect
+                   shader passes + track compositing
+  playback.rs      streaming cpal playback (lock-free ring, live updates)
 ```
 
 The renderer is deterministic: a project + seeds always produces the same
