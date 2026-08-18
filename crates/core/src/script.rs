@@ -16,6 +16,7 @@
 
 use crate::audio::AudioClip;
 use crate::dsp::{FilterKind, FilterSpec};
+use crate::fx::{AvEffect, EffectKind};
 use crate::media;
 use crate::music::Key;
 use crate::render::render_project;
@@ -196,6 +197,24 @@ pub fn build_engine(session: Session, log: Arc<Mutex<String>>) -> Engine {
         s.project.lock().unwrap().add_track(name) as i64
     });
 
+    fn push_clip(
+        s: &mut Session,
+        track: i64,
+        source: i64,
+        clip: Clip,
+    ) -> ScriptResult<ClipRef> {
+        let mut p = s.project.lock().unwrap();
+        if source as usize >= p.sources.len() {
+            return Err(rt_err(format!("no source {source}")));
+        }
+        let t = p
+            .tracks
+            .get_mut(track as usize)
+            .ok_or_else(|| rt_err(format!("no track {track}")))?;
+        t.clips.push(clip);
+        Ok(ClipRef { track, index: (t.clips.len() - 1) as i64 })
+    }
+
     engine.register_fn(
         "clip",
         |s: &mut Session,
@@ -204,16 +223,23 @@ pub fn build_engine(session: Session, log: Arc<Mutex<String>>) -> Engine {
          start_beat: f64,
          length_beats: f64|
          -> ScriptResult<ClipRef> {
-            let mut p = s.project.lock().unwrap();
-            if source as usize >= p.sources.len() {
-                return Err(rt_err(format!("no source {source}")));
-            }
-            let t = p
-                .tracks
-                .get_mut(track as usize)
-                .ok_or_else(|| rt_err(format!("no track {track}")))?;
-            t.clips.push(Clip::new(source as usize, start_beat, length_beats.max(0.001)));
-            Ok(ClipRef { track, index: (t.clips.len() - 1) as i64 })
+            let c = Clip::new(source as usize, start_beat, length_beats.max(0.001));
+            push_clip(s, track, source, c)
+        },
+    );
+
+    // A snippet: the source played straight as ONE long grain, keeping the
+    // full AV correspondence (gain->opacity, pitch->rate/hue, pan->x).
+    engine.register_fn(
+        "snippet",
+        |s: &mut Session,
+         track: i64,
+         source: i64,
+         start_beat: f64,
+         length_beats: f64|
+         -> ScriptResult<ClipRef> {
+            let c = Clip::new_snippet(source as usize, start_beat, length_beats.max(0.001));
+            push_clip(s, track, source, c)
         },
     );
 
@@ -240,13 +266,21 @@ pub fn build_engine(session: Session, log: Arc<Mutex<String>>) -> Engine {
                     "envelope" => g.envelope = x.clamp(0.01, 1.0),
                     "reverse_prob" => g.reverse_prob = x.clamp(0.0, 1.0),
                     "seed" => g.seed = value as u64,
+                    "pan" => g.pan = x.clamp(-1.0, 1.0),
                     "size_scale" => v.size_scale = x.max(0.0),
                     "min_size" => v.min_size = x.clamp(0.01, 1.0),
                     "max_size" => v.max_size = x.clamp(0.01, 1.0),
-                    "hue_per_semitone" => v.hue_per_semitone = x,
                     "additive" => v.additive = x.clamp(0.0, 1.0),
                     "scatter_y" => v.scatter_y = x.clamp(0.0, 1.0),
-                    other => return Err(format!("unknown parameter '{other}'")),
+                    // Correspondence dials (gain_to_opacity, pitch_to_hue,
+                    // pitch_to_rate, pan_to_x, envelope_to_opacity,
+                    // reverse_video, hue_per_semitone alias).
+                    other => {
+                        return clip
+                            .link
+                            .set_param(other, x)
+                            .map_err(|_| format!("unknown parameter '{other}'"))
+                    }
                 }
                 Ok(())
             })?
@@ -313,6 +347,66 @@ pub fn build_engine(session: Session, log: Arc<Mutex<String>>) -> Engine {
             s.with_clip(c, |clip| clip.color_filter = None)
         },
     );
+
+    // ------------------------------------------------------------ effects
+    // Chains: s.effect(c, "crush") -> index; s.fx(c, idx, "bits", 4.0);
+    // master: s.master_effect("reverb") -> idx; s.master_fx(idx, "mix", 0.4).
+    engine.register_fn(
+        "effect",
+        |s: &mut Session, c: ClipRef, kind: &str| -> ScriptResult<i64> {
+            let kind = EffectKind::parse(kind)
+                .ok_or_else(|| rt_err(format!("unknown effect '{kind}'")))?;
+            s.with_clip(c, |clip| {
+                clip.effects.push(AvEffect::new(kind));
+                (clip.effects.len() - 1) as i64
+            })
+        },
+    );
+
+    engine.register_fn(
+        "fx",
+        |s: &mut Session, c: ClipRef, idx: i64, param: &str, value: f64| -> ScriptResult<()> {
+            s.with_clip(c, |clip| -> Result<(), String> {
+                let fx = clip
+                    .effects
+                    .get_mut(idx as usize)
+                    .ok_or_else(|| format!("no effect {idx} on clip"))?;
+                fx.set_param(param, value as f32)
+            })?
+            .map_err(rt_err)
+        },
+    );
+
+    engine.register_fn("clear_effects", |s: &mut Session, c: ClipRef| -> ScriptResult<()> {
+        s.with_clip(c, |clip| clip.effects.clear())
+    });
+
+    engine.register_fn(
+        "master_effect",
+        |s: &mut Session, kind: &str| -> ScriptResult<i64> {
+            let kind = EffectKind::parse(kind)
+                .ok_or_else(|| rt_err(format!("unknown effect '{kind}'")))?;
+            let mut p = s.project.lock().unwrap();
+            p.master_effects.push(AvEffect::new(kind));
+            Ok((p.master_effects.len() - 1) as i64)
+        },
+    );
+
+    engine.register_fn(
+        "master_fx",
+        |s: &mut Session, idx: i64, param: &str, value: f64| -> ScriptResult<()> {
+            let mut p = s.project.lock().unwrap();
+            let fx = p
+                .master_effects
+                .get_mut(idx as usize)
+                .ok_or_else(|| rt_err(format!("no master effect {idx}")))?;
+            fx.set_param(param, value as f32).map_err(rt_err)
+        },
+    );
+
+    engine.register_fn("clear_master_effects", |s: &mut Session| {
+        s.project.lock().unwrap().master_effects.clear();
+    });
 
     // ------------------------------------------------------------- render
     {
@@ -439,6 +533,64 @@ mod tests {
         "#;
         let err = run_script(project, Path::new("/tmp"), bad_prop).unwrap_err();
         assert!(err.contains("unknown parameter"), "err: {err}");
+    }
+
+    #[test]
+    fn script_snippets_effects_and_links() {
+        let project = fresh();
+        let script = r#"
+            let s = session(120.0);
+            let src = s.demo_source();
+            let t = s.track("g");
+            let c = s.snippet(t, src, 0.0, 4.0);
+            s.set(c, "gain", 0.5);
+            s.set(c, "pan", -0.5);
+            s.set(c, "gain_to_opacity", 0.3);
+            s.set(c, "pitch_to_hue", -18.0);
+            let cr = s.effect(c, "crush");
+            s.fx(c, cr, "bits", 4.0);
+            s.fx(c, cr, "video", 0.7);
+            let dl = s.effect(c, "delay");
+            s.fx(c, dl, "time", 0.4);
+            let mr = s.master_effect("reverb");
+            s.master_fx(mr, "mix", 0.5);
+        "#;
+        run_script(project.clone(), Path::new("/tmp"), script).unwrap();
+
+        let p = project.lock().unwrap();
+        let clip = &p.tracks[0].clips[0];
+        assert_eq!(clip.kind, crate::timeline::ClipKind::Snippet);
+        assert_eq!(clip.grains.gain, 0.5);
+        assert_eq!(clip.grains.pan, -0.5);
+        assert_eq!(clip.link.gain_to_opacity, 0.3);
+        assert_eq!(clip.link.pitch_to_hue, -18.0);
+        assert_eq!(clip.effects.len(), 2);
+        assert!(matches!(
+            clip.effects[0].kind,
+            crate::fx::EffectKind::Crush { bits, .. } if bits == 4.0
+        ));
+        assert_eq!(clip.effects[0].video, 0.7);
+        assert!(matches!(
+            clip.effects[1].kind,
+            crate::fx::EffectKind::Delay { time, .. } if (time - 0.4).abs() < 1e-6
+        ));
+        assert_eq!(p.master_effects.len(), 1);
+        assert!(matches!(
+            p.master_effects[0].kind,
+            crate::fx::EffectKind::Reverb { mix, .. } if mix == 0.5
+        ));
+
+        // Bad effect index and unknown effect error cleanly.
+        drop(p);
+        let bad = r#"
+            let s = session(120.0);
+            let src = s.demo_source();
+            let t = s.track("g");
+            let c = s.clip(t, src, 0.0, 4.0);
+            s.fx(c, 5, "time", 0.4);
+        "#;
+        let err = run_script(fresh(), Path::new("/tmp"), bad).unwrap_err();
+        assert!(err.contains("no effect"), "err: {err}");
     }
 
     #[test]

@@ -2,9 +2,10 @@
 
 use crate::audio::AudioClip;
 use crate::dsp::FilterSpec;
+use crate::fx::AvEffect;
 use crate::grain::GrainSettings;
 use crate::music::Key;
-use crate::video::{ColorFilter, VideoClip, VisualGrainStyle};
+use crate::video::{AvLink, ColorFilter, VideoClip, VisualGrainStyle};
 
 pub type SourceId = usize;
 
@@ -36,12 +37,27 @@ impl Source {
     }
 }
 
-/// A granular clip placed on the timeline (positions in beats).
+/// What a clip does with its source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipKind {
+    /// A cloud of grains (audio + visual) from the source.
+    Granular,
+    /// The source played straight, as ONE long grain — so the same AV
+    /// correspondence machinery (gain->opacity, pitch->rate/hue, pan->x)
+    /// applies to plain snippets too.
+    Snippet,
+}
+
+/// A clip placed on the timeline (positions in beats).
 #[derive(Debug, Clone)]
 pub struct Clip {
+    pub kind: ClipKind,
     pub source: SourceId,
     pub start_beat: f64,
     pub length_beats: f64,
+    /// Granular params. Snippets reuse a subset: position (source offset),
+    /// pitch, gain, pan, envelope (edge fades), reverse_prob (>=0.5 =
+    /// reversed).
     pub grains: GrainSettings,
     /// Quantize grain pitches onto this key.
     pub key: Option<Key>,
@@ -50,11 +66,16 @@ pub struct Clip {
     /// Color (hue-band) filtering applied to visual grains.
     pub color_filter: Option<ColorFilter>,
     pub visual: VisualGrainStyle,
+    /// The audio->visual correspondence dials (full correspondence default).
+    pub link: AvLink,
+    /// AV effect chain applied to this clip's audio AND its visual layer.
+    pub effects: Vec<AvEffect>,
 }
 
 impl Clip {
     pub fn new(source: SourceId, start_beat: f64, length_beats: f64) -> Clip {
         Clip {
+            kind: ClipKind::Granular,
             source,
             start_beat,
             length_beats,
@@ -63,7 +84,18 @@ impl Clip {
             audio_filters: Vec::new(),
             color_filter: None,
             visual: VisualGrainStyle::default(),
+            link: AvLink::default(),
+            effects: Vec::new(),
         }
+    }
+
+    pub fn new_snippet(source: SourceId, start_beat: f64, length_beats: f64) -> Clip {
+        let mut c = Clip::new(source, start_beat, length_beats);
+        c.kind = ClipKind::Snippet;
+        // Snippets default to short edge fades rather than a grain window.
+        c.grains.envelope = 0.05;
+        c.grains.pan_spread = 0.0;
+        c
     }
 
     pub fn end_beat(&self) -> f64 {
@@ -89,6 +121,8 @@ pub struct Project {
     pub fps: f32,
     pub sources: Vec<Source>,
     pub tracks: Vec<Track>,
+    /// Master AV effect chain applied to the final mix and final frames.
+    pub master_effects: Vec<AvEffect>,
 }
 
 impl Default for Project {
@@ -101,6 +135,7 @@ impl Default for Project {
             fps: 24.0,
             sources: Vec::new(),
             tracks: Vec::new(),
+            master_effects: Vec::new(),
         }
     }
 }
@@ -180,7 +215,25 @@ impl Project {
             ..Default::default()
         };
         c1.color_filter = Some(ColorFilter::keep(200.0, 160.0));
+        c1.effects.push(AvEffect::new(
+            crate::fx::EffectKind::Crush { downsample: 5.0, bits: 5.0 },
+        ));
         p.tracks[t1].clips.push(c1);
+
+        // A quiet snippet bed underneath: the source played straight, an
+        // octave down, dimmed — gain drives opacity via the AV link.
+        let t2 = p.add_track("bed (snippet)");
+        let mut c2 = Clip::new_snippet(sid, 0.0, 8.0);
+        c2.grains.pitch = -12.0;
+        c2.grains.gain = 0.35;
+        p.tracks[t2].clips.push(c2);
+
+        // Gentle master smear ties it together.
+        p.master_effects.push(AvEffect {
+            kind: crate::fx::EffectKind::Reverb { size: 0.5, damp: 0.4, mix: 0.2 },
+            audio: 1.0,
+            video: 1.0,
+        });
 
         p
     }

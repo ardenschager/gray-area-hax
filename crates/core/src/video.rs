@@ -34,6 +34,15 @@ impl Frame {
         Frame { width, height, data }
     }
 
+    /// Fully transparent frame — the starting point for a clip's layer.
+    pub fn transparent(width: u32, height: u32) -> Frame {
+        Frame {
+            width,
+            height,
+            data: vec![0u8; (width * height * 4) as usize],
+        }
+    }
+
     #[inline]
     pub fn get(&self, x: u32, y: u32) -> [u8; 4] {
         let i = ((y * self.width + x) * 4) as usize;
@@ -235,7 +244,8 @@ impl ColorFilter {
     }
 }
 
-/// How grain events are drawn.
+/// How grain events are drawn (pure style — the audio->visual mapping
+/// itself lives in [`AvLink`]).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct VisualGrainStyle {
     /// Patch size as a fraction of the canvas per second of grain duration.
@@ -243,8 +253,6 @@ pub struct VisualGrainStyle {
     pub size_scale: f32,
     pub min_size: f32,
     pub max_size: f32,
-    /// Degrees of hue rotation per semitone of grain pitch.
-    pub hue_per_semitone: f32,
     /// 0 = alpha-over blending, 1 = additive glow. In between blends both.
     pub additive: f32,
     /// Vertical scatter amount (0 = all grains centered vertically).
@@ -257,10 +265,72 @@ impl Default for VisualGrainStyle {
             size_scale: 2.2,
             min_size: 0.12,
             max_size: 0.65,
-            hue_per_semitone: 12.0,
             additive: 0.35,
             scatter_y: 0.7,
         }
+    }
+}
+
+impl VisualGrainStyle {
+    /// Style for snippet clips: the patch is the whole frame.
+    pub fn full_frame(additive: f32) -> VisualGrainStyle {
+        VisualGrainStyle {
+            size_scale: 1000.0,
+            min_size: 1.0,
+            max_size: 1.0,
+            additive,
+            scatter_y: 0.0,
+        }
+    }
+}
+
+/// The audio->visual correspondence, per clip. Full correspondence is the
+/// default; every mapping is a dial (0 = unlinked, 1 = fully linked).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct AvLink {
+    /// Grain gain drives visual opacity (0 = opacity ignores gain).
+    pub gain_to_opacity: f32,
+    /// The audio amplitude envelope drives opacity over the grain's life
+    /// (0 = constant opacity while active).
+    pub envelope_to_opacity: f32,
+    /// Degrees of hue rotation per semitone of grain pitch.
+    pub pitch_to_hue: f32,
+    /// The visual patch plays its video at the audio playback rate
+    /// (0 = patch always plays at 1x).
+    pub pitch_to_rate: f32,
+    /// Audio pan drives horizontal placement (0 = always centered).
+    pub pan_to_x: f32,
+    /// Reversed audio grains also play their video backwards.
+    pub reverse_video: bool,
+}
+
+impl Default for AvLink {
+    fn default() -> Self {
+        AvLink {
+            gain_to_opacity: 1.0,
+            envelope_to_opacity: 1.0,
+            pitch_to_hue: 12.0,
+            pitch_to_rate: 1.0,
+            pan_to_x: 1.0,
+            reverse_video: true,
+        }
+    }
+}
+
+impl AvLink {
+    /// Set a link dial by name.
+    pub fn set_param(&mut self, name: &str, value: f32) -> Result<(), String> {
+        let key = name.to_ascii_lowercase().replace([' ', '-'], "_");
+        match key.as_str() {
+            "gain_to_opacity" => self.gain_to_opacity = value.clamp(0.0, 1.0),
+            "envelope_to_opacity" => self.envelope_to_opacity = value.clamp(0.0, 1.0),
+            "pitch_to_hue" | "hue_per_semitone" => self.pitch_to_hue = value,
+            "pitch_to_rate" => self.pitch_to_rate = value.clamp(0.0, 1.0),
+            "pan_to_x" => self.pan_to_x = value.clamp(0.0, 1.0),
+            "reverse_video" => self.reverse_video = value > 0.5,
+            other => return Err(format!("unknown link parameter '{other}'")),
+        }
+        Ok(())
     }
 }
 
@@ -274,11 +344,15 @@ fn hash01(x: u64) -> f32 {
 }
 
 /// Composite every grain active at output time `t` (timeline seconds) onto
-/// `out`. Call once per output frame.
+/// `out` — a transparent layer with straight-alpha accumulation. Call once
+/// per output frame, then blend the layer onto the master with
+/// [`blend_layer`]. The `link` controls how much of each audio property
+/// carries over to the visual grain.
 pub fn composite_grains_frame(
     clip: &VideoClip,
     events: &[GrainEvent],
     style: &VisualGrainStyle,
+    link: &AvLink,
     color_filter: Option<&ColorFilter>,
     out: &mut Frame,
     t: f64,
@@ -290,15 +364,20 @@ pub fn composite_grains_frame(
             continue;
         }
         let phase = ((t - ev.onset) / ev.duration as f64) as f32;
-        let alpha = grain_env(phase, ev.envelope) * ev.gain.min(1.5);
+        let env_part = 1.0 + (grain_env(phase, ev.envelope) - 1.0) * link.envelope_to_opacity;
+        let gain_part = 1.0 + (ev.gain.min(1.5) - 1.0) * link.gain_to_opacity;
+        let alpha = (env_part * gain_part).clamp(0.0, 1.0);
         if alpha <= 0.003 {
             continue;
         }
 
-        // The visual grain plays its patch of video at the audio's rate.
-        let local = (t - ev.onset) * ev.pitch_ratio as f64;
-        let src_t = if ev.reverse {
-            ev.source_pos + ev.duration as f64 * ev.pitch_ratio as f64 - local
+        // The visual grain plays its patch of video at the audio's rate
+        // (scaled by the pitch_to_rate link).
+        let visual_rate = 1.0 + (ev.pitch_ratio - 1.0) * link.pitch_to_rate;
+        let local = (t - ev.onset) * visual_rate as f64;
+        let reverse = ev.reverse && link.reverse_video;
+        let src_t = if reverse {
+            ev.source_pos + ev.duration as f64 * visual_rate as f64 - local
         } else {
             ev.source_pos + local
         };
@@ -309,7 +388,7 @@ pub fn composite_grains_frame(
             .clamp(style.min_size, style.max_size);
         let pw = (size * ow).max(2.0) as i32;
         let ph = (size * oh).max(2.0) as i32;
-        let cx = (0.5 + 0.45 * ev.pan) * ow;
+        let cx = (0.5 + 0.45 * ev.pan * link.pan_to_x) * ow;
         let jy = (hash01(ev.id) - 0.5) * style.scatter_y;
         let cy = (0.5 + jy) * oh;
         let x0 = cx as i32 - pw / 2;
@@ -329,7 +408,7 @@ pub fn composite_grains_frame(
         let sx0 = (src_frac * (sw - patch_w)).clamp(0.0, (sw - patch_w).max(0.0));
         let sy0 = ((0.5 + jy * 0.5) * (sh - patch_h)).clamp(0.0, (sh - patch_h).max(0.0));
 
-        let hue_shift = ev.semitones() * style.hue_per_semitone;
+        let hue_shift = ev.semitones() * link.pitch_to_hue;
         let add = style.additive.clamp(0.0, 1.0);
 
         for dy in 0..ph {
@@ -362,21 +441,50 @@ pub fn composite_grains_frame(
                     (r, g, b) = (nr, ng, nb);
                 }
 
+                // Straight-alpha accumulation into the layer, with an
+                // additive component for glow.
                 let dst = out.get(x as u32, y as u32);
+                let da = dst[3] as f32 / 255.0;
+                let out_a = (a + da * (1.0 - a)).max(1e-6);
                 let blend = |src_c: u8, dst_c: u8| -> u8 {
                     let s = src_c as f32;
                     let d = dst_c as f32;
-                    let over = d + (s - d) * a;
-                    let additive = (d + s * a).min(255.0);
+                    let over = (s * a + d * da * (1.0 - a)) / out_a;
+                    let additive = (d * da + s * a).min(255.0);
                     (over * (1.0 - add) + additive * add) as u8
                 };
                 out.put(
                     x as u32,
                     y as u32,
-                    [blend(r, dst[0]), blend(g, dst[1]), blend(b, dst[2]), 255],
+                    [
+                        blend(r, dst[0]),
+                        blend(g, dst[1]),
+                        blend(b, dst[2]),
+                        (out_a * 255.0) as u8,
+                    ],
                 );
             }
         }
+    }
+}
+
+/// Blend a (possibly effect-processed) clip layer onto an opaque master
+/// frame. `additive` mixes between alpha-over and additive glow.
+pub fn blend_layer(dst: &mut Frame, layer: &Frame, additive: f32) {
+    debug_assert_eq!(dst.width, layer.width);
+    debug_assert_eq!(dst.height, layer.height);
+    let add = additive.clamp(0.0, 1.0);
+    for (d, s) in dst.data.chunks_exact_mut(4).zip(layer.data.chunks_exact(4)) {
+        let la = s[3] as f32 / 255.0;
+        if la <= 0.002 {
+            continue;
+        }
+        for c in 0..3 {
+            let over = d[c] as f32 * (1.0 - la) + s[c] as f32 * la;
+            let additive_v = (d[c] as f32 + s[c] as f32 * la).min(255.0);
+            d[c] = (over * (1.0 - add) + additive_v * add) as u8;
+        }
+        d[3] = 255;
     }
 }
 
@@ -421,6 +529,21 @@ mod tests {
         assert!(f.mask(r, g, b) < 0.1);
     }
 
+    fn render_layer_at(
+        clip: &VideoClip,
+        events: &[crate::grain::GrainEvent],
+        style: &VisualGrainStyle,
+        link: &AvLink,
+        cf: Option<&ColorFilter>,
+        t: f64,
+    ) -> Frame {
+        let mut layer = Frame::transparent(96, 72);
+        composite_grains_frame(clip, events, style, link, cf, &mut layer, t);
+        let mut out = Frame::black(96, 72);
+        blend_layer(&mut out, &layer, style.additive);
+        out
+    }
+
     #[test]
     fn compositor_draws_active_grains() {
         let clip = VideoClip::test_pattern(64, 48, 12.0, 2.0);
@@ -428,11 +551,10 @@ mod tests {
         let events =
             schedule_grains(&settings, 0.0, 1.0, clip.duration(), 440.0, None);
         let style = VisualGrainStyle::default();
+        let link = AvLink::default();
 
-        let mut active = Frame::black(96, 72);
-        composite_grains_frame(&clip, &events, &style, None, &mut active, 0.5);
-        let mut idle = Frame::black(96, 72);
-        composite_grains_frame(&clip, &events, &style, None, &mut idle, 500.0);
+        let active = render_layer_at(&clip, &events, &style, &link, None, 0.5);
+        let idle = render_layer_at(&clip, &events, &style, &link, None, 500.0);
 
         assert!(active.mean_luma() > 1.0, "grains should light up the frame");
         assert!(idle.mean_luma() < 0.5, "no grains active -> black frame");
@@ -444,10 +566,10 @@ mod tests {
         let settings = GrainSettings { density: 40.0, ..Default::default() };
         let events =
             schedule_grains(&settings, 0.0, 1.0, clip.duration(), 440.0, None);
-        let style = VisualGrainStyle { hue_per_semitone: 0.0, ..Default::default() };
+        let style = VisualGrainStyle::default();
+        let link = AvLink { pitch_to_hue: 0.0, ..Default::default() };
 
-        let mut unfiltered = Frame::black(96, 72);
-        composite_grains_frame(&clip, &events, &style, None, &mut unfiltered, 0.4);
+        let unfiltered = render_layer_at(&clip, &events, &style, &link, None, 0.4);
 
         // A keep-band that matches nothing (test pattern at t<9s has hue<360
         // sweeping slowly; pick a band far from early hues but sat_min high).
@@ -455,10 +577,86 @@ mod tests {
             sat_min: 0.99,
             ..ColorFilter::keep(200.0, 2.0)
         };
-        let mut filtered = Frame::black(96, 72);
-        composite_grains_frame(&clip, &events, &style, Some(&cf), &mut filtered, 0.4);
+        let filtered = render_layer_at(&clip, &events, &style, &link, Some(&cf), 0.4);
 
         assert!(filtered.mean_luma() < unfiltered.mean_luma() * 0.2 + 1.0);
+    }
+
+    #[test]
+    fn gain_to_opacity_link_is_configurable() {
+        let clip = VideoClip::test_pattern(64, 48, 12.0, 2.0);
+        // One quiet grain covering the eval time.
+        let ev = crate::grain::GrainEvent {
+            onset: 0.0,
+            source_pos: 0.5,
+            duration: 1.0,
+            pitch_ratio: 1.0,
+            gain: 0.25,
+            pan: 0.0,
+            envelope: 0.2,
+            reverse: false,
+            id: 0,
+        };
+        let style = VisualGrainStyle { additive: 0.0, ..Default::default() };
+
+        // Linked (default): low gain -> dim visual grain.
+        let linked = render_layer_at(&clip, &[ev.clone()], &style, &AvLink::default(), None, 0.5);
+        // Unlinked: opacity ignores gain -> brighter.
+        let unlinked_link = AvLink { gain_to_opacity: 0.0, ..Default::default() };
+        let unlinked = render_layer_at(&clip, &[ev], &style, &unlinked_link, None, 0.5);
+
+        assert!(
+            unlinked.mean_luma() > linked.mean_luma() * 2.0,
+            "unlinked {} vs linked {}",
+            unlinked.mean_luma(),
+            linked.mean_luma()
+        );
+    }
+
+    #[test]
+    fn pitch_to_hue_link_is_configurable() {
+        let clip = VideoClip::test_pattern(64, 48, 12.0, 2.0);
+        let ev = crate::grain::GrainEvent {
+            onset: 0.0,
+            source_pos: 0.2,
+            duration: 1.0,
+            pitch_ratio: 2.0, // +12 semitones
+            gain: 1.0,
+            pan: 0.0,
+            envelope: 0.2,
+            reverse: false,
+            id: 0,
+        };
+        let style = VisualGrainStyle { additive: 0.0, ..Default::default() };
+        let shifted = render_layer_at(
+            &clip,
+            &[ev.clone()],
+            &style,
+            &AvLink { pitch_to_hue: 15.0, pitch_to_rate: 0.0, ..Default::default() },
+            None,
+            0.5,
+        );
+        let unshifted = render_layer_at(
+            &clip,
+            &[ev],
+            &style,
+            &AvLink { pitch_to_hue: 0.0, pitch_to_rate: 0.0, ..Default::default() },
+            None,
+            0.5,
+        );
+        assert_ne!(shifted.data, unshifted.data, "hue link should change colors");
+    }
+
+    #[test]
+    fn link_param_setter() {
+        let mut link = AvLink::default();
+        link.set_param("gain_to_opacity", 0.5).unwrap();
+        link.set_param("pitch_to_hue", -20.0).unwrap();
+        link.set_param("reverse_video", 0.0).unwrap();
+        assert_eq!(link.gain_to_opacity, 0.5);
+        assert_eq!(link.pitch_to_hue, -20.0);
+        assert!(!link.reverse_video);
+        assert!(link.set_param("bogus", 1.0).is_err());
     }
 
     #[test]

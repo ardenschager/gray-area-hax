@@ -29,7 +29,9 @@ pub struct GrainSettings {
     pub pitch_jitter: f32,
     /// Linear gain applied per grain.
     pub gain: f32,
-    /// Stereo/pan spread 0..1; pan also positions visual grains horizontally.
+    /// Center pan -1..1 (audio position == visual x position).
+    pub pan: f32,
+    /// Random pan spread around the center, 0..1.
     pub pan_spread: f32,
     /// Envelope shape 0..1 (tukey taper fraction; 1 = hann).
     pub envelope: f32,
@@ -51,6 +53,7 @@ impl Default for GrainSettings {
             pitch: 0.0,
             pitch_jitter: 0.0,
             gain: 0.8,
+            pan: 0.0,
             pan_spread: 0.6,
             envelope: 0.6,
             reverse_prob: 0.0,
@@ -137,7 +140,8 @@ pub fn schedule_grains(
             ratio = k.quantize_ratio(base_hz, ratio);
         }
 
-        let pan = settings.pan_spread.clamp(0.0, 1.0) * rng.bipolar();
+        let pan = (settings.pan + settings.pan_spread.clamp(0.0, 1.0) * rng.bipolar())
+            .clamp(-1.0, 1.0);
         let reverse = rng.next_f32() < settings.reverse_prob;
 
         events.push(GrainEvent {

@@ -7,11 +7,12 @@
 mod playback;
 
 use chromagrain_core::dsp::{FilterKind, FilterSpec};
+use chromagrain_core::fx::{AvEffect, EffectKind};
 use chromagrain_core::media;
 use chromagrain_core::music::{Key, ScaleKind, PITCH_CLASS_NAMES};
 use chromagrain_core::render::{render_project, RenderOutput};
 use chromagrain_core::script::run_script;
-use chromagrain_core::timeline::{Clip, Project, Source};
+use chromagrain_core::timeline::{Clip, ClipKind, Project, Source};
 use chromagrain_core::video::{ColorFilter, ColorFilterMode};
 use eframe::egui;
 use std::path::PathBuf;
@@ -393,17 +394,31 @@ impl App {
             let n = p.tracks.len();
             p.add_track(&format!("track {}", n + 1));
         }
-        if ui.button("+ clip at playhead").clicked() {
-            let mut p = self.project.lock().unwrap();
-            if self.selected_source < p.sources.len() && !p.tracks.is_empty() {
-                let t = self.selected_track.min(p.tracks.len() - 1);
-                let clip = Clip::new(self.selected_source, self.playhead_beats, 4.0);
-                p.tracks[t].clips.push(clip);
-                let idx = p.tracks[t].clips.len() - 1;
-                drop(p);
-                self.selected_clip = Some((t, idx));
-                self.bounce_dirty = true;
+        ui.horizontal(|ui| {
+            if ui.button("+ grain clip").clicked() {
+                self.add_clip(false);
             }
+            if ui.button("+ snippet").clicked() {
+                self.add_clip(true);
+            }
+        });
+        ui.label(egui::RichText::new("clips land at the playhead").weak());
+    }
+
+    fn add_clip(&mut self, snippet: bool) {
+        let mut p = self.project.lock().unwrap();
+        if self.selected_source < p.sources.len() && !p.tracks.is_empty() {
+            let t = self.selected_track.min(p.tracks.len() - 1);
+            let clip = if snippet {
+                Clip::new_snippet(self.selected_source, self.playhead_beats, 4.0)
+            } else {
+                Clip::new(self.selected_source, self.playhead_beats, 4.0)
+            };
+            p.tracks[t].clips.push(clip);
+            let idx = p.tracks[t].clips.len() - 1;
+            drop(p);
+            self.selected_clip = Some((t, idx));
+            self.bounce_dirty = true;
         }
     }
 
@@ -515,19 +530,28 @@ impl App {
             }
 
             // Clips.
-            let clip_data: Vec<(usize, usize, f64, f64, bool, usize)> = {
+            #[allow(clippy::type_complexity)]
+            let clip_data: Vec<(usize, usize, f64, f64, bool, usize, bool)> = {
                 let p = self.project.lock().unwrap();
                 p.tracks
                     .iter()
                     .enumerate()
                     .flat_map(|(ti, t)| {
                         t.clips.iter().enumerate().map(move |(ci, c)| {
-                            (ti, ci, c.start_beat, c.length_beats, c.key.is_some(), c.source)
+                            (
+                                ti,
+                                ci,
+                                c.start_beat,
+                                c.length_beats,
+                                c.key.is_some(),
+                                c.source,
+                                c.kind == ClipKind::Snippet,
+                            )
                         })
                     })
                     .collect()
             };
-            for (ti, ci, start, len, has_key, source) in &clip_data {
+            for (ti, ci, start, len, has_key, source, is_snippet) in &clip_data {
                 let x0 = origin.x + *start as f32 * beat_w;
                 let y0 = origin.y + ruler_h + *ti as f32 * track_h + 3.0;
                 let rect = egui::Rect::from_min_size(
@@ -550,7 +574,8 @@ impl App {
                         egui::StrokeKind::Outside,
                     );
                 }
-                let label = if *has_key { "grains ♪" } else { "grains" };
+                let base = if *is_snippet { "snippet" } else { "grains" };
+                let label = if *has_key { format!("{base} ♪") } else { base.to_string() };
                 painter.text(
                     rect.min + egui::vec2(5.0, 4.0),
                     egui::Align2::LEFT_TOP,
@@ -573,7 +598,7 @@ impl App {
             // drag clip to move.
             if let Some(pos) = resp.interact_pointer_pos() {
                 let beat = ((pos.x - origin.x) / beat_w) as f64;
-                let hit_clip = clip_data.iter().rev().find(|(ti, _, start, len, _, _)| {
+                let hit_clip = clip_data.iter().rev().find(|(ti, _, start, len, _, _, _)| {
                     let y0 = origin.y + ruler_h + *ti as f32 * track_h;
                     pos.y >= y0
                         && pos.y < y0 + track_h
@@ -582,7 +607,7 @@ impl App {
                 });
                 if resp.drag_started() || resp.clicked() {
                     match hit_clip {
-                        Some((ti, ci, _, _, _, _)) => {
+                        Some((ti, ci, _, _, _, _, _)) => {
                             self.selected_clip = Some((*ti, *ci));
                             self.selected_track = *ti;
                         }
@@ -623,6 +648,100 @@ impl App {
         });
     }
 
+    /// Editor for an AV effect chain. Returns true when anything changed.
+    fn effects_chain_ui(ui: &mut egui::Ui, effects: &mut Vec<AvEffect>, salt: &str) -> bool {
+        let mut changed = false;
+        let mut remove: Option<usize> = None;
+        for (i, fx) in effects.iter_mut().enumerate() {
+            ui.push_id((salt, i), |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(fx.kind.name()).strong());
+                    if ui.button("x").clicked() {
+                        remove = Some(i);
+                    }
+                });
+                match &mut fx.kind {
+                    EffectKind::Crush { downsample, bits } => {
+                        changed |= ui
+                            .add(egui::Slider::new(downsample, 1.0..=32.0).text("downres"))
+                            .changed();
+                        changed |= ui
+                            .add(egui::Slider::new(bits, 1.0..=16.0).text("bits"))
+                            .changed();
+                    }
+                    EffectKind::Delay { time, feedback, mix, shift_x, shift_y } => {
+                        changed |= ui
+                            .add(
+                                egui::Slider::new(time, 0.02..=2.0)
+                                    .logarithmic(true)
+                                    .text("time (s)"),
+                            )
+                            .changed();
+                        changed |= ui
+                            .add(egui::Slider::new(feedback, 0.0..=0.95).text("feedback"))
+                            .changed();
+                        changed |=
+                            ui.add(egui::Slider::new(mix, 0.0..=1.0).text("mix")).changed();
+                        changed |= ui
+                            .add(egui::Slider::new(shift_x, -0.3..=0.3).text("ghost drift x"))
+                            .changed();
+                        changed |= ui
+                            .add(egui::Slider::new(shift_y, -0.3..=0.3).text("ghost drift y"))
+                            .changed();
+                    }
+                    EffectKind::Reverb { size, damp, mix } => {
+                        changed |=
+                            ui.add(egui::Slider::new(size, 0.0..=1.0).text("size")).changed();
+                        changed |= ui
+                            .add(egui::Slider::new(damp, 0.0..=1.0).text("damp / blur"))
+                            .changed();
+                        changed |=
+                            ui.add(egui::Slider::new(mix, 0.0..=1.0).text("mix")).changed();
+                    }
+                    EffectKind::Compress { quality } => {
+                        changed |= ui
+                            .add(egui::Slider::new(quality, 0.0..=1.0).text("quality"))
+                            .changed();
+                    }
+                }
+                ui.horizontal(|ui| {
+                    changed |= ui
+                        .add(egui::Slider::new(&mut fx.audio, 0.0..=1.0).text("audio"))
+                        .changed();
+                    changed |= ui
+                        .add(egui::Slider::new(&mut fx.video, 0.0..=1.0).text("video"))
+                        .changed();
+                });
+                ui.separator();
+            });
+        }
+        if let Some(i) = remove {
+            effects.remove(i);
+            changed = true;
+        }
+        ui.horizontal(|ui| {
+            for name in ["crush", "delay", "reverb", "compress"] {
+                if ui.button(format!("+ {name}")).clicked() {
+                    effects.push(AvEffect::new(EffectKind::parse(name).unwrap()));
+                    changed = true;
+                }
+            }
+        });
+        changed
+    }
+
+    fn master_fx_ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading("master effects");
+        let mut p = self.project.lock().unwrap();
+        let mut effects = std::mem::take(&mut p.master_effects);
+        drop(p);
+        let changed = Self::effects_chain_ui(ui, &mut effects, "master_fx");
+        self.project.lock().unwrap().master_effects = effects;
+        if changed {
+            self.bounce_dirty = true;
+        }
+    }
+
     fn inspector_ui(&mut self, ui: &mut egui::Ui) {
         let Some((ti, ci)) = self.selected_clip else {
             ui.label("select a clip on the timeline");
@@ -637,7 +756,17 @@ impl App {
         };
         let mut changed = false;
 
-        ui.heading("clip");
+        let kind_name = match clip.kind {
+            ClipKind::Granular => "grain clip",
+            ClipKind::Snippet => "snippet",
+        };
+        ui.heading(kind_name);
+        ui.horizontal(|ui| {
+            for (k, label) in [(ClipKind::Granular, "granular"), (ClipKind::Snippet, "snippet")]
+            {
+                changed |= ui.selectable_value(&mut clip.kind, k, label).changed();
+            }
+        });
         ui.horizontal(|ui| {
             ui.label("source");
             changed |= ui
@@ -676,6 +805,7 @@ impl App {
         changed |= slider(ui, &mut g.pitch, -24.0..=24.0, "pitch (semitones)", false);
         changed |= slider(ui, &mut g.pitch_jitter, 0.0..=24.0, "pitch jitter", false);
         changed |= slider(ui, &mut g.gain, 0.0..=2.0, "gain", false);
+        changed |= slider(ui, &mut g.pan, -1.0..=1.0, "pan / x position", false);
         changed |= slider(ui, &mut g.pan_spread, 0.0..=1.0, "pan/x spread", false);
         changed |= slider(ui, &mut g.envelope, 0.01..=1.0, "envelope shape", false);
         changed |= slider(ui, &mut g.reverse_prob, 0.0..=1.0, "reverse prob", false);
@@ -811,16 +941,42 @@ impl App {
         }
 
         ui.separator();
+        ui.heading("effects chain  (audio + video)");
+        changed |= Self::effects_chain_ui(ui, &mut clip.effects, "clip_fx");
+
+        ui.separator();
+        ui.heading("correspondence (AV link)");
+        let l = &mut clip.link;
+        changed |= ui
+            .add(egui::Slider::new(&mut l.gain_to_opacity, 0.0..=1.0).text("gain -> opacity"))
+            .changed();
+        changed |= ui
+            .add(
+                egui::Slider::new(&mut l.envelope_to_opacity, 0.0..=1.0)
+                    .text("envelope -> opacity"),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::Slider::new(&mut l.pitch_to_hue, -30.0..=30.0)
+                    .text("pitch -> hue (deg/st)"),
+            )
+            .changed();
+        changed |= ui
+            .add(egui::Slider::new(&mut l.pitch_to_rate, 0.0..=1.0).text("pitch -> video rate"))
+            .changed();
+        changed |= ui
+            .add(egui::Slider::new(&mut l.pan_to_x, 0.0..=1.0).text("pan -> x position"))
+            .changed();
+        changed |= ui
+            .checkbox(&mut l.reverse_video, "reversed audio reverses video")
+            .changed();
+
+        ui.separator();
         ui.heading("visual grain style");
         let v = &mut clip.visual;
         changed |= ui
             .add(egui::Slider::new(&mut v.size_scale, 0.2..=8.0).text("size per duration"))
-            .changed();
-        changed |= ui
-            .add(
-                egui::Slider::new(&mut v.hue_per_semitone, -30.0..=30.0)
-                    .text("hue °/semitone"),
-            )
             .changed();
         changed |= ui
             .add(egui::Slider::new(&mut v.additive, 0.0..=1.0).text("additive glow"))
@@ -885,7 +1041,11 @@ impl eframe::App for App {
         egui::SidePanel::right("inspector")
             .default_width(340.0)
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| self.inspector_ui(ui));
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    self.inspector_ui(ui);
+                    ui.separator();
+                    self.master_fx_ui(ui);
+                });
             });
         egui::CentralPanel::default().show(ctx, |ui| {
             self.preview_ui(ui);
@@ -902,12 +1062,18 @@ const DEFAULT_SCRIPT: &str = r#"
 let s = session(100.0);
 let src = s.demo_source();          // or: s.load("clip.mp4") / s.youtube("https://…")
 let t = s.track("scripted");
-let c = s.clip(t, src, 8.0, 8.0);
+let c = s.clip(t, src, 8.0, 8.0);   // or s.snippet(t, src, 8.0, 8.0)
 s.key(c, "A", "minor_pentatonic");
 s.set(c, "density", 35.0);
 s.set(c, "pitch_jitter", 12.0);
 s.set(c, "spray", 0.5);
 s.audio_filter(c, "bandpass", 1200.0, 1.5);
 s.color_keep(c, 200.0, 140.0);
-print("clip added — bounce to hear/see it");
+s.set(c, "gain_to_opacity", 1.0);   // AV correspondence dials
+let d = s.effect(c, "delay");       // AV effect chain: crush/delay/reverb/compress
+s.fx(c, d, "time", 0.3);
+s.fx(c, d, "feedback", 0.55);
+let m = s.master_effect("compress"); // master bus crunch
+s.master_fx(m, "quality", 0.35);
+print("clip + effects added — bounce to hear/see it");
 "#;

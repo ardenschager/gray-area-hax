@@ -19,9 +19,32 @@ renderer and the video compositor both consume the *same* events:
 | reverse       | backwards audio          | backwards video                  |
 
 So a cloud of high, short, wide-panned grains *sounds* sparkly and *looks*
-like small, hue-shifted, scattered patches — automatically.
+like small, hue-shifted, scattered patches — automatically. **The
+correspondence itself is configurable**: every mapping is a dial on the
+clip's AV link (0 = unlinked, 1 = fully linked, full correspondence is the
+default), so you can, say, keep pitch→hue but let opacity ignore gain.
+
+Clips come in two kinds: **grain clips** (clouds) and **snippets** — media
+placed straight on the timeline. A snippet is rendered as ONE long grain, so
+the same correspondence applies: its gain is its loudness *and* its opacity.
 
 ![demo frame](docs/demo-frame.png)
+
+## AV effects — the crunch you hear is the crunch you see
+
+Effect chains run per clip and on the master bus, and every effect processes
+BOTH domains with the same idea:
+
+| effect   | audio                            | video                              |
+|----------|----------------------------------|------------------------------------|
+| crush    | sample-rate decimation + bit depth reduction | pixelation + color posterize |
+| delay    | feedback delay line              | ghost frames at the same delay/feedback, with optional drift |
+| reverb   | Freeverb-style combs/allpasses   | frame persistence + blur smear     |
+| compress | FFT spectral quantization (codec crunch) | JPEG-style 8×8 DCT block quantization — the same transform-domain math |
+
+Each effect has independent `audio` and `video` amount dials — that's the
+per-effect correspondence control (video 0 = audio-only effect, and vice
+versa). It will be crunchy.
 
 ## Features
 
@@ -85,15 +108,32 @@ s.set(c, "spray", 1.2);                  // read-position randomness (s)
 s.set(c, "scan_speed", 0.7);             // read-head speed vs realtime
 s.audio_filter(c, "bandpass", 1000.0, 1.2);  // filter audio frequencies
 s.color_remove(c, 120.0, 80.0);              // filter out a hue band
+
+let b = s.snippet(t, src, 16.0, 8.0);    // media straight on the timeline
+s.set(b, "gain", 0.5);                   // loudness AND opacity
+s.set(b, "gain_to_opacity", 0.0);        // ...unless you unlink it
+
+let fx = s.effect(c, "crush");           // AV effect chains
+s.fx(c, fx, "bits", 4.0);                // heard as bitcrush, seen as posterize
+s.fx(c, fx, "video", 0.5);               // per-effect correspondence dial
+let m = s.master_effect("compress");     // master bus crunch
+s.master_fx(m, "quality", 0.3);
+
 s.render(0.0, 16.0, "out.mp4");          // .mp4 / .wav / .png
 ```
 
-Settable parameters: `density, duration, duration_jitter, position, spray,
-scan_speed, pitch, pitch_jitter, gain, pan_spread, envelope, reverse_prob,
-seed` (grains) and `size_scale, min_size, max_size, hue_per_semitone,
-additive, scatter_y` (visual style). Other calls: `bpm`, `canvas`,
-`sine_source`, `source_secs`, `base_hz`, `set_base_hz`, `no_key`,
-`clear_audio_filters`, `color_keep`, `no_color_filter`,
+Settable clip parameters: `density, duration, duration_jitter, position,
+spray, scan_speed, pitch, pitch_jitter, gain, pan, pan_spread, envelope,
+reverse_prob, seed` (grains), `size_scale, min_size, max_size, additive,
+scatter_y` (visual style), and the correspondence dials `gain_to_opacity,
+envelope_to_opacity, pitch_to_hue, pitch_to_rate, pan_to_x, reverse_video`.
+Effects: `effect(clip, kind)` / `master_effect(kind)` with kinds
+`crush | delay | reverb | compress`, parameters via `fx` / `master_fx`
+(`downsample, bits`; `time, feedback, mix, shift_x, shift_y`;
+`size, damp, mix`; `quality`; plus `audio` and `video` on every effect).
+Other calls: `bpm`, `canvas`, `sine_source`, `source_secs`, `base_hz`,
+`set_base_hz`, `no_key`, `clear_audio_filters`, `clear_effects`,
+`clear_master_effects`, `color_keep`, `no_color_filter`,
 `ffmpeg_available`, `ytdlp_available`.
 
 ## Architecture
@@ -104,9 +144,10 @@ crates/core        chromagrain-core (headless, fully tested)
   dsp.rs           RBJ biquads, tukey grain envelope, pitch detection, PRNG
   grain.rs         GrainSettings -> [GrainEvent]  (the shared AV events)
   audio.rs         AudioClip, granular audio renderer, stereo bus + soft clip
-  video.rs         Frame/VideoClip, HSV, ColorFilter, visual grain compositor
-  timeline.rs      Source / Clip / Track / Project (beats <-> seconds)
-  render.rs        offline renderer: timeline -> audio buffer + frames
+  video.rs         Frame/VideoClip, HSV, ColorFilter, AvLink, grain compositor
+  fx.rs            AV effects: crush/delay/reverb/compress, FFT + 8x8 DCT
+  timeline.rs      Source / Clip (granular|snippet) / Track / Project
+  render.rs        offline renderer: per-clip buses & layers -> master chain
   media.rs         wav/png IO, ffmpeg decode/encode, yt-dlp fetch
   script.rs        rhai bindings over all of the above
 crates/app         chromagrain (desktop app)

@@ -24,6 +24,7 @@
 
 pub mod audio;
 pub mod dsp;
+pub mod fx;
 pub mod grain;
 pub mod media;
 pub mod music;
