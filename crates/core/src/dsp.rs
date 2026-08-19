@@ -124,13 +124,24 @@ pub fn apply_filter_chain(samples: &mut [f32], chain: &[FilterSpec], sample_rate
 /// a rectangular window with short ramps.
 #[inline]
 pub fn grain_env(phase: f32, shape: f32) -> f32 {
+    grain_env_skewed(phase, shape, 0.0)
+}
+
+/// Skewed tukey grain envelope: `skew` in [-1, 1] shifts the fade budget
+/// between attack and release. -1 = instant attack, all release (expodec
+/// percussive shape); 0 = symmetric; +1 = all attack, instant release
+/// (reverse-decay swell).
+#[inline]
+pub fn grain_env_skewed(phase: f32, shape: f32, skew: f32) -> f32 {
     let phase = phase.clamp(0.0, 1.0);
     let a = shape.clamp(0.01, 1.0);
-    let half = a / 2.0;
-    if phase < half {
-        0.5 * (1.0 + (std::f32::consts::PI * (phase / half - 1.0)).cos())
-    } else if phase > 1.0 - half {
-        0.5 * (1.0 + (std::f32::consts::PI * ((phase - 1.0 + half) / half)).cos())
+    let skew = skew.clamp(-1.0, 1.0);
+    let attack = (a * (1.0 + skew) / 2.0).max(0.002);
+    let release = (a * (1.0 - skew) / 2.0).max(0.002);
+    if phase < attack {
+        0.5 * (1.0 + (std::f32::consts::PI * (phase / attack - 1.0)).cos())
+    } else if phase > 1.0 - release {
+        0.5 * (1.0 + (std::f32::consts::PI * ((phase - 1.0 + release) / release)).cos())
     } else {
         1.0
     }

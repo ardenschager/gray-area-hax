@@ -83,25 +83,7 @@ fn rt_err(msg: impl Into<String>) -> Box<EvalAltResult> {
 /// Shared grain-parameter setter (clips and sequencer rows). Returns
 /// false when the key is not a grain parameter.
 fn set_grain_param(g: &mut crate::grain::GrainSettings, key: &str, value: f64) -> bool {
-    let x = value as f32;
-    match key {
-        "density" => g.density = x.clamp(0.1, 500.0),
-        "duration" => g.duration = x.clamp(0.005, 5.0),
-        "duration_jitter" => g.duration_jitter = x.clamp(0.0, 1.0),
-        "position" => g.position = x.clamp(0.0, 1.0),
-        "spray" => g.spray = x.max(0.0),
-        "scan_speed" => g.scan_speed = x,
-        "pitch" => g.pitch = x.clamp(-48.0, 48.0),
-        "pitch_jitter" => g.pitch_jitter = x.clamp(0.0, 48.0),
-        "gain" => g.gain = x.clamp(0.0, 4.0),
-        "pan" => g.pan = x.clamp(-1.0, 1.0),
-        "pan_spread" => g.pan_spread = x.clamp(0.0, 1.0),
-        "envelope" => g.envelope = x.clamp(0.01, 1.0),
-        "reverse_prob" => g.reverse_prob = x.clamp(0.0, 1.0),
-        "seed" => g.seed = value as u64,
-        _ => return false,
-    }
-    true
+    g.set_param(key, value).is_ok()
 }
 
 /// Build a rhai engine with the chromagrain API registered. `log` collects

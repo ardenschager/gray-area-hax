@@ -203,6 +203,7 @@ pub fn pattern_events(
                         gain: g.gain * step.gain,
                         pan: (g.pan + g.pan_spread * pan_j).clamp(-1.0, 1.0),
                         envelope: g.envelope,
+                        env_skew: g.env_skew,
                         reverse: rev_j < g.reverse_prob,
                         id,
                     });
@@ -235,6 +236,7 @@ pub fn pattern_events(
                         gain: g.gain,
                         pan: (g.pan + g.pan_spread * pan_j).clamp(-1.0, 1.0),
                         envelope: g.envelope,
+                        env_skew: g.env_skew,
                         reverse: g.reverse_prob >= 0.5,
                         id,
                     });

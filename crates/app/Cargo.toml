@@ -15,3 +15,4 @@ eframe = { version = "0.32", default-features = false, features = [
 ] }
 cpal = "0.15"
 rtrb = "0.3"
+midir = "0.10"

@@ -1,9 +1,9 @@
-//! Streaming performance playback: a producer thread runs the core
-//! realtime engine (block-rendering the project with persistent effect
-//! state), resamples to the device rate, and feeds a lock-free ring
-//! buffer that the cpal callback drains. Edits mid-performance rebuild
-//! the engine at the current playhead.
+//! Always-on audio engine: a persistent producer thread runs the core
+//! realtime engine and feeds a lock-free ring buffer that the cpal
+//! callback drains. The transport can start/stop the arrangement while
+//! the engine keeps running, so live MIDI pads sound at any time.
 
+use chromagrain_core::grain::GrainEvent;
 use chromagrain_core::realtime::RealtimeAudio;
 use chromagrain_core::timeline::Project;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -14,27 +14,30 @@ const BLOCK: usize = 1024;
 /// Ring capacity in interleaved samples (~90 ms at 48k stereo).
 const RING_CAPACITY: usize = 8192;
 
+enum TransportCmd {
+    Play { start_beat: f64, loop_region: Option<(f64, f64)> },
+    Stop,
+}
+
 struct Shared {
-    playing: AtomicBool,
-    /// Frames consumed by the audio device since play started.
+    shutdown: AtomicBool,
+    transport: AtomicBool,
+    /// Frames consumed by the device while the transport ran.
     consumed_frames: AtomicU64,
-    /// Set to request the producer rebuild its engine from `new_project`.
     dirty: AtomicBool,
     new_project: Mutex<Option<Project>>,
     loop_region: Mutex<Option<(f64, f64)>>,
+    transport_cmd: Mutex<Option<TransportCmd>>,
+    /// Live pad hits waiting for the engine (onset filled engine-side).
+    live_queue: Mutex<Vec<(usize, GrainEvent)>>,
 }
 
 pub struct Playback {
     stream: Option<cpal::Stream>,
-    consumer_slot: Arc<Mutex<Option<rtrb::Consumer<f32>>>>,
     shared: Arc<Shared>,
     device_rate: u32,
-    device_channels: usize,
     producer_thread: Option<std::thread::JoinHandle<()>>,
     start_secs: f64,
-    project_rate: u32,
-    /// Wall-clock fallback so the visual performance still runs when no
-    /// audio device exists.
     wall_start: Option<std::time::Instant>,
     pub last_error: Option<String>,
 }
@@ -42,31 +45,38 @@ pub struct Playback {
 impl Playback {
     pub fn new() -> Playback {
         let shared = Arc::new(Shared {
-            playing: AtomicBool::new(false),
+            shutdown: AtomicBool::new(false),
+            transport: AtomicBool::new(false),
             consumed_frames: AtomicU64::new(0),
             dirty: AtomicBool::new(false),
             new_project: Mutex::new(None),
             loop_region: Mutex::new(None),
+            transport_cmd: Mutex::new(None),
+            live_queue: Mutex::new(Vec::new()),
         });
+        let (producer, consumer) = rtrb::RingBuffer::<f32>::new(RING_CAPACITY);
         let mut pb = Playback {
             stream: None,
-            consumer_slot: Arc::new(Mutex::new(None)),
-            shared,
+            shared: shared.clone(),
             device_rate: 48000,
-            device_channels: 2,
             producer_thread: None,
             start_secs: 0.0,
-            project_rate: 48000,
             wall_start: None,
             last_error: None,
         };
-        if let Err(e) = pb.init_stream() {
+        if let Err(e) = pb.init_stream(consumer) {
             pb.last_error = Some(e);
         }
+        // The engine runs regardless of the device so pads/visuals work
+        // headless too (audio simply has nowhere to go without a stream).
+        let device_rate = pb.device_rate;
+        pb.producer_thread = Some(std::thread::spawn(move || {
+            producer_loop(device_rate, producer, shared);
+        }));
         pb
     }
 
-    fn init_stream(&mut self) -> Result<(), String> {
+    fn init_stream(&mut self, consumer: rtrb::Consumer<f32>) -> Result<(), String> {
         let host = cpal::default_host();
         let device = host.default_output_device().ok_or("no audio output device")?;
         let config = device.default_output_config().map_err(|e| e.to_string())?;
@@ -74,26 +84,18 @@ impl Playback {
             return Err(format!("unsupported sample format {:?}", config.sample_format()));
         }
         self.device_rate = config.sample_rate().0;
-        self.device_channels = config.channels() as usize;
-        let channels = self.device_channels;
+        let channels = config.channels() as usize;
         let shared = self.shared.clone();
-        let consumer_slot = self.consumer_slot.clone();
+        let mut consumer = consumer;
 
         let stream = device
             .build_output_stream(
                 &config.into(),
                 move |data: &mut [f32], _| {
                     data.fill(0.0);
-                    if !shared.playing.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    // try_lock keeps the callback non-blocking; a missed
-                    // buffer swap just plays one quiet callback.
-                    let Ok(mut guard) = consumer_slot.try_lock() else { return };
-                    let Some(cons) = guard.as_mut() else { return };
                     let mut frames = 0u64;
                     for frame in data.chunks_mut(channels) {
-                        let (Ok(l), Ok(r)) = (cons.pop(), cons.pop()) else { break };
+                        let (Ok(l), Ok(r)) = (consumer.pop(), consumer.pop()) else { break };
                         match channels {
                             1 => frame[0] = 0.5 * (l + r),
                             _ => {
@@ -103,7 +105,9 @@ impl Playback {
                         }
                         frames += 1;
                     }
-                    shared.consumed_frames.fetch_add(frames, Ordering::Relaxed);
+                    if shared.transport.load(Ordering::Relaxed) {
+                        shared.consumed_frames.fetch_add(frames, Ordering::Relaxed);
+                    }
                 },
                 |e| eprintln!("audio stream error: {e}"),
                 None,
@@ -119,46 +123,28 @@ impl Playback {
     }
 
     pub fn is_playing(&self) -> bool {
-        self.shared.playing.load(Ordering::Relaxed)
+        self.shared.transport.load(Ordering::Relaxed)
     }
 
-    /// Start performance playback from `start_beat`.
-    pub fn play(&mut self, project: Project, start_beat: f64, loop_region: Option<(f64, f64)>) {
-        self.stop();
-        let (producer, consumer) = rtrb::RingBuffer::<f32>::new(RING_CAPACITY);
-        *self.consumer_slot.lock().unwrap() = Some(consumer);
+    /// Start the arrangement transport from `start_beat`.
+    pub fn play(&mut self, project: &Project, start_beat: f64, loop_region: Option<(f64, f64)>) {
         self.shared.consumed_frames.store(0, Ordering::Relaxed);
-        self.shared.dirty.store(false, Ordering::Relaxed);
         *self.shared.loop_region.lock().unwrap() = loop_region;
+        *self.shared.transport_cmd.lock().unwrap() =
+            Some(TransportCmd::Play { start_beat, loop_region });
         self.start_secs = project.beats_to_secs(start_beat);
-        self.project_rate = project.sample_rate;
         self.wall_start = self.stream.is_none().then(std::time::Instant::now);
-        self.shared.playing.store(true, Ordering::Relaxed);
-
-        let shared = self.shared.clone();
-        let device_rate = self.device_rate;
-        if self.stream.is_some() {
-            self.producer_thread = Some(std::thread::spawn(move || {
-                producer_loop(project, start_beat, loop_region, device_rate, producer, shared);
-            }));
-        }
+        self.shared.transport.store(true, Ordering::Relaxed);
     }
 
     pub fn stop(&mut self) {
-        self.shared.playing.store(false, Ordering::Relaxed);
+        *self.shared.transport_cmd.lock().unwrap() = Some(TransportCmd::Stop);
+        self.shared.transport.store(false, Ordering::Relaxed);
         self.wall_start = None;
-        if let Some(t) = self.producer_thread.take() {
-            let _ = t.join();
-        }
-        *self.consumer_slot.lock().unwrap() = None;
     }
 
-    /// Live-update the performing project (rebuilds the engine at the
-    /// current playhead; effect tails reset).
-    pub fn update_project(&self, project: Project) {
-        if !self.is_playing() {
-            return;
-        }
+    /// Hand the engine a fresh project snapshot (edits, any time).
+    pub fn set_project(&self, project: Project) {
         *self.shared.new_project.lock().unwrap() = Some(project);
         self.shared.dirty.store(true, Ordering::Relaxed);
     }
@@ -166,6 +152,12 @@ impl Playback {
     pub fn set_loop(&self, loop_region: Option<(f64, f64)>) {
         *self.shared.loop_region.lock().unwrap() = loop_region;
         self.shared.dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// Fire a live pad hit (MIDI note / on-screen pad). The engine stamps
+    /// the onset when it picks the event up.
+    pub fn trigger(&self, source: usize, event: GrainEvent) {
+        self.shared.live_queue.lock().unwrap().push((source, event));
     }
 
     /// Current playhead in project seconds (loop-folded).
@@ -190,36 +182,52 @@ impl Playback {
 
 impl Drop for Playback {
     fn drop(&mut self) {
-        self.stop();
+        self.shared.shutdown.store(true, Ordering::Relaxed);
+        if let Some(t) = self.producer_thread.take() {
+            let _ = t.join();
+        }
     }
 }
 
-fn producer_loop(
-    project: Project,
-    start_beat: f64,
-    loop_region: Option<(f64, f64)>,
-    device_rate: u32,
-    mut producer: rtrb::Producer<f32>,
-    shared: Arc<Shared>,
-) {
-    let mut engine = RealtimeAudio::new(project, start_beat, loop_region);
+fn producer_loop(device_rate: u32, mut producer: rtrb::Producer<f32>, shared: Arc<Shared>) {
+    let mut engine = RealtimeAudio::new(Project::default(), 0.0, None);
+    engine.transport = false;
     let mut left = vec![0.0f32; BLOCK];
     let mut right = vec![0.0f32; BLOCK];
-    // Linear resampler state (project rate -> device rate).
-    let ratio = engine.sample_rate() as f64 / device_rate as f64;
+    let mut ratio = engine.sample_rate() as f64 / device_rate as f64;
     let mut frac = 0.0f64;
     let mut prev = (0.0f32, 0.0f32);
     let mut pending: Vec<f32> = Vec::new();
 
-    while shared.playing.load(Ordering::Relaxed) {
+    while !shared.shutdown.load(Ordering::Relaxed) {
         if shared.dirty.swap(false, Ordering::Relaxed) {
             let new_project = shared.new_project.lock().unwrap().take();
             let loop_now = *shared.loop_region.lock().unwrap();
             if let Some(p) = new_project {
                 let beat = engine.playhead_beats();
+                let transport = engine.transport;
                 engine = RealtimeAudio::new(p, beat, loop_now);
+                engine.transport = transport;
+                ratio = engine.sample_rate() as f64 / device_rate as f64;
             } else {
                 engine.loop_region = loop_now;
+            }
+        }
+        if let Some(cmd) = shared.transport_cmd.lock().unwrap().take() {
+            match cmd {
+                TransportCmd::Play { start_beat, loop_region } => {
+                    engine.seek_beats(start_beat);
+                    engine.loop_region = loop_region;
+                    engine.transport = true;
+                }
+                TransportCmd::Stop => engine.transport = false,
+            }
+        }
+        {
+            let mut queue = shared.live_queue.lock().unwrap();
+            for (source, mut ev) in queue.drain(..) {
+                ev.onset = engine.live_now_secs();
+                engine.trigger_live(source, ev);
             }
         }
 

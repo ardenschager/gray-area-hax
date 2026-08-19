@@ -307,6 +307,8 @@ impl Project {
             spray: 0.8,
             gain: 0.5,
             reverse_prob: 0.3,
+            env_skew: -0.6, // percussive grains
+            voices: 2,      // octave shimmer
             seed: 77,
             ..Default::default()
         };

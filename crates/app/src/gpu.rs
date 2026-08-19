@@ -23,6 +23,9 @@ pub struct Scene {
     pub project: Project,
     pub plan: Arc<Vec<ClipPlan>>,
     pub t: f64,
+    /// Live pad hits (MIDI / on-screen), timed on the app clock.
+    pub live: Vec<(usize, chromagrain_core::grain::GrainEvent)>,
+    pub live_t: f64,
 }
 
 const MAX_SRC_W: u32 = 256;
@@ -971,6 +974,68 @@ impl GpuPreview {
                 self.set_4f(gl, p, "u_rect", [0.0, 0.0, 1.0, 1.0]);
                 self.draw_quad(gl);
                 gl.disable(glow::BLEND);
+            }
+
+            // Live pad hits on top, full correspondence, default style.
+            if !scene.live.is_empty() {
+                let clip_target = self.clip_t.as_ref().unwrap();
+                self.bind_target(gl, clip_target, Some([0.0, 0.0, 0.0, 0.0]));
+                gl.enable(glow::BLEND);
+                gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
+                let style = VisualGrainStyle::default();
+                let link = chromagrain_core::video::AvLink::default();
+                let mut drew = false;
+                for (sid, ev) in &scene.live {
+                    self.ensure_source(gl, &scene.project, *sid);
+                    let Some(gsrc) = self.sources.get(sid) else { continue };
+                    let (gtex, layers, dur) = (gsrc.tex, gsrc.layers, gsrc.duration.max(1e-6));
+                    let draws = grain_draws(
+                        std::slice::from_ref(ev),
+                        &style,
+                        &link,
+                        dur,
+                        scene.live_t,
+                    );
+                    if draws.is_empty() {
+                        continue;
+                    }
+                    let p = self.use_program(gl, "grain");
+                    gl.active_texture(glow::TEXTURE0);
+                    gl.bind_texture(glow::TEXTURE_2D_ARRAY, Some(gtex));
+                    self.set_i(gl, p, "u_src", 0);
+                    self.set_i(gl, p, "u_cf_mode", 0);
+                    self.set_f(gl, p, "u_cf_valmin", 0.0);
+                    self.set_f(gl, p, "u_additive", 0.4);
+                    for d in draws {
+                        let layer = ((d.src_time / dur).rem_euclid(1.0) * layers as f64)
+                            .min(layers as f64 - 1.0) as f32;
+                        self.set_f(gl, p, "u_layer", layer.floor());
+                        self.set_4f(gl, p, "u_patch", d.patch);
+                        self.set_f(gl, p, "u_alpha", d.alpha);
+                        self.set_f(gl, p, "u_hue", d.hue_shift);
+                        self.set_4f(gl, p, "u_rect", d.dest);
+                        self.draw_quad(gl);
+                        drew = true;
+                    }
+                }
+                gl.disable(glow::BLEND);
+                if drew {
+                    let live_tex = self.clip_t.as_ref().unwrap().tex;
+                    gl.bind_framebuffer(glow::FRAMEBUFFER, Some(master_fbo));
+                    gl.viewport(0, 0, self.size.0, self.size.1);
+                    gl.enable(glow::BLEND);
+                    gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
+                    let p = self.use_program(gl, "blit");
+                    gl.active_texture(glow::TEXTURE0);
+                    gl.bind_texture(glow::TEXTURE_2D, Some(live_tex));
+                    self.set_i(gl, p, "u_tex", 0);
+                    self.set_f(gl, p, "u_opacity", 1.0);
+                    self.set_f(gl, p, "u_additive", 0.3);
+                    self.set_f(gl, p, "u_alpha_mul", 1.0);
+                    self.set_4f(gl, p, "u_rect", [0.0, 0.0, 1.0, 1.0]);
+                    self.draw_quad(gl);
+                    gl.disable(glow::BLEND);
+                }
             }
 
             // Master chain.

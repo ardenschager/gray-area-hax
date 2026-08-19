@@ -1,6 +1,6 @@
 //! Audio side: clips, granular rendering into a stereo buffer.
 
-use crate::dsp::{apply_filter_chain, grain_env, FilterSpec};
+use crate::dsp::{apply_filter_chain, grain_env, grain_env_skewed, FilterSpec};
 use crate::grain::GrainEvent;
 use serde::{Deserialize, Serialize};
 
@@ -63,17 +63,29 @@ impl AudioClip {
         out
     }
 
+    /// 4-point Catmull-Rom (Hermite) interpolation — audibly cleaner than
+    /// linear when grains are pitched, especially downward.
     #[inline]
-    fn sample_lerp(&self, idx: f64) -> f32 {
+    fn sample_hermite(&self, idx: f64) -> f32 {
         if idx < 0.0 {
             return 0.0;
         }
         let i = idx as usize;
-        if i + 1 >= self.samples.len() {
+        let n = self.samples.len();
+        if i + 1 >= n {
             return 0.0;
         }
         let frac = (idx - i as f64) as f32;
-        self.samples[i] * (1.0 - frac) + self.samples[i + 1] * frac
+        let xm1 = if i > 0 { self.samples[i - 1] } else { self.samples[i] };
+        let x0 = self.samples[i];
+        let x1 = self.samples[i + 1];
+        let x2 = if i + 2 < n { self.samples[i + 2] } else { x1 };
+        let c = (x1 - xm1) * 0.5;
+        let v = x0 - x1;
+        let w = c + v;
+        let a = w + v + (x2 - x0) * 0.5;
+        let b = w + a;
+        ((a * frac - b) * frac + c) * frac + x0
     }
 }
 
@@ -183,13 +195,13 @@ pub fn render_grains_audio(
                 continue;
             }
             let phase = i as f32 / n as f32;
-            let env = grain_env(phase, ev.envelope);
+            let env = grain_env_skewed(phase, ev.envelope, ev.env_skew);
             let src_off = if ev.reverse {
                 grain_src_len - i as f64 * ev.pitch_ratio as f64
             } else {
                 i as f64 * ev.pitch_ratio as f64
             };
-            let s = clip.sample_lerp(src_start + src_off) * env;
+            let s = clip.sample_hermite(src_start + src_off) * env;
             out.left[oi as usize] += s * gain_l;
             out.right[oi as usize] += s * gain_r;
         }
@@ -235,6 +247,7 @@ mod tests {
             gain: 1.0,
             pan: 0.0,
             envelope: 0.2,
+            env_skew: 0.0,
             reverse: false,
             id: 0,
         };

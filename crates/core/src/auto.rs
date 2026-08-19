@@ -77,13 +77,17 @@ pub fn param_range(name: &str) -> Option<(f32, f32)> {
         "pan" => (-1.0, 1.0),
         "pan_spread" => (0.0, 1.0),
         "envelope" => (0.01, 1.0),
+        "env_skew" => (-1.0, 1.0),
         "reverse_prob" => (0.0, 1.0),
+        "voices" => (1.0, 4.0),
+        "voice_interval" => (-12.0, 12.0),
+        "voice_detune" => (0.0, 1.0),
         _ => return None,
     })
 }
 
 /// The parameters offered by automation UIs, in menu order.
-pub const AUTOMATABLE: [&str; 13] = [
+pub const AUTOMATABLE: [&str; 17] = [
     "density",
     "duration",
     "duration_jitter",
@@ -96,7 +100,11 @@ pub const AUTOMATABLE: [&str; 13] = [
     "pan",
     "pan_spread",
     "envelope",
+    "env_skew",
     "reverse_prob",
+    "voices",
+    "voice_interval",
+    "voice_detune",
 ];
 
 /// Apply every lane's value at `beat` onto a copy of `base`.

@@ -13,7 +13,7 @@
 //!                     moment the audio grain reads from the waveform
 //! * reverse         — the patch's video runs backwards too
 
-use crate::dsp::grain_env;
+use crate::dsp::grain_env_skewed;
 use crate::grain::GrainEvent;
 use serde::{Deserialize, Serialize};
 
@@ -372,7 +372,9 @@ pub fn grain_draws(
             continue;
         }
         let phase = ((t - ev.onset) / ev.duration as f64) as f32;
-        let env_part = 1.0 + (grain_env(phase, ev.envelope) - 1.0) * link.envelope_to_opacity;
+        let env_part = 1.0
+            + (grain_env_skewed(phase, ev.envelope, ev.env_skew) - 1.0)
+                * link.envelope_to_opacity;
         let gain_part = 1.0 + (ev.gain.min(1.5) - 1.0) * link.gain_to_opacity;
         let alpha = (env_part * gain_part).clamp(0.0, 1.0);
         if alpha <= 0.003 {
@@ -434,7 +436,9 @@ pub fn composite_grains_frame(
             continue;
         }
         let phase = ((t - ev.onset) / ev.duration as f64) as f32;
-        let env_part = 1.0 + (grain_env(phase, ev.envelope) - 1.0) * link.envelope_to_opacity;
+        let env_part = 1.0
+            + (grain_env_skewed(phase, ev.envelope, ev.env_skew) - 1.0)
+                * link.envelope_to_opacity;
         let gain_part = 1.0 + (ev.gain.min(1.5) - 1.0) * link.gain_to_opacity;
         let alpha = (env_part * gain_part).clamp(0.0, 1.0);
         if alpha <= 0.003 {
@@ -691,6 +695,7 @@ mod tests {
             gain: 0.25,
             pan: 0.0,
             envelope: 0.2,
+            env_skew: 0.0,
             reverse: false,
             id: 0,
         };
@@ -721,6 +726,7 @@ mod tests {
             gain: 1.0,
             pan: 0.0,
             envelope: 0.2,
+            env_skew: 0.0,
             reverse: false,
             id: 0,
         };

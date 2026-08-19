@@ -53,6 +53,7 @@ fn snippet_event(clip: &Clip, source: &Source, clip_t0: f64, clip_len: f64) -> G
         gain: g.gain,
         pan: g.pan.clamp(-1.0, 1.0),
         envelope: g.envelope,
+        env_skew: g.env_skew,
         reverse: g.reverse_prob >= 0.5,
         id: g.seed,
     }

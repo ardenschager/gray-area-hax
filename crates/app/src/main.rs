@@ -6,6 +6,7 @@
 //!            chromagrain --render-demo out.mp4
 
 mod gpu;
+mod midi;
 mod playback;
 
 use chromagrain_core::dsp::{FilterKind, FilterSpec};
@@ -157,6 +158,15 @@ struct App {
     tx: mpsc::Sender<WorkerMsg>,
     status: String,
 
+    midi: midi::Midi,
+    midi_port: usize,
+    cc_mappings: Vec<midi::CcMapping>,
+    /// Live pad hits for the GPU preview, on the app clock.
+    live_events: Vec<(usize, chromagrain_core::grain::GrainEvent)>,
+    live_id: u64,
+    app_clock: std::time::Instant,
+    last_sync: std::time::Instant,
+
     media_path: String,
     youtube_url: String,
     script_text: String,
@@ -190,6 +200,13 @@ impl App {
             rx,
             tx,
             status: "demo project — press play".into(),
+            midi: midi::Midi::new(),
+            midi_port: 0,
+            cc_mappings: Vec::new(),
+            live_events: Vec::new(),
+            live_id: 0,
+            app_clock: std::time::Instant::now(),
+            last_sync: std::time::Instant::now(),
             media_path: String::new(),
             youtube_url: String::new(),
             script_text: DEFAULT_SCRIPT.trim_start().into(),
@@ -203,22 +220,105 @@ impl App {
             .then_some((self.loop_start, self.loop_end))
     }
 
-    /// Call after any project edit: replans events + live-updates playback.
+    /// Call after any project edit: replans events + live-updates the
+    /// always-on engine. Throttled so CC streams don't rebuild per message.
     fn sync_project(&mut self) {
         if self.project_rev == self.plan_rev {
             return;
         }
+        if self.last_sync.elapsed() < std::time::Duration::from_millis(80) {
+            return; // try again next frame
+        }
+        self.last_sync = std::time::Instant::now();
         self.plan_rev = self.project_rev;
         let p = self.project.lock().unwrap().clone();
         self.plan = Arc::new(plan_project(&p));
-        if self.playback.is_playing() {
-            self.playback.update_project(p);
-        }
+        self.playback.set_project(p);
     }
 
     fn start_play(&mut self) {
         let p = self.project.lock().unwrap().clone();
-        self.playback.play(p, self.playhead_beats, self.loop_region());
+        self.playback.play(&p, self.playhead_beats, self.loop_region());
+        self.playback.set_project(p);
+    }
+
+    /// Fire a pad: play the selected clip's grain preset at `note`
+    /// (sampler mapping, C4 = unity), audible any time, visible live.
+    fn trigger_note(&mut self, note: u8, velocity: u8) {
+        let (source, settings) = {
+            let p = self.project.lock().unwrap();
+            let from_clip = self.selected_clip.and_then(|(ti, ci)| {
+                p.tracks.get(ti).and_then(|t| t.clips.get(ci)).and_then(|c| match c.kind {
+                    ClipKind::Pattern(_) => None,
+                    _ => Some((c.source, c.grains.clone())),
+                })
+            });
+            match from_clip {
+                Some(x) => x,
+                None => (
+                    self.selected_source.min(p.sources.len().saturating_sub(1)),
+                    chromagrain_core::grain::GrainSettings {
+                        duration: 0.4,
+                        ..Default::default()
+                    },
+                ),
+            }
+        };
+        let source_len = {
+            let p = self.project.lock().unwrap();
+            p.sources.get(source).map(|s| s.duration()).unwrap_or(0.0)
+        };
+        if source_len <= 0.0 {
+            return;
+        }
+        self.live_id += 1;
+        let ev = chromagrain_core::grain::grain_from_note(
+            &settings,
+            note,
+            velocity,
+            source_len,
+            0.0, // engine stamps its own onset
+            self.live_id,
+        );
+        self.playback.trigger(source, ev.clone());
+        // Mirror on the app clock for the GPU preview.
+        let mut vis = ev;
+        vis.onset = self.app_clock.elapsed().as_secs_f64();
+        self.live_events.push((source, vis));
+    }
+
+    fn handle_midi(&mut self) {
+        let msgs = self.midi.poll();
+        if msgs.is_empty() {
+            return;
+        }
+        for msg in msgs {
+            match msg {
+                midi::MidiMsg::NoteOn { note, velocity } => {
+                    self.trigger_note(note, velocity);
+                }
+                midi::MidiMsg::NoteOff { .. } => {}
+                midi::MidiMsg::Cc { cc, value } => {
+                    // Learning mapping claims the first CC it hears.
+                    if let Some(m) = self.cc_mappings.iter_mut().find(|m| m.cc.is_none()) {
+                        m.cc = Some(cc);
+                        self.status = format!("mapped CC {cc} -> {}", m.target.label());
+                    }
+                    let mut changed = false;
+                    {
+                        let mut p = self.project.lock().unwrap();
+                        for m in &self.cc_mappings {
+                            if m.cc == Some(cc) {
+                                changed |= midi::apply_cc(&mut p, &m.target, value);
+                            }
+                        }
+                    }
+                    if changed {
+                        self.project_rev += 1;
+                    }
+                }
+            }
+        }
     }
 
     fn start_load(&mut self, path: String) {
@@ -518,6 +618,91 @@ impl App {
             self.project_rev += 1;
         }
 
+        section(ui, "pads / midi");
+        // On-screen pads (sampler: C4 = unity pitch of the selected clip).
+        ui.horizontal(|ui| {
+            for (label, note) in
+                [("C", 60u8), ("D", 62), ("E", 64), ("G", 67), ("A", 69), ("C'", 72)]
+            {
+                if ui.small_button(label).clicked() {
+                    self.trigger_note(note, 110);
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            if ui.small_button("⟳").on_hover_text("rescan midi inputs").clicked() {
+                self.midi.refresh();
+            }
+            let selected = self
+                .midi
+                .connected
+                .clone()
+                .or_else(|| self.midi.ports.get(self.midi_port).cloned())
+                .unwrap_or_else(|| "no midi inputs".into());
+            egui::ComboBox::from_id_salt("midi_port")
+                .selected_text(selected)
+                .width(140.0)
+                .show_ui(ui, |ui| {
+                    for (i, name) in self.midi.ports.clone().iter().enumerate() {
+                        if ui.selectable_label(self.midi_port == i, name).clicked() {
+                            self.midi_port = i;
+                            match self.midi.connect(i) {
+                                Ok(()) => self.status = format!("midi: {name}"),
+                                Err(e) => self.status = format!("midi failed: {e}"),
+                            }
+                        }
+                    }
+                });
+        });
+        // CC mappings with learn.
+        let mut remove_map: Option<usize> = None;
+        for (i, m) in self.cc_mappings.iter().enumerate() {
+            ui.horizontal(|ui| {
+                let cc = m
+                    .cc
+                    .map(|c| format!("CC {c}"))
+                    .unwrap_or_else(|| "move a knob…".into());
+                ui.label(
+                    egui::RichText::new(format!("{cc} → {}", m.target.label())).size(11.0),
+                );
+                if ui.small_button("x").clicked() {
+                    remove_map = Some(i);
+                }
+            });
+        }
+        if let Some(i) = remove_map {
+            self.cc_mappings.remove(i);
+        }
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("learn_cc")
+                .selected_text("learn cc →")
+                .width(120.0)
+                .show_ui(ui, |ui| {
+                    if let Some((ti, ci)) = self.selected_clip {
+                        for p in chromagrain_core::auto::AUTOMATABLE {
+                            if ui.selectable_label(false, p).clicked() {
+                                self.cc_mappings.push(midi::CcMapping {
+                                    cc: None,
+                                    target: midi::CcTarget::ClipParam {
+                                        track: ti,
+                                        clip: ci,
+                                        param: p.to_string(),
+                                    },
+                                });
+                                self.status = "twist a knob to finish mapping".into();
+                            }
+                        }
+                    }
+                    if ui.selectable_label(false, "track level").clicked() {
+                        self.cc_mappings.push(midi::CcMapping {
+                            cc: None,
+                            target: midi::CcTarget::TrackLevel { track: self.selected_track },
+                        });
+                        self.status = "twist a knob to finish mapping".into();
+                    }
+                });
+        });
+
         section(ui, "add clip at playhead");
         ui.horizontal_wrapped(|ui| {
             if ui.button("grains").clicked() {
@@ -583,6 +768,8 @@ impl App {
                 project: p.clone(),
                 plan: self.plan.clone(),
                 t,
+                live: self.live_events.clone(),
+                live_t: self.app_clock.elapsed().as_secs_f64(),
             });
         }
         let gpu_slot = self.gpu.clone();
@@ -1278,7 +1465,62 @@ impl App {
             changed |= slider(ui, &mut g.pan, -1.0..=1.0, "pan / x position", false);
             changed |= slider(ui, &mut g.pan_spread, 0.0..=1.0, "pan/x spread", false);
             changed |= slider(ui, &mut g.envelope, 0.01..=1.0, "envelope shape", false);
+            changed |= slider(ui, &mut g.env_skew, -1.0..=1.0, "env skew (perc <-> swell)", false);
             changed |= slider(ui, &mut g.reverse_prob, 0.0..=1.0, "reverse prob", false);
+            // Beat-sync grid for grain onsets.
+            ui.horizontal(|ui| {
+                ui.label("grain sync");
+                let mut sync = g.sync_div;
+                egui::ComboBox::from_id_salt("grain_sync")
+                    .selected_text(match sync {
+                        s if s <= 0.0 => "free".to_string(),
+                        s if s >= 1.0 => "1/4".to_string(),
+                        s if s >= 0.5 => "1/8".to_string(),
+                        s if s >= 0.25 => "1/16".to_string(),
+                        _ => "1/32".to_string(),
+                    })
+                    .width(70.0)
+                    .show_ui(ui, |ui| {
+                        for (label, v) in
+                            [("free", 0.0f32), ("1/4", 1.0), ("1/8", 0.5), ("1/16", 0.25), ("1/32", 0.125)]
+                        {
+                            if ui.selectable_value(&mut sync, v, label).changed() {
+                                g.sync_div = sync;
+                                changed = true;
+                            }
+                        }
+                    });
+            });
+            // Harmony voices.
+            ui.horizontal(|ui| {
+                let mut v = g.voices as i64;
+                if ui
+                    .add(egui::DragValue::new(&mut v).range(1..=4).suffix(" voices"))
+                    .changed()
+                {
+                    g.voices = v as u32;
+                    changed = true;
+                }
+                if g.voices > 1 {
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut g.voice_interval)
+                                .speed(1.0)
+                                .range(-24.0..=24.0)
+                                .suffix(" st"),
+                        )
+                        .on_hover_text("interval between voices (12 = octaves, 7 = fifths)")
+                        .changed();
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut g.voice_detune)
+                                .speed(0.02)
+                                .range(0.0..=1.0)
+                                .suffix(" det"),
+                        )
+                        .changed();
+                }
+            });
         }
 
         section(ui, "key quantize");
@@ -1504,8 +1746,18 @@ fn quantize_label(q: f64) -> &'static str {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.handle_midi();
         self.poll_workers();
         self.sync_project();
+        // Prune finished live pad hits; repaint while any are visible.
+        let now = self.app_clock.elapsed().as_secs_f64();
+        self.live_events.retain(|(_, e)| e.end() + 0.5 > now);
+        if !self.live_events.is_empty() {
+            ctx.request_repaint();
+        }
+        if self.project_rev != self.plan_rev {
+            ctx.request_repaint_after(std::time::Duration::from_millis(90));
+        }
         if self.playback.is_playing() {
             let p = self.project.lock().unwrap();
             self.playhead_beats = p.secs_to_beats(self.playback.playhead_secs(&p));

@@ -5,6 +5,7 @@
 
 use crate::audio::{render_grains_audio, StereoBuffer};
 use crate::fx::{self, AudioFxState};
+use crate::grain::GrainEvent;
 use crate::render::{plan_project, ClipPlan};
 use crate::timeline::Project;
 
@@ -20,6 +21,13 @@ pub struct RealtimeAudio {
     sample_pos: u64,
     /// Loop region in beats (start, end), if looping.
     pub loop_region: Option<(f64, f64)>,
+    /// When false, the arrangement is paused: the playhead freezes and
+    /// plan events are silent, but live (MIDI) events keep sounding.
+    pub transport: bool,
+    /// One-shot live events (MIDI pads), on the monotonic live clock.
+    live: Vec<(usize, GrainEvent)>,
+    /// Monotonic sample clock that never pauses (times live events).
+    live_pos: u64,
     scratch_clip: StereoBuffer,
     scratch_track: StereoBuffer,
 }
@@ -70,6 +78,9 @@ impl RealtimeAudio {
             master_states,
             sample_pos,
             loop_region,
+            transport: true,
+            live: Vec::new(),
+            live_pos: 0,
             scratch_clip: StereoBuffer { left: Vec::new(), right: Vec::new(), sample_rate: sr },
             scratch_track: StereoBuffer { left: Vec::new(), right: Vec::new(), sample_rate: sr },
         }
@@ -93,8 +104,27 @@ impl RealtimeAudio {
             .round() as u64;
     }
 
+    /// Seconds on the monotonic live clock ("now" for trigger_live).
+    pub fn live_now_secs(&self) -> f64 {
+        self.live_pos as f64 / self.project.sample_rate as f64
+    }
+
+    /// Fire a one-shot live grain (a MIDI pad hit). The event's `onset`
+    /// is on the live clock; pass `live_now_secs()` for "immediately".
+    pub fn trigger_live(&mut self, source: usize, event: GrainEvent) {
+        self.live.push((source, event));
+    }
+
     /// Fill one stereo block, advancing (and looping) the playhead.
     pub fn next_block(&mut self, left: &mut [f32], right: &mut [f32]) {
+        if !self.transport {
+            // Arrangement paused: only the live bus + master chain run.
+            let n = left.len();
+            left.fill(0.0);
+            right.fill(0.0);
+            self.render_live_and_master(0, n, left, right);
+            return;
+        }
         let sr = self.project.sample_rate as f64;
         let mut filled = 0usize;
         while filled < left.len() {
@@ -196,6 +226,37 @@ impl RealtimeAudio {
                 right[at + i] += self.scratch_track.right[i] * level;
             }
         }
+
+        self.render_live_and_master(at, n, left, right);
+    }
+
+    /// Mix live (MIDI) events on the monotonic clock, then run the master
+    /// chain and soft clip. Called for every block, transport or not.
+    fn render_live_and_master(&mut self, at: usize, n: usize, left: &mut [f32], right: &mut [f32]) {
+        let sr = self.project.sample_rate as f64;
+        if !self.live.is_empty() {
+            let t_live = self.live_pos as f64 / sr;
+            self.scratch_clip.left.resize(n, 0.0);
+            self.scratch_clip.right.resize(n, 0.0);
+            self.scratch_clip.left.fill(0.0);
+            self.scratch_clip.right.fill(0.0);
+            for (sid, ev) in &self.live {
+                let Some(audio) =
+                    self.project.sources.get(*sid).and_then(|s| s.audio.as_deref())
+                else {
+                    continue;
+                };
+                render_grains_audio(audio, std::slice::from_ref(ev), &mut self.scratch_clip, t_live);
+            }
+            for i in 0..n {
+                left[at + i] += self.scratch_clip.left[i];
+                right[at + i] += self.scratch_clip.right[i];
+            }
+            // Prune finished pads.
+            let done_before = t_live + n as f64 / sr;
+            self.live.retain(|(_, ev)| ev.end() > done_before);
+        }
+        self.live_pos += n as u64;
 
         fx::process_audio_chain(
             &mut left[at..at + n],
@@ -324,6 +385,40 @@ mod tests {
         // Audio in the second pass of the loop is present (still playing).
         let seg: f32 = l[sr..sr + 4800].iter().map(|s| s * s).sum();
         assert!(seg > 1e-6, "loop keeps sounding");
+    }
+
+    #[test]
+    fn live_pads_sound_with_transport_stopped() {
+        let p = perf_project();
+        let sr = p.sample_rate as usize;
+        let mut rt = RealtimeAudio::new(p, 0.0, None);
+        rt.transport = false;
+
+        // Silence before any pad.
+        let mut l = vec![0.0f32; sr / 4];
+        let mut r = vec![0.0f32; sr / 4];
+        rt.next_block(&mut l, &mut r);
+        let rms0: f32 = (l.iter().map(|s| s * s).sum::<f32>() / l.len() as f32).sqrt();
+        assert!(rms0 < 1e-6, "paused transport is silent: {rms0}");
+
+        // A MIDI pad: C5 on the demo source.
+        let settings = crate::grain::GrainSettings { gain: 1.0, ..Default::default() };
+        let ev = crate::grain::grain_from_note(&settings, 72, 100, 3.0, rt.live_now_secs(), 1);
+        rt.trigger_live(0, ev);
+        rt.next_block(&mut l, &mut r);
+        let rms1: f32 = (l.iter().map(|s| s * s).sum::<f32>() / l.len() as f32).sqrt();
+        assert!(rms1 > 1e-4, "pad sounds while stopped: {rms1}");
+
+        // Pads also mix during transport playback.
+        rt.transport = true;
+        let ev2 = crate::grain::grain_from_note(&settings, 60, 100, 3.0, rt.live_now_secs(), 2);
+        rt.trigger_live(0, ev2);
+        rt.next_block(&mut l, &mut r);
+        let rms2: f32 = (l.iter().map(|s| s * s).sum::<f32>() / l.len() as f32).sqrt();
+        assert!(rms2 > 1e-4);
+        // Playhead advanced only while transport ran.
+        assert!(rt.playhead_secs() > 0.0);
+        assert!((rt.playhead_secs() - 0.25).abs() < 1e-6, "paused blocks froze it");
     }
 
     #[test]

@@ -76,8 +76,18 @@ versa). It will be crunchy.
 
 ## Features
 
-- **Granular engine** — density, duration, spray, scan speed, pitch ±
-  jitter, per-grain reverse, deterministic seeds (same seed = same cloud).
+- **Granular engine** (sampler first, and the deepest part of the tool) —
+  density, duration ± jitter, spray, scan speed, pitch ± jitter, per-grain
+  reverse, deterministic seeds (same seed = same cloud). Grains resample
+  with 4-point Hermite interpolation; the grain window has a **skew**
+  morphing percussive → symmetric → swell (and the visual grain's opacity
+  follows the same shape); onsets can **beat-sync** to a 1/32–1/4 grid for
+  rhythmic clouds; and each grain can stack up to 4 **harmony voices** at
+  a chosen interval (octaves, fifths…), key-quantized, detuned and spread.
+- **MIDI** — play any clip like a pad instrument (sampler mapping, C4 =
+  unity, velocity → gain, live in audio AND video, transport running or
+  not), and map hardware CCs to any automatable parameter or track level
+  with MIDI-learn. On-screen pads work without hardware.
 - **Key quantization** — every grain's pitch is snapped so
   `base_pitch × ratio` lands on a chosen key/scale (major, minor, harmonic
   minor, pentatonics, blues, modes, whole-tone…). Source base pitch is
@@ -95,28 +105,61 @@ versa). It will be crunchy.
 - **Bounce & play** — cpal audio playback with synced video preview, and
   mp4/wav export through ffmpeg.
 
-## Building
+## How to run it
+
+### 1. Install what it needs
+
+| what | why | how |
+|------|-----|-----|
+| Rust (stable) | build | https://rustup.rs |
+| ALSA headers (Linux only) | audio device + MIDI | `sudo apt install libasound2-dev pkg-config` |
+| ffmpeg + ffprobe | load mp4/mov/webm…, export mp4 | `sudo apt install ffmpeg` / `brew install ffmpeg` |
+| yt-dlp (optional) | YouTube scraping | `pip install yt-dlp` |
+
+Without ffmpeg you can still load .wav files, use procedural sources, and
+render .wav; without yt-dlp everything except `youtube(...)` works.
+macOS and Windows need no extra system libraries.
+
+### 2. Build & launch
 
 ```sh
-cargo build --release          # binary: target/release/chromagrain
-cargo test                     # 38 unit + integration tests
+git clone <this repo> && cd <repo>
+cargo run --release            # builds (first time takes a few minutes) and opens the app
 ```
 
-Linux needs ALSA headers to build (`apt install libasound2-dev`). Runtime
-media features shell out to external tools on PATH:
+The binary lands at `target/release/chromagrain` if you want to launch it
+directly later. `cargo test` runs the full engine test suite.
 
-- `ffmpeg`/`ffprobe` — decoding any media file, mp4 export (`apt install ffmpeg`)
-- `yt-dlp` — YouTube scraping (`pip install yt-dlp`)
+### 3. First session, in 60 seconds
 
-Everything else (wav import, procedural sources, rendering, playback) works
-without them.
+1. The app opens with a demo project. Press **▶ play** — playback is live
+   (GPU-rendered video, streaming audio); tweak any slider while it runs.
+2. **Load your media**: type a file path into the left panel and hit
+   *load file* (any format ffmpeg reads), or paste a YouTube URL and hit
+   *scrape youtube*. The source's base pitch is auto-detected.
+3. **Put something on the timeline**: pick a source, pick a track, then
+   *grains* (granular cloud), *snippet* (plays straight), or *pattern*
+   (step sequencer). Clips land at the playhead; drag them around
+   (snapping follows the quantize picker in the top bar).
+4. **Shape it** in the right panel: grain params, key quantize, filters,
+   the AV effect chain, correspondence dials, and drag-to-draw automation.
+5. **Sequence** in the panel under the timeline: click steps on/off, give
+   a row its own step count for polymeter, or flip a row to *loop* mode.
+6. **Play it like a sampler**: click the pads in *pads / midi* — or plug
+   in a MIDI keyboard, pick its port in the dropdown, and play. Notes are
+   sampler-mapped (C4 = the selected clip's pitch); this works even with
+   the transport stopped. Map hardware knobs with *learn cc →* (pick a
+   parameter, then twist a knob).
+7. **Render** with the *render mp4* / *render wav* buttons — the output
+   lands in the working directory as `chromagrain-render.mp4/.wav`,
+   rendered by the deterministic offline engine.
 
-## Running
+### Headless / scripted
 
 ```sh
-chromagrain                                # GUI, loads a demo project
-chromagrain --script examples/demo.rhai    # headless scripted render
-chromagrain --render-demo out.mp4          # render the demo project
+chromagrain --script examples/sequencer.rhai   # build + render a composition from a script
+chromagrain --script examples/crunchy.rhai
+chromagrain --render-demo out.mp4              # render the built-in demo project
 ```
 
 ## Scripting
@@ -172,8 +215,9 @@ s.render(0.0, 16.0, "out.mp4");          // .mp4 / .wav / .png
 
 Settable clip parameters: `density, duration, duration_jitter, position,
 spray, scan_speed, pitch, pitch_jitter, gain, pan, pan_spread, envelope,
-reverse_prob, seed` (grains), `size_scale, min_size, max_size, additive,
-scatter_y` (visual style), and the correspondence dials `gain_to_opacity,
+env_skew, reverse_prob, sync_div, voices, voice_interval, voice_detune,
+seed` (grains), `size_scale, min_size, max_size, additive, scatter_y`
+(visual style), and the correspondence dials `gain_to_opacity,
 envelope_to_opacity, pitch_to_hue, pitch_to_rate, pan_to_x, reverse_video`.
 Effects: `effect(clip, kind)` / `master_effect(kind)` with kinds
 `crush | delay | reverb | compress`, parameters via `fx` / `master_fx`
@@ -204,8 +248,10 @@ crates/core        chromagrain-core (headless, fully tested)
 crates/app         chromagrain (desktop app)
   main.rs          eframe GUI: preview, timeline, sequencer, inspector
   gpu.rs           glow/OpenGL realtime pipeline: grain quads + effect
-                   shader passes + track compositing
-  playback.rs      streaming cpal playback (lock-free ring, live updates)
+                   shader passes + track compositing + live pad layer
+  playback.rs      always-on engine: lock-free ring into cpal, transport
+                   start/stop, live pad triggers any time
+  midi.rs          midir input, note pads, CC mappings with learn
 ```
 
 The renderer is deterministic: a project + seeds always produces the same
