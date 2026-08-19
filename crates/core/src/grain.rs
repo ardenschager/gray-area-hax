@@ -23,6 +23,9 @@ pub struct GrainSettings {
     /// How fast the read head scans through the source relative to
     /// timeline time (1.0 = realtime, 0.0 = frozen).
     pub scan_speed: f32,
+    /// Media playback speed (snippets/stretch): 1.0 = realtime. Changes
+    /// duration WITHOUT changing pitch — pitch is the separate param below.
+    pub speed: f32,
     /// Pitch offset in semitones (also visual playback rate / hue shift).
     pub pitch: f32,
     /// Random pitch variation in semitones.
@@ -67,6 +70,7 @@ impl GrainSettings {
             "position" => self.position = x.clamp(0.0, 1.0),
             "spray" => self.spray = x.max(0.0),
             "scan_speed" => self.scan_speed = x,
+            "speed" => self.speed = x.clamp(0.05, 8.0),
             "pitch" => self.pitch = x.clamp(-48.0, 48.0),
             "pitch_jitter" => self.pitch_jitter = x.clamp(0.0, 48.0),
             "gain" => self.gain = x.clamp(0.0, 4.0),
@@ -95,6 +99,7 @@ impl Default for GrainSettings {
             position: 0.0,
             spray: 0.05,
             scan_speed: 1.0,
+            speed: 1.0,
             pitch: 0.0,
             pitch_jitter: 0.0,
             gain: 0.8,

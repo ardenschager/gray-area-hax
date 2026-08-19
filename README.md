@@ -84,6 +84,15 @@ versa). It will be crunchy.
   follows the same shape); onsets can **beat-sync** to a 1/32–1/4 grid for
   rhythmic clouds; and each grain can stack up to 4 **harmony voices** at
   a chosen interval (octaves, fifths…), key-quantized, detuned and spread.
+- **Speed and pitch are separate** — a snippet's `speed` changes tempo
+  without touching pitch (granular time-stretch under the hood; video
+  crossfades along at the same rate), while `pitch` transposes without
+  changing tempo. Set them to match and it collapses to a pristine
+  record-player resample automatically.
+- **Canvas placement** — every clip's video can be positioned, scaled and
+  rotated on the canvas. Placement is audible: x position drives pan and
+  scale drives loudness (the distance cue of a simple 3D panning model),
+  each through its own unlinkable correspondence dial.
 - **MIDI** — play any clip like a pad instrument (sampler mapping, C4 =
   unity, velocity → gain, live in audio AND video, transport running or
   not), and map hardware CCs to any automatable parameter or track level
@@ -204,6 +213,9 @@ s.step_pitch(p, r, 3, 12.0);
 let l = s.row(p, src);
 s.row_loop(p, l, 0.25, 0.5);             // loop mode: repeat a source slice
 s.pattern_clip(t, p, 0.0, 16.0);         // loops on the timeline
+
+s.set(b, "speed", 0.5);                  // half-time, same pitch
+s.transform(b, -0.3, 0.0, 0.7, -8.0);    // place/scale/rotate; x pans audio
 
 s.automate(c, "density", 0.0, 5.0);      // parameter automation over time
 s.automate(c, "density", 16.0, 60.0);    // (per-grain: the cloud thickens)

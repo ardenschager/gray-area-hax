@@ -40,8 +40,11 @@ s.row_key(p, drone, "A", "minor_pentatonic");
 // so later tracks composite on top of this.
 let bed_t = s.track("bed");
 let bed = s.snippet(bed_t, src, 0.0, 16.0);
-s.set(bed, "pitch", -12.0);
+s.set(bed, "pitch", -12.0);      // pitch and speed are separate:
+s.set(bed, "speed", 0.5);        // half-time WITHOUT dropping the pitch
 s.set(bed, "gain", 0.3);
+s.transform(bed, -0.2, -0.1, 0.8, -6.0);  // place/scale/rotate on canvas;
+                                          // x also pans the audio left
 s.track_level(bed_t, 0.8);
 
 // The sequencer lives on the timeline: a pattern clip, looping 16 beats,

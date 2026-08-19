@@ -522,6 +522,21 @@ pub fn build_engine(session: Session, log: Arc<Mutex<String>>) -> Engine {
         },
     );
 
+    // ---------------------------------------------------- canvas placement
+    engine.register_fn(
+        "transform",
+        |s: &mut Session, c: ClipRef, x: f64, y: f64, scale: f64, rotation: f64| -> ScriptResult<()> {
+            s.with_clip(c, |clip| {
+                clip.transform = crate::timeline::ClipTransform {
+                    x: (x as f32).clamp(-2.0, 2.0),
+                    y: (y as f32).clamp(-2.0, 2.0),
+                    scale: (scale as f32).clamp(0.05, 4.0),
+                    rotation: rotation as f32,
+                };
+            })
+        },
+    );
+
     // --------------------------------------------------------- automation
     engine.register_fn(
         "automate",

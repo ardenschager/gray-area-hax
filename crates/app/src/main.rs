@@ -1441,6 +1441,7 @@ impl App {
                 .changed();
         });
         let is_pattern = matches!(clip.kind, ClipKind::Pattern(_));
+        let is_snippet = matches!(clip.kind, ClipKind::Snippet);
 
         if !is_pattern {
             section(ui, "grains (audio <-> visual)");
@@ -1459,6 +1460,9 @@ impl App {
             changed |= slider(ui, &mut g.position, 0.0..=1.0, "position", false);
             changed |= slider(ui, &mut g.spray, 0.0..=3.0, "spray (s)", false);
             changed |= slider(ui, &mut g.scan_speed, -2.0..=4.0, "scan speed", false);
+            if is_snippet {
+                changed |= slider(ui, &mut g.speed, 0.25..=4.0, "speed (time, keeps pitch)", true);
+            }
             changed |= slider(ui, &mut g.pitch, -24.0..=24.0, "pitch (semitones)", false);
             changed |= slider(ui, &mut g.pitch_jitter, 0.0..=24.0, "pitch jitter", false);
             changed |= slider(ui, &mut g.gain, 0.0..=2.0, "gain", false);
@@ -1644,6 +1648,19 @@ impl App {
                 .changed();
         }
 
+        section(ui, "canvas placement (video + pan)");
+        let tr = &mut clip.transform;
+        changed |= ui
+            .add(egui::Slider::new(&mut tr.x, -1.0..=1.0).text("x (drives pan)"))
+            .changed();
+        changed |= ui.add(egui::Slider::new(&mut tr.y, -1.0..=1.0).text("y")).changed();
+        changed |= ui
+            .add(egui::Slider::new(&mut tr.scale, 0.1..=2.5).text("scale (drives distance)"))
+            .changed();
+        changed |= ui
+            .add(egui::Slider::new(&mut tr.rotation, -180.0..=180.0).text("rotation °"))
+            .changed();
+
         section(ui, "automation");
         let clip_beats = clip.length_beats;
         changed |= Self::automation_ui(ui, &mut clip.automation, clip_beats);
@@ -1670,6 +1687,15 @@ impl App {
             .changed();
         changed |= ui
             .add(egui::Slider::new(&mut l.pan_to_x, 0.0..=1.0).text("pan -> x position"))
+            .changed();
+        changed |= ui
+            .add(egui::Slider::new(&mut l.x_to_pan, 0.0..=1.0).text("canvas x -> pan"))
+            .changed();
+        changed |= ui
+            .add(
+                egui::Slider::new(&mut l.scale_to_gain, 0.0..=1.0)
+                    .text("scale -> loudness (3D distance)"),
+            )
             .changed();
         changed |= ui.checkbox(&mut l.reverse_video, "reverse video with audio").changed();
 

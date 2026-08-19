@@ -9,7 +9,7 @@
 //!
 //! Track order is the video z-order: later tracks composite on top.
 
-use crate::audio::{render_grains_audio, StereoBuffer};
+use crate::audio::{render_grains_audio_spatial, StereoBuffer};
 use crate::fx;
 use crate::grain::{schedule_grains_auto, GrainEvent};
 use crate::music::semitones_to_ratio;
@@ -36,27 +36,81 @@ pub struct ClipPlan {
     pub style: VisualGrainStyle,
 }
 
-/// Build the single event a snippet clip plays: the source as ONE grain,
-/// so all correspondence machinery applies.
-fn snippet_event(clip: &Clip, source: &Source, clip_t0: f64, clip_len: f64) -> GrainEvent {
+/// Events for a snippet clip. When `speed` matches the pitch ratio
+/// (including the default speed=1 / pitch=0), the source plays as ONE
+/// pristine grain. Otherwise the snippet becomes a granular time-stretch:
+/// overlapping hann grains whose read head advances at `speed` while each
+/// grain resamples at the pitch ratio — tempo changes WITHOUT pitch
+/// changes (and vice versa). Automation is honored per grain.
+fn snippet_events(
+    clip: &Clip,
+    source: &Source,
+    clip_t0: f64,
+    clip_len: f64,
+    secs_per_beat: f64,
+) -> Vec<GrainEvent> {
     let g = &clip.grains;
     let source_len = source.duration();
-    let mut ratio = semitones_to_ratio(g.pitch);
-    if let Some(key) = &clip.key {
-        ratio = key.quantize_ratio(source.effective_base_hz(), ratio);
+    let base_hz = source.effective_base_hz();
+    let quantized = |st: f32| -> f32 {
+        let r = semitones_to_ratio(st);
+        match &clip.key {
+            Some(k) => k.quantize_ratio(base_hz, r),
+            None => r,
+        }
+    };
+
+    let base_ratio = quantized(g.pitch);
+    if clip.automation.is_empty() && (g.speed - base_ratio).abs() < 1e-3 {
+        // Record-player coupling: a single unbroken grain.
+        return vec![GrainEvent {
+            onset: clip_t0,
+            source_pos: (g.position as f64 * source_len).min(source_len),
+            duration: clip_len as f32,
+            pitch_ratio: base_ratio,
+            gain: g.gain,
+            pan: g.pan.clamp(-1.0, 1.0),
+            envelope: g.envelope,
+            env_skew: g.env_skew,
+            reverse: g.reverse_prob >= 0.5,
+            id: g.seed,
+        }];
     }
-    GrainEvent {
-        onset: clip_t0,
-        source_pos: (g.position as f64 * source_len).min(source_len),
-        duration: clip_len as f32,
-        pitch_ratio: ratio,
-        gain: g.gain,
-        pan: g.pan.clamp(-1.0, 1.0),
-        envelope: g.envelope,
-        env_skew: g.env_skew,
-        reverse: g.reverse_prob >= 0.5,
-        id: g.seed,
+
+    // Granular time-stretch train: 150 ms hann grains at 50% overlap sum
+    // to constant amplitude; the read head integrates `speed` over time.
+    const GRAIN: f64 = 0.15;
+    const HOP: f64 = GRAIN / 2.0;
+    let mut events = Vec::new();
+    let mut head = g.position as f64 * source_len;
+    let mut k = 0u64;
+    loop {
+        let t = k as f64 * HOP;
+        if t >= clip_len {
+            break;
+        }
+        let eff = if clip.automation.is_empty() {
+            g.clone()
+        } else {
+            crate::auto::settings_at(g, &clip.automation, t / secs_per_beat.max(1e-9))
+        };
+        let ratio = quantized(eff.pitch);
+        events.push(GrainEvent {
+            onset: clip_t0 + t,
+            source_pos: head.rem_euclid(source_len.max(1e-6)),
+            duration: GRAIN.min(clip_len - t + HOP) as f32,
+            pitch_ratio: ratio,
+            gain: eff.gain,
+            pan: eff.pan.clamp(-1.0, 1.0),
+            envelope: 1.0, // full hann: overlapped windows sum to unity
+            env_skew: 0.0,
+            reverse: eff.reverse_prob >= 0.5,
+            id: g.seed.wrapping_add(k),
+        });
+        head += HOP * eff.speed.max(0.05) as f64;
+        k += 1;
     }
+    events
 }
 
 /// Schedule every clip in the project (absolute timeline seconds). Shared
@@ -91,9 +145,9 @@ pub fn plan_project(project: &Project) -> Vec<ClipPlan> {
                     if source.duration() <= 0.0 {
                         continue;
                     }
-                    let ev = snippet_event(clip, source, clip_t0, clip_len);
+                    let evs = snippet_events(clip, source, clip_t0, clip_len, secs_per_beat);
                     (
-                        vec![(clip.source, vec![ev])],
+                        vec![(clip.source, evs)],
                         VisualGrainStyle::full_frame(clip.visual.additive),
                     )
                 }
@@ -117,6 +171,15 @@ pub fn plan_project(project: &Project) -> Vec<ClipPlan> {
     plans
 }
 
+/// The clip transform's audio placement: x -> pan offset, scale ->
+/// distance loudness (both through their AV-link dials).
+pub fn clip_spatial(clip: &Clip) -> (f32, f32) {
+    let pan_offset = (clip.transform.x * clip.link.x_to_pan).clamp(-1.0, 1.0);
+    let gain_mult =
+        (1.0 + (clip.transform.scale.clamp(0.0, 1.5) - 1.0) * clip.link.scale_to_gain).max(0.0);
+    (pan_offset, gain_mult)
+}
+
 fn render_audio_part(
     project: &Project,
     clip: &Clip,
@@ -127,11 +190,12 @@ fn render_audio_part(
 ) {
     let Some(source) = project.sources.get(source_id) else { return };
     let Some(audio_src) = &source.audio else { return };
+    let (pan_offset, gain_mult) = clip_spatial(clip);
     if clip.audio_filters.is_empty() {
-        render_grains_audio(audio_src, events, bus, t0);
+        render_grains_audio_spatial(audio_src, events, bus, t0, pan_offset, gain_mult);
     } else {
         let filtered = audio_src.filtered(&clip.audio_filters);
-        render_grains_audio(&filtered, events, bus, t0);
+        render_grains_audio_spatial(&filtered, events, bus, t0, pan_offset, gain_mult);
     }
 }
 
@@ -227,6 +291,7 @@ pub fn render_project(project: &Project, from_beat: f64, to_beat: f64) -> Render
                                 evs,
                                 &cp.style,
                                 &clip.link,
+                                &clip.transform,
                                 clip.color_filter.as_ref(),
                                 &mut clip_layer,
                                 ft,
@@ -573,6 +638,183 @@ mod tests {
         let f_early = out.frames[(0.75 * p.fps as f64) as usize].mean_luma();
         let f_late = out.frames[(3.25 * p.fps as f64) as usize].mean_luma();
         assert!(f_late < f_early * 0.5, "video fades: {f_early} -> {f_late}");
+    }
+
+    #[test]
+    fn snippet_speed_changes_tempo_not_pitch() {
+        // Half speed: the 220 Hz source still sounds at 220 Hz (granular
+        // time-stretch), NOT chipmunked down to 110.
+        let mut p = snippet_project();
+        p.tracks[0].clips[0].grains.speed = 0.5;
+        let out = render_project(&p, 0.0, 4.0);
+        let mono: Vec<f32> =
+            out.audio.left.iter().zip(&out.audio.right).map(|(l, r)| l + r).collect();
+        let pitch = crate::dsp::detect_pitch(&mono, p.sample_rate).expect("pitch");
+        assert!(
+            (pitch - 220.0).abs() < 10.0,
+            "half speed keeps pitch: got {pitch}"
+        );
+        // And the source is consumed at half rate: the read heads of late
+        // events sit near t/2.
+        let evs = &out.events[0];
+        assert!(evs.len() > 4, "stretch train, not one grain");
+        let late = evs.iter().find(|e| (e.onset - 1.5).abs() < 0.08).unwrap();
+        assert!(
+            (late.source_pos - 0.75).abs() < 0.08,
+            "read head at half rate: {} at onset {}",
+            late.source_pos,
+            late.onset
+        );
+
+        // Separate pitch param: speed 1, pitch +12 -> octave up, full tempo.
+        let mut p2 = snippet_project();
+        p2.tracks[0].clips[0].grains.pitch = 12.0;
+        let out2 = render_project(&p2, 0.0, 4.0);
+        let mono2: Vec<f32> =
+            out2.audio.left.iter().zip(&out2.audio.right).map(|(l, r)| l + r).collect();
+        let pitch2 = crate::dsp::detect_pitch(&mono2, p2.sample_rate).expect("pitch");
+        assert!((pitch2 - 440.0).abs() < 20.0, "pitch shift alone: {pitch2}");
+
+        // Default stays the pristine single grain.
+        let out3 = render_project(&snippet_project(), 0.0, 4.0);
+        assert_eq!(out3.events[0].len(), 1, "speed==pitch ratio -> one grain");
+    }
+
+    fn bright_project() -> Project {
+        let mut p = Project { bpm: 120.0, width: 64, height: 36, fps: 12.0, ..Default::default() };
+        let mut f = crate::video::Frame::black(64, 36);
+        for px in f.data.chunks_exact_mut(4) {
+            px[0] = 230;
+            px[1] = 230;
+            px[2] = 230;
+        }
+        let sid = p.add_source(crate::timeline::Source {
+            name: "bright".into(),
+            audio: Some(std::sync::Arc::new(crate::audio::AudioClip::sine(
+                220.0, 4.0, p.sample_rate,
+            ))),
+            video: Some(std::sync::Arc::new(crate::video::VideoClip {
+                frames: vec![f; 24],
+                fps: 12.0,
+            })),
+            base_hz: 220.0,
+        });
+        let t = p.add_track("t");
+        p.tracks[t].clips.push(Clip::new_snippet(sid, 0.0, 4.0));
+        p
+    }
+
+    fn half_lumas(frame: &Frame) -> (f32, f32) {
+        // (left half, right half)
+        let (w, h) = (frame.width, frame.height);
+        let mut l = 0.0f64;
+        let mut r = 0.0f64;
+        for y in 0..h {
+            for x in 0..w {
+                let px = frame.get(x, y);
+                let luma = 0.2126 * px[0] as f64 + 0.7152 * px[1] as f64 + 0.0722 * px[2] as f64;
+                if x < w / 2 {
+                    l += luma;
+                } else {
+                    r += luma;
+                }
+            }
+        }
+        let n = (w * h / 2) as f64;
+        ((l / n) as f32, (r / n) as f32)
+    }
+
+    #[test]
+    fn transform_positions_scales_and_rotates() {
+        // Scale 0.5 + x offset right: bright content lands on the right.
+        let mut p = bright_project();
+        p.tracks[0].clips[0].transform.scale = 0.5;
+        p.tracks[0].clips[0].transform.x = 0.5;
+        let out = render_project(&p, 0.0, 4.0);
+        let mid = &out.frames[out.frames.len() / 2];
+        let (l, r) = half_lumas(mid);
+        assert!(r > l * 2.0 + 5.0, "moved right: left {l} right {r}");
+
+        // Scale shrinks coverage: full-scale frame is much brighter overall.
+        let full = render_project(&bright_project(), 0.0, 4.0);
+        let full_mid = &full.frames[full.frames.len() / 2];
+        assert!(
+            mid.mean_luma() < full_mid.mean_luma() * 0.55,
+            "half scale covers ~quarter area: {} vs {}",
+            mid.mean_luma(),
+            full_mid.mean_luma()
+        );
+
+        // Rotation: make the top half bright, bottom dark; rotate 90 deg
+        // -> the asymmetry flips to left/right.
+        let mut pr = bright_project();
+        {
+            let src = &pr.sources[0];
+            let mut frames = Vec::new();
+            for _ in 0..24 {
+                let mut f = crate::video::Frame::black(64, 36);
+                for y in 0..18u32 {
+                    for x in 0..64u32 {
+                        f.put(x, y, [230, 230, 230, 255]);
+                    }
+                }
+                frames.push(f);
+            }
+            let _ = src;
+            pr.sources[0].video =
+                Some(std::sync::Arc::new(crate::video::VideoClip { frames, fps: 12.0 }));
+        }
+        pr.tracks[0].clips[0].transform.scale = 0.6;
+        pr.tracks[0].clips[0].transform.rotation = 90.0;
+        let out_r = render_project(&pr, 0.0, 4.0);
+        let mid_r = &out_r.frames[out_r.frames.len() / 2];
+        let (rl, rr) = half_lumas(mid_r);
+        assert!(
+            (rl - rr).abs() > 4.0,
+            "rotated top-bright becomes side-bright: {rl} vs {rr}"
+        );
+    }
+
+    #[test]
+    fn canvas_x_drives_pan_and_scale_drives_gain() {
+        // x = +0.9: audio pans hard right.
+        let mut p = bright_project();
+        p.tracks[0].clips[0].transform.x = 0.9;
+        let out = render_project(&p, 0.0, 4.0);
+        let rms = |ch: &Vec<f32>| -> f32 {
+            (ch.iter().map(|s| s * s).sum::<f32>() / ch.len() as f32).sqrt()
+        };
+        assert!(
+            rms(&out.audio.right) > rms(&out.audio.left) * 2.0,
+            "panned right: L {} R {}",
+            rms(&out.audio.left),
+            rms(&out.audio.right)
+        );
+
+        // Unlink x_to_pan: pan stays centered despite the offset.
+        let mut pu = bright_project();
+        pu.tracks[0].clips[0].transform.x = 0.9;
+        pu.tracks[0].clips[0].link.x_to_pan = 0.0;
+        let out_u = render_project(&pu, 0.0, 4.0);
+        let (ul, ur) = (rms(&out_u.audio.left), rms(&out_u.audio.right));
+        assert!((ul - ur).abs() < ul * 0.1, "unlinked stays centered");
+
+        // Small scale = far away = quiet (the 3D distance cue).
+        let mut ps = bright_project();
+        ps.tracks[0].clips[0].transform.scale = 0.25;
+        let out_s = render_project(&ps, 0.0, 4.0);
+        assert!(
+            out_s.audio.rms() < out.audio.rms() * 0.5,
+            "scale ducks loudness: {} vs {}",
+            out_s.audio.rms(),
+            out.audio.rms()
+        );
+        // Unlink scale_to_gain: loudness restored.
+        let mut psu = bright_project();
+        psu.tracks[0].clips[0].transform.scale = 0.25;
+        psu.tracks[0].clips[0].link.scale_to_gain = 0.0;
+        let out_su = render_project(&psu, 0.0, 4.0);
+        assert!(out_su.audio.rms() > out_s.audio.rms() * 1.8);
     }
 
     #[test]

@@ -169,6 +169,20 @@ pub fn render_grains_audio(
     out: &mut StereoBuffer,
     t0: f64,
 ) {
+    render_grains_audio_spatial(clip, events, out, t0, 0.0, 1.0);
+}
+
+/// Like [`render_grains_audio`], with a clip-level spatial placement:
+/// `pan_offset` shifts every grain's pan (the canvas-x -> pan link) and
+/// `gain_mult` scales every grain (the scale -> distance-loudness link).
+pub fn render_grains_audio_spatial(
+    clip: &AudioClip,
+    events: &[GrainEvent],
+    out: &mut StereoBuffer,
+    t0: f64,
+    pan_offset: f32,
+    gain_mult: f32,
+) {
     let out_sr = out.sample_rate as f64;
     let src_sr = clip.sample_rate as f64;
     let out_len = out.len() as i64;
@@ -181,10 +195,11 @@ pub fn render_grains_audio(
         if n <= 0 || start_sample + n < 0 || start_sample >= out_len {
             continue;
         }
-        // Equal-power pan.
-        let pan = ev.pan.clamp(-1.0, 1.0);
+        // Equal-power pan (grain pan + clip placement offset).
+        let pan = (ev.pan + pan_offset).clamp(-1.0, 1.0);
         let angle = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
-        let (gain_l, gain_r) = (angle.cos() * ev.gain, angle.sin() * ev.gain);
+        let g = ev.gain * gain_mult.max(0.0);
+        let (gain_l, gain_r) = (angle.cos() * g, angle.sin() * g);
 
         let src_start = ev.source_pos * src_sr;
         let grain_src_len = ev.duration as f64 * ev.pitch_ratio as f64 * src_sr;

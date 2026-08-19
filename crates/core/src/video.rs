@@ -302,6 +302,11 @@ pub struct AvLink {
     pub pan_to_x: f32,
     /// Reversed audio grains also play their video backwards.
     pub reverse_video: bool,
+    /// The clip transform's x position drives audio pan (0 = unlinked).
+    pub x_to_pan: f32,
+    /// The clip transform's scale drives loudness — the distance cue of
+    /// the "3D" panning model (smaller = farther = quieter).
+    pub scale_to_gain: f32,
 }
 
 impl Default for AvLink {
@@ -313,6 +318,8 @@ impl Default for AvLink {
             pitch_to_rate: 1.0,
             pan_to_x: 1.0,
             reverse_video: true,
+            x_to_pan: 1.0,
+            scale_to_gain: 1.0,
         }
     }
 }
@@ -328,6 +335,8 @@ impl AvLink {
             "pitch_to_rate" => self.pitch_to_rate = value.clamp(0.0, 1.0),
             "pan_to_x" => self.pan_to_x = value.clamp(0.0, 1.0),
             "reverse_video" => self.reverse_video = value > 0.5,
+            "x_to_pan" => self.x_to_pan = value.clamp(0.0, 1.0),
+            "scale_to_gain" => self.scale_to_gain = value.clamp(0.0, 1.0),
             other => return Err(format!("unknown link parameter '{other}'")),
         }
         Ok(())
@@ -343,13 +352,17 @@ fn hash01(x: u64) -> f32 {
     (z >> 40) as f32 / (1u64 << 24) as f32
 }
 
-/// Geometry + shading for one visual grain at output time `t`, mirroring
-/// the CPU compositor's math — used by GPU previews to draw each grain as
-/// a textured quad. Keep in sync with [`composite_grains_frame`].
+/// Geometry + shading for one visual grain at output time `t` — the ONE
+/// place grain placement is computed. Both the CPU compositor and the GPU
+/// preview consume these, so they cannot drift.
 #[derive(Debug, Clone, Copy)]
 pub struct GrainDraw {
-    /// Destination rect, normalized 0..1 (x, y, w, h), y-down.
+    /// Destination rect, normalized 0..1 (x, y, w, h), y-down, already
+    /// carrying the clip transform's translate/scale.
     pub dest: [f32; 4],
+    /// Rotation about the rect center, radians (from the clip transform),
+    /// applied in aspect-corrected space.
+    pub rotation: f32,
     /// Source patch rect, normalized 0..1 in the source frame.
     pub patch: [f32; 4],
     /// Source video time to sample (seconds; wrap at source duration).
@@ -358,15 +371,22 @@ pub struct GrainDraw {
     pub hue_shift: f32,
 }
 
-/// Compute the draw list for all events active at `t`.
+/// Compute the draw list for all events active at `t`. `aspect` is the
+/// canvas width/height ratio (rotation stays rigid, not skewed).
 pub fn grain_draws(
     events: &[GrainEvent],
     style: &VisualGrainStyle,
     link: &AvLink,
+    transform: &crate::timeline::ClipTransform,
     source_duration: f64,
     t: f64,
+    aspect: f32,
 ) -> Vec<GrainDraw> {
     let mut out = Vec::new();
+    let rot = transform.rotation.to_radians();
+    let (sin_r, cos_r) = rot.sin_cos();
+    let tscale = transform.scale.max(0.01);
+    let aspect = aspect.max(0.01);
     for ev in events {
         if t < ev.onset || t >= ev.end() {
             continue;
@@ -394,6 +414,15 @@ pub fn grain_draws(
         let jy = (hash01(ev.id) - 0.5) * style.scatter_y;
         let cy = 0.5 + jy;
 
+        // Clip transform: scale + rotate about the canvas center (in
+        // aspect-corrected units), then translate. Half-canvas x/y units.
+        let mut ox = (cx - 0.5) * tscale * aspect;
+        let mut oy = (cy - 0.5) * tscale;
+        (ox, oy) = (ox * cos_r - oy * sin_r, ox * sin_r + oy * cos_r);
+        let cx = 0.5 + ox / aspect + transform.x * 0.5;
+        let cy = 0.5 + oy + transform.y * 0.5;
+        let size = size * tscale;
+
         let src_frac = if source_duration > 0.0 {
             (ev.source_pos / source_duration).fract() as f32
         } else {
@@ -406,6 +435,7 @@ pub fn grain_draws(
 
         out.push(GrainDraw {
             dest: [cx - size / 2.0, cy - size / 2.0, size, size],
+            rotation: rot,
             patch: [sx0, sy0, patch_size, patch_size],
             src_time,
             alpha,
@@ -416,90 +446,67 @@ pub fn grain_draws(
 }
 
 /// Composite every grain active at output time `t` (timeline seconds) onto
-/// `out` — a transparent layer with straight-alpha accumulation. Call once
-/// per output frame, then blend the layer onto the master with
-/// [`blend_layer`]. The `link` controls how much of each audio property
-/// carries over to the visual grain.
+/// `out` — a transparent layer with straight-alpha accumulation. Geometry
+/// comes from [`grain_draws`] (shared with the GPU preview); this function
+/// rasterizes each draw, supporting the clip transform's rotation.
+#[allow(clippy::too_many_arguments)]
 pub fn composite_grains_frame(
     clip: &VideoClip,
     events: &[GrainEvent],
     style: &VisualGrainStyle,
     link: &AvLink,
+    transform: &crate::timeline::ClipTransform,
     color_filter: Option<&ColorFilter>,
     out: &mut Frame,
     t: f64,
 ) {
     let ow = out.width as f32;
     let oh = out.height as f32;
-    for ev in events {
-        if t < ev.onset || t >= ev.end() {
+    let aspect = ow / oh.max(1.0);
+    let add = style.additive.clamp(0.0, 1.0);
+    let draws = grain_draws(events, style, link, transform, clip.duration(), t, aspect);
+
+    for d in draws {
+        let Some(src) = clip.frame_at(d.src_time) else { continue };
+        let alpha = d.alpha;
+        let hue_shift = d.hue_shift;
+
+        // Dest rect in pixels.
+        let rw = (d.dest[2] * ow / 2.0).max(1.0); // half extents
+        let rh = (d.dest[3] * oh / 2.0).max(1.0);
+        let cx = (d.dest[0] + d.dest[2] / 2.0) * ow;
+        let cy = (d.dest[1] + d.dest[3] / 2.0) * oh;
+        let (sin_r, cos_r) = d.rotation.sin_cos();
+
+        // AABB of the (possibly rotated) rect.
+        let ext_x = rw * cos_r.abs() + rh * sin_r.abs();
+        let ext_y = rw * sin_r.abs() + rh * cos_r.abs();
+        let x_min = ((cx - ext_x).floor() as i32).max(0);
+        let x_max = ((cx + ext_x).ceil() as i32).min(ow as i32 - 1);
+        let y_min = ((cy - ext_y).floor() as i32).max(0);
+        let y_max = ((cy + ext_y).ceil() as i32).min(oh as i32 - 1);
+        if x_min > x_max || y_min > y_max {
             continue;
         }
-        let phase = ((t - ev.onset) / ev.duration as f64) as f32;
-        let env_part = 1.0
-            + (grain_env_skewed(phase, ev.envelope, ev.env_skew) - 1.0)
-                * link.envelope_to_opacity;
-        let gain_part = 1.0 + (ev.gain.min(1.5) - 1.0) * link.gain_to_opacity;
-        let alpha = (env_part * gain_part).clamp(0.0, 1.0);
-        if alpha <= 0.003 {
-            continue;
-        }
 
-        // The visual grain plays its patch of video at the audio's rate
-        // (scaled by the pitch_to_rate link).
-        let visual_rate = 1.0 + (ev.pitch_ratio - 1.0) * link.pitch_to_rate;
-        let local = (t - ev.onset) * visual_rate as f64;
-        let reverse = ev.reverse && link.reverse_video;
-        let src_t = if reverse {
-            ev.source_pos + ev.duration as f64 * visual_rate as f64 - local
-        } else {
-            ev.source_pos + local
-        };
-        let Some(src) = clip.frame_at(src_t) else { continue };
-
-        // Size from duration; position from pan (x) + stable per-grain scatter (y).
-        let size = (ev.duration * style.size_scale)
-            .clamp(style.min_size, style.max_size);
-        let pw = (size * ow).max(2.0) as i32;
-        let ph = (size * oh).max(2.0) as i32;
-        let cx = (0.5 + 0.45 * ev.pan * link.pan_to_x) * ow;
-        let jy = (hash01(ev.id) - 0.5) * style.scatter_y;
-        let cy = (0.5 + jy) * oh;
-        let x0 = cx as i32 - pw / 2;
-        let y0 = cy as i32 - ph / 2;
-
-        // Source patch: sample a window of the source frame centered where
-        // the read head is horizontally (source_pos as fraction of clip).
-        let src_frac = if clip.duration() > 0.0 {
-            (ev.source_pos / clip.duration()).fract() as f32
-        } else {
-            0.0
-        };
         let sw = src.width as f32;
         let sh = src.height as f32;
-        let patch_w = sw * size.clamp(0.05, 1.0);
-        let patch_h = sh * size.clamp(0.05, 1.0);
-        let sx0 = (src_frac * (sw - patch_w)).clamp(0.0, (sw - patch_w).max(0.0));
-        let sy0 = ((0.5 + jy * 0.5) * (sh - patch_h)).clamp(0.0, (sh - patch_h).max(0.0));
-
-        let hue_shift = ev.semitones() * link.pitch_to_hue;
-        let add = style.additive.clamp(0.0, 1.0);
-
-        for dy in 0..ph {
-            let y = y0 + dy;
-            if y < 0 || y >= oh as i32 {
-                continue;
-            }
-            let sy = (sy0 + (dy as f32 / ph as f32) * (patch_h - 1.0)) as u32;
-            let sy = sy.min(src.height - 1);
-            for dx in 0..pw {
-                let x = x0 + dx;
-                if x < 0 || x >= ow as i32 {
+        for y in y_min..=y_max {
+            for x in x_min..=x_max {
+                // Inverse-rotate the pixel offset into rect space.
+                let dx = x as f32 + 0.5 - cx;
+                let dy = y as f32 + 0.5 - cy;
+                let ux = dx * cos_r + dy * sin_r;
+                let uy = -dx * sin_r + dy * cos_r;
+                let qx = ux / rw * 0.5 + 0.5;
+                let qy = uy / rh * 0.5 + 0.5;
+                if !(0.0..1.0).contains(&qx) || !(0.0..1.0).contains(&qy) {
                     continue;
                 }
-                let sx = (sx0 + (dx as f32 / pw as f32) * (patch_w - 1.0)) as u32;
-                let sx = sx.min(src.width - 1);
-                let [mut r, mut g, mut b, _] = src.get(sx, sy);
+                let sx = ((d.patch[0] + qx * d.patch[2]) * (sw - 1.0)) as u32;
+                let sy = ((d.patch[1] + qy * d.patch[3]) * (sh - 1.0)) as u32;
+                let [mut r, mut g, mut b, _] =
+                    src.get(sx.min(src.width - 1), sy.min(src.height - 1));
 
                 let mut a = alpha;
                 if let Some(cf) = color_filter {
@@ -508,7 +515,6 @@ pub fn composite_grains_frame(
                         continue;
                     }
                 }
-
                 if hue_shift.abs() > 0.5 {
                     let (h, s, v) = rgb_to_hsv(r, g, b);
                     let (nr, ng, nb) = hsv_to_rgb(h + hue_shift, s, v);
@@ -522,9 +528,9 @@ pub fn composite_grains_frame(
                 let out_a = (a + da * (1.0 - a)).max(1e-6);
                 let blend = |src_c: u8, dst_c: u8| -> u8 {
                     let s = src_c as f32;
-                    let d = dst_c as f32;
-                    let over = (s * a + d * da * (1.0 - a)) / out_a;
-                    let additive = (d * da + s * a).min(255.0);
+                    let dd = dst_c as f32;
+                    let over = (s * a + dd * da * (1.0 - a)) / out_a;
+                    let additive = (dd * da + s * a).min(255.0);
                     (over * (1.0 - add) + additive * add) as u8
                 };
                 out.put(
@@ -639,7 +645,16 @@ mod tests {
         t: f64,
     ) -> Frame {
         let mut layer = Frame::transparent(96, 72);
-        composite_grains_frame(clip, events, style, link, cf, &mut layer, t);
+        composite_grains_frame(
+            clip,
+            events,
+            style,
+            link,
+            &crate::timeline::ClipTransform::default(),
+            cf,
+            &mut layer,
+            t,
+        );
         let mut out = Frame::black(96, 72);
         blend_layer(&mut out, &layer, style.additive, 1.0);
         out

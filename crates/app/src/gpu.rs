@@ -70,6 +70,24 @@ pub struct GpuPreview {
     fx: HashMap<u64, FxInst>,
 }
 
+const GRAIN_VS: &str = r#"#version 330 core
+layout(location=0) in vec2 a_pos;
+uniform vec4 u_rect;   // x,y,w,h in 0..1, y-down
+uniform float u_rot;   // radians, about the rect center
+uniform float u_aspect;
+out vec2 v_uv;
+void main() {
+    v_uv = a_pos;
+    vec2 c = u_rect.xy + 0.5 * u_rect.zw;
+    vec2 off = (a_pos - 0.5) * u_rect.zw;
+    off.x *= u_aspect;
+    float cs = cos(u_rot), sn = sin(u_rot);
+    off = vec2(off.x * cs - off.y * sn, off.x * sn + off.y * cs);
+    off.x /= u_aspect;
+    vec2 p = c + off;
+    gl_Position = vec4(p.x * 2.0 - 1.0, 1.0 - p.y * 2.0, 0.0, 1.0);
+}"#;
+
 const QUAD_VS: &str = r#"#version 330 core
 layout(location=0) in vec2 a_pos;
 uniform vec4 u_rect; // x,y,w,h in 0..1, y-down "screen" space
@@ -382,7 +400,7 @@ impl GpuPreview {
     pub fn new(gl: &glow::Context) -> Result<GpuPreview, String> {
         unsafe {
             let mut programs = HashMap::new();
-            programs.insert("grain", compile(gl, QUAD_VS, &grain_fs())?);
+            programs.insert("grain", compile(gl, GRAIN_VS, &grain_fs())?);
             programs.insert("blit", compile(gl, QUAD_VS, BLIT_FS)?);
             programs.insert("present", compile(gl, QUAD_VS, PRESENT_FS)?);
             programs.insert("crush", compile(gl, QUAD_VS, CRUSH_FS)?);
@@ -894,8 +912,16 @@ impl GpuPreview {
                             let (gtex, layers, dur) =
                                 (gsrc.tex, gsrc.layers, gsrc.duration.max(1e-6));
                             let style: VisualGrainStyle = cp.style;
-                            let draws =
-                                grain_draws(evs, &style, &clip.link, dur, t);
+                            let aspect = self.size.0 as f32 / self.size.1.max(1) as f32;
+                            let draws = grain_draws(
+                                evs,
+                                &style,
+                                &clip.link,
+                                &clip.transform,
+                                dur,
+                                t,
+                                aspect,
+                            );
                             let p = self.use_program(gl, "grain");
                             gl.active_texture(glow::TEXTURE0);
                             gl.bind_texture(glow::TEXTURE_2D_ARRAY, Some(gtex));
@@ -912,6 +938,7 @@ impl GpuPreview {
                             self.set_4f(gl, p, "u_cf", cf);
                             self.set_f(gl, p, "u_cf_valmin", valmin);
                             self.set_f(gl, p, "u_additive", style.additive);
+                            self.set_f(gl, p, "u_aspect", aspect);
                             for d in draws {
                                 let layer = ((d.src_time / dur).rem_euclid(1.0)
                                     * layers as f64)
@@ -921,6 +948,7 @@ impl GpuPreview {
                                 self.set_4f(gl, p, "u_patch", d.patch);
                                 self.set_f(gl, p, "u_alpha", d.alpha);
                                 self.set_f(gl, p, "u_hue", d.hue_shift);
+                                self.set_f(gl, p, "u_rot", d.rotation);
                                 self.set_4f(gl, p, "u_rect", d.dest);
                                 self.draw_quad(gl);
                             }
@@ -989,12 +1017,15 @@ impl GpuPreview {
                     self.ensure_source(gl, &scene.project, *sid);
                     let Some(gsrc) = self.sources.get(sid) else { continue };
                     let (gtex, layers, dur) = (gsrc.tex, gsrc.layers, gsrc.duration.max(1e-6));
+                    let aspect = self.size.0 as f32 / self.size.1.max(1) as f32;
                     let draws = grain_draws(
                         std::slice::from_ref(ev),
                         &style,
                         &link,
+                        &chromagrain_core::timeline::ClipTransform::default(),
                         dur,
                         scene.live_t,
+                        aspect,
                     );
                     if draws.is_empty() {
                         continue;
@@ -1006,6 +1037,12 @@ impl GpuPreview {
                     self.set_i(gl, p, "u_cf_mode", 0);
                     self.set_f(gl, p, "u_cf_valmin", 0.0);
                     self.set_f(gl, p, "u_additive", 0.4);
+                    self.set_f(
+                        gl,
+                        p,
+                        "u_aspect",
+                        self.size.0 as f32 / self.size.1.max(1) as f32,
+                    );
                     for d in draws {
                         let layer = ((d.src_time / dur).rem_euclid(1.0) * layers as f64)
                             .min(layers as f64 - 1.0) as f32;
@@ -1013,6 +1050,7 @@ impl GpuPreview {
                         self.set_4f(gl, p, "u_patch", d.patch);
                         self.set_f(gl, p, "u_alpha", d.alpha);
                         self.set_f(gl, p, "u_hue", d.hue_shift);
+                        self.set_f(gl, p, "u_rot", d.rotation);
                         self.set_4f(gl, p, "u_rect", d.dest);
                         self.draw_quad(gl);
                         drew = true;

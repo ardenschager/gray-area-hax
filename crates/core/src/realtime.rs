@@ -3,7 +3,7 @@
 //! cpal callback drains is (sample-exactly) the offline render, streamed.
 //! Supports a beat-quantized loop region for live use.
 
-use crate::audio::{render_grains_audio, StereoBuffer};
+use crate::audio::{render_grains_audio, render_grains_audio_spatial, StereoBuffer};
 use crate::fx::{self, AudioFxState};
 use crate::grain::GrainEvent;
 use crate::render::{plan_project, ClipPlan};
@@ -189,7 +189,8 @@ impl RealtimeAudio {
                         }
                     };
                     let Some(audio) = audio else { continue };
-                    render_grains_audio(audio, evs, bus, t0);
+                    let (pan_offset, gain_mult) = crate::render::clip_spatial(clip);
+                    render_grains_audio_spatial(audio, evs, bus, t0, pan_offset, gain_mult);
                     any = true;
                 }
                 if has_fx {

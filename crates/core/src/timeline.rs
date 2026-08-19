@@ -53,6 +53,22 @@ pub enum ClipKind {
     Pattern(usize),
 }
 
+/// Placement of a clip's visuals on the canvas. x/y are offsets in
+/// half-canvas units (-1..1, 0 = centered); rotation in degrees.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ClipTransform {
+    pub x: f32,
+    pub y: f32,
+    pub scale: f32,
+    pub rotation: f32,
+}
+
+impl Default for ClipTransform {
+    fn default() -> Self {
+        ClipTransform { x: 0.0, y: 0.0, scale: 1.0, rotation: 0.0 }
+    }
+}
+
 /// A clip placed on the timeline (positions in beats).
 #[derive(Debug, Clone)]
 pub struct Clip {
@@ -78,6 +94,9 @@ pub struct Clip {
     /// Parameter automation lanes (grain params, evaluated per grain;
     /// lane beats are relative to the clip start).
     pub automation: Vec<crate::auto::AutomationLane>,
+    /// Canvas placement of this clip's visuals — and, through the AV link,
+    /// of its audio: x drives pan, scale drives distance loudness.
+    pub transform: ClipTransform,
 }
 
 impl Clip {
@@ -95,6 +114,7 @@ impl Clip {
             link: AvLink::default(),
             effects: Vec::new(),
             automation: Vec::new(),
+            transform: ClipTransform::default(),
         }
     }
 
@@ -324,6 +344,10 @@ impl Project {
         let mut c2 = Clip::new_snippet(sid, 0.0, 8.0);
         c2.grains.pitch = -12.0;
         c2.grains.gain = 0.35;
+        // Half-speed drift (granular stretch keeps the pitch), placed as a
+        // tilted pane — its x offset also pans the audio left.
+        c2.grains.speed = 0.5;
+        c2.transform = ClipTransform { x: -0.25, y: -0.1, scale: 0.85, rotation: -7.0 };
         p.tracks[t2].clips.push(c2);
         // Snippet bed sits at the bottom of the stack: move it first.
         p.tracks.rotate_right(1);
