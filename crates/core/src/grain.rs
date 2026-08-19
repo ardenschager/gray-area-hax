@@ -41,6 +41,32 @@ pub struct GrainSettings {
     pub seed: u64,
 }
 
+impl GrainSettings {
+    /// Set a parameter by name (shared by scripting and automation).
+    /// Returns Err for names that are not grain parameters.
+    pub fn set_param(&mut self, key: &str, value: f64) -> Result<(), ()> {
+        let x = value as f32;
+        match key {
+            "density" => self.density = x.clamp(0.1, 500.0),
+            "duration" => self.duration = x.clamp(0.005, 5.0),
+            "duration_jitter" => self.duration_jitter = x.clamp(0.0, 1.0),
+            "position" => self.position = x.clamp(0.0, 1.0),
+            "spray" => self.spray = x.max(0.0),
+            "scan_speed" => self.scan_speed = x,
+            "pitch" => self.pitch = x.clamp(-48.0, 48.0),
+            "pitch_jitter" => self.pitch_jitter = x.clamp(0.0, 48.0),
+            "gain" => self.gain = x.clamp(0.0, 4.0),
+            "pan" => self.pan = x.clamp(-1.0, 1.0),
+            "pan_spread" => self.pan_spread = x.clamp(0.0, 1.0),
+            "envelope" => self.envelope = x.clamp(0.01, 1.0),
+            "reverse_prob" => self.reverse_prob = x.clamp(0.0, 1.0),
+            "seed" => self.seed = value as u64,
+            _ => return Err(()),
+        }
+        Ok(())
+    }
+}
+
 impl Default for GrainSettings {
     fn default() -> Self {
         GrainSettings {
@@ -110,48 +136,69 @@ pub fn schedule_grains(
     base_hz: f32,
     key: Option<&Key>,
 ) -> Vec<GrainEvent> {
+    schedule_grains_auto(settings, &[], 1.0, clip_start, clip_len, source_len, base_hz, key)
+}
+
+/// Like [`schedule_grains`], with automation lanes evaluated at each
+/// grain's onset (lane beats are relative to the clip start;
+/// `secs_per_beat` converts grain time to beats). Density automation
+/// changes the scheduling rate itself.
+#[allow(clippy::too_many_arguments)]
+pub fn schedule_grains_auto(
+    settings: &GrainSettings,
+    lanes: &[crate::auto::AutomationLane],
+    secs_per_beat: f64,
+    clip_start: f64,
+    clip_len: f64,
+    source_len: f64,
+    base_hz: f32,
+    key: Option<&Key>,
+) -> Vec<GrainEvent> {
     let mut events = Vec::new();
     if clip_len <= 0.0 || source_len <= 0.0 || settings.density <= 0.0 {
         return events;
     }
     let mut rng = Rng::new(settings.seed ^ 0xA5A5_5A5A);
-    let mean_interval = 1.0 / settings.density.max(0.01) as f64;
 
     let mut t = 0.0f64; // time within clip
     let mut id: u64 = 0;
     while t < clip_len {
+        let s = if lanes.is_empty() {
+            settings.clone()
+        } else {
+            crate::auto::settings_at(settings, lanes, t / secs_per_beat.max(1e-9))
+        };
+        let mean_interval = 1.0 / s.density.max(0.01) as f64;
         // Jitter inter-onset interval +-50% for an organic cloud.
         let interval = mean_interval * (0.5 + rng.next_f32() as f64);
 
-        let dur = (settings.duration
-            * (1.0 + settings.duration_jitter * rng.bipolar()))
-        .clamp(0.005, 5.0);
+        let dur = (s.duration * (1.0 + s.duration_jitter * rng.bipolar())).clamp(0.005, 5.0);
 
         // Read head: base position + scan + spray.
-        let mut pos = settings.position as f64 * source_len
-            + settings.scan_speed as f64 * t
-            + settings.spray as f64 * rng.bipolar() as f64;
+        let mut pos = s.position as f64 * source_len
+            + s.scan_speed as f64 * t
+            + s.spray as f64 * rng.bipolar() as f64;
         // Wrap into the source.
         pos = pos.rem_euclid(source_len.max(1e-6));
 
-        let st = settings.pitch + settings.pitch_jitter * rng.bipolar();
+        let st = s.pitch + s.pitch_jitter * rng.bipolar();
         let mut ratio = semitones_to_ratio(st);
         if let Some(k) = key {
             ratio = k.quantize_ratio(base_hz, ratio);
         }
 
-        let pan = (settings.pan + settings.pan_spread.clamp(0.0, 1.0) * rng.bipolar())
-            .clamp(-1.0, 1.0);
-        let reverse = rng.next_f32() < settings.reverse_prob;
+        let pan =
+            (s.pan + s.pan_spread.clamp(0.0, 1.0) * rng.bipolar()).clamp(-1.0, 1.0);
+        let reverse = rng.next_f32() < s.reverse_prob;
 
         events.push(GrainEvent {
             onset: clip_start + t,
             source_pos: pos,
             duration: dur,
             pitch_ratio: ratio,
-            gain: settings.gain,
+            gain: s.gain,
             pan,
-            envelope: settings.envelope,
+            envelope: s.envelope,
             reverse,
             id,
         });

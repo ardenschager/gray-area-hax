@@ -53,6 +53,15 @@ versa). It will be crunchy.
   trigger with optional per-step pitch/gain. Patterns sit ON the timeline
   as pattern clips and loop to fill them — the tool stays timeline-first,
   with the sequencer panel editing whatever pattern clip is selected.
+  Every row has its **own step count** (a 5-step row against a 16-step
+  grid phases against it — polymeter, drawn in blue), and rows can flip
+  into **loop mode**: not sequenced at all, just repeating a start..stop
+  slice of their source.
+- **Automation**: drag across a strip to draw a curve on any grain
+  parameter of a clip (density, pitch, position, gain, pan, spray, scan
+  speed…), evaluated per grain so clouds morph as they play. Tracks get a
+  drawable level curve that fades audio gain and video opacity together
+  (through the same unlinkable correspondence dial).
 - **Performance playback**: play is live — a streaming engine renders the
   project in blocks (verified sample-identical to the offline render) into
   the audio device while a **GPU shader pipeline** (grain quads, effect
@@ -146,9 +155,17 @@ let p = s.pattern("hits");               // step sequencer
 s.pattern_grid(p, 4.0, 4);               // 4 beats, 16th steps
 let r = s.row(p, src);
 s.row_key(p, r, "A", "minor_pentatonic");
+s.row_steps(p, r, 5);                    // own step count -> polymeter
 s.step(p, r, 0, true);
-s.step_pitch(p, r, 8, 12.0);
+s.step_pitch(p, r, 3, 12.0);
+let l = s.row(p, src);
+s.row_loop(p, l, 0.25, 0.5);             // loop mode: repeat a source slice
 s.pattern_clip(t, p, 0.0, 16.0);         // loops on the timeline
+
+s.automate(c, "density", 0.0, 5.0);      // parameter automation over time
+s.automate(c, "density", 16.0, 60.0);    // (per-grain: the cloud thickens)
+s.track_level_point(t, 0.0, 0.0);        // track fade: gain AND opacity
+s.track_level_point(t, 8.0, 1.0);
 
 s.render(0.0, 16.0, "out.mp4");          // .mp4 / .wav / .png
 ```

@@ -14,7 +14,7 @@ use chromagrain_core::media;
 use chromagrain_core::music::{Key, ScaleKind, PITCH_CLASS_NAMES};
 use chromagrain_core::render::{plan_project, render_project, ClipPlan};
 use chromagrain_core::script::run_script;
-use chromagrain_core::seq::StepPattern;
+use chromagrain_core::seq::{RowMode, StepPattern};
 use chromagrain_core::timeline::{Clip, ClipKind, Project, Source};
 use chromagrain_core::video::{ColorFilter, ColorFilterMode};
 use eframe::egui;
@@ -814,7 +814,7 @@ impl App {
             }
         });
 
-        let n = pat.n_steps();
+        let grid_n = pat.n_steps();
         let spb = pat.steps_per_beat as usize;
         let mut remove_row: Option<usize> = None;
         for (ri, row) in pat.rows.iter_mut().enumerate() {
@@ -823,7 +823,7 @@ impl App {
                     if ui.small_button("x").clicked() {
                         remove_row = Some(ri);
                     }
-                    ui.label(egui::RichText::new(format!("src")).weak().size(10.0));
+                    ui.label(egui::RichText::new("src").weak().size(10.0));
                     changed |= ui
                         .add(
                             egui::DragValue::new(&mut row.source)
@@ -846,27 +846,78 @@ impl App {
                                 .suffix(" g"),
                         )
                         .changed();
-                    // The step grid.
-                    for si in 0..n {
-                        if si % spb == 0 && si > 0 {
-                            ui.add_space(3.0);
-                        }
-                        let on = row.steps.get(si).map(|s| s.on).unwrap_or(false);
-                        let (rect, resp) = ui
-                            .allocate_exact_size(egui::vec2(16.0, 22.0), egui::Sense::click());
-                        let accent = egui::Color32::from_rgb(255, 122, 89);
-                        let color = if on {
-                            accent
-                        } else if (si / spb) % 2 == 0 {
-                            egui::Color32::from_gray(45)
-                        } else {
-                            egui::Color32::from_gray(36)
-                        };
-                        ui.painter().rect_filled(rect.shrink(1.0), 2.0, color);
-                        if resp.clicked() {
-                            if let Some(s) = row.steps.get_mut(si) {
-                                s.on = !s.on;
+                    // Steps <-> loop mode.
+                    let is_loop = row.mode == RowMode::Loop;
+                    let mut loop_toggle = is_loop;
+                    if ui
+                        .toggle_value(&mut loop_toggle, "loop")
+                        .on_hover_text("not sequenced: repeat a start..stop slice of the source")
+                        .changed()
+                    {
+                        row.mode = if loop_toggle { RowMode::Loop } else { RowMode::Steps };
+                        changed = true;
+                    }
+                    match row.mode {
+                        RowMode::Loop => {
+                            let mut s0 = row.loop_start;
+                            let mut s1 = row.loop_end;
+                            let a = ui
+                                .add(egui::Slider::new(&mut s0, 0.0..=1.0).text("start"))
+                                .changed();
+                            let b = ui
+                                .add(egui::Slider::new(&mut s1, 0.0..=1.0).text("stop"))
+                                .changed();
+                            if a || b {
+                                row.loop_start = s0.min(s1 - 0.01).clamp(0.0, 0.99);
+                                row.loop_end = s1.max(s0 + 0.01).clamp(0.01, 1.0);
                                 changed = true;
+                            }
+                        }
+                        RowMode::Steps => {
+                            // Per-row step count: != grid = polymeter drift.
+                            let mut count = row.steps.len();
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut count)
+                                        .speed(0.2)
+                                        .range(1..=64)
+                                        .suffix(" steps"),
+                                )
+                                .on_hover_text(
+                                    "this row cycles its own length — offset goodness",
+                                )
+                                .changed()
+                            {
+                                row.set_steps(count);
+                                changed = true;
+                            }
+                            let poly = row.steps.len() != grid_n;
+                            for si in 0..row.steps.len() {
+                                if si % spb == 0 && si > 0 {
+                                    ui.add_space(3.0);
+                                }
+                                let on = row.steps[si].on;
+                                let (rect, resp) = ui.allocate_exact_size(
+                                    egui::vec2(16.0, 22.0),
+                                    egui::Sense::click(),
+                                );
+                                let accent = if poly {
+                                    egui::Color32::from_rgb(122, 196, 255)
+                                } else {
+                                    egui::Color32::from_rgb(255, 122, 89)
+                                };
+                                let color = if on {
+                                    accent
+                                } else if (si / spb) % 2 == 0 {
+                                    egui::Color32::from_gray(45)
+                                } else {
+                                    egui::Color32::from_gray(36)
+                                };
+                                ui.painter().rect_filled(rect.shrink(1.0), 2.0, color);
+                                if resp.clicked() {
+                                    row.steps[si].on = !row.steps[si].on;
+                                    changed = true;
+                                }
                             }
                         }
                     }
@@ -886,6 +937,128 @@ impl App {
         if changed {
             self.project_rev += 1;
         }
+    }
+
+    /// Freehand automation strip: drag across it to draw the curve.
+    /// `beats` is the x-axis span; values map linearly to `range`.
+    fn lane_strip(
+        ui: &mut egui::Ui,
+        lane: &mut chromagrain_core::auto::AutomationLane,
+        range: (f32, f32),
+        beats: f64,
+    ) -> bool {
+        let mut changed = false;
+        let width = ui.available_width().min(300.0).max(120.0);
+        let (rect, resp) = ui.allocate_exact_size(
+            egui::vec2(width, 44.0),
+            egui::Sense::click_and_drag(),
+        );
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 3.0, egui::Color32::from_rgb(12, 12, 14));
+        // Beat grid.
+        let beats = beats.max(0.25);
+        for b in 0..=(beats as usize) {
+            let x = rect.min.x + (b as f64 / beats) as f32 * rect.width();
+            painter.line_segment(
+                [egui::pos2(x, rect.min.y), egui::pos2(x, rect.max.y)],
+                egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_gray(if b % 4 == 0 { 44 } else { 26 }),
+                ),
+            );
+        }
+        let (lo, hi) = range;
+        let to_y = |v: f64| -> f32 {
+            let t = ((v as f32 - lo) / (hi - lo).max(1e-6)).clamp(0.0, 1.0);
+            rect.max.y - t * rect.height()
+        };
+        // Draw the curve (or the "empty" hint line).
+        if lane.points.is_empty() {
+            painter.line_segment(
+                [
+                    egui::pos2(rect.min.x, rect.center().y),
+                    egui::pos2(rect.max.x, rect.center().y),
+                ],
+                egui::Stroke::new(1.0, egui::Color32::from_gray(60)),
+            );
+        } else {
+            let n = 64;
+            let pts: Vec<egui::Pos2> = (0..=n)
+                .map(|i| {
+                    let beat = i as f64 / n as f64 * beats;
+                    let v = lane.value_at(beat).unwrap_or(0.0);
+                    egui::pos2(
+                        rect.min.x + (i as f32 / n as f32) * rect.width(),
+                        to_y(v),
+                    )
+                })
+                .collect();
+            painter.add(egui::Shape::line(
+                pts,
+                egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 122, 89)),
+            ));
+        }
+        // Drag to draw: snap x to a 32nd of the span so freehand stays tidy.
+        if resp.dragged() || resp.clicked() {
+            if let Some(pos) = resp.interact_pointer_pos() {
+                let fx = ((pos.x - rect.min.x) / rect.width()).clamp(0.0, 1.0) as f64;
+                let fy = 1.0 - ((pos.y - rect.min.y) / rect.height()).clamp(0.0, 1.0);
+                let grid = beats / 32.0;
+                let beat = (fx * beats / grid).round() * grid;
+                let value = (lo + (hi - lo) * fy as f32) as f64;
+                lane.set_point(beat, value);
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    fn automation_ui(
+        ui: &mut egui::Ui,
+        automation: &mut Vec<chromagrain_core::auto::AutomationLane>,
+        beats: f64,
+    ) -> bool {
+        use chromagrain_core::auto::{param_range, AutomationLane, AUTOMATABLE};
+        let mut changed = false;
+        let mut remove: Option<usize> = None;
+        for (i, lane) in automation.iter_mut().enumerate() {
+            ui.push_id(("auto_lane", i), |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(&lane.param).strong().size(11.0));
+                    if ui.small_button("x").clicked() {
+                        remove = Some(i);
+                    }
+                    ui.label(
+                        egui::RichText::new("drag to draw")
+                            .weak()
+                            .size(9.0),
+                    );
+                });
+                let range = param_range(&lane.param).unwrap_or((0.0, 1.0));
+                changed |= Self::lane_strip(ui, lane, range, beats);
+            });
+        }
+        if let Some(i) = remove {
+            automation.remove(i);
+            changed = true;
+        }
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("add_lane")
+                .selected_text("+ lane")
+                .width(110.0)
+                .show_ui(ui, |ui| {
+                    for p in AUTOMATABLE {
+                        if automation.iter().any(|l| l.param == p) {
+                            continue;
+                        }
+                        if ui.selectable_label(false, p).clicked() {
+                            automation.push(AutomationLane::new(p));
+                            changed = true;
+                        }
+                    }
+                });
+        });
+        changed
     }
 
     /// Editor for an AV effect chain. Returns true when anything changed.
@@ -972,6 +1145,7 @@ impl App {
     fn track_ui(&mut self, ui: &mut egui::Ui) {
         let ti = self.selected_track;
         let mut p = self.project.lock().unwrap();
+        let end_beats = p.end_beat();
         let Some(track) = p.tracks.get_mut(ti) else { return };
         let mut changed = false;
 
@@ -986,6 +1160,27 @@ impl App {
                     .text("level -> opacity link"),
             )
             .changed();
+        // Level automation over the arrangement (also fades video opacity).
+        let mut automated = !track.level_points.is_empty();
+        if ui.checkbox(&mut automated, "automate level").changed() {
+            if automated {
+                track.level_points = vec![
+                    chromagrain_core::auto::AutoPoint { beat: 0.0, value: track.level as f64 },
+                ];
+            } else {
+                track.level_points.clear();
+            }
+            changed = true;
+        }
+        if !track.level_points.is_empty() {
+            let span = end_beats.max(8.0);
+            let mut lane = chromagrain_core::auto::AutomationLane {
+                param: "level".into(),
+                points: std::mem::take(&mut track.level_points),
+            };
+            changed |= Self::lane_strip(ui, &mut lane, (0.0, 1.5), span);
+            track.level_points = lane.points;
+        }
         ui.label(egui::RichText::new("track effects").weak().size(10.0));
         changed |= Self::effects_chain_ui(ui, &mut track.effects, "track_fx");
         drop(p);
@@ -1206,6 +1401,10 @@ impl App {
                 .add(egui::Slider::new(&mut cf.sat_min, 0.0..=1.0).text("min sat"))
                 .changed();
         }
+
+        section(ui, "automation");
+        let clip_beats = clip.length_beats;
+        changed |= Self::automation_ui(ui, &mut clip.automation, clip_beats);
 
         section(ui, "effects chain (audio + video)");
         changed |= Self::effects_chain_ui(ui, &mut clip.effects, "clip_fx");

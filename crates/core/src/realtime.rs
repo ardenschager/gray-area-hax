@@ -186,8 +186,12 @@ impl RealtimeAudio {
                 &track.effects,
                 &mut self.track_states[ti],
             );
-            let level = track.level.max(0.0);
+            // Same per-sample level-automation expression as the offline
+            // renderer, so streamed output stays sample-exact.
+            let beats_per_sec = self.project.bpm / 60.0;
             for i in 0..n {
+                let beat = (t0 + i as f64 / sr) * beats_per_sec;
+                let level = track.level_at(beat);
                 left[at + i] += self.scratch_track.left[i] * level;
                 right[at + i] += self.scratch_track.right[i] * level;
             }
@@ -258,6 +262,12 @@ mod tests {
         let pid = p.add_pattern(pat);
         let t2 = p.add_track("seq");
         p.tracks[t2].clips.push(Clip::new_pattern(pid, 0.0, 4.0));
+        // Track-level automation on the bed (fade in), locking realtime
+        // parity of the per-sample level curve.
+        p.tracks[t1].level_points = vec![
+            crate::auto::AutoPoint { beat: 0.0, value: 0.2 },
+            crate::auto::AutoPoint { beat: 4.0, value: 1.0 },
+        ];
         // Master crush (streams with zero latency, unlike compress).
         p.master_effects.push(AvEffect::new(EffectKind::Crush {
             downsample: 3.0,

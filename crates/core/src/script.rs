@@ -540,6 +540,80 @@ pub fn build_engine(session: Session, log: Arc<Mutex<String>>) -> Engine {
         },
     );
 
+    // --------------------------------------------------------- automation
+    engine.register_fn(
+        "automate",
+        |s: &mut Session, c: ClipRef, param: &str, beat: f64, value: f64| -> ScriptResult<()> {
+            let key = param.to_ascii_lowercase().replace([' ', '-'], "_");
+            if crate::auto::param_range(&key).is_none() {
+                return Err(rt_err(format!("'{param}' is not automatable")));
+            }
+            s.with_clip(c, |clip| {
+                match clip.automation.iter_mut().find(|l| l.param == key) {
+                    Some(lane) => lane.set_point(beat, value),
+                    None => {
+                        let mut lane = crate::auto::AutomationLane::new(&key);
+                        lane.set_point(beat, value);
+                        clip.automation.push(lane);
+                    }
+                }
+            })
+        },
+    );
+    engine.register_fn(
+        "clear_automation",
+        |s: &mut Session, c: ClipRef, param: &str| -> ScriptResult<()> {
+            let key = param.to_ascii_lowercase().replace([' ', '-'], "_");
+            s.with_clip(c, |clip| clip.automation.retain(|l| l.param != key))
+        },
+    );
+    engine.register_fn(
+        "track_level_point",
+        |s: &mut Session, track: i64, beat: f64, value: f64| -> ScriptResult<()> {
+            let mut p = s.project.lock().unwrap();
+            let t = p
+                .tracks
+                .get_mut(track as usize)
+                .ok_or_else(|| rt_err(format!("no track {track}")))?;
+            let mut lane = crate::auto::AutomationLane {
+                param: String::new(),
+                points: std::mem::take(&mut t.level_points),
+            };
+            lane.set_point(beat, value.clamp(0.0, 2.0));
+            t.level_points = lane.points;
+            Ok(())
+        },
+    );
+    engine.register_fn("clear_track_level", |s: &mut Session, track: i64| {
+        if let Some(t) = s.project.lock().unwrap().tracks.get_mut(track as usize) {
+            t.level_points.clear();
+        }
+    });
+
+    // -------------------------------------------- row modes / polymeter
+    engine.register_fn(
+        "row_steps",
+        |s: &mut Session, pid: i64, row: i64, n: i64| -> ScriptResult<()> {
+            with_row(s, pid, row, |r| r.set_steps(n.max(1) as usize))
+        },
+    );
+    engine.register_fn(
+        "row_loop",
+        |s: &mut Session, pid: i64, row: i64, start: f64, end: f64| -> ScriptResult<()> {
+            with_row(s, pid, row, |r| {
+                r.mode = crate::seq::RowMode::Loop;
+                r.loop_start = (start as f32).clamp(0.0, 1.0);
+                r.loop_end = (end as f32).clamp(0.0, 1.0).max(r.loop_start + 0.01);
+            })
+        },
+    );
+    engine.register_fn(
+        "row_steps_mode",
+        |s: &mut Session, pid: i64, row: i64| -> ScriptResult<()> {
+            with_row(s, pid, row, |r| r.mode = crate::seq::RowMode::Steps)
+        },
+    );
+
     // ------------------------------------------------------------ effects
     // Chains: s.effect(c, "crush") -> index; s.fx(c, idx, "bits", 4.0);
     // master: s.master_effect("reverb") -> idx; s.master_fx(idx, "mix", 0.4).
@@ -827,6 +901,56 @@ mod tests {
             t.clips[0].kind,
             crate::timeline::ClipKind::Pattern(0)
         ));
+    }
+
+    #[test]
+    fn script_automation_and_row_modes() {
+        let project = fresh();
+        let script = r#"
+            let s = session(120.0);
+            let src = s.demo_source();
+            let t = s.track("g");
+            let c = s.clip(t, src, 0.0, 8.0);
+            s.automate(c, "density", 0.0, 5.0);
+            s.automate(c, "density", 8.0, 60.0);
+            s.automate(c, "gain", 4.0, 0.5);
+            s.track_level_point(t, 0.0, 1.0);
+            s.track_level_point(t, 8.0, 0.2);
+
+            let p = s.pattern("poly");
+            let r = s.row(p, src);
+            s.row_steps(p, r, 5);
+            s.step(p, r, 0, true);
+            let l = s.row(p, src);
+            s.row_loop(p, l, 0.25, 0.75);
+        "#;
+        run_script(project.clone(), Path::new("/tmp"), script).unwrap();
+
+        let p = project.lock().unwrap();
+        let clip = &p.tracks[0].clips[0];
+        assert_eq!(clip.automation.len(), 2);
+        let dens = clip.automation.iter().find(|l| l.param == "density").unwrap();
+        assert_eq!(dens.points.len(), 2);
+        assert!((dens.value_at(4.0).unwrap() - 32.5).abs() < 1e-9);
+        assert_eq!(p.tracks[0].level_points.len(), 2);
+        assert!((p.tracks[0].level_at(4.0) - 0.6).abs() < 1e-6);
+
+        let pat = &p.patterns[0];
+        assert_eq!(pat.rows[0].steps.len(), 5);
+        assert_eq!(pat.rows[1].mode, crate::seq::RowMode::Loop);
+        assert!((pat.rows[1].loop_start - 0.25).abs() < 1e-6);
+
+        // Bad param errors cleanly.
+        drop(p);
+        let bad = r#"
+            let s = session(120.0);
+            let src = s.demo_source();
+            let t = s.track("g");
+            let c = s.clip(t, src, 0.0, 8.0);
+            s.automate(c, "seed", 0.0, 5.0);
+        "#;
+        let err = run_script(fresh(), Path::new("/tmp"), bad).unwrap_err();
+        assert!(err.contains("not automatable"), "err: {err}");
     }
 
     #[test]

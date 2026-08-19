@@ -75,6 +75,9 @@ pub struct Clip {
     pub link: AvLink,
     /// AV effect chain applied to this clip's audio AND its visual layer.
     pub effects: Vec<AvEffect>,
+    /// Parameter automation lanes (grain params, evaluated per grain;
+    /// lane beats are relative to the clip start).
+    pub automation: Vec<crate::auto::AutomationLane>,
 }
 
 impl Clip {
@@ -91,6 +94,7 @@ impl Clip {
             visual: VisualGrainStyle::default(),
             link: AvLink::default(),
             effects: Vec::new(),
+            automation: Vec::new(),
         }
     }
 
@@ -127,6 +131,9 @@ pub struct Track {
     pub level: f32,
     /// How strongly the level drives video opacity (correspondence dial).
     pub level_to_opacity: f32,
+    /// Level automation over absolute timeline beats (empty = static
+    /// `level`). Drives audio gain per sample and video opacity per frame.
+    pub level_points: Vec<crate::auto::AutoPoint>,
 }
 
 impl Default for Track {
@@ -138,14 +145,48 @@ impl Default for Track {
             effects: Vec::new(),
             level: 1.0,
             level_to_opacity: 1.0,
+            level_points: Vec::new(),
         }
     }
 }
 
 impl Track {
-    /// Video opacity implied by the level fader and its link dial.
+    /// Level at an absolute timeline beat (automation, or the fader).
+    /// Allocation-free: this runs per audio sample.
+    pub fn level_at(&self, beat: f64) -> f32 {
+        let pts = &self.level_points;
+        if pts.is_empty() {
+            return self.level.max(0.0);
+        }
+        if beat <= pts[0].beat {
+            return pts[0].value.max(0.0) as f32;
+        }
+        let last = &pts[pts.len() - 1];
+        if beat >= last.beat {
+            return last.value.max(0.0) as f32;
+        }
+        for w in pts.windows(2) {
+            if beat >= w[0].beat && beat <= w[1].beat {
+                let span = (w[1].beat - w[0].beat).max(1e-12);
+                let f = (beat - w[0].beat) / span;
+                return ((w[0].value + (w[1].value - w[0].value) * f).max(0.0)) as f32;
+            }
+        }
+        last.value.max(0.0) as f32
+    }
+
+    fn opacity_of(&self, level: f32) -> f32 {
+        (1.0 + (level.min(1.5) - 1.0) * self.level_to_opacity).clamp(0.0, 1.0)
+    }
+
+    /// Video opacity implied by the (static) level fader and its link dial.
     pub fn opacity(&self) -> f32 {
-        (1.0 + (self.level.min(1.5) - 1.0) * self.level_to_opacity).clamp(0.0, 1.0)
+        self.opacity_of(self.level)
+    }
+
+    /// Video opacity at an absolute timeline beat.
+    pub fn opacity_at(&self, beat: f64) -> f32 {
+        self.opacity_of(self.level_at(beat))
     }
 }
 
@@ -248,6 +289,11 @@ impl Project {
             freq: 2500.0,
             q: 0.9,
         });
+        // Automation: the cloud thickens over the clip.
+        let mut dens = crate::auto::AutomationLane::new("density");
+        dens.set_point(0.0, 8.0);
+        dens.set_point(8.0, 40.0);
+        c0.automation.push(dens);
         p.tracks[t0].clips.push(c0);
 
         let t1 = p.add_track("grains B");
@@ -294,9 +340,10 @@ impl Project {
         pat.rows[r1].grains.duration = 0.12;
         pat.rows[r1].grains.gain = 0.5;
         pat.rows[r1].key = Some(Key::new(9, ScaleKind::MinorPentatonic));
-        for i in [6usize, 10, 14] {
-            pat.rows[r1].steps[i].on = true;
-        }
+        // A 5-step polymeter row: phases against the 16-step grid.
+        pat.rows[r1].set_steps(5);
+        pat.rows[r1].steps[0].on = true;
+        pat.rows[r1].steps[3].on = true;
         let pid = p.add_pattern(pat);
         let t3 = p.add_track("seq");
         p.tracks[t3].clips.push(Clip::new_pattern(pid, 0.0, 8.0));

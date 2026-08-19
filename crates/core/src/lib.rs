@@ -23,6 +23,7 @@
 //! * [`media`] — ffmpeg decode/encode + yt-dlp YouTube scraping
 
 pub mod audio;
+pub mod auto;
 pub mod dsp;
 pub mod fx;
 pub mod grain;

@@ -964,7 +964,8 @@ impl GpuPreview {
                 gl.active_texture(glow::TEXTURE0);
                 gl.bind_texture(glow::TEXTURE_2D, Some(final_tex));
                 self.set_i(gl, p, "u_tex", 0);
-                self.set_f(gl, p, "u_opacity", track.opacity());
+                let beat = t * scene.project.bpm / 60.0;
+                self.set_f(gl, p, "u_opacity", track.opacity_at(beat));
                 self.set_f(gl, p, "u_additive", 0.0);
                 self.set_f(gl, p, "u_alpha_mul", 1.0);
                 self.set_4f(gl, p, "u_rect", [0.0, 0.0, 1.0, 1.0]);

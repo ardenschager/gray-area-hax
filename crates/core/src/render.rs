@@ -11,7 +11,7 @@
 
 use crate::audio::{render_grains_audio, StereoBuffer};
 use crate::fx;
-use crate::grain::{schedule_grains, GrainEvent};
+use crate::grain::{schedule_grains_auto, GrainEvent};
 use crate::music::semitones_to_ratio;
 use crate::seq::pattern_events;
 use crate::timeline::{Clip, ClipKind, Project, Source};
@@ -73,8 +73,10 @@ pub fn plan_project(project: &Project) -> Vec<ClipPlan> {
                     if source.duration() <= 0.0 {
                         continue;
                     }
-                    let events = schedule_grains(
+                    let events = schedule_grains_auto(
                         &clip.grains,
+                        &clip.automation,
+                        secs_per_beat,
                         clip_t0,
                         clip_len,
                         source.duration(),
@@ -103,6 +105,7 @@ pub fn plan_project(project: &Project) -> Vec<ClipPlan> {
                         clip_len,
                         secs_per_beat,
                         clip.key.as_ref(),
+                        &clip.automation,
                     );
                     (parts, clip.visual)
                 }
@@ -173,14 +176,16 @@ pub fn render_project(project: &Project, from_beat: f64, to_beat: f64) -> Render
             }
         }
         fx::apply_audio_chain(&mut track_bus, &track.effects);
-        let level = track.level.max(0.0);
+        let sr = project.sample_rate as f64;
+        let beats_per_sec = project.bpm / 60.0;
         for i in 0..master_audio.len().min(track_bus.len()) {
+            let beat = (t0 + i as f64 / sr) * beats_per_sec;
+            let level = track.level_at(beat);
             master_audio.left[i] += track_bus.left[i] * level;
             master_audio.right[i] += track_bus.right[i] * level;
         }
 
         // ---- video: clips -> clip fx -> track layer -> track fx -> z ----
-        let opacity = track.opacity();
         let track_has_video = clip_plans.iter().any(|cp| {
             cp.parts.iter().any(|(sid, evs)| {
                 !evs.is_empty()
@@ -240,6 +245,8 @@ pub fn render_project(project: &Project, from_beat: f64, to_beat: f64) -> Render
             let mut tl = track_layer
                 .unwrap_or_else(|| Frame::transparent(project.width, project.height));
             fx::apply_video_chain(&mut tl, &track.effects, &mut track_vstates);
+            let opacity = track.opacity_at((t0 + fi as f64 / project.fps as f64)
+                * project.bpm / 60.0);
             blend_layer(frame, &tl, 0.0, opacity);
         }
     }
@@ -501,6 +508,70 @@ mod tests {
         let lu = out_u.frames[out_u.frames.len() / 2].mean_luma();
         assert!((lu - lf).abs() < lf * 0.15, "unlinked stays bright: {lu} vs {lf}");
         assert!(out_u.audio.rms() < out_f.audio.rms() * 0.55, "audio still ducked");
+    }
+
+    #[test]
+    fn grain_automation_morphs_the_cloud() {
+        // Density ramps 4 -> 60 over the clip: far more grains land in the
+        // second half. Gain rides the opposite way, so audio fades even as
+        // grains multiply.
+        let mut p = snippet_project();
+        let clip = &mut p.tracks[0].clips[0];
+        clip.kind = crate::timeline::ClipKind::Granular;
+        clip.grains.density = 10.0;
+        let mut dens = crate::auto::AutomationLane::new("density");
+        dens.set_point(0.0, 4.0);
+        dens.set_point(8.0, 60.0);
+        let mut gain = crate::auto::AutomationLane::new("gain");
+        gain.set_point(0.0, 1.2);
+        gain.set_point(8.0, 0.05);
+        clip.automation = vec![dens, gain];
+        clip.length_beats = 8.0;
+
+        let out = render_project(&p, 0.0, 8.0);
+        let ev = &out.events[0];
+        let mid = 2.0; // seconds (8 beats at 120 bpm = 4s)
+        let first: Vec<_> = ev.iter().filter(|e| e.onset < mid).collect();
+        let second: Vec<_> = ev.iter().filter(|e| e.onset >= mid).collect();
+        // A linear 4->60 ramp puts ~2.7x the grains in the second half.
+        assert!(
+            second.len() > first.len() * 2,
+            "density ramp: {} then {}",
+            first.len(),
+            second.len()
+        );
+        let avg = |v: &Vec<&crate::grain::GrainEvent>| -> f32 {
+            v.iter().map(|e| e.gain).sum::<f32>() / v.len().max(1) as f32
+        };
+        assert!(
+            avg(&first) > avg(&second) * 2.0,
+            "gain fade: {} -> {}",
+            avg(&first),
+            avg(&second)
+        );
+    }
+
+    #[test]
+    fn track_level_automation_fades_audio_and_video() {
+        let mut p = snippet_project();
+        p.tracks[0].level_points = vec![
+            crate::auto::AutoPoint { beat: 0.0, value: 1.0 },
+            crate::auto::AutoPoint { beat: 8.0, value: 0.0 },
+        ];
+        p.tracks[0].clips[0].length_beats = 8.0;
+        let out = render_project(&p, 0.0, 8.0);
+        let sr = p.sample_rate as usize;
+        let seg = |a: usize, b: usize| -> f32 {
+            (out.audio.left[a..b].iter().map(|s| s * s).sum::<f32>() / (b - a) as f32).sqrt()
+        };
+        // 8 beats at 120bpm = 4s; early loud, late quiet.
+        let early = seg(sr / 2, sr);
+        let late = seg(3 * sr, 3 * sr + sr / 2);
+        assert!(late < early * 0.4, "audio fades: {early} -> {late}");
+        // Video opacity follows the same curve.
+        let f_early = out.frames[(0.75 * p.fps as f64) as usize].mean_luma();
+        let f_late = out.frames[(3.25 * p.fps as f64) as usize].mean_luma();
+        assert!(f_late < f_early * 0.5, "video fades: {f_early} -> {f_late}");
     }
 
     #[test]
