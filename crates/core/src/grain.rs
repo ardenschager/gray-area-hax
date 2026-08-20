@@ -4,7 +4,7 @@
 //! playback rate, pan and gain — so what you hear is literally what you see.
 
 use crate::dsp::Rng;
-use crate::music::{semitones_to_ratio, Key};
+use crate::music::Key;
 use serde::{Deserialize, Serialize};
 
 /// User-facing granular parameters on a clip.
@@ -30,6 +30,12 @@ pub struct GrainSettings {
     pub pitch: f32,
     /// Random pitch variation in semitones.
     pub pitch_jitter: f32,
+    /// Cents offset applied AFTER key quantization (-100..100) — subtle
+    /// off-pitch shading that survives the snap.
+    pub detune_cents: f32,
+    /// Key quantize strength: 1 = hard snap, 0.5 = pulled halfway toward
+    /// the scale, 0 = free pitch even with a key set.
+    pub quantize_amount: f32,
     /// Linear gain applied per grain.
     pub gain: f32,
     /// Center pan -1..1 (audio position == visual x position).
@@ -73,6 +79,8 @@ impl GrainSettings {
             "speed" => self.speed = x.clamp(0.05, 8.0),
             "pitch" => self.pitch = x.clamp(-48.0, 48.0),
             "pitch_jitter" => self.pitch_jitter = x.clamp(0.0, 48.0),
+            "detune_cents" | "detune" => self.detune_cents = x.clamp(-100.0, 100.0),
+            "quantize_amount" | "key_strength" => self.quantize_amount = x.clamp(0.0, 1.0),
             "gain" => self.gain = x.clamp(0.0, 4.0),
             "pan" => self.pan = x.clamp(-1.0, 1.0),
             "pan_spread" => self.pan_spread = x.clamp(0.0, 1.0),
@@ -102,6 +110,8 @@ impl Default for GrainSettings {
             speed: 1.0,
             pitch: 0.0,
             pitch_jitter: 0.0,
+            detune_cents: 0.0,
+            quantize_amount: 1.0,
             gain: 0.8,
             pan: 0.0,
             pan_spread: 0.6,
@@ -221,10 +231,13 @@ pub fn schedule_grains_auto(
         for v in 0..n_voices {
             let detune = if v == 0 { 0.0 } else { s.voice_detune * rng.bipolar() };
             let st = s.pitch + v as f32 * s.voice_interval + pitch_j + detune;
-            let mut ratio = semitones_to_ratio(st);
-            if let Some(k) = key {
-                ratio = k.quantize_ratio(base_hz, ratio);
-            }
+            let ratio = crate::music::effective_ratio(
+                st,
+                key,
+                base_hz,
+                s.quantize_amount,
+                s.detune_cents,
+            );
             let pan = (s.pan + s.pan_spread.clamp(0.0, 1.0) * rng.bipolar())
                 .clamp(-1.0, 1.0);
             events.push(GrainEvent {
@@ -302,7 +315,9 @@ pub fn grain_from_note(
         onset,
         source_pos: (settings.position as f64 * source_len).min(source_len),
         duration: settings.duration.clamp(0.01, 5.0),
-        pitch_ratio: semitones_to_ratio(st),
+        // Notes are explicit pitches (no key snap), but detune still
+        // shades them off-center.
+        pitch_ratio: crate::music::effective_ratio(st, None, 440.0, 0.0, settings.detune_cents),
         gain: settings.gain * (velocity as f32 / 127.0),
         pan: settings.pan.clamp(-1.0, 1.0),
         envelope: settings.envelope,

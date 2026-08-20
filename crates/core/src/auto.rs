@@ -74,6 +74,8 @@ pub fn param_range(name: &str) -> Option<(f32, f32)> {
         "speed" => (0.25, 4.0),
         "pitch" => (-24.0, 24.0),
         "pitch_jitter" => (0.0, 24.0),
+        "detune_cents" => (-100.0, 100.0),
+        "quantize_amount" => (0.0, 1.0),
         "gain" => (0.0, 2.0),
         "pan" => (-1.0, 1.0),
         "pan_spread" => (0.0, 1.0),
@@ -88,7 +90,7 @@ pub fn param_range(name: &str) -> Option<(f32, f32)> {
 }
 
 /// The parameters offered by automation UIs, in menu order.
-pub const AUTOMATABLE: [&str; 18] = [
+pub const AUTOMATABLE: [&str; 20] = [
     "density",
     "duration",
     "duration_jitter",
@@ -98,6 +100,8 @@ pub const AUTOMATABLE: [&str; 18] = [
     "speed",
     "pitch",
     "pitch_jitter",
+    "detune_cents",
+    "quantize_amount",
     "gain",
     "pan",
     "pan_spread",

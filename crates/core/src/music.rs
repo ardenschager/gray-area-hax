@@ -147,6 +147,31 @@ impl Key {
     }
 }
 
+/// The one place a grain's final pitch ratio is computed: raw semitones,
+/// optionally pulled toward the key by `quantize_amount` (1 = hard snap,
+/// 0.5 = halfway, 0 = free), then shifted by `detune_cents` AFTER the
+/// snap — so you can sit subtly off-pitch of a perfectly quantized note.
+pub fn effective_ratio(
+    semitones: f32,
+    key: Option<&Key>,
+    base_hz: f32,
+    quantize_amount: f32,
+    detune_cents: f32,
+) -> f32 {
+    let raw = semitones_to_ratio(semitones);
+    let amount = quantize_amount.clamp(0.0, 1.0);
+    let snapped = match key {
+        Some(k) if amount > 0.0 => {
+            let q = k.quantize_ratio(base_hz, raw);
+            let st_raw = ratio_to_semitones(raw);
+            let st_q = ratio_to_semitones(q);
+            semitones_to_ratio(st_raw + (st_q - st_raw) * amount)
+        }
+        _ => raw,
+    };
+    snapped * semitones_to_ratio(detune_cents.clamp(-100.0, 100.0) / 100.0)
+}
+
 /// Semitone offset -> playback ratio.
 pub fn semitones_to_ratio(st: f32) -> f32 {
     2.0_f32.powf(st / 12.0)
@@ -191,6 +216,41 @@ mod tests {
         assert_eq!(key.quantize_midi(70.4), 71.0);
         // 69.6 should also snap to... A# is not in scale; nearest of {69, 71} to 69.6 is 69.
         assert_eq!(key.quantize_midi(69.6), 69.0);
+    }
+
+    #[test]
+    fn effective_ratio_partial_quantize_lands_halfway() {
+        let key = Key::parse("C", "major").unwrap();
+        let base = midi_to_hz(60.0); // source fundamental = C4
+        // +0.5 semitones from C4 sits between C and C#; hard snap goes to C.
+        let st = 0.5;
+        let raw_st = st;
+        let full = effective_ratio(st, Some(&key), base, 1.0, 0.0);
+        let snapped_st = ratio_to_semitones(full);
+        let half = effective_ratio(st, Some(&key), base, 0.5, 0.0);
+        let half_st = ratio_to_semitones(half);
+        // amount=0.5 lands halfway between raw and snapped in semitone space.
+        assert!((half_st - (raw_st + snapped_st) / 2.0).abs() < 1e-3);
+        // amount=0 is a no-op even with a key set.
+        let free = effective_ratio(st, Some(&key), base, 0.0, 0.0);
+        assert!((ratio_to_semitones(free) - raw_st).abs() < 1e-3);
+    }
+
+    #[test]
+    fn effective_ratio_detune_applies_after_snap() {
+        let key = Key::parse("C", "major").unwrap();
+        let base = midi_to_hz(60.0);
+        let snapped = effective_ratio(0.3, Some(&key), base, 1.0, 0.0);
+        let detuned = effective_ratio(0.3, Some(&key), base, 1.0, 50.0);
+        // +50 cents shifts the already-snapped ratio by exactly 2^(50/1200).
+        let expect = snapped * 2.0_f32.powf(50.0 / 1200.0);
+        assert!((detuned - expect).abs() < 1e-5);
+        // Detune works with no key too.
+        let d = effective_ratio(0.0, None, base, 1.0, -25.0);
+        assert!((d - 2.0_f32.powf(-25.0 / 1200.0)).abs() < 1e-5);
+        // Out-of-range detune clamps to +/-100 cents.
+        let c = effective_ratio(0.0, None, base, 0.0, 400.0);
+        assert!((c - 2.0_f32.powf(100.0 / 1200.0)).abs() < 1e-5);
     }
 
     #[test]

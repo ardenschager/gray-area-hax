@@ -202,6 +202,20 @@ pub fn build_engine(session: Session, log: Arc<Mutex<String>>) -> Engine {
         },
     );
 
+    engine.register_fn(
+        "paulstretch",
+        |s: &mut Session, src: i64, factor: f64| -> ScriptResult<i64> {
+            let mut p = s.project.lock().unwrap();
+            let source = p
+                .sources
+                .get(src as usize)
+                .ok_or_else(|| rt_err(format!("no source {src}")))?
+                .clone();
+            let stretched = crate::stretch::paulstretch_source(&source, factor as f32);
+            Ok(p.add_source(stretched) as i64)
+        },
+    );
+
     engine.register_fn("source_secs", |s: &mut Session, src: i64| -> f64 {
         s.project
             .lock()
@@ -803,6 +817,46 @@ mod tests {
         assert_eq!(clip.grains.pitch_jitter, 12.0);
         assert_eq!(clip.audio_filters.len(), 1);
         assert!(clip.color_filter.is_some());
+    }
+
+    #[test]
+    fn script_paulstretch_and_pitch_dials() {
+        let project = fresh();
+        let script = r#"
+            let s = session(120.0);
+            let src = s.demo_source();
+            let wash = s.paulstretch(src, 4.0);
+            let t = s.track("g");
+            let c = s.clip(t, wash, 0.0, 8.0);
+            s.key(c, "A", "minor_pentatonic");
+            s.set(c, "quantize_amount", 0.7);
+            s.set(c, "detune_cents", 12.0);
+        "#;
+        run_script(project.clone(), Path::new("/tmp"), script).unwrap();
+
+        let p = project.lock().unwrap();
+        assert_eq!(p.sources.len(), 2);
+        let wash = &p.sources[1];
+        assert!(wash.name.contains("paul"), "name: {}", wash.name);
+        // Stretched audio is ~4x the demo source's length; pitch anchor kept.
+        let orig = p.sources[0].audio.as_ref().unwrap().duration();
+        let out = wash.audio.as_ref().unwrap().duration();
+        assert!((out / orig - 4.0).abs() < 0.3, "ratio {}", out / orig);
+        assert_eq!(wash.base_hz, p.sources[0].base_hz);
+        assert!(wash.video.is_some());
+
+        let clip = &p.tracks[0].clips[0];
+        assert!(clip.key.is_some());
+        assert_eq!(clip.grains.quantize_amount, 0.7);
+        assert_eq!(clip.grains.detune_cents, 12.0);
+
+        drop(p);
+        let bad = r#"
+            let s = session(120.0);
+            s.paulstretch(7, 8.0);
+        "#;
+        let err = run_script(fresh(), Path::new("/tmp"), bad).unwrap_err();
+        assert!(err.contains("no source"), "err: {err}");
     }
 
     #[test]

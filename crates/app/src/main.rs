@@ -168,6 +168,7 @@ struct App {
     last_sync: std::time::Instant,
 
     media_path: String,
+    stretch_factor: f32,
     youtube_url: String,
     script_text: String,
     script_log: String,
@@ -208,6 +209,7 @@ impl App {
             app_clock: std::time::Instant::now(),
             last_sync: std::time::Instant::now(),
             media_path: String::new(),
+            stretch_factor: 8.0,
             youtube_url: String::new(),
             script_text: DEFAULT_SCRIPT.trim_start().into(),
             script_log: String::new(),
@@ -330,6 +332,22 @@ impl App {
         let tx = self.tx.clone();
         std::thread::spawn(move || {
             let res = media::load_source(std::path::Path::new(&path), sr);
+            let _ = tx.send(WorkerMsg::Source(res));
+        });
+    }
+
+    fn start_paulstretch(&mut self, src_idx: usize, factor: f32) {
+        if self.busy.is_some() {
+            return;
+        }
+        let source = match self.project.lock().unwrap().sources.get(src_idx) {
+            Some(s) => s.clone(),
+            None => return,
+        };
+        self.busy = Some(format!("paulstretching {} x{:.0}…", source.name, factor));
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let res = Ok(chromagrain_core::stretch::paulstretch_source(&source, factor));
             let _ = tx.send(WorkerMsg::Source(res));
         });
     }
@@ -565,6 +583,46 @@ impl App {
                 self.project_rev += 1;
             }
         });
+        // Selected-source tools: base pitch (anchor for key quantize) and
+        // the AV paulstretch derive button.
+        let src_ok = {
+            let p = self.project.lock().unwrap();
+            self.selected_source < p.sources.len()
+        };
+        if src_ok {
+            ui.horizontal(|ui| {
+                ui.label("base hz");
+                let mut hz = {
+                    let p = self.project.lock().unwrap();
+                    p.sources[self.selected_source].base_hz
+                };
+                if ui
+                    .add(egui::DragValue::new(&mut hz).range(0.0..=4000.0).speed(0.5))
+                    .on_hover_text("source fundamental used by key quantize (0 = A440 relative)")
+                    .changed()
+                {
+                    self.project.lock().unwrap().sources[self.selected_source].base_hz =
+                        hz.max(0.0);
+                    self.project_rev += 1;
+                }
+            });
+            ui.horizontal(|ui| {
+                if ui
+                    .button("paulstretch")
+                    .on_hover_text("derive a spectral wash: audio phases randomized, video smeared")
+                    .clicked()
+                {
+                    let (idx, f) = (self.selected_source, self.stretch_factor);
+                    self.start_paulstretch(idx, f);
+                }
+                ui.label("x");
+                ui.add(
+                    egui::DragValue::new(&mut self.stretch_factor)
+                        .range(2.0..=64.0)
+                        .speed(0.25),
+                );
+            });
+        }
         ui.text_edit_singleline(&mut self.media_path);
         if ui.button("load file").clicked() && !self.media_path.is_empty() {
             let p = self.media_path.clone();
@@ -1495,6 +1553,7 @@ impl App {
             }
             changed |= slider(ui, &mut g.pitch, -24.0..=24.0, "pitch (semitones)", false);
             changed |= slider(ui, &mut g.pitch_jitter, 0.0..=24.0, "pitch jitter", false);
+            changed |= slider(ui, &mut g.detune_cents, -100.0..=100.0, "detune (cents, post-key)", false);
             changed |= slider(ui, &mut g.gain, 0.0..=2.0, "gain", false);
             changed |= slider(ui, &mut g.pan, -1.0..=1.0, "pan / x position", false);
             changed |= slider(ui, &mut g.pan_spread, 0.0..=1.0, "pan/x spread", false);
@@ -1596,6 +1655,12 @@ impl App {
                         }
                     });
             });
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut clip.grains.quantize_amount, 0.0..=1.0)
+                        .text("key strength (1 = hard snap)"),
+                )
+                .changed();
         }
 
         section(ui, "audio frequency filters");

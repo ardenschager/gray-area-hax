@@ -6,7 +6,7 @@
 
 use crate::dsp::Rng;
 use crate::grain::{GrainEvent, GrainSettings};
-use crate::music::{semitones_to_ratio, Key};
+use crate::music::Key;
 use crate::timeline::{Source, SourceId};
 
 /// One step of a row: on/off, semitone offset, gain multiplier.
@@ -187,10 +187,13 @@ pub fn pattern_events(
                     let g = eff_at(t);
 
                     let st = g.pitch + step.pitch + g.pitch_jitter * pitch_j;
-                    let mut ratio = semitones_to_ratio(st);
-                    if let Some(k) = key {
-                        ratio = k.quantize_ratio(base_hz, ratio);
-                    }
+                    let ratio = crate::music::effective_ratio(
+                        st,
+                        key,
+                        base_hz,
+                        g.quantize_amount,
+                        g.detune_cents,
+                    );
                     let mut pos =
                         g.position as f64 * source_len + g.spray as f64 * spray_j as f64;
                     pos = pos.rem_euclid(source_len.max(1e-6));
@@ -220,11 +223,13 @@ pub fn pattern_events(
                 while t < clip_len_secs {
                     let pan_j = rng.bipolar();
                     let g = eff_at(t);
-                    let st = g.pitch;
-                    let mut ratio = semitones_to_ratio(st);
-                    if let Some(k) = key {
-                        ratio = k.quantize_ratio(base_hz, ratio);
-                    }
+                    let ratio = crate::music::effective_ratio(
+                        g.pitch,
+                        key,
+                        base_hz,
+                        g.quantize_amount,
+                        g.detune_cents,
+                    );
                     // Playing the segment at `ratio` takes seg/ratio output
                     // seconds; repetitions tile back to back.
                     let dur_out = (seg_src / ratio.max(0.01) as f64).clamp(0.02, 60.0);

@@ -12,7 +12,6 @@
 use crate::audio::{render_grains_audio_spatial, StereoBuffer};
 use crate::fx;
 use crate::grain::{schedule_grains_auto, GrainEvent};
-use crate::music::semitones_to_ratio;
 use crate::seq::pattern_events;
 use crate::timeline::{Clip, ClipKind, Project, Source};
 use crate::video::{
@@ -52,15 +51,17 @@ fn snippet_events(
     let g = &clip.grains;
     let source_len = source.duration();
     let base_hz = source.effective_base_hz();
-    let quantized = |st: f32| -> f32 {
-        let r = semitones_to_ratio(st);
-        match &clip.key {
-            Some(k) => k.quantize_ratio(base_hz, r),
-            None => r,
-        }
+    let quantized = |st: f32, g: &crate::grain::GrainSettings| -> f32 {
+        crate::music::effective_ratio(
+            st,
+            clip.key.as_ref(),
+            base_hz,
+            g.quantize_amount,
+            g.detune_cents,
+        )
     };
 
-    let base_ratio = quantized(g.pitch);
+    let base_ratio = quantized(g.pitch, g);
     if clip.automation.is_empty() && (g.speed - base_ratio).abs() < 1e-3 {
         // Record-player coupling: a single unbroken grain.
         return vec![GrainEvent {
@@ -94,7 +95,7 @@ fn snippet_events(
         } else {
             crate::auto::settings_at(g, &clip.automation, t / secs_per_beat.max(1e-9))
         };
-        let ratio = quantized(eff.pitch);
+        let ratio = quantized(eff.pitch, &eff);
         events.push(GrainEvent {
             onset: clip_t0 + t,
             source_pos: head.rem_euclid(source_len.max(1e-6)),

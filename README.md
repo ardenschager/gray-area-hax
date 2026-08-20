@@ -113,7 +113,19 @@ versa). It will be crunchy.
 - **Key quantization** — every grain's pitch is snapped so
   `base_pitch × ratio` lands on a chosen key/scale (major, minor, harmonic
   minor, pentatonics, blues, modes, whole-tone…). Source base pitch is
-  auto-detected via autocorrelation on import.
+  auto-detected via autocorrelation on import (and overridable per source).
+  **Key strength** dials the snap from hard (1) through partial pull (0.5)
+  to free (0), and a **detune** control shifts everything a few cents off
+  AFTER the snap — perfectly in key, subtly off pitch. Both apply to AV
+  samples, snippets, synths and sequencer rows alike, and both are
+  automatable.
+- **AV paulstretch** — derive a spectral wash from any source: overlapping
+  FFT frames keep their magnitudes but get randomized phases, so time
+  dissolves (2×–64×) while pitch stays put — key quantize still works on
+  the wash. The video stretches by the same factor with neighbor-frame
+  crossfades through a decaying accumulator, so motion smears the way the
+  audio does. The result is just another source: granulate it, sequence
+  it, chain effects on it.
 - **Frequency filtering** — per-clip biquad chains (low/high/band-pass,
   notch) filter out audio frequency bands before granulation.
 - **Color filtering** — the visual analog: keep or remove a hue band
@@ -209,6 +221,11 @@ s.set(b, "gain_to_opacity", 0.0);        // ...unless you unlink it
 let syn = s.fm_source(110.0, 2.0, 1.5, 4.0);  // pure synths as sources
 let nz  = s.noise_source(0.5, 4.0);           // (white->pink->brown)
 
+let wash = s.paulstretch(src, 8.0);      // AV spectral wash: 8x slower,
+let w = s.clip(t, wash, 0.0, 16.0);      // same pitch, smeared video
+s.set(w, "quantize_amount", 0.7);        // partial key snap (1 = hard)
+s.set(w, "detune_cents", 12.0);          // sit subtly off pitch, post-snap
+
 let fx = s.effect(c, "crush");           // AV effect chains
 s.fx(c, fx, "bits", 4.0);                // heard as bitcrush, seen as posterize
 s.fx(c, fx, "video", 0.5);               // per-effect correspondence dial
@@ -242,7 +259,8 @@ s.render(0.0, 16.0, "out.mp4");          // .mp4 / .wav / .png
 ```
 
 Settable clip parameters: `density, duration, duration_jitter, position,
-spray, scan_speed, pitch, pitch_jitter, gain, pan, pan_spread, envelope,
+spray, scan_speed, pitch, pitch_jitter, detune_cents, quantize_amount,
+gain, pan, pan_spread, envelope,
 env_skew, reverse_prob, sync_div, voices, voice_interval, voice_detune,
 seed` (grains), `size_scale, min_size, max_size, additive, scatter_y`
 (visual style), and the correspondence dials `gain_to_opacity,
@@ -251,7 +269,7 @@ Effects: `effect(clip, kind)` / `master_effect(kind)` with kinds
 `crush | delay | reverb | compress`, parameters via `fx` / `master_fx`
 (`downsample, bits`; `time, feedback, mix, shift_x, shift_y`;
 `size, damp, mix`; `quality`; plus `audio` and `video` on every effect).
-Other calls: `bpm`, `canvas`, `sine_source`, `source_secs`, `base_hz`,
+Other calls: `bpm`, `canvas`, `sine_source`, `paulstretch`, `source_secs`, `base_hz`,
 `set_base_hz`, `no_key`, `clear_audio_filters`, `clear_effects`,
 `clear_master_effects`, `color_keep`, `no_color_filter`,
 `ffmpeg_available`, `ytdlp_available`.
