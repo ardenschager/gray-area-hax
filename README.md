@@ -134,6 +134,14 @@ versa). It will be crunchy.
   source + grain settings + key + filters; drag clips, click to seek.
 - **YouTube scraping** — `yt-dlp`-powered import (capped at 480p / 90s),
   decoded through ffmpeg into grain-ready audio + frames.
+- **Object segmentation (SAM 3)** — type "cat", and Meta's Segment
+  Anything 3 cuts every cat out of the video, tracked across frames
+  through occlusions. The mask is baked into the alpha channel of a
+  derived source (feathered edges), so the cat — and only the cat —
+  granulates, sequences, transforms and composites over your other
+  tracks. Purely visual: the source's audio passes through untouched.
+  Runs as an optional Python sidecar (`tools/segment.py`); the UI button
+  and `segment(src, "cat")` script call both use it.
 - **Scripting** — the whole engine is drivable from [rhai](https://rhai.rs)
   scripts, in the in-app console or headless from the CLI.
 - **Bounce & play** — cpal audio playback with synced video preview, and
@@ -149,10 +157,28 @@ versa). It will be crunchy.
 | ALSA headers (Linux only) | audio device + MIDI | `sudo apt install libasound2-dev pkg-config` |
 | ffmpeg + ffprobe | load mp4/mov/webm…, export mp4 | `sudo apt install ffmpeg` / `brew install ffmpeg` |
 | yt-dlp (optional) | YouTube scraping | `pip install yt-dlp` |
+| SAM 3 (optional) | object segmentation (`segment`) | see below |
 
 Without ffmpeg you can still load .wav files, use procedural sources, and
 render .wav; without yt-dlp everything except `youtube(...)` works.
 macOS and Windows need no extra system libraries.
+
+**SAM 3 setup (optional, GPU recommended).** The `segment` button/call cuts
+a text-prompted object ("cat") out of a source's video, tracked across
+frames, by shelling out to `tools/segment.py` — Meta's Segment Anything 3
+runs in Python, never inside the Rust process:
+
+```sh
+pip install torch torchvision          # CUDA build — see pytorch.org
+git clone https://github.com/facebookresearch/sam3 && pip install -e sam3
+# request checkpoint access: https://huggingface.co/facebook/sam3
+hf auth login
+python3 tools/segment.py --check       # should print "sam3 ok (cuda)"
+```
+
+Any other segmenter can stand in by setting `CHROMAGRAIN_SEGMENT_CMD` to a
+command with the same contract (video + prompt + out dir → one binary PGM
+mask per frame); chromagrain's tests use a tiny stub this way.
 
 ### 2. Build & launch
 
@@ -223,6 +249,9 @@ let nz  = s.noise_source(0.5, 4.0);           // (white->pink->brown)
 
 let wash = s.paulstretch(src, 8.0);      // AV spectral wash: 8x slower,
 let w = s.clip(t, wash, 0.0, 16.0);      // same pitch, smeared video
+
+let cat = s.segment(src, "cat");         // SAM 3: just the cat, tracked;
+s.snippet(t2, cat, 0.0, 8.0);            // transparent everywhere else
 s.set(w, "quantize_amount", 0.7);        // partial key snap (1 = hard)
 s.set(w, "detune_cents", 12.0);          // sit subtly off pitch, post-snap
 
@@ -269,7 +298,8 @@ Effects: `effect(clip, kind)` / `master_effect(kind)` with kinds
 `crush | delay | reverb | compress`, parameters via `fx` / `master_fx`
 (`downsample, bits`; `time, feedback, mix, shift_x, shift_y`;
 `size, damp, mix`; `quality`; plus `audio` and `video` on every effect).
-Other calls: `bpm`, `canvas`, `sine_source`, `paulstretch`, `source_secs`, `base_hz`,
+Other calls: `bpm`, `canvas`, `sine_source`, `paulstretch`, `segment`,
+`segment_available`, `source_secs`, `base_hz`,
 `set_base_hz`, `no_key`, `clear_audio_filters`, `clear_effects`,
 `clear_master_effects`, `color_keep`, `no_color_filter`,
 `ffmpeg_available`, `ytdlp_available`.

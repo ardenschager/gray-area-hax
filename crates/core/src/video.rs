@@ -510,10 +510,15 @@ pub fn composite_grains_frame(
                 }
                 let sx = ((d.patch[0] + qx * d.patch[2]) * (sw - 1.0)) as u32;
                 let sy = ((d.patch[1] + qy * d.patch[3]) * (sh - 1.0)) as u32;
-                let [mut r, mut g, mut b, _] =
+                let [mut r, mut g, mut b, ta] =
                     src.get(sx.min(src.width - 1), sy.min(src.height - 1));
 
-                let mut a = alpha;
+                // The source frame's own alpha participates: segmented
+                // (masked) sources composite only where the object is.
+                let mut a = alpha * ta as f32 / 255.0;
+                if a <= 0.003 {
+                    continue;
+                }
                 if let Some(cf) = color_filter {
                     a *= cf.mask(r, g, b);
                     if a <= 0.003 {
@@ -679,6 +684,65 @@ mod tests {
 
         assert!(active.mean_luma() > 1.0, "grains should light up the frame");
         assert!(idle.mean_luma() < 0.5, "no grains active -> black frame");
+    }
+
+    #[test]
+    fn compositor_respects_source_alpha() {
+        // A source whose left half is transparent (as a segmented/masked
+        // source would be) must only composite its right half.
+        let mut clip = VideoClip::test_pattern(64, 48, 12.0, 2.0);
+        let frames: Vec<Frame> = clip
+            .frames
+            .iter()
+            .map(|f| {
+                let mut nf = f.clone();
+                for y in 0..nf.height {
+                    for x in 0..nf.width {
+                        let i = ((y * nf.width + x) * 4 + 3) as usize;
+                        nf.data[i] = if x < nf.width / 2 { 0 } else { 255 };
+                    }
+                }
+                nf
+            })
+            .collect();
+        clip.frames = frames;
+
+        // One full-frame, full-opacity grain so output geometry maps 1:1
+        // onto source pixels.
+        let settings = GrainSettings {
+            density: 2.0,
+            duration: 1.0,
+            envelope: 1.0,
+            ..Default::default()
+        };
+        let events =
+            schedule_grains(&settings, 0.0, 1.0, clip.duration(), 440.0, None);
+        let style = VisualGrainStyle::full_frame(0.0);
+        let link = AvLink { envelope_to_opacity: 0.0, pitch_to_hue: 0.0, ..Default::default() };
+
+        let out = render_layer_at(&clip, &events, &style, &link, None, 0.25);
+        let half_luma = |f: &Frame, left: bool| {
+            let mut sum = 0.0f32;
+            let mut n = 0u32;
+            for y in 0..f.height {
+                for x in 0..f.width {
+                    let in_left = x < f.width / 2;
+                    if in_left == left {
+                        let i = ((y * f.width + x) * 4) as usize;
+                        sum += f.data[i] as f32;
+                        n += 1;
+                    }
+                }
+            }
+            sum / n.max(1) as f32
+        };
+        let left = half_luma(&out, true);
+        let right = half_luma(&out, false);
+        assert!(right > 5.0, "opaque half should draw (luma {right})");
+        assert!(
+            left < right * 0.1,
+            "transparent half must stay dark: left {left} right {right}"
+        );
     }
 
     #[test]

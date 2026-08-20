@@ -216,6 +216,27 @@ pub fn build_engine(session: Session, log: Arc<Mutex<String>>) -> Engine {
         },
     );
 
+    engine.register_fn(
+        "segment",
+        |s: &mut Session, src: i64, prompt: &str| -> ScriptResult<i64> {
+            let source = s
+                .project
+                .lock()
+                .unwrap()
+                .sources
+                .get(src as usize)
+                .ok_or_else(|| rt_err(format!("no source {src}")))?
+                .clone();
+            let work = s.cache_dir.join("segment");
+            let seg = media::segment_source(&source, prompt, &work).map_err(rt_err)?;
+            Ok(s.project.lock().unwrap().add_source(seg) as i64)
+        },
+    );
+
+    engine.register_fn("segment_available", |_: &mut Session| -> bool {
+        media::segment_available()
+    });
+
     engine.register_fn("source_secs", |s: &mut Session, src: i64| -> f64 {
         s.project
             .lock()

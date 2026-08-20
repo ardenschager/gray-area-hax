@@ -400,6 +400,240 @@ pub fn load_youtube_source(url: &str, cache_dir: &Path, sample_rate: u32) -> Med
     Ok(src)
 }
 
+// --------------------------------------------------- SAM 3 segmentation
+//
+// Text-prompted object segmentation via a Python sidecar (tools/segment.py,
+// SAM 3 under the hood). The sidecar receives a video file + prompt and
+// writes one binary PGM mask per frame; we bake those masks into the alpha
+// channel of a derived Source, so "the cat" becomes an ordinary source
+// that granulates, sequences and composites everywhere — transparent
+// outside the tracked object.
+
+/// Feather radius for mask edges, as a fraction of the frame's smaller
+/// dimension. Softens the cutout so composites don't look sticker-sharp.
+const MASK_FEATHER_FRAC: f32 = 0.01;
+
+/// The sidecar command: `CHROMAGRAIN_SEGMENT_CMD` (whitespace-split)
+/// overrides; otherwise `python3 tools/segment.py` when the script exists
+/// relative to the working directory.
+pub fn segment_cmd() -> Option<Vec<String>> {
+    if let Ok(cmd) = std::env::var("CHROMAGRAIN_SEGMENT_CMD") {
+        let parts: Vec<String> = cmd.split_whitespace().map(String::from).collect();
+        if !parts.is_empty() {
+            return Some(parts);
+        }
+    }
+    let script = Path::new("tools/segment.py");
+    if script.exists() {
+        return Some(vec!["python3".into(), "tools/segment.py".into()]);
+    }
+    None
+}
+
+/// True when a segmenter is configured AND reports itself ready
+/// (`--check` exits 0; for the default sidecar that means SAM 3 imports).
+pub fn segment_available() -> bool {
+    let Some(cmd) = segment_cmd() else { return false };
+    Command::new(&cmd[0])
+        .args(&cmd[1..])
+        .arg("--check")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// A grayscale mask frame from the sidecar (255 = object).
+pub struct MaskFrame {
+    pub width: u32,
+    pub height: u32,
+    pub data: Vec<u8>,
+}
+
+/// Minimal binary PGM (P5) reader — the sidecar writes these so neither
+/// side needs an image library for the mask hand-off.
+pub fn read_pgm(path: &Path) -> MediaResult<MaskFrame> {
+    let bytes = std::fs::read(path).map_err(|e| format!("read {path:?}: {e}"))?;
+    // Header: "P5" <ws> width <ws> height <ws> maxval <single ws> data.
+    // Comments (# ...) are legal between tokens.
+    let mut pos = 0usize;
+    let mut token = |bytes: &[u8]| -> MediaResult<String> {
+        while pos < bytes.len() {
+            let b = bytes[pos];
+            if b == b'#' {
+                while pos < bytes.len() && bytes[pos] != b'\n' {
+                    pos += 1;
+                }
+            } else if b.is_ascii_whitespace() {
+                pos += 1;
+            } else {
+                break;
+            }
+        }
+        let start = pos;
+        while pos < bytes.len() && !bytes[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        if start == pos {
+            return Err("truncated pgm header".into());
+        }
+        Ok(String::from_utf8_lossy(&bytes[start..pos]).into_owned())
+    };
+    if token(&bytes)? != "P5" {
+        return Err("not a binary PGM (P5)".into());
+    }
+    let w: u32 = token(&bytes)?.parse().map_err(|_| "bad pgm width")?;
+    let h: u32 = token(&bytes)?.parse().map_err(|_| "bad pgm height")?;
+    let maxval: u32 = token(&bytes)?.parse().map_err(|_| "bad pgm maxval")?;
+    if maxval == 0 || maxval > 255 {
+        return Err(format!("unsupported pgm maxval {maxval}"));
+    }
+    pos += 1; // single whitespace after maxval
+    let n = (w * h) as usize;
+    if bytes.len() < pos + n {
+        return Err("pgm data truncated".into());
+    }
+    let mut data = bytes[pos..pos + n].to_vec();
+    if maxval != 255 {
+        for v in data.iter_mut() {
+            *v = (*v as u32 * 255 / maxval) as u8;
+        }
+    }
+    Ok(MaskFrame { width: w, height: h, data })
+}
+
+/// Separable box blur on a grayscale mask — cheap edge feathering.
+fn feather(mask: &mut MaskFrame, radius: u32) {
+    if radius == 0 {
+        return;
+    }
+    let (w, h) = (mask.width as i32, mask.height as i32);
+    let r = radius as i32;
+    let mut tmp = vec![0u8; mask.data.len()];
+    for y in 0..h {
+        for x in 0..w {
+            let mut sum = 0u32;
+            let mut n = 0u32;
+            for dx in -r..=r {
+                let sx = (x + dx).clamp(0, w - 1);
+                sum += mask.data[(y * w + sx) as usize] as u32;
+                n += 1;
+            }
+            tmp[(y * w + x) as usize] = (sum / n) as u8;
+        }
+    }
+    for x in 0..w {
+        for y in 0..h {
+            let mut sum = 0u32;
+            let mut n = 0u32;
+            for dy in -r..=r {
+                let sy = (y + dy).clamp(0, h - 1);
+                sum += tmp[(sy * w + x) as usize] as u32;
+                n += 1;
+            }
+            mask.data[(y * w + x) as usize] = (sum / n) as u8;
+        }
+    }
+}
+
+/// Bake mask frames into a video's alpha channel (pure; tested directly).
+/// Masks are index-mapped onto frames when counts differ and
+/// nearest-sampled when dimensions differ.
+pub fn apply_masks(video: &VideoClip, masks: &[MaskFrame]) -> VideoClip {
+    if masks.is_empty() {
+        return video.clone();
+    }
+    let frames = video
+        .frames
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let mi = (i * masks.len() / video.frames.len().max(1)).min(masks.len() - 1);
+            let m = &masks[mi];
+            let mut nf = f.clone();
+            for y in 0..nf.height {
+                let my = (y * m.height / nf.height.max(1)).min(m.height - 1);
+                for x in 0..nf.width {
+                    let mx = (x * m.width / nf.width.max(1)).min(m.width - 1);
+                    let a = m.data[(my * m.width + mx) as usize];
+                    let di = ((y * nf.width + x) * 4 + 3) as usize;
+                    nf.data[di] = a;
+                }
+            }
+            nf
+        })
+        .collect();
+    VideoClip { frames, fps: video.fps }
+}
+
+/// Run the segmenter sidecar on `video` with a text `prompt` and return
+/// the same video with the tracked object's mask baked into alpha.
+pub fn segment_video(
+    video: &VideoClip,
+    prompt: &str,
+    work_dir: &Path,
+) -> MediaResult<VideoClip> {
+    let cmd = segment_cmd().ok_or("no segmenter configured (tools/segment.py missing and CHROMAGRAIN_SEGMENT_CMD unset)")?;
+    if video.frames.is_empty() {
+        return Err("source has no video".into());
+    }
+    std::fs::create_dir_all(work_dir).map_err(|e| e.to_string())?;
+    let vid_path = work_dir.join("segment-input.mp4");
+    let mask_dir = work_dir.join("masks");
+    let _ = std::fs::remove_dir_all(&mask_dir);
+    std::fs::create_dir_all(&mask_dir).map_err(|e| e.to_string())?;
+
+    // Silent temp encode so the sidecar sees exactly our frames.
+    let silence = StereoBuffer::new(video.duration().max(0.1), 44100);
+    encode_video(&vid_path, &video.frames, video.fps, &silence)?;
+
+    let out = Command::new(&cmd[0])
+        .args(&cmd[1..])
+        .arg(&vid_path)
+        .arg(prompt)
+        .arg(&mask_dir)
+        .output()
+        .map_err(|e| format!("segmenter failed to launch: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("segmenter failed: {}", err.trim()));
+    }
+
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(&mask_dir)
+        .map_err(|e| e.to_string())?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().map(|x| x == "pgm").unwrap_or(false))
+        .collect();
+    paths.sort();
+    if paths.is_empty() {
+        return Err("segmenter produced no masks".into());
+    }
+    let radius = ((video.frames[0].width.min(video.frames[0].height) as f32
+        * MASK_FEATHER_FRAC) as u32)
+        .max(1);
+    let mut masks = Vec::with_capacity(paths.len());
+    for p in &paths {
+        let mut m = read_pgm(p)?;
+        feather(&mut m, radius);
+        masks.push(m);
+    }
+    Ok(apply_masks(video, &masks))
+}
+
+/// Derive a segmented Source: same audio, video transparent outside the
+/// prompted object. Purely visual — audio and base pitch pass through.
+pub fn segment_source(src: &Source, prompt: &str, work_dir: &Path) -> MediaResult<Source> {
+    let video = src.video.as_ref().ok_or("source has no video to segment")?;
+    let masked = segment_video(video, prompt, work_dir)?;
+    Ok(Source {
+        name: format!("{prompt} @ {}", src.name),
+        audio: src.audio.clone(),
+        video: Some(std::sync::Arc::new(masked)),
+        base_hz: src.base_hz,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -428,6 +662,95 @@ mod tests {
             / loaded.samples.len() as f32)
             .sqrt();
         assert!((orig_rms - load_rms).abs() < 0.02);
+    }
+
+    #[test]
+    fn pgm_roundtrip_and_masks_bake_into_alpha() {
+        let dir = std::env::temp_dir().join("chromagrain-test-pgm");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Write a P5 by hand: 4x2, left half black, right half white.
+        let path = dir.join("m.pgm");
+        let mut bytes = b"P5\n# comment\n4 2\n255\n".to_vec();
+        bytes.extend_from_slice(&[0, 0, 255, 255, 0, 0, 255, 255]);
+        std::fs::write(&path, &bytes).unwrap();
+        let m = read_pgm(&path).unwrap();
+        assert_eq!((m.width, m.height), (4, 2));
+        assert_eq!(m.data, vec![0, 0, 255, 255, 0, 0, 255, 255]);
+
+        // Bake into a 8x4 clip: alpha should follow the mask, upsampled.
+        let clip = crate::video::VideoClip::test_pattern(8, 4, 10.0, 0.3);
+        let out = apply_masks(&clip, &[m]);
+        assert_eq!(out.frames.len(), clip.frames.len());
+        let f = &out.frames[0];
+        let a = |x: u32, y: u32| f.data[((y * f.width + x) * 4 + 3) as usize];
+        assert_eq!(a(0, 0), 0, "left half transparent");
+        assert_eq!(a(3, 3), 0);
+        assert_eq!(a(4, 0), 255, "right half opaque");
+        assert_eq!(a(7, 3), 255);
+        // RGB untouched.
+        assert_eq!(f.data[0], clip.frames[0].data[0]);
+    }
+
+    #[test]
+    fn segment_pipeline_with_stub_sidecar() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not available");
+            return;
+        }
+        let dir = std::env::temp_dir().join("chromagrain-test-segment");
+        std::fs::create_dir_all(&dir).unwrap();
+        // A stub segmenter honoring the sidecar contract: --check exits 0;
+        // segmentation writes bottom-half-white masks regardless of input.
+        let stub = dir.join("stub_segment.py");
+        std::fs::write(
+            &stub,
+            r#"
+import os, sys
+if len(sys.argv) == 2 and sys.argv[1] == "--check":
+    print("stub ok"); sys.exit(0)
+video, prompt, out_dir = sys.argv[1], sys.argv[2], sys.argv[3]
+os.makedirs(out_dir, exist_ok=True)
+w, h = 16, 12
+rows = bytes([0]) * w * (h // 2) + bytes([255]) * w * (h - h // 2)
+for i in range(4):
+    with open(os.path.join(out_dir, f"mask_{i:05d}.pgm"), "wb") as f:
+        f.write(f"P5\n{w} {h}\n255\n".encode())
+        f.write(rows)
+print("ok 4")
+"#,
+        )
+        .unwrap();
+        std::env::set_var(
+            "CHROMAGRAIN_SEGMENT_CMD",
+            format!("python3 {}", stub.display()),
+        );
+        assert!(segment_available(), "stub --check should pass");
+
+        let src = Source {
+            name: "pat".into(),
+            audio: Some(std::sync::Arc::new(AudioClip::new(vec![0.1; 4410], 44100))),
+            video: Some(std::sync::Arc::new(
+                crate::video::VideoClip::test_pattern(32, 24, 10.0, 0.5),
+            )),
+            base_hz: 220.0,
+        };
+        let out = segment_source(&src, "cat", &dir.join("work")).unwrap();
+        std::env::remove_var("CHROMAGRAIN_SEGMENT_CMD");
+
+        assert_eq!(out.name, "cat @ pat");
+        assert_eq!(out.base_hz, 220.0);
+        assert!(out.audio.is_some(), "audio passes through untouched");
+        let v = out.video.as_ref().unwrap();
+        assert_eq!(v.frames.len(), src.video.as_ref().unwrap().frames.len());
+        let f = &v.frames[0];
+        let a = |x: u32, y: u32| f.data[((y * f.width + x) * 4 + 3) as usize];
+        // Top rows transparent, bottom rows opaque (feather softens the
+        // boundary, so sample away from the midline).
+        assert!(a(5, 1) < 30, "top should be transparent, got {}", a(5, 1));
+        assert!(a(5, 22) > 225, "bottom should be opaque, got {}", a(5, 22));
+        // The feathered edge actually grades.
+        let mid = a(5, 12);
+        assert!(mid > 30 && mid < 225, "edge should be feathered, got {mid}");
     }
 
     #[test]

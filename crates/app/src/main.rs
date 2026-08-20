@@ -169,6 +169,7 @@ struct App {
 
     media_path: String,
     stretch_factor: f32,
+    segment_prompt: String,
     youtube_url: String,
     script_text: String,
     script_log: String,
@@ -210,6 +211,7 @@ impl App {
             last_sync: std::time::Instant::now(),
             media_path: String::new(),
             stretch_factor: 8.0,
+            segment_prompt: String::new(),
             youtube_url: String::new(),
             script_text: DEFAULT_SCRIPT.trim_start().into(),
             script_log: String::new(),
@@ -348,6 +350,23 @@ impl App {
         let tx = self.tx.clone();
         std::thread::spawn(move || {
             let res = Ok(chromagrain_core::stretch::paulstretch_source(&source, factor));
+            let _ = tx.send(WorkerMsg::Source(res));
+        });
+    }
+
+    fn start_segment(&mut self, src_idx: usize, prompt: String) {
+        if self.busy.is_some() || prompt.trim().is_empty() {
+            return;
+        }
+        let source = match self.project.lock().unwrap().sources.get(src_idx) {
+            Some(s) => s.clone(),
+            None => return,
+        };
+        self.busy = Some(format!("segmenting '{prompt}' in {}…", source.name));
+        let tx = self.tx.clone();
+        let work = std::env::temp_dir().join("chromagrain-segment");
+        std::thread::spawn(move || {
+            let res = media::segment_source(&source, prompt.trim(), &work);
             let _ = tx.send(WorkerMsg::Source(res));
         });
     }
@@ -620,6 +639,24 @@ impl App {
                     egui::DragValue::new(&mut self.stretch_factor)
                         .range(2.0..=64.0)
                         .speed(0.25),
+                );
+            });
+            ui.horizontal(|ui| {
+                if ui
+                    .button("segment")
+                    .on_hover_text(
+                        "SAM 3: cut the prompted object out of the video, tracked over \
+                         time (needs tools/segment.py set up — see README)",
+                    )
+                    .clicked()
+                {
+                    let (idx, p) = (self.selected_source, self.segment_prompt.clone());
+                    self.start_segment(idx, p);
+                }
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.segment_prompt)
+                        .hint_text("cat")
+                        .desired_width(90.0),
                 );
             });
         }

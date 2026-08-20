@@ -129,8 +129,11 @@ uniform float u_additive;
 {HSV_HELPERS}
 void main() {{
     vec2 suv = u_patch.xy + v_uv * u_patch.zw;
-    vec3 rgb = texture(u_src, vec3(suv, u_layer)).rgb;
-    float a = u_alpha;
+    vec4 texel = texture(u_src, vec3(suv, u_layer));
+    vec3 rgb = texel.rgb;
+    // Source alpha participates: segmented sources are transparent
+    // outside the tracked object, matching the CPU compositor.
+    float a = u_alpha * texel.a;
     vec3 hsv = rgb2hsv(rgb);
     if (u_cf_mode != 0) {{
         float h = hsv.x * 360.0;
