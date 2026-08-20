@@ -33,5 +33,6 @@ pub mod realtime;
 pub mod render;
 pub mod script;
 pub mod seq;
+pub mod synth;
 pub mod timeline;
 pub mod video;

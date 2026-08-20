@@ -34,6 +34,11 @@ pub enum EffectKind {
     Reverb { size: f32, damp: f32, mix: f32 },
     /// Codec crunch. `quality` 1 = transparent, 0 = destroyed.
     Compress { quality: f32 },
+    /// Synesthetic tint: smush every hue toward `hue` (video) while a
+    /// resonant bandpass smushes the spectrum toward the corresponding
+    /// frequency (audio) — the shared hue<->freq axis in `synth`.
+    /// `amount` 0 = off, 1 = fully monochrome / fully resonant.
+    Tint { hue: f32, amount: f32 },
 }
 
 impl EffectKind {
@@ -52,6 +57,7 @@ impl EffectKind {
             },
             "reverb" | "smear" => EffectKind::Reverb { size: 0.6, damp: 0.4, mix: 0.35 },
             "compress" | "compression" | "codec" => EffectKind::Compress { quality: 0.25 },
+            "tint" | "smush" | "chroma" => EffectKind::Tint { hue: 8.0, amount: 0.6 },
             _ => return None,
         })
     }
@@ -62,6 +68,7 @@ impl EffectKind {
             EffectKind::Delay { .. } => "delay",
             EffectKind::Reverb { .. } => "reverb",
             EffectKind::Compress { .. } => "compress",
+            EffectKind::Tint { .. } => "tint",
         }
     }
 }
@@ -119,6 +126,11 @@ impl AvEffect {
                 "quality" => *quality = value.clamp(0.0, 1.0),
                 _ => return Err(format!("compress has no parameter '{name}'")),
             },
+            EffectKind::Tint { hue, amount } => match key.as_str() {
+                "hue" => *hue = value.rem_euclid(360.0).min(crate::synth::HUE_SPAN),
+                "amount" => *amount = value.clamp(0.0, 1.0),
+                _ => return Err(format!("tint has no parameter '{name}'")),
+            },
         }
         Ok(())
     }
@@ -141,6 +153,7 @@ pub enum AudioFxState {
     Delay { ring: [Vec<f32>; 2], pos: usize },
     Reverb { channels: [ReverbChannel; 2] },
     Compress { channels: [SpectralState; 2] },
+    Tint { bq: [crate::dsp::Biquad; 2] },
 }
 
 /// Build fresh states for a chain. Rebuild whenever the chain's shape or
@@ -165,6 +178,19 @@ pub fn audio_chain_states(chain: &[AvEffect], sample_rate: u32) -> Vec<AudioFxSt
             EffectKind::Compress { .. } => AudioFxState::Compress {
                 channels: [SpectralState::new(), SpectralState::new()],
             },
+            EffectKind::Tint { hue, amount } => {
+                let freq = crate::synth::hue_to_freq(hue);
+                let q = 1.0 + amount * 7.0;
+                let mk = || {
+                    crate::dsp::Biquad::new(
+                        crate::dsp::FilterKind::BandPass,
+                        sample_rate as f32,
+                        freq,
+                        q,
+                    )
+                };
+                AudioFxState::Tint { bq: [mk(), mk()] }
+            }
         })
         .collect()
 }
@@ -172,6 +198,7 @@ pub fn audio_chain_states(chain: &[AvEffect], sample_rate: u32) -> Vec<AudioFxSt
 /// Samples of latency the chain introduces (spectral compression is
 /// windowed and cannot be zero-latency in a stream).
 pub fn audio_chain_latency(chain: &[AvEffect]) -> usize {
+    // Only Compress is windowed; everything else (incl. Tint) is 0-latency.
     chain
         .iter()
         .filter(|fx| {
@@ -237,6 +264,18 @@ pub fn process_audio_chain(
                 }
                 channels[0].process(left, q);
                 channels[1].process(right, q);
+            }
+            (EffectKind::Tint { amount, .. }, AudioFxState::Tint { bq }) => {
+                // Morph toward the resonant band; makeup keeps loudness as
+                // the band narrows.
+                let mix = (amount * fx.audio).clamp(0.0, 1.0);
+                let makeup = 1.0 + amount * 1.8;
+                for (c, ch) in [&mut *left, &mut *right].into_iter().enumerate() {
+                    for x in ch.iter_mut() {
+                        let wet = bq[c].process(*x) * makeup;
+                        *x = *x * (1.0 - mix) + wet * mix;
+                    }
+                }
             }
             _ => debug_assert!(false, "chain/state mismatch — rebuild states"),
         }
@@ -534,7 +573,9 @@ pub fn video_chain_states(chain: &[AvEffect], fps: f32) -> Vec<VideoFxState> {
                 delay_frames: ((time * fps).round() as usize).max(1),
             },
             EffectKind::Reverb { .. } => VideoFxState::Reverb { acc: Vec::new() },
-            _ => VideoFxState::Stateless,
+            EffectKind::Crush { .. } | EffectKind::Compress { .. } | EffectKind::Tint { .. } => {
+                VideoFxState::Stateless
+            }
         })
         .collect()
 }
@@ -585,7 +626,34 @@ pub fn apply_video_chain(
                 let q = lerp(1.0, quality, fx.video);
                 video_compress(frame, q);
             }
+            EffectKind::Tint { hue, amount } => {
+                video_tint(frame, hue, amount * fx.video);
+            }
         }
+    }
+}
+
+/// Smush every pixel's hue toward `hue`; at high amounts even grey pixels
+/// pick up the tint (that is what "make it all reddish" means).
+fn video_tint(frame: &mut Frame, hue: f32, amount: f32) {
+    use crate::video::{hsv_to_rgb, rgb_to_hsv};
+    let amount = amount.clamp(0.0, 1.0);
+    if amount <= 0.002 {
+        return;
+    }
+    for px in frame.data.chunks_exact_mut(4) {
+        let (h, s, v) = rgb_to_hsv(px[0], px[1], px[2]);
+        let mut d = (h - hue).rem_euclid(360.0);
+        if d > 180.0 {
+            d -= 360.0;
+        }
+        let nh = (hue + d * (1.0 - amount)).rem_euclid(360.0);
+        // Greys gain saturation toward the tint as the smush deepens.
+        let ns = s.max(amount * amount * 0.5 * v.min(1.0));
+        let (r, g, b) = hsv_to_rgb(nh, ns, v);
+        px[0] = r;
+        px[1] = g;
+        px[2] = b;
     }
 }
 
@@ -1036,6 +1104,7 @@ mod tests {
                 shift_y: 0.0,
             }),
             AvEffect::new(EffectKind::Reverb { size: 0.6, damp: 0.3, mix: 0.4 }),
+            AvEffect::new(EffectKind::Tint { hue: 40.0, amount: 0.5 }),
             AvEffect::new(EffectKind::Compress { quality: 0.3 }),
         ];
 
@@ -1098,6 +1167,70 @@ mod tests {
             "energy centered on the impulse: {}",
             around / total
         );
+    }
+
+    #[test]
+    fn tint_smushes_hues_and_spectrum_together() {
+        use crate::video::{hsv_to_rgb, rgb_to_hsv, VideoClip};
+        // VIDEO: a colorful frame smushed toward red gets red-dominant.
+        let clip = VideoClip::test_pattern(64, 48, 10.0, 0.4);
+        let mut frame = clip.frames[2].clone();
+        let fx = AvEffect::new(EffectKind::Tint { hue: 5.0, amount: 0.85 });
+        let mut st = video_chain_states(&[fx], 10.0);
+        apply_video_chain(&mut frame, &[fx], &mut st);
+        let mut near = 0usize;
+        let mut total = 0usize;
+        for px in frame.data.chunks_exact(4) {
+            let (h, s_, _) = rgb_to_hsv(px[0], px[1], px[2]);
+            if s_ > 0.1 {
+                total += 1;
+                let mut d = (h - 5.0).rem_euclid(360.0);
+                if d > 180.0 {
+                    d = 360.0 - d;
+                }
+                if d < 40.0 {
+                    near += 1;
+                }
+            }
+        }
+        assert!(total > 0 && near as f32 / total as f32 > 0.9,
+            "hues smushed to red: {near}/{total}");
+        // Greys pick up the tint at high amounts.
+        let mut grey = Frame::black(8, 8);
+        for px in grey.data.chunks_exact_mut(4) {
+            px[0] = 128; px[1] = 128; px[2] = 128;
+        }
+        let mut st2 = video_chain_states(&[fx], 10.0);
+        apply_video_chain(&mut grey, &[fx], &mut st2);
+        let p0 = grey.get(4, 4);
+        assert!(p0[0] > p0[2] + 10, "grey turned reddish: {p0:?}");
+
+        // AUDIO: the corresponding band survives; far bands are crushed.
+        // hue 5 -> ~85 Hz center. Compare a near-band 90 Hz sine with a
+        // 4 kHz sine after full-amount tint.
+        let sr = 48000;
+        let center = crate::synth::hue_to_freq(5.0);
+        assert!(center < 120.0, "red maps low: {center}");
+        let tone = |freq: f32| -> f32 {
+            let mut buf = StereoBuffer::new(0.5, sr);
+            for (i, v) in buf.left.iter_mut().enumerate() {
+                *v = (2.0 * std::f32::consts::PI * freq * i as f32 / sr as f32).sin();
+            }
+            buf.right.copy_from_slice(&buf.left);
+            let fx = AvEffect::new(EffectKind::Tint { hue: 5.0, amount: 1.0 });
+            apply_audio_chain(&mut buf, &[fx]);
+            let tail = &buf.left[sr as usize / 4..];
+            (tail.iter().map(|s| s * s).sum::<f32>() / tail.len() as f32).sqrt()
+        };
+        let near_band = tone(center);
+        let far_band = tone(4000.0);
+        assert!(
+            near_band > far_band * 4.0,
+            "spectrum smushed toward red's frequency: {near_band} vs {far_band}"
+        );
+        // Same hue<->freq axis as the scope video: hsv sanity.
+        let (r, _, _) = hsv_to_rgb(5.0, 1.0, 1.0);
+        assert!(r > 200);
     }
 
     #[test]

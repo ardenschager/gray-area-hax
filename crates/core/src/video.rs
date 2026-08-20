@@ -304,6 +304,9 @@ pub struct AvLink {
     pub reverse_video: bool,
     /// The clip transform's x position drives audio pan (0 = unlinked).
     pub x_to_pan: f32,
+    /// The clip transform's y drives audio brightness — up = airy, down =
+    /// heavy (the elevation cue of the panning model). 0 = unlinked.
+    pub y_to_brightness: f32,
     /// The clip transform's scale drives loudness — the distance cue of
     /// the "3D" panning model (smaller = farther = quieter).
     pub scale_to_gain: f32,
@@ -319,6 +322,7 @@ impl Default for AvLink {
             pan_to_x: 1.0,
             reverse_video: true,
             x_to_pan: 1.0,
+            y_to_brightness: 1.0,
             scale_to_gain: 1.0,
         }
     }
@@ -336,6 +340,7 @@ impl AvLink {
             "pan_to_x" => self.pan_to_x = value.clamp(0.0, 1.0),
             "reverse_video" => self.reverse_video = value > 0.5,
             "x_to_pan" => self.x_to_pan = value.clamp(0.0, 1.0),
+            "y_to_brightness" => self.y_to_brightness = value.clamp(0.0, 1.0),
             "scale_to_gain" => self.scale_to_gain = value.clamp(0.0, 1.0),
             other => return Err(format!("unknown link parameter '{other}'")),
         }

@@ -153,6 +153,36 @@ pub fn build_engine(session: Session, log: Arc<Mutex<String>>) -> Engine {
     );
 
     engine.register_fn(
+        "fm_source",
+        |s: &mut Session, base_hz: f64, ratio: f64, index: f64, secs: f64| -> i64 {
+            let mut p = s.project.lock().unwrap();
+            let sr = p.sample_rate;
+            let src = crate::synth::fm_source(
+                (base_hz as f32).clamp(20.0, 4000.0),
+                (ratio as f32).clamp(0.01, 16.0),
+                (index as f32).clamp(0.0, 10.0),
+                (secs as f32).clamp(0.1, 30.0),
+                sr,
+            );
+            p.add_source(src) as i64
+        },
+    );
+
+    engine.register_fn(
+        "noise_source",
+        |s: &mut Session, color: f64, secs: f64| -> i64 {
+            let mut p = s.project.lock().unwrap();
+            let sr = p.sample_rate;
+            let src = crate::synth::noise_source(
+                (color as f32).clamp(0.0, 1.0),
+                (secs as f32).clamp(0.1, 30.0),
+                sr,
+            );
+            p.add_source(src) as i64
+        },
+    );
+
+    engine.register_fn(
         "load",
         |s: &mut Session, path: &str| -> ScriptResult<i64> {
             let full = s.resolve(path);

@@ -15,6 +15,7 @@ pub struct RealtimeAudio {
     /// Pre-filtered audio per plan part (clip audio_filters applied once).
     part_audio: Vec<Vec<Option<crate::audio::AudioClip>>>,
     clip_states: Vec<Vec<AudioFxState>>,
+    tilt_states: Vec<crate::dsp::TiltState>,
     track_states: Vec<Vec<AudioFxState>>,
     master_states: Vec<AudioFxState>,
     /// Absolute playhead in samples from beat 0.
@@ -68,12 +69,14 @@ impl RealtimeAudio {
             .map(|t| fx::audio_chain_states(&t.effects, sr))
             .collect();
         let master_states = fx::audio_chain_states(&project.master_effects, sr);
+        let tilt_states = plan.iter().map(|_| crate::dsp::TiltState::default()).collect();
         let sample_pos = (project.beats_to_secs(start_beat) * sr as f64).round() as u64;
         RealtimeAudio {
             project,
             plan,
             part_audio,
             clip_states,
+            tilt_states,
             track_states,
             master_states,
             sample_pos,
@@ -172,7 +175,8 @@ impl RealtimeAudio {
                     continue;
                 }
                 let clip = &track.clips[cp.clip_index];
-                let has_fx = !clip.effects.is_empty();
+                let (_, _, tilt) = crate::render::clip_spatial(clip);
+                let has_fx = !clip.effects.is_empty() || tilt.abs() > 1e-4;
                 let bus = if has_fx {
                     self.scratch_clip.left.fill(0.0);
                     self.scratch_clip.right.fill(0.0);
@@ -189,7 +193,7 @@ impl RealtimeAudio {
                         }
                     };
                     let Some(audio) = audio else { continue };
-                    let (pan_offset, gain_mult) = crate::render::clip_spatial(clip);
+                    let (pan_offset, gain_mult, _) = crate::render::clip_spatial(clip);
                     render_grains_audio_spatial(audio, evs, bus, t0, pan_offset, gain_mult);
                     any = true;
                 }
@@ -199,6 +203,13 @@ impl RealtimeAudio {
                         &mut self.scratch_clip.right,
                         &clip.effects,
                         &mut self.clip_states[pi],
+                    );
+                    crate::dsp::apply_tilt(
+                        &mut self.scratch_clip.left,
+                        &mut self.scratch_clip.right,
+                        &mut self.tilt_states[pi],
+                        tilt,
+                        self.project.sample_rate,
                     );
                     for i in 0..n {
                         self.scratch_track.left[i] += self.scratch_clip.left[i];
@@ -308,6 +319,10 @@ mod tests {
         let t1 = p.add_track("bed");
         let mut s = Clip::new_snippet(sid, 1.0, 3.0);
         s.grains.gain = 0.5;
+        // Spatial placement: pan right, up-tilt brightness, tint chain.
+        s.transform.x = 0.4;
+        s.transform.y = -0.5;
+        s.effects.push(AvEffect::new(EffectKind::Tint { hue: 60.0, amount: 0.5 }));
         p.tracks[t1].clips.push(s);
         p.tracks[t1].effects.push(AvEffect::new(EffectKind::Reverb {
             size: 0.6,

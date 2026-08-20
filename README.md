@@ -41,6 +41,7 @@ BOTH domains with the same idea:
 | delay    | feedback delay line              | ghost frames at the same delay/feedback, with optional drift |
 | reverb   | Freeverb-style combs/allpasses   | frame persistence + blur smear     |
 | compress | FFT spectral quantization (codec crunch) | JPEG-style 8×8 DCT block quantization — the same transform-domain math |
+| tint     | resonant bandpass narrowing toward the hue's frequency | every hue smushed toward the target color — same axis |
 
 Each effect has independent `audio` and `video` amount dials — that's the
 per-effect correspondence control (video 0 = audio-only effect, and vice
@@ -84,15 +85,27 @@ versa). It will be crunchy.
   follows the same shape); onsets can **beat-sync** to a 1/32–1/4 grid for
   rhythmic clouds; and each grain can stack up to 4 **harmony voices** at
   a chosen interval (octaves, fifths…), key-quantized, detuned and spread.
+- **Synth engines** — pure FM (carrier/modulator ratio + index) and
+  colored noise (white → pink → brown) render as sources whose video is
+  generated FROM their own audio: an oscilloscope trace whose hue follows
+  the spectral centroid on the shared hue↔frequency axis (red = low,
+  violet = high). Synths get everything samples get: granular clips,
+  snippets, sequencer rows, MIDI pads, key quantize, effect chains,
+  canvas transforms.
+- **Tint (spectral smush)** — a fifth AV effect: smush every hue toward a
+  target color while a narrowing resonant bandpass smushes the audio
+  spectrum toward the corresponding frequency on the same hue↔freq axis.
+  "Make it all reddish" makes it all rumble.
 - **Speed and pitch are separate** — a snippet's `speed` changes tempo
   without touching pitch (granular time-stretch under the hood; video
   crossfades along at the same rate), while `pitch` transposes without
   changing tempo. Set them to match and it collapses to a pristine
   record-player resample automatically.
 - **Canvas placement** — every clip's video can be positioned, scaled and
-  rotated on the canvas. Placement is audible: x position drives pan and
-  scale drives loudness (the distance cue of a simple 3D panning model),
-  each through its own unlinkable correspondence dial.
+  rotated on the canvas. Placement is audible: x drives pan, y drives a
+  brightness tilt (up = airy, down = heavy — the elevation cue), and
+  scale drives loudness (the distance cue), each through its own
+  unlinkable correspondence dial.
 - **MIDI** — play any clip like a pad instrument (sampler mapping, C4 =
   unity, velocity → gain, live in audio AND video, transport running or
   not), and map hardware CCs to any automatable parameter or track level
@@ -192,6 +205,9 @@ s.color_remove(c, 120.0, 80.0);              // filter out a hue band
 let b = s.snippet(t, src, 16.0, 8.0);    // media straight on the timeline
 s.set(b, "gain", 0.5);                   // loudness AND opacity
 s.set(b, "gain_to_opacity", 0.0);        // ...unless you unlink it
+
+let syn = s.fm_source(110.0, 2.0, 1.5, 4.0);  // pure synths as sources
+let nz  = s.noise_source(0.5, 4.0);           // (white->pink->brown)
 
 let fx = s.effect(c, "crush");           // AV effect chains
 s.fx(c, fx, "bits", 4.0);                // heard as bitcrush, seen as posterize

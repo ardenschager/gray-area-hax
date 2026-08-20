@@ -172,12 +172,15 @@ pub fn plan_project(project: &Project) -> Vec<ClipPlan> {
 }
 
 /// The clip transform's audio placement: x -> pan offset, scale ->
-/// distance loudness (both through their AV-link dials).
-pub fn clip_spatial(clip: &Clip) -> (f32, f32) {
+/// distance loudness, y -> spectral tilt (screen-up = brighter), each
+/// through its AV-link dial.
+pub fn clip_spatial(clip: &Clip) -> (f32, f32, f32) {
     let pan_offset = (clip.transform.x * clip.link.x_to_pan).clamp(-1.0, 1.0);
     let gain_mult =
         (1.0 + (clip.transform.scale.clamp(0.0, 1.5) - 1.0) * clip.link.scale_to_gain).max(0.0);
-    (pan_offset, gain_mult)
+    // Screen y is down-positive; elevation up should brighten.
+    let tilt = (-clip.transform.y * clip.link.y_to_brightness).clamp(-1.0, 1.0);
+    (pan_offset, gain_mult, tilt)
 }
 
 fn render_audio_part(
@@ -190,7 +193,7 @@ fn render_audio_part(
 ) {
     let Some(source) = project.sources.get(source_id) else { return };
     let Some(audio_src) = &source.audio else { return };
-    let (pan_offset, gain_mult) = clip_spatial(clip);
+    let (pan_offset, gain_mult, _) = clip_spatial(clip);
     if clip.audio_filters.is_empty() {
         render_grains_audio_spatial(audio_src, events, bus, t0, pan_offset, gain_mult);
     } else {
@@ -224,7 +227,9 @@ pub fn render_project(project: &Project, from_beat: f64, to_beat: f64) -> Render
         let mut track_bus = StereoBuffer::new(len, project.sample_rate);
         for cp in &clip_plans {
             let clip = &track.clips[cp.clip_index];
-            if clip.effects.is_empty() {
+            let (_, _, tilt) = clip_spatial(clip);
+            let needs_bus = !clip.effects.is_empty() || tilt.abs() > 1e-4;
+            if !needs_bus {
                 for (sid, evs) in &cp.parts {
                     render_audio_part(project, clip, *sid, evs, &mut track_bus, t0);
                 }
@@ -234,6 +239,14 @@ pub fn render_project(project: &Project, from_beat: f64, to_beat: f64) -> Render
                     render_audio_part(project, clip, *sid, evs, &mut clip_bus, t0);
                 }
                 fx::apply_audio_chain(&mut clip_bus, &clip.effects);
+                let mut tilt_state = crate::dsp::TiltState::default();
+                crate::dsp::apply_tilt(
+                    &mut clip_bus.left,
+                    &mut clip_bus.right,
+                    &mut tilt_state,
+                    tilt,
+                    project.sample_rate,
+                );
                 for i in 0..track_bus.len().min(clip_bus.len()) {
                     track_bus.left[i] += clip_bus.left[i];
                     track_bus.right[i] += clip_bus.right[i];
@@ -815,6 +828,79 @@ mod tests {
         psu.tracks[0].clips[0].link.scale_to_gain = 0.0;
         let out_su = render_project(&psu, 0.0, 4.0);
         assert!(out_su.audio.rms() > out_s.audio.rms() * 1.8);
+    }
+
+    #[test]
+    fn canvas_y_drives_brightness_tilt() {
+        // A harmonically rich source; move it up vs down the canvas.
+        let make = |y: f32, link: f32| -> f32 {
+            let mut p = Project { bpm: 120.0, width: 32, height: 24, fps: 12.0, ..Default::default() };
+            let sid = p.add_source(crate::timeline::Source {
+                name: "saw".into(),
+                audio: Some(std::sync::Arc::new(crate::audio::AudioClip::saw_stack(
+                    110.0, 3.0, p.sample_rate,
+                ))),
+                video: None,
+                base_hz: 110.0,
+            });
+            let t = p.add_track("t");
+            let mut c = Clip::new_snippet(sid, 0.0, 4.0);
+            c.transform.y = y;
+            c.link.y_to_brightness = link;
+            p.tracks[t].clips.push(c);
+            let out = render_project(&p, 0.0, 4.0);
+            // High-frequency ratio: rms of first difference / rms.
+            let sr = p.sample_rate as usize;
+            let seg = &out.audio.left[sr / 2..sr * 3 / 2];
+            let rms = (seg.iter().map(|x| x * x).sum::<f32>() / seg.len() as f32).sqrt();
+            let d = (seg.windows(2).map(|w| (w[1] - w[0]).powi(2)).sum::<f32>()
+                / (seg.len() - 1) as f32)
+                .sqrt();
+            d / rms.max(1e-9)
+        };
+        let up = make(-0.8, 1.0); // screen-up
+        let mid = make(0.0, 1.0);
+        let down = make(0.8, 1.0);
+        assert!(up > mid * 1.15, "up is brighter: {up} vs {mid}");
+        assert!(down < mid * 0.9, "down is darker: {down} vs {mid}");
+        // Unlinked: y has no audible effect.
+        let unlinked = make(0.8, 0.0);
+        assert!((unlinked - mid).abs() < mid * 0.05, "unlinked: {unlinked} vs {mid}");
+    }
+
+    #[test]
+    fn synth_sources_flow_through_the_whole_engine() {
+        // An FM synth source sequenced by a pattern with a tint on the
+        // clip chain: synths get sequencing + effects like any sample.
+        let mut p = Project { bpm: 120.0, width: 48, height: 32, fps: 12.0, ..Default::default() };
+        let fm = p.add_source(crate::synth::fm_source(220.0, 2.0, 1.0, 2.0, p.sample_rate));
+        let mut pat = crate::seq::StepPattern::new("fm hits");
+        let r = pat.add_row(fm);
+        pat.rows[r].grains.duration = 0.3;
+        for i in (0..16).step_by(4) {
+            pat.rows[r].steps[i].on = true;
+        }
+        let pid = p.add_pattern(pat);
+        let t = p.add_track("synth");
+        let mut clip = Clip::new_pattern(pid, 0.0, 4.0);
+        clip.effects.push(crate::fx::AvEffect::new(crate::fx::EffectKind::Tint {
+            hue: 10.0,
+            amount: 0.7,
+        }));
+        p.tracks[t].clips.push(clip);
+
+        let out = render_project(&p, 0.0, 4.0);
+        assert!(out.audio.rms() > 0.005, "sequenced synth sounds: {}", out.audio.rms());
+        // The scope video flows through and the tint reddens it.
+        let mid = &out.frames[7];
+        let mut r_sum = 0u64;
+        let mut b_sum = 0u64;
+        for px in mid.data.chunks_exact(4) {
+            r_sum += px[0] as u64;
+            b_sum += px[2] as u64;
+        }
+        assert!(mid.mean_luma() > 0.5, "synth video visible");
+        assert!(r_sum > b_sum, "tinted toward red: r {r_sum} b {b_sum}");
     }
 
     #[test]

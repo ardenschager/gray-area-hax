@@ -225,6 +225,38 @@ pub fn detect_pitch(samples: &[f32], sample_rate: u32) -> Option<f32> {
     Some(sr / lag)
 }
 
+/// Spectral tilt (the up/down elevation cue): `tilt` +1 = bright/airy
+/// (highs up, lows down), -1 = dark/heavy. One-pole split at 800 Hz,
+/// streaming-safe.
+#[derive(Debug, Clone, Default)]
+pub struct TiltState {
+    lp: [f32; 2],
+}
+
+pub fn apply_tilt(
+    left: &mut [f32],
+    right: &mut [f32],
+    state: &mut TiltState,
+    tilt: f32,
+    sample_rate: u32,
+) {
+    let tilt = tilt.clamp(-1.0, 1.0);
+    if tilt.abs() < 1e-4 {
+        return;
+    }
+    let a = 1.0 - (-2.0 * std::f32::consts::PI * 800.0 / sample_rate as f32).exp();
+    let k = tilt * 0.85;
+    for (c, ch) in [left, right].into_iter().enumerate() {
+        let mut lp = state.lp[c];
+        for x in ch.iter_mut() {
+            lp += a * (*x - lp);
+            let hp = *x - lp;
+            *x = lp * (1.0 - k) + hp * (1.0 + k);
+        }
+        state.lp[c] = lp;
+    }
+}
+
 /// Small deterministic xorshift* PRNG so renders are reproducible.
 #[derive(Debug, Clone)]
 pub struct Rng(u64);

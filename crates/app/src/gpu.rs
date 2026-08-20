@@ -170,6 +170,29 @@ void main() {
     frag = vec4(c.rgb, 1.0);
 }"#;
 
+fn tint_fs() -> String {
+    format!(
+        r#"#version 330 core
+in vec2 v_uv; out vec4 frag;
+uniform sampler2D u_tex;
+uniform float u_hue;     // target, degrees
+uniform float u_amount;
+{HSV_HELPERS}
+void main() {{
+    vec4 c = texture(u_tex, v_uv);
+    float a = max(c.a, 1e-5);
+    vec3 rgb = c.rgb / a;          // unpremultiply
+    vec3 hsv = rgb2hsv(rgb);
+    float h = hsv.x * 360.0;
+    float d = mod(h - u_hue + 540.0, 360.0) - 180.0;
+    float nh = mod(u_hue + d * (1.0 - u_amount) + 360.0, 360.0);
+    float ns = max(hsv.y, u_amount * u_amount * 0.5 * min(hsv.z, 1.0));
+    rgb = hsv2rgb(vec3(nh / 360.0, ns, hsv.z));
+    frag = vec4(rgb * a, c.a);
+}}"#
+    )
+}
+
 const CRUSH_FS: &str = r#"#version 330 core
 in vec2 v_uv; out vec4 frag;
 uniform sampler2D u_tex;
@@ -404,6 +427,7 @@ impl GpuPreview {
             programs.insert("blit", compile(gl, QUAD_VS, BLIT_FS)?);
             programs.insert("present", compile(gl, QUAD_VS, PRESENT_FS)?);
             programs.insert("crush", compile(gl, QUAD_VS, CRUSH_FS)?);
+            programs.insert("tint", compile(gl, QUAD_VS, &tint_fs())?);
             programs.insert("delay", compile(gl, QUAD_VS, DELAY_FS)?);
             programs.insert("racc", compile(gl, QUAD_VS, REVERB_ACCUM_FS)?);
             programs.insert("rmix", compile(gl, QUAD_VS, REVERB_MIX_FS)?);
@@ -604,6 +628,23 @@ impl GpuPreview {
                 }
                 let (w, h) = (self.size.0 as f32, self.size.1 as f32);
                 match fx.kind {
+                    EffectKind::Tint { hue, amount } => {
+                        let out = if cur == self.ping.as_ref().unwrap().tex {
+                            self.pong.as_ref().unwrap()
+                        } else {
+                            self.ping.as_ref().unwrap()
+                        };
+                        self.bind_target(gl, out, None);
+                        let p = self.use_program(gl, "tint");
+                        gl.active_texture(glow::TEXTURE0);
+                        gl.bind_texture(glow::TEXTURE_2D, Some(cur));
+                        self.set_i(gl, p, "u_tex", 0);
+                        self.set_f(gl, p, "u_hue", hue);
+                        self.set_f(gl, p, "u_amount", (amount * fx.video).clamp(0.0, 1.0));
+                        self.set_4f(gl, p, "u_rect", [0.0, 0.0, 1.0, 1.0]);
+                        self.draw_quad(gl);
+                        cur = out.tex;
+                    }
                     EffectKind::Crush { downsample, bits } => {
                         let out = if cur == self.ping.as_ref().unwrap().tex {
                             self.pong.as_ref().unwrap()

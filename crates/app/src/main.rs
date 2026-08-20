@@ -528,6 +528,25 @@ impl App {
             }
         }
         ui.horizontal(|ui| {
+            if ui.button("+ fm").clicked() {
+                let mut p = self.project.lock().unwrap();
+                let sr = p.sample_rate;
+                let id = p.add_source(chromagrain_core::synth::fm_source(
+                    110.0, 2.0, 1.5, 4.0, sr,
+                ));
+                drop(p);
+                self.selected_source = id;
+                self.project_rev += 1;
+            }
+            if ui.button("+ noise").clicked() {
+                let mut p = self.project.lock().unwrap();
+                let sr = p.sample_rate;
+                let id =
+                    p.add_source(chromagrain_core::synth::noise_source(0.5, 4.0, sr));
+                drop(p);
+                self.selected_source = id;
+                self.project_rev += 1;
+            }
             if ui.button("+ demo").clicked() {
                 let mut p = self.project.lock().unwrap();
                 let sr = p.sample_rate;
@@ -1302,6 +1321,17 @@ impl App {
                             .add(egui::Slider::new(quality, 0.0..=1.0).text("quality"))
                             .changed();
                     }
+                    EffectKind::Tint { hue, amount } => {
+                        changed |= ui
+                            .add(
+                                egui::Slider::new(hue, 0.0..=330.0)
+                                    .text("hue (red=low .. violet=high)"),
+                            )
+                            .changed();
+                        changed |= ui
+                            .add(egui::Slider::new(amount, 0.0..=1.0).text("smush"))
+                            .changed();
+                    }
                 }
                 ui.horizontal(|ui| {
                     changed |= ui
@@ -1319,7 +1349,7 @@ impl App {
             changed = true;
         }
         ui.horizontal(|ui| {
-            for name in ["crush", "delay", "reverb", "compress"] {
+            for name in ["crush", "delay", "reverb", "compress", "tint"] {
                 if ui.small_button(format!("+{name}")).clicked() {
                     effects.push(AvEffect::new(EffectKind::parse(name).unwrap()));
                     changed = true;
@@ -1653,7 +1683,9 @@ impl App {
         changed |= ui
             .add(egui::Slider::new(&mut tr.x, -1.0..=1.0).text("x (drives pan)"))
             .changed();
-        changed |= ui.add(egui::Slider::new(&mut tr.y, -1.0..=1.0).text("y")).changed();
+        changed |= ui
+            .add(egui::Slider::new(&mut tr.y, -1.0..=1.0).text("y (drives brightness)"))
+            .changed();
         changed |= ui
             .add(egui::Slider::new(&mut tr.scale, 0.1..=2.5).text("scale (drives distance)"))
             .changed();
@@ -1690,6 +1722,12 @@ impl App {
             .changed();
         changed |= ui
             .add(egui::Slider::new(&mut l.x_to_pan, 0.0..=1.0).text("canvas x -> pan"))
+            .changed();
+        changed |= ui
+            .add(
+                egui::Slider::new(&mut l.y_to_brightness, 0.0..=1.0)
+                    .text("canvas y -> brightness"),
+            )
             .changed();
         changed |= ui
             .add(
