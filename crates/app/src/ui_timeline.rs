@@ -3,7 +3,7 @@
 
 use crate::theme::{self, ACCENT, BG, LINE, PANEL, RAISED, RAISED_HI, TEXT, TEXT_DIM, TEXT_FAINT};
 use crate::ui_library::draw_peaks;
-use crate::{App, ClipDrag, PlayMode, Sel, SourceDrag};
+use crate::{App, BrowseDrag, ClipDrag, PlayMode, Sel, SourceDrag};
 use chromagrain_core::seq::{RowMode, StepPattern};
 use chromagrain_core::timeline::{Clip, ClipKind, Project};
 use eframe::egui::{self, Color32, Pos2, Rect, Stroke};
@@ -621,9 +621,11 @@ impl App {
             });
         }
 
-        // Drop media from the library.
+        // Drop media from the library (or straight from Browse).
+        let dragging_media = egui::DragAndDrop::has_payload_of_type::<SourceDrag>(ui.ctx())
+            || egui::DragAndDrop::has_payload_of_type::<BrowseDrag>(ui.ctx());
         if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
-            if resp.rect.contains(pos) && egui::DragAndDrop::has_payload_of_type::<SourceDrag>(ui.ctx()) {
+            if resp.rect.contains(pos) && dragging_media {
                 let row = row_at(pos.y).max(0) as usize;
                 let beat = snap(beat_at(pos.x));
                 let new_track = row >= n_tracks;
@@ -651,6 +653,14 @@ impl App {
                     row
                 };
                 self.place_source(payload.0, track, beat, PlayMode::Snippet);
+            }
+        }
+        if let Some(payload) = resp.dnd_release_payload::<BrowseDrag>() {
+            if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                let row = row_at(pos.y).max(0) as usize;
+                let beat = snap(beat_at(pos.x));
+                let place = crate::Place { track: row, new_track: row >= n_tracks, beat };
+                self.import_path(payload.0.clone(), Some(place));
             }
         }
     }

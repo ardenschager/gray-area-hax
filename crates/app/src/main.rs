@@ -16,10 +16,12 @@
 //! * **Inspector** (right) — edits whatever is selected (source, clip,
 //!   track or master). Nothing is editable in two places.
 
+mod browser;
 mod gpu;
 mod midi;
 mod playback;
 mod theme;
+mod ui_browse;
 mod ui_inspector;
 mod ui_library;
 mod ui_timeline;
@@ -148,16 +150,40 @@ impl PlayMode {
 #[derive(Debug, Clone, Copy)]
 pub struct SourceDrag(pub usize);
 
+/// Payload carried while dragging a file from the Browse tab (not yet
+/// imported — it's decoded when dropped).
+#[derive(Debug, Clone)]
+pub struct BrowseDrag(pub PathBuf);
+
+/// Where a file should land on the timeline once it has loaded.
+#[derive(Debug, Clone, Copy)]
+pub struct Place {
+    pub track: usize,
+    /// Append a fresh track instead of using `track`.
+    pub new_track: bool,
+    pub beat: f64,
+}
+
+/// Which list the library panel shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LibTab {
+    Project,
+    Browse,
+}
+
 enum Job {
-    Load(String),
+    Load(String, Option<Place>),
     Youtube(String),
 }
 
 enum WorkerMsg {
     Source(Result<Source, String>),
+    /// A file finished loading: remember its path, maybe place it.
+    Loaded(PathBuf, Option<Place>, Result<Source, String>),
     Script(Result<String, String>),
     Export(Result<String, String>),
 }
+
 
 /// In-progress clip drag on the timeline.
 #[derive(Debug, Clone, Copy)]
@@ -226,6 +252,13 @@ pub struct App {
     step_paint: Option<bool>,
     thumbs: HashMap<usize, egui::TextureHandle>,
     peaks: HashMap<usize, Arc<Vec<f32>>>,
+
+    lib_tab: LibTab,
+    browser: browser::Browser,
+    /// File path -> source id, so a file is only ever decoded once.
+    imported: HashMap<PathBuf, usize>,
+    /// Paths queued/decoding right now (avoid double-queueing).
+    loading: HashSet<PathBuf>,
 }
 
 impl App {
@@ -233,6 +266,8 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let project = Project::demo();
         let plan = Arc::new(plan_project(&project));
+        let mut browser = browser::Browser::new();
+        browser.ensure_started();
         App {
             plan_project: project.clone(),
             project: Arc::new(Mutex::new(project)),
@@ -276,6 +311,10 @@ impl App {
             step_paint: None,
             thumbs: HashMap::new(),
             peaks: HashMap::new(),
+            lib_tab: LibTab::Project,
+            browser,
+            imported: HashMap::new(),
+            loading: HashSet::new(),
         }
     }
 
@@ -554,6 +593,12 @@ impl App {
         }
         let name = p.sources.remove(src).name;
         drop(p);
+        self.imported.retain(|_, id| *id != src);
+        for id in self.imported.values_mut() {
+            if *id > src {
+                *id -= 1;
+            }
+        }
         self.thumbs.clear();
         self.peaks.clear();
         self.sel = Sel::None;
@@ -632,8 +677,36 @@ impl App {
     // ------------------------------------------------------------ workers
 
     fn queue_load(&mut self, path: String) {
-        self.jobs.push_back(Job::Load(path));
+        self.import_path(PathBuf::from(path), None);
+    }
+
+    /// Bring a file into the library (once) and optionally drop it on the
+    /// timeline. Already-imported files are reused instantly.
+    pub(crate) fn import_path(&mut self, path: PathBuf, place: Option<Place>) {
+        if let Some(&id) = self.imported.get(&path) {
+            match place {
+                Some(pl) => self.place_at(id, pl),
+                None => self.select(Sel::Source(id)),
+            }
+            return;
+        }
+        if !self.loading.insert(path.clone()) && place.is_none() {
+            return; // already on its way
+        }
+        self.jobs.push_back(Job::Load(path.display().to_string(), place));
         self.pump_jobs();
+    }
+
+    fn place_at(&mut self, src: usize, pl: Place) {
+        let track = if pl.new_track {
+            let mut p = self.project.lock().unwrap();
+            let n = p.tracks.len();
+            p.add_track(&format!("track {}", n + 1))
+        } else {
+            pl.track
+        };
+        self.last_source = src;
+        self.place_source(src, track, pl.beat, PlayMode::Snippet);
     }
 
     fn queue_youtube(&mut self, url: String) {
@@ -649,15 +722,21 @@ impl App {
         let sr = self.project.lock().unwrap().sample_rate;
         let tx = self.tx.clone();
         match job {
-            Job::Load(path) => {
-                let short = std::path::Path::new(&path)
-                    .file_name()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or(path.clone());
+            Job::Load(path, place) => {
+                let pb = PathBuf::from(&path);
+                // A duplicate queued before the first finished: reuse it.
+                if let Some(&id) = self.imported.get(&pb) {
+                    if let Some(pl) = place {
+                        self.place_at(id, pl);
+                    }
+                    self.pump_jobs();
+                    return;
+                }
+                let short = pb.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or(path.clone());
                 self.busy = Some(format!("loading {short}…"));
                 std::thread::spawn(move || {
-                    let res = media::load_source(std::path::Path::new(&path), sr);
-                    let _ = tx.send(WorkerMsg::Source(res));
+                    let res = media::load_source(&pb, sr);
+                    let _ = tx.send(WorkerMsg::Loaded(pb, place, res));
                 });
             }
             Job::Youtube(url) => {
@@ -789,6 +868,25 @@ impl App {
                     };
                 }
                 WorkerMsg::Source(Err(e)) => self.status = format!("couldn't add media: {e}"),
+                WorkerMsg::Loaded(path, place, res) => {
+                    self.loading.remove(&path);
+                    match res {
+                        Ok(src) => {
+                            let name = src.name.clone();
+                            let id = self.project.lock().unwrap().add_source(src);
+                            self.imported.insert(path, id);
+                            match place {
+                                Some(pl) => self.place_at(id, pl),
+                                None => {
+                                    self.select(Sel::Source(id));
+                                    self.status = format!("added '{name}' — drag it onto a track");
+                                }
+                            }
+                            self.mark_now();
+                        }
+                        Err(e) => self.status = format!("couldn't add {}: {e}", path.display()),
+                    }
+                }
                 WorkerMsg::Script(Ok(log)) => {
                     self.script_log = if log.is_empty() { "(ok)".into() } else { log };
                     self.mark_now();
@@ -858,6 +956,7 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_midi();
         self.poll_workers();
+        self.browser.poll(ctx);
         self.handle_shortcuts(ctx);
         self.sync_project();
 
@@ -892,8 +991,8 @@ impl eframe::App for App {
                 .show(ctx, |ui| self.script_ui(ui));
         }
         egui::SidePanel::left("library")
-            .default_width(250.0)
-            .width_range(200.0..=380.0)
+            .default_width(if self.lib_tab == LibTab::Browse { 380.0 } else { 250.0 })
+            .width_range(200.0..=640.0)
             .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(egui::Margin::same(10)))
             .show(ctx, |ui| self.library_ui(ui));
         egui::SidePanel::right("inspector")

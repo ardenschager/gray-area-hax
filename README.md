@@ -222,6 +222,27 @@ The window has three places, and every thing lives in exactly one of them:
 8. **Render** from *export* in the top bar — mp4 or wav, rendered by the
    deterministic offline engine.
 
+### Browse — every video on this Mac
+
+The library's **Browse** tab turns every folder of videos under
+`~/Documents`, `~/Movies`, `~/Downloads`, `~/Desktop`, `~/Pictures` and
+`~/Screencaps` into one sample library, grouped by folder (skipping
+`node_modules`, build output, app bundles, etc.).
+
+- **Drag a tile onto a track** — it's imported on drop and lands there as a
+  snippet. Double-click drops it at the playhead; *add to library* just
+  imports it. A file is only ever decoded once: using it again reuses the
+  same library source ("in project" badge).
+- **Search by meaning**: projects that ship a semantic corpus
+  (`public/corpus.json` + `public/vectors.bin`, like video-grid) are listed
+  first. Type a description and press **enter** — the query is embedded with
+  the corpus' own model (read from `corpus.json`) and ranked by cosine
+  similarity. Needs `GEMINI_API_KEY` (env, or the project's `.env`). Typing
+  without enter is a plain word filter, which works everywhere.
+- **shuffle** reorders what's showing, for happy accidents.
+- Thumbnails are grabbed by ffmpeg in the background and cached in
+  `~/Library/Caches/chromagrain/thumbs`.
+
 ### Headless / scripted
 
 ```sh

@@ -2,8 +2,8 @@
 //! files, YouTube scrapes, synths and derived artifacts alike. Cards are
 //! dragged onto the timeline (or into a pattern) to be used.
 
-use crate::theme::{self, RAISED, RAISED_HI, TEXT, TEXT_DIM};
-use crate::{App, PlayMode, Sel, SourceDrag};
+use crate::theme::{self, ACCENT, RAISED, RAISED_HI, TEXT, TEXT_DIM};
+use crate::{App, BrowseDrag, LibTab, PlayMode, Sel, SourceDrag};
 use chromagrain_core::timeline::Source;
 use eframe::egui;
 use std::sync::Arc;
@@ -11,11 +11,39 @@ use std::sync::Arc;
 impl App {
     pub(crate) fn library_ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Library").heading().color(TEXT));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.menu_button(egui::RichText::new("+ add").strong(), |ui| self.add_menu(ui));
-            });
+            let n_src = self.project.lock().unwrap().sources.len();
+            let tab = |ui: &mut egui::Ui, cur: &mut LibTab, t: LibTab, label: String| {
+                let on = *cur == t;
+                let text = egui::RichText::new(label).size(15.0).color(if on { TEXT } else { TEXT_DIM });
+                let r = ui.add(egui::Button::new(text).frame(false));
+                if on {
+                    let y = r.rect.bottom() + 1.0;
+                    ui.painter().line_segment(
+                        [egui::pos2(r.rect.left(), y), egui::pos2(r.rect.right(), y)],
+                        egui::Stroke::new(2.0, ACCENT),
+                    );
+                }
+                if r.clicked() {
+                    *cur = t;
+                }
+            };
+            tab(ui, &mut self.lib_tab, LibTab::Project, format!("Project · {n_src}"));
+            let total = self.browser.total_clips();
+            let browse = if total > 0 { format!("Browse · {total}") } else { "Browse".into() };
+            tab(ui, &mut self.lib_tab, LibTab::Browse, browse);
+            if self.lib_tab == LibTab::Project {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.menu_button(egui::RichText::new("+ add").strong(), |ui| self.add_menu(ui));
+                });
+            }
         });
+        ui.add_space(6.0);
+        if self.lib_tab == LibTab::Browse {
+            theme::hint(ui, "videos on this Mac · drag onto a track · double-click = at playhead");
+            ui.add_space(4.0);
+            self.browse_ui(ui);
+            return;
+        }
         theme::hint(ui, "drag media onto a track · drop files anywhere");
         ui.add_space(4.0);
 
@@ -217,18 +245,22 @@ impl App {
 
     /// Ghost label that follows the pointer while a card is dragged.
     pub(crate) fn paint_drag_ghost(&self, ctx: &egui::Context) {
-        let Some(payload) = egui::DragAndDrop::payload::<SourceDrag>(ctx) else { return };
+        let (name, color) = if let Some(payload) = egui::DragAndDrop::payload::<SourceDrag>(ctx) {
+            let p = self.project.lock().unwrap();
+            (p.sources.get(payload.0).map(|s| s.name.clone()).unwrap_or_default(), theme::source_color(payload.0))
+        } else if let Some(payload) = egui::DragAndDrop::payload::<BrowseDrag>(ctx) {
+            let stem = payload.0.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            (stem, ACCENT)
+        } else {
+            return;
+        };
         let Some(pos) = ctx.pointer_latest_pos() else { return };
         ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
-        let name = {
-            let p = self.project.lock().unwrap();
-            p.sources.get(payload.0).map(|s| s.name.clone()).unwrap_or_default()
-        };
         let painter =
             ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("dnd_ghost")));
         let galley = painter.layout_no_wrap(name, egui::FontId::proportional(12.5), egui::Color32::BLACK);
         let rect = egui::Rect::from_min_size(pos + egui::vec2(12.0, 8.0), galley.size() + egui::vec2(16.0, 8.0));
-        painter.rect_filled(rect, 5.0, theme::source_color(payload.0));
+        painter.rect_filled(rect, 5.0, color);
         painter.galley(rect.min + egui::vec2(8.0, 4.0), galley, egui::Color32::BLACK);
     }
 
