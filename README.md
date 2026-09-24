@@ -140,8 +140,10 @@ versa). It will be crunchy.
   derived source (feathered edges), so the cat — and only the cat —
   granulates, sequences, transforms and composites over your other
   tracks. Purely visual: the source's audio passes through untouched.
-  Runs as an optional Python sidecar (`tools/segment.py`); the UI button
-  and `segment(src, "cat")` script call both use it.
+  Runs as a sidecar: Apple Vision on macOS out of the box
+  (`tools/segment_vision.swift` — people or any foreground subject), or
+  SAM 3 in Python (`tools/segment.py`) for arbitrary text prompts; the UI
+  button and `segment(src, "cat")` script call both use it.
 - **Scripting** — the whole engine is drivable from [rhai](https://rhai.rs)
   scripts, in the in-app console or headless from the CLI.
 - **Bounce & play** — cpal audio playback with synced video preview, and
@@ -157,16 +159,32 @@ versa). It will be crunchy.
 | ALSA headers (Linux only) | audio device + MIDI | `sudo apt install libasound2-dev pkg-config` |
 | ffmpeg + ffprobe | load mp4/mov/webm…, export mp4 | `sudo apt install ffmpeg` / `brew install ffmpeg` |
 | yt-dlp (optional) | YouTube scraping | `pip install yt-dlp` |
-| SAM 3 (optional) | object segmentation (`segment`) | see below |
+| Xcode CLI tools (macOS) | Vision segmentation (`segment`) | `xcode-select --install` |
+| SAM 3 (optional) | text-prompted segmentation on CUDA | see below |
 
 Without ffmpeg you can still load .wav files, use procedural sources, and
 render .wav; without yt-dlp everything except `youtube(...)` works.
 macOS and Windows need no extra system libraries.
 
-**SAM 3 setup (optional, GPU recommended).** The `segment` button/call cuts
-a text-prompted object ("cat") out of a source's video, tracked across
-frames, by shelling out to `tools/segment.py` — Meta's Segment Anything 3
-runs in Python, never inside the Rust process:
+**Segmentation setup.** The `segment` button/call cuts a text-prompted
+object out of a source's video, tracked across frames, by shelling out to
+a sidecar process (the model never lives inside the Rust process):
+
+- **macOS: works out of the box.** `tools/segment_vision.swift` uses
+  Apple's Vision framework on-device — no Python, no model download.
+  chromagrain compiles it with `swiftc -O` on first use (needs the Xcode
+  command-line tools: `xcode-select --install`) and caches the binary in
+  `~/Library/Caches/chromagrain/`. Prompts mentioning people ("person",
+  "dancer", "crowd", "woman"…) cut out **people**; any other prompt
+  ("subject", "cat", "car") cuts out **every salient foreground subject** —
+  Vision can't pick a class by name, so on macOS the prompt only selects
+  between those two modes. Needs macOS 14+ for subject mode (people work
+  on 12+). About 75 ms/frame for people, 25–35 ms/frame for subjects
+  (400×226, M2 Pro).
+- **SAM 3 (optional, GPU recommended)** for true arbitrary text prompts
+  ("the red car", "cat") via `tools/segment.py` — Meta's Segment Anything 3
+  in Python. Used automatically where Vision isn't available (Linux,
+  Windows); on macOS point `CHROMAGRAIN_SEGMENT_CMD` at it to override:
 
 ```sh
 pip install torch torchvision          # CUDA build — see pytorch.org
@@ -174,11 +192,14 @@ git clone https://github.com/facebookresearch/sam3 && pip install -e sam3
 # request checkpoint access: https://huggingface.co/facebook/sam3
 hf auth login
 python3 tools/segment.py --check       # should print "sam3 ok (cuda)"
+# macOS only, to prefer SAM 3 over Vision:
+export CHROMAGRAIN_SEGMENT_CMD="python3 tools/segment.py"
 ```
 
 Any other segmenter can stand in by setting `CHROMAGRAIN_SEGMENT_CMD` to a
-command with the same contract (video + prompt + out dir → one binary PGM
-mask per frame); chromagrain's tests use a tiny stub this way.
+command with the same contract (video + prompt + out dir → one PGM mask
+per frame, 255 = keep, soft values = soft edges); chromagrain's tests use
+a tiny stub this way.
 
 ### 2. Build & launch
 

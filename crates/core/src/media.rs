@@ -400,38 +400,111 @@ pub fn load_youtube_source(url: &str, cache_dir: &Path, sample_rate: u32) -> Med
     Ok(src)
 }
 
-// --------------------------------------------------- SAM 3 segmentation
+// --------------------------------------------------- segmentation
 //
-// Text-prompted object segmentation via a Python sidecar (tools/segment.py,
-// SAM 3 under the hood). The sidecar receives a video file + prompt and
-// writes one binary PGM mask per frame; we bake those masks into the alpha
-// channel of a derived Source, so "the cat" becomes an ordinary source
-// that granulates, sequences and composites everywhere — transparent
-// outside the tracked object.
+// Text-prompted object segmentation via a sidecar process. On macOS the
+// default is tools/segment_vision.swift (Apple Vision: people or any
+// salient foreground subject, on-device, nothing to install beyond the
+// Xcode command-line tools); elsewhere / as an alternative, tools/segment.py
+// (SAM 3, arbitrary text prompts, wants CUDA). The sidecar receives a
+// video file + prompt and writes one PGM mask per frame; we bake those
+// masks into the alpha channel of a derived Source, so "the cat" becomes
+// an ordinary source that granulates, sequences and composites everywhere
+// — transparent outside the tracked object.
 
 /// Feather radius for mask edges, as a fraction of the frame's smaller
 /// dimension. Softens the cutout so composites don't look sticker-sharp.
 const MASK_FEATHER_FRAC: f32 = 0.01;
 
-/// The sidecar command: `CHROMAGRAIN_SEGMENT_CMD` (whitespace-split)
-/// overrides; otherwise `python3 tools/segment.py` when the script exists
-/// relative to the working directory.
+/// The sidecar command, resolved in order:
+/// 1. `CHROMAGRAIN_SEGMENT_CMD` (whitespace-split) overrides everything;
+/// 2. on macOS, the Vision sidecar (compiled once from
+///    tools/segment_vision.swift and cached — see [`vision_sidecar`]);
+/// 3. `python3 tools/segment.py` (SAM 3) when the script exists relative
+///    to the working directory.
 pub fn segment_cmd() -> Option<Vec<String>> {
+    resolve_segment_cmd().ok()
+}
+
+/// [`segment_cmd`] with the reason when nothing usable is found (e.g. the
+/// Vision sidecar's compile errors), for surfacing in the UI.
+pub fn resolve_segment_cmd() -> MediaResult<Vec<String>> {
     if let Ok(cmd) = std::env::var("CHROMAGRAIN_SEGMENT_CMD") {
         let parts: Vec<String> = cmd.split_whitespace().map(String::from).collect();
         if !parts.is_empty() {
-            return Some(parts);
+            return Ok(parts);
         }
+    }
+    #[allow(unused_mut)]
+    let mut why = String::from("no segmenter configured (CHROMAGRAIN_SEGMENT_CMD unset");
+    #[cfg(target_os = "macos")]
+    match vision_sidecar() {
+        Ok(bin) => return Ok(vec![bin.to_string_lossy().into_owned()]),
+        Err(e) => why.push_str(&format!("; Vision sidecar unavailable: {e}")),
     }
     let script = Path::new("tools/segment.py");
     if script.exists() {
-        return Some(vec!["python3".into(), "tools/segment.py".into()]);
+        return Ok(vec!["python3".into(), "tools/segment.py".into()]);
     }
-    None
+    why.push_str("; tools/segment.py missing)");
+    Err(why)
+}
+
+/// Locate tools/segment_vision.swift: next to this crate's workspace (baked
+/// in at compile time), else relative to the working directory.
+#[cfg(target_os = "macos")]
+fn vision_source() -> Option<PathBuf> {
+    let baked = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/segment_vision.swift");
+    let local = PathBuf::from("tools/segment_vision.swift");
+    [baked, local].into_iter().find(|p| p.exists())
+}
+
+/// Path of the compiled Vision sidecar, building it with `swiftc -O` into
+/// ~/Library/Caches/chromagrain/ on first use (and whenever the .swift is
+/// newer than the cached binary). Errors carry swiftc's diagnostics.
+#[cfg(target_os = "macos")]
+pub fn vision_sidecar() -> MediaResult<PathBuf> {
+    let src = vision_source().ok_or("tools/segment_vision.swift not found")?;
+    let cache = std::env::var_os("HOME")
+        .map(|h| PathBuf::from(h).join("Library/Caches/chromagrain"))
+        .unwrap_or_else(|| std::env::temp_dir().join("chromagrain"));
+    let bin = cache.join("segment_vision");
+    let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let fresh = match (mtime(&bin), mtime(&src)) {
+        (Some(b), Some(s)) => b >= s,
+        _ => false,
+    };
+    if fresh {
+        return Ok(bin);
+    }
+    std::fs::create_dir_all(&cache).map_err(|e| format!("create {cache:?}: {e}"))?;
+    // Build to a temp name then rename, so a concurrent caller never runs
+    // a half-written binary.
+    let tmp = cache.join(format!("segment_vision.build-{}", std::process::id()));
+    let out = Command::new("swiftc")
+        .arg("-O")
+        .arg(&src)
+        .arg("-o")
+        .arg(&tmp)
+        .output()
+        .map_err(|e| format!("swiftc not available (install Xcode command-line tools): {e}"))?;
+    if !out.status.success() {
+        let _ = std::fs::remove_file(&tmp);
+        let err = String::from_utf8_lossy(&out.stderr);
+        let errs: Vec<&str> = err.lines().filter(|l| l.contains("error")).take(8).collect();
+        return Err(format!(
+            "compiling {} failed:\n{}",
+            src.display(),
+            if errs.is_empty() { err.trim().to_string() } else { errs.join("\n") }
+        ));
+    }
+    std::fs::rename(&tmp, &bin).map_err(|e| format!("install {bin:?}: {e}"))?;
+    Ok(bin)
 }
 
 /// True when a segmenter is configured AND reports itself ready
-/// (`--check` exits 0; for the default sidecar that means SAM 3 imports).
+/// (`--check` exits 0; for SAM 3 that means it imports, for Vision that the
+/// sidecar compiled and runs).
 pub fn segment_available() -> bool {
     let Some(cmd) = segment_cmd() else { return false };
     Command::new(&cmd[0])
@@ -574,7 +647,7 @@ pub fn segment_video(
     prompt: &str,
     work_dir: &Path,
 ) -> MediaResult<VideoClip> {
-    let cmd = segment_cmd().ok_or("no segmenter configured (tools/segment.py missing and CHROMAGRAIN_SEGMENT_CMD unset)")?;
+    let cmd = resolve_segment_cmd()?;
     if video.frames.is_empty() {
         return Err("source has no video".into());
     }
@@ -691,8 +764,78 @@ mod tests {
         assert_eq!(f.data[0], clip.frames[0].data[0]);
     }
 
+    /// Segmentation tests read/write CHROMAGRAIN_SEGMENT_CMD (process-global),
+    /// so they must not run concurrently.
+    static SEGMENT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// End-to-end: Apple Vision sidecar compiled from tools/ on the fly,
+    /// run through segment_source on a real clip (or a synthetic one).
+    /// Ignored by default (~10-20s incl. first swiftc build):
+    /// `cargo test --release -p chromagrain-core -- --ignored vision`
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn segment_with_vision_sidecar() {
+        let _g = SEGMENT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not available");
+            return;
+        }
+        std::env::remove_var("CHROMAGRAIN_SEGMENT_CMD");
+        let bin = vision_sidecar().expect("vision sidecar should compile");
+        assert!(segment_cmd().unwrap()[0] == bin.to_string_lossy());
+        assert!(segment_available(), "vision --check should pass");
+
+        let clip = Path::new(concat!(
+            "/Users/ardenschager/Documents/Projects/video-grid/public/clips/",
+            "ff_home_movie_000448_1947_detroit_family_0002.mp4"
+        ));
+        let src = if clip.exists() {
+            let mut s = load_source(clip, 44100).unwrap();
+            // Keep the test quick: first ~2s of frames.
+            let v = s.video.as_ref().unwrap();
+            let frames = v.frames.iter().take(48).cloned().collect();
+            s.video = Some(std::sync::Arc::new(VideoClip { frames, fps: v.fps }));
+            s
+        } else {
+            eprintln!("real clip missing; using a synthetic pattern");
+            Source {
+                name: "pat".into(),
+                audio: None,
+                video: Some(std::sync::Arc::new(
+                    crate::video::VideoClip::test_pattern(160, 120, 12.0, 1.0),
+                )),
+                base_hz: 220.0,
+            }
+        };
+        let n_in = src.video.as_ref().unwrap().frames.len();
+        let dir = std::env::temp_dir().join("chromagrain-test-vision");
+        for prompt in ["person", "subject"] {
+            let work = dir.join(prompt);
+            let out = segment_source(&src, prompt, &work).unwrap();
+            let v = out.video.as_ref().unwrap();
+            assert_eq!(v.frames.len(), n_in);
+            // The sidecar wrote one mask per encoded frame (±1 for the
+            // encoder's -shortest trim).
+            let n_masks = std::fs::read_dir(work.join("masks")).unwrap().count();
+            assert!(n_masks.abs_diff(n_in) <= 1, "{prompt}: {n_masks} masks for {n_in} frames");
+            if clip.exists() {
+                // Real footage with people: alpha must actually vary.
+                let (mut lo, mut hi) = (255u8, 0u8);
+                for f in &v.frames {
+                    for a in f.data.iter().skip(3).step_by(4) {
+                        lo = lo.min(*a);
+                        hi = hi.max(*a);
+                    }
+                }
+                assert!(lo < 20 && hi > 235, "{prompt}: alpha range {lo}..{hi}");
+            }
+        }
+    }
+
     #[test]
     fn segment_pipeline_with_stub_sidecar() {
+        let _g = SEGMENT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         if !ffmpeg_available() {
             eprintln!("skipping: ffmpeg not available");
             return;
