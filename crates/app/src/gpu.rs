@@ -937,7 +937,7 @@ impl GpuPreview {
                 let mut track_any = !track.effects.is_empty();
 
                 for cp in &plans {
-                    let clip = &track.clips[cp.clip_index];
+                    let Some(clip) = track.clips.get(cp.clip_index) else { continue };
                     let any_active = cp
                         .parts
                         .iter()

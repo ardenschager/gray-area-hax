@@ -192,27 +192,35 @@ directly later. `cargo test` runs the full engine test suite.
 
 ### 3. First session, in 60 seconds
 
-1. The app opens with a demo project. Press **▶ play** — playback is live
-   (GPU-rendered video, streaming audio); tweak any slider while it runs.
-2. **Load your media**: type a file path into the left panel and hit
-   *load file* (any format ffmpeg reads), or paste a YouTube URL and hit
-   *scrape youtube*. The source's base pitch is auto-detected.
-3. **Put something on the timeline**: pick a source, pick a track, then
-   *grains* (granular cloud), *snippet* (plays straight), or *pattern*
-   (step sequencer). Clips land at the playhead; drag them around
-   (snapping follows the quantize picker in the top bar).
-4. **Shape it** in the right panel: grain params, key quantize, filters,
-   the AV effect chain, correspondence dials, and drag-to-draw automation.
-5. **Sequence** in the panel under the timeline: click steps on/off, give
-   a row its own step count for polymeter, or flip a row to *loop* mode.
-6. **Play it like a sampler**: click the pads in *pads / midi* — or plug
-   in a MIDI keyboard, pick its port in the dropdown, and play. Notes are
-   sampler-mapped (C4 = the selected clip's pitch); this works even with
-   the transport stopped. Map hardware knobs with *learn cc →* (pick a
-   parameter, then twist a knob).
-7. **Render** with the *render mp4* / *render wav* buttons — the output
-   lands in the working directory as `chromagrain-render.mp4/.wav`,
-   rendered by the deterministic offline engine.
+The window has three places, and every thing lives in exactly one of them:
+
+| where | what lives there |
+|-------|------------------|
+| **Library** (left) | all media — files, YouTube scrapes, synths, and derived artifacts (paulstretch washes, cutouts). Each gets a color that follows it everywhere. |
+| **Timeline** (center) | tracks, clips and the master bus. Selecting a pattern clip opens its step grid right below. |
+| **Inspector** (right) | edits whatever you selected — media, clip, track or master. |
+
+1. The app opens with a demo project. Press **space** — playback is live
+   (GPU-rendered video, streaming audio); tweak anything while it runs.
+2. **Add media**: *+ add* in the library (files, a YouTube link, or a
+   synth) — or just drop files onto the window. Base pitch is auto-detected.
+3. **Use it**: drag a library card onto a track (or below the last track
+   for a new one). It lands as a *snippet*.
+4. **Choose how it plays**: click the clip and flip *snippet / grains /
+   pattern* at the top of the inspector — same clip, different mode. The
+   inspector only shows the controls that mode uses; key, canvas, effects,
+   filters, automation and sound↔picture links fold away below.
+5. **Arrange**: drag clips (across tracks too), drag their right edge to
+   resize, right-click for more; ⌘D duplicates, ⌫ deletes. Drag or scroll
+   on the preview to place the selected clip's picture (which also pans it).
+6. **Sequence**: with a pattern clip selected, click/drag steps in the grid
+   under the timeline, give a row its own step count for polymeter, flip a
+   row to *loop*, or drop media on the grid for a new row.
+7. **Play it like a sampler**: *midi* in the top bar — pick a port, use the
+   pads, and map knobs (*learn*, then twist). Notes play the selected clip
+   (C4 = unity), even with the transport stopped.
+8. **Render** from *export* in the top bar — mp4 or wav, rendered by the
+   deterministic offline engine.
 
 ### Headless / scripted
 
