@@ -64,12 +64,13 @@ pub fn load_wav(path: &Path) -> MediaResult<AudioClip> {
                 .map_err(|e| e.to_string())?
         }
     };
-    // Mixdown to mono.
-    let samples: Vec<f32> = raw
-        .chunks(channels)
-        .map(|c| c.iter().sum::<f32>() / channels as f32)
-        .collect();
-    Ok(AudioClip::new(samples, spec.sample_rate))
+    if channels >= 2 {
+        // Keep the first two channels as stereo (extra channels dropped).
+        let (l, r): (Vec<f32>, Vec<f32>) =
+            raw.chunks_exact(channels).map(|c| (c[0], c[1])).unzip();
+        return Ok(AudioClip::stereo(&l, &r, spec.sample_rate));
+    }
+    Ok(AudioClip::new(raw, spec.sample_rate))
 }
 
 pub fn save_wav(path: &Path, buffer: &StereoBuffer) -> MediaResult<()> {
@@ -100,7 +101,8 @@ pub fn save_frame_png(path: &Path, frame: &Frame) -> MediaResult<()> {
 
 // ------------------------------------------------------------- ffmpeg i/o
 
-/// Decode any media file's audio track to a mono AudioClip via ffmpeg.
+/// Decode any media file's audio track via ffmpeg (stereo when the source
+/// has distinct channels; mono sources come back as mono).
 pub fn decode_audio(path: &Path, sample_rate: u32) -> MediaResult<AudioClip> {
     let out = Command::new("ffmpeg")
         .args(["-v", "error", "-i"])
@@ -114,7 +116,7 @@ pub fn decode_audio(path: &Path, sample_rate: u32) -> MediaResult<AudioClip> {
             "-acodec",
             "pcm_f32le",
             "-ac",
-            "1",
+            "2",
             "-ar",
             &sample_rate.to_string(),
             "-",
@@ -127,15 +129,20 @@ pub fn decode_audio(path: &Path, sample_rate: u32) -> MediaResult<AudioClip> {
             String::from_utf8_lossy(&out.stderr)
         ));
     }
-    let samples: Vec<f32> = out
+    let (l, r): (Vec<f32>, Vec<f32>) = out
         .stdout
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .collect();
-    if samples.is_empty() {
+        .chunks_exact(8)
+        .map(|b| {
+            (
+                f32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+                f32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+            )
+        })
+        .unzip();
+    if l.is_empty() {
         return Err("no audio stream decoded".into());
     }
-    Ok(AudioClip::new(samples, sample_rate))
+    Ok(AudioClip::stereo(&l, &r, sample_rate))
 }
 
 /// Probe a media file's video stream dimensions with ffprobe.
@@ -735,6 +742,20 @@ mod tests {
             / loaded.samples.len() as f32)
             .sqrt();
         assert!((orig_rms - load_rms).abs() < 0.02);
+        assert!(!loaded.is_stereo(), "identical channels load as mono");
+
+        // Distinct channels stay stereo.
+        let mut buf = StereoBuffer::new(0.2, 48000);
+        for i in 0..buf.len() {
+            buf.left[i] = 0.5 * (i as f32 * 0.03).sin();
+        }
+        let path = dir.join("stereo.wav");
+        save_wav(&path, &buf).unwrap();
+        let st = load_wav(&path).unwrap();
+        assert!(st.is_stereo());
+        let (l, r) = st.left_right();
+        assert!(r.iter().all(|v| v.abs() < 1e-3));
+        assert!(l.iter().map(|v| v.abs()).fold(0.0, f32::max) > 0.4);
     }
 
     #[test]
@@ -904,5 +925,29 @@ print("ok 4")
         let f = crate::video::VideoClip::test_pattern(32, 24, 10.0, 0.2).frames[0].clone();
         save_frame_png(&path, &f).unwrap();
         assert!(path.metadata().unwrap().len() > 100);
+    }
+
+    /// `CG_STEREO_FILE=/path/to/stereo.mp4 cargo test --release -p chromagrain-core stereo_media -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn stereo_media_keeps_its_image() {
+        let Ok(path) = std::env::var("CG_STEREO_FILE") else { return };
+        let src = load_source(Path::new(&path), 48000).unwrap();
+        let a = src.audio.expect("audio");
+        let (l, r) = a.left_right();
+        let e = |v: &[f32]| v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>();
+        let side = a.side.as_deref().map(e).unwrap_or(0.0);
+        eprintln!("stereo={} side/mid energy {:.3}", a.is_stereo(), side / e(&a.samples).max(1e-12));
+        assert!(a.is_stereo());
+        // Straight playback through the grain renderer keeps L != R.
+        let ev = crate::grain::GrainEvent {
+            onset: 0.0, source_pos: 0.0, duration: a.duration().min(5.0) as f32, pitch_ratio: 1.0,
+            gain: 1.0, pan: 0.0, envelope: 0.05, env_skew: 0.0, reverse: false, id: 0,
+        };
+        let mut out = StereoBuffer::new(ev.duration as f64, 48000);
+        crate::audio::render_grains_audio(&a, &[ev], &mut out, 0.0);
+        let d: f64 = out.left.iter().zip(&out.right).map(|(x, y)| ((x - y) as f64).powi(2)).sum();
+        eprintln!("rendered L-R energy {:.3} (L {:.3}, R {:.3}); source L {:.3} R {:.3}", d, e(&out.left), e(&out.right), e(&l), e(&r));
+        assert!(d > 1e-3);
     }
 }

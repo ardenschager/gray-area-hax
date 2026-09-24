@@ -4,16 +4,52 @@ use crate::dsp::{apply_filter_chain, grain_env, grain_env_skewed, FilterSpec};
 use crate::grain::GrainEvent;
 use serde::{Deserialize, Serialize};
 
-/// Mono audio clip (sources are mixed down on load; grains re-spatialize).
+/// Audio clip stored as mid (+ optional side). `samples` is always the
+/// mono mid signal `(L+R)/2`, so analysis (pitch, peaks, scopes) stays mono;
+/// stereo sources also carry `side = (L-R)/2`, which the grain renderer
+/// uses to keep the original width (`L = mid+side`, `R = mid-side`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AudioClip {
     pub samples: Vec<f32>,
     pub sample_rate: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub side: Option<Vec<f32>>,
 }
 
 impl AudioClip {
     pub fn new(samples: Vec<f32>, sample_rate: u32) -> AudioClip {
-        AudioClip { samples, sample_rate }
+        AudioClip { samples, sample_rate, side: None }
+    }
+
+    /// Build from left/right channels. Falls back to mono when the channels
+    /// are (near) identical, so dual-mono files cost nothing extra.
+    pub fn stereo(left: &[f32], right: &[f32], sample_rate: u32) -> AudioClip {
+        let n = left.len().min(right.len());
+        let mid: Vec<f32> = (0..n).map(|i| 0.5 * (left[i] + right[i])).collect();
+        let side: Vec<f32> = (0..n).map(|i| 0.5 * (left[i] - right[i])).collect();
+        let side_peak = side.iter().fold(0f32, |m, v| m.max(v.abs()));
+        AudioClip {
+            samples: mid,
+            sample_rate,
+            side: (side_peak > 1e-4).then_some(side),
+        }
+    }
+
+    pub fn is_stereo(&self) -> bool {
+        self.side.is_some()
+    }
+
+    /// Left and right channels (copies; mono clips return mid twice).
+    pub fn left_right(&self) -> (Vec<f32>, Vec<f32>) {
+        match &self.side {
+            None => (self.samples.clone(), self.samples.clone()),
+            Some(side) => self
+                .samples
+                .iter()
+                .zip(side)
+                .map(|(m, s)| (m + s, m - s))
+                .unzip(),
+        }
     }
 
     pub fn duration(&self) -> f64 {
@@ -60,6 +96,10 @@ impl AudioClip {
     pub fn filtered(&self, chain: &[FilterSpec]) -> AudioClip {
         let mut out = self.clone();
         apply_filter_chain(&mut out.samples, chain, self.sample_rate as f32);
+        // Linear filters: filtering mid and side == filtering L and R.
+        if let Some(side) = out.side.as_mut() {
+            apply_filter_chain(side, chain, self.sample_rate as f32);
+        }
         out
     }
 
@@ -67,26 +107,32 @@ impl AudioClip {
     /// linear when grains are pitched, especially downward.
     #[inline]
     fn sample_hermite(&self, idx: f64) -> f32 {
-        if idx < 0.0 {
-            return 0.0;
-        }
-        let i = idx as usize;
-        let n = self.samples.len();
-        if i + 1 >= n {
-            return 0.0;
-        }
-        let frac = (idx - i as f64) as f32;
-        let xm1 = if i > 0 { self.samples[i - 1] } else { self.samples[i] };
-        let x0 = self.samples[i];
-        let x1 = self.samples[i + 1];
-        let x2 = if i + 2 < n { self.samples[i + 2] } else { x1 };
-        let c = (x1 - xm1) * 0.5;
-        let v = x0 - x1;
-        let w = c + v;
-        let a = w + v + (x2 - x0) * 0.5;
-        let b = w + a;
-        ((a * frac - b) * frac + c) * frac + x0
+        hermite(&self.samples, idx)
     }
+}
+
+/// 4-point Catmull-Rom (Hermite) interpolation of `x` at fractional `idx`.
+#[inline]
+fn hermite(x: &[f32], idx: f64) -> f32 {
+    if idx < 0.0 {
+        return 0.0;
+    }
+    let i = idx as usize;
+    let n = x.len();
+    if i + 1 >= n {
+        return 0.0;
+    }
+    let frac = (idx - i as f64) as f32;
+    let xm1 = if i > 0 { x[i - 1] } else { x[i] };
+    let x0 = x[i];
+    let x1 = x[i + 1];
+    let x2 = if i + 2 < n { x[i + 2] } else { x1 };
+    let c = (x1 - xm1) * 0.5;
+    let v = x0 - x1;
+    let w = c + v;
+    let a = w + v + (x2 - x0) * 0.5;
+    let b = w + a;
+    ((a * frac - b) * frac + c) * frac + x0
 }
 
 /// Interleaved-free stereo render target.
@@ -186,6 +232,7 @@ pub fn render_grains_audio_spatial(
     let out_sr = out.sample_rate as f64;
     let src_sr = clip.sample_rate as f64;
     let out_len = out.len() as i64;
+    let side = clip.side.as_deref();
 
     for ev in events {
         // Rounded independently so block-wise rendering at t0 = k/sr is
@@ -216,9 +263,19 @@ pub fn render_grains_audio_spatial(
             } else {
                 i as f64 * ev.pitch_ratio as f64
             };
-            let s = clip.sample_hermite(src_start + src_off) * env;
-            out.left[oi as usize] += s * gain_l;
-            out.right[oi as usize] += s * gain_r;
+            let idx = src_start + src_off;
+            let m = clip.sample_hermite(idx) * env;
+            match side {
+                None => {
+                    out.left[oi as usize] += m * gain_l;
+                    out.right[oi as usize] += m * gain_r;
+                }
+                Some(sd) => {
+                    let s = hermite(sd, idx) * env;
+                    out.left[oi as usize] += (m + s) * gain_l;
+                    out.right[oi as usize] += (m - s) * gain_r;
+                }
+            }
         }
     }
 }
@@ -286,5 +343,45 @@ mod tests {
         }
         out.soft_clip();
         assert!(out.peak() <= 1.0001);
+    }
+
+    #[test]
+    fn stereo_source_keeps_its_width() {
+        let sr = 48000;
+        let n = sr as usize;
+        let left: Vec<f32> = (0..n).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
+        let right = vec![0.0f32; n];
+        let clip = AudioClip::stereo(&left, &right, sr);
+        assert!(clip.is_stereo());
+        let (l, r) = clip.left_right();
+        assert!((l[100] - left[100]).abs() < 1e-6 && r[100].abs() < 1e-6);
+        let ev = GrainEvent {
+            onset: 0.0,
+            source_pos: 0.1,
+            duration: 0.5,
+            pitch_ratio: 1.0,
+            gain: 1.0,
+            pan: 0.0,
+            envelope: 0.2,
+            env_skew: 0.0,
+            reverse: false,
+            id: 0,
+        };
+        let mut out = StereoBuffer::new(0.6, sr);
+        render_grains_audio(&clip, &[ev], &mut out, 0.0);
+        let e = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>();
+        assert!(e(&out.left) > 0.1, "left carries the signal");
+        assert!(e(&out.right) < 1e-6 * e(&out.left), "right stays silent");
+        // Filtering keeps channels apart too.
+        let f = clip.filtered(&[]);
+        assert!(f.is_stereo());
+    }
+
+    #[test]
+    fn dual_mono_collapses_to_mono() {
+        let a: Vec<f32> = (0..1000).map(|i| (i as f32 * 0.1).sin()).collect();
+        let clip = AudioClip::stereo(&a, &a, 48000);
+        assert!(!clip.is_stereo());
+        assert_eq!(clip.samples.len(), 1000);
     }
 }

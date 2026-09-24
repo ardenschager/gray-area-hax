@@ -443,20 +443,24 @@ pub fn note_name(p: u8) -> String {
 /// Seconds rendered past the loop end and folded back onto the start.
 const TAIL_SECS: f64 = 6.0;
 
-/// Render a part to mono audio at `bpm` as a seamless loop.
+/// Render a part to stereo audio at `bpm` as a seamless loop.
 pub fn render_part(part: &SynthPart, bpm: f64, sample_rate: u32) -> Result<AudioClip, String> {
     let inst = instrument(&part.instrument).ok_or_else(|| format!("unknown instrument '{}'", part.instrument))?;
     let sr = sample_rate as f64;
     let spb = 60.0 / bpm.max(1.0);
     let loop_n = ((part.length_beats.max(0.25) * spb) * sr).round() as usize;
-    let out = render_raw(part, inst, bpm, sample_rate, loop_n + (TAIL_SECS * sr) as usize)?;
+    let (l, r) = render_raw(part, inst, bpm, sample_rate, loop_n + (TAIL_SECS * sr) as usize)?;
     // Fold the tail back onto the loop start: seamless looping.
-    let mut samples = out[..loop_n].to_vec();
-    for (i, s) in out[loop_n..].iter().enumerate() {
-        samples[i % loop_n] += *s;
-    }
-    finish_level(&mut samples, inst.trim);
-    Ok(AudioClip::new(samples, sample_rate))
+    let fold = |out: &[f32]| {
+        let mut v = out[..loop_n].to_vec();
+        for (i, s) in out[loop_n..].iter().enumerate() {
+            v[i % loop_n] += *s;
+        }
+        v
+    };
+    let (mut l, mut r) = (fold(&l), fold(&r));
+    finish_level(&mut [&mut l, &mut r], inst.trim);
+    Ok(AudioClip::stereo(&l, &r, sample_rate))
 }
 
 /// One note of a part's instrument (with its current knobs), for
@@ -469,7 +473,8 @@ pub fn render_note(part: &SynthPart, pitch: u8, vel: f32, bpm: f64, sample_rate:
     p.notes = vec![Note { start: 0.0, len, pitch, vel }];
     p.length_beats = 64.0;
     let secs = len * spb + if inst.kit { 1.0 } else { 2.5 };
-    let mut out = render_raw(&p, inst, bpm, sample_rate, (secs * sample_rate as f64) as usize)?;
+    let (l, r) = render_raw(&p, inst, bpm, sample_rate, (secs * sample_rate as f64) as usize)?;
+    let mut out: Vec<f32> = l.iter().zip(&r).map(|(a, b)| 0.5 * (a + b)).collect();
     let last = out.iter().rposition(|v| v.abs() > 1e-4).unwrap_or(0);
     out.truncate((last + 1).max(64));
     let fade = (0.03 * sample_rate as f64) as usize;
@@ -477,11 +482,11 @@ pub fn render_note(part: &SynthPart, pitch: u8, vel: f32, bpm: f64, sample_rate:
     for i in 0..fade.min(n) {
         out[n - 1 - i] *= i as f32 / fade as f32;
     }
-    finish_level(&mut out, inst.trim * 0.8);
+    finish_level(&mut [&mut out], inst.trim * 0.8);
     Ok(out)
 }
 
-fn render_raw(part: &SynthPart, inst: &Instrument, bpm: f64, sample_rate: u32, total_n: usize) -> Result<Vec<f32>, String> {
+fn render_raw(part: &SynthPart, inst: &Instrument, bpm: f64, sample_rate: u32, total_n: usize) -> Result<(Vec<f32>, Vec<f32>), String> {
     let sr = sample_rate as f64;
     let spb = 60.0 / bpm.max(1.0);
 
@@ -534,7 +539,8 @@ fn render_raw(part: &SynthPart, inst: &Instrument, bpm: f64, sample_rate: u32, t
     let mut node_of: Vec<i32> = vec![0; part.notes.len()];
     let mut next_id = 1000i32;
     let mut buf = vec![0f32; 64 * 2];
-    let mut out = vec![0f32; total_n];
+    let mut out_l = vec![0f32; total_n];
+    let mut out_r = vec![0f32; total_n];
     let mut ei = 0usize;
     let mut pos = 0usize;
     let mut batch: Vec<ControllerBatchCommand> = Vec::new();
@@ -564,6 +570,13 @@ fn render_raw(part: &SynthPart, inst: &Instrument, bpm: f64, sample_rate: u32, t
                     };
                     set("freq", freq);
                     set("amp", nt.vel.clamp(0.0, 1.0) * 0.5);
+                    // A little kit image: hats right, open hat left.
+                    match drum {
+                        Some("hat") => set("pan", 0.3),
+                        Some("open hat") => set("pan", -0.25),
+                        Some("snare") => set("pan", 0.05),
+                        _ => {}
+                    }
                     for (name, v) in &part.params {
                         match name.split_once('.') {
                             Some((d, c)) if d == def => {
@@ -591,11 +604,12 @@ fn render_raw(part: &SynthPart, inst: &Instrument, bpm: f64, sample_rate: u32, t
         while nrt.poll().is_some() {}
         let n = 64.min(total_n - pos);
         for i in 0..n {
-            out[pos + i] = 0.5 * (buf[2 * i] + buf[2 * i + 1]);
+            out_l[pos + i] = buf[2 * i];
+            out_r[pos + i] = buf[2 * i + 1];
         }
         pos += 64;
     }
-    Ok(out)
+    Ok((out_l, out_r))
 }
 
 /// Library media for a rendered part: the audio plus a glowing
@@ -613,21 +627,32 @@ pub fn part_name(part: &SynthPart) -> String {
 
 /// Bring every render to a consistent loudness with a soft ceiling, so
 /// switching instruments or knobs never jumps the level.
-fn finish_level(s: &mut [f32], trim: f32) {
-    let active: Vec<f32> = s.iter().copied().filter(|v| v.abs() > 1e-4).collect();
-    if active.is_empty() {
+/// Channels share one gain so the stereo image is preserved.
+fn finish_level(chans: &mut [&mut Vec<f32>], trim: f32) {
+    let (mut sum, mut count, mut peak) = (0f64, 0usize, 0f32);
+    for s in chans.iter() {
+        for &v in s.iter() {
+            if v.abs() > 1e-4 {
+                sum += (v * v) as f64;
+                count += 1;
+            }
+            peak = peak.max(v.abs());
+        }
+    }
+    if count == 0 {
         return;
     }
-    let rms = (active.iter().map(|v| v * v).sum::<f32>() / active.len() as f32).sqrt();
-    let peak = s.iter().fold(0f32, |a, v| a.max(v.abs()));
+    let rms = (sum / count as f64).sqrt() as f32;
     // Target ~ -16 dBFS RMS, but never push the peak past ~-1 dBFS.
     let mut g = 0.16 / rms.max(1e-6);
     g = g.min(0.89 / peak.max(1e-6) * 1.6);
     g *= trim;
-    for v in s.iter_mut() {
-        let x = *v * g;
-        // Soft knee above 0.8.
-        *v = if x.abs() <= 0.8 { x } else { x.signum() * (0.8 + 0.2 * ((x.abs() - 0.8) / 0.2).tanh()) };
+    for s in chans.iter_mut() {
+        for v in s.iter_mut() {
+            let x = *v * g;
+            // Soft knee above 0.8.
+            *v = if x.abs() <= 0.8 { x } else { x.signum() * (0.8 + 0.2 * ((x.abs() - 0.8) / 0.2).tanh()) };
+        }
     }
 }
 
@@ -644,11 +669,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         for inst in INSTRUMENTS {
             let a = render_part(&SynthPart::new(inst.id, 0), 100.0, 48000).unwrap();
-            let spec = hound::WavSpec { channels: 1, sample_rate: 48000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+            let spec = hound::WavSpec { channels: 2, sample_rate: 48000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
             let mut w = hound::WavWriter::create(format!("{dir}/{}.wav", inst.id), spec).unwrap();
+            let (l, r) = a.left_right();
             for _ in 0..2 {
-                for s in &a.samples {
-                    w.write_sample((s.clamp(-1.0, 1.0) * 32767.0) as i16).unwrap();
+                for (x, y) in l.iter().zip(&r) {
+                    w.write_sample((x.clamp(-1.0, 1.0) * 32767.0) as i16).unwrap();
+                    w.write_sample((y.clamp(-1.0, 1.0) * 32767.0) as i16).unwrap();
                 }
             }
             w.finalize().unwrap();
@@ -727,5 +754,22 @@ mod tests {
         let jump = (s[s.len() - 1] - s[0]).abs();
         let typical = s.windows(2).map(|w| (w[1] - w[0]).abs()).sum::<f32>() / s.len() as f32;
         assert!(jump < typical * 40.0 + 0.02, "loop seam jump {jump} vs typical step {typical}");
+    }
+
+    #[test]
+    fn wide_instruments_render_in_stereo() {
+        for id in ["cg_pad", "cg_lead", "cg_drone"] {
+            let a = render_part(&SynthPart::new(id, 0), 100.0, 48000).unwrap();
+            let (l, r) = a.left_right();
+            // Normalized correlation < 1 means real width, not dual mono.
+            let dot: f64 = l.iter().zip(&r).map(|(x, y)| (*x * *y) as f64).sum();
+            let el: f64 = l.iter().map(|x| (*x * *x) as f64).sum();
+            let er: f64 = r.iter().map(|x| (*x * *x) as f64).sum();
+            let corr = dot / (el * er).sqrt().max(1e-12);
+            eprintln!("{id}: L/R correlation {corr:.2}");
+            assert!(a.is_stereo(), "{id} came back mono");
+            assert!(corr < 0.98, "{id}: L/R nearly identical ({corr:.3})");
+            assert!(l.iter().chain(&r).all(|v| v.abs() <= 1.0));
+        }
     }
 }

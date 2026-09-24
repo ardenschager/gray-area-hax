@@ -39,12 +39,25 @@ pub fn clamp_factor(factor: f32) -> f32 {
 
 /// Paulstretch `clip` by `factor` (2..64). Pitch/spectrum is preserved;
 /// time is smeared. Deterministic for a given input and factor.
+/// Stereo sources are stretched per channel with the same per-segment
+/// phases, which keeps each frequency's left/right balance (the image).
 pub fn paulstretch(clip: &AudioClip, factor: f32) -> AudioClip {
-    let factor = clamp_factor(factor) as f64;
     let sr = clip.sample_rate.max(1);
-    let input = &clip.samples;
-    if input.is_empty() {
+    if clip.samples.is_empty() {
         return AudioClip::new(Vec::new(), sr);
+    }
+    if clip.is_stereo() {
+        let (l, r) = clip.left_right();
+        let (l, r) = (paulstretch_channel(&l, factor, sr), paulstretch_channel(&r, factor, sr));
+        return AudioClip::stereo(&l, &r, sr);
+    }
+    AudioClip::new(paulstretch_channel(&clip.samples, factor, sr), sr)
+}
+
+fn paulstretch_channel(input: &[f32], factor: f32, sr: u32) -> Vec<f32> {
+    let factor = clamp_factor(factor) as f64;
+    if input.is_empty() {
+        return Vec::new();
     }
 
     // Window must be a power of two and no longer than the clip (down to a
@@ -124,8 +137,7 @@ pub fn paulstretch(clip: &AudioClip, factor: f32) -> AudioClip {
             *s = (*s * g).clamp(-1.0, 1.0);
         }
     }
-
-    AudioClip::new(out, sr)
+    out
 }
 
 /// Slow `video` down by `factor` with neighbor-frame crossfades and a

@@ -338,7 +338,13 @@ empty pad in perform mode) and opens its editor under the timeline:
   plyphon is vendored with two fixes (`vendor/plyphon-unit/PATCHES.md`):
   audio-rate `MulAdd` operands and control-rate operands of binary ops
   are now interpolated across the block like scsynth, which removes a
-  750 Hz zipper from most SynthDefs. Renders are mono for now.
+  750 Hz zipper from most SynthDefs. Renders are stereo (pads, leads,
+  choir, bell and drone are wide; the kit has hats slightly off-center).
+
+Stereo everywhere: media with distinct left/right channels (video
+soundtracks, stereo WAVs) keeps its image through grains, snippets,
+paulstretch and export; grain pan and the clip's pan knob steer it like a
+balance control. Mono files stay mono at no extra cost.
 
 ### Headless / scripted
 
