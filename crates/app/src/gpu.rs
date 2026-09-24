@@ -70,11 +70,16 @@ pub struct GpuPreview {
     fx: HashMap<u64, FxInst>,
 }
 
+// Vertical convention: every offscreen target stores rows y-down with
+// v = 0 at the top (same as uploaded source frames), so full-screen passes
+// sample `v_uv` directly and never flip. Only drawing to the real screen
+// (`u_screen = 1`, the present pass) maps y-down to GL's y-up.
 const GRAIN_VS: &str = r#"#version 330 core
 layout(location=0) in vec2 a_pos;
 uniform vec4 u_rect;   // x,y,w,h in 0..1, y-down
 uniform float u_rot;   // radians, about the rect center
 uniform float u_aspect;
+uniform float u_screen;
 out vec2 v_uv;
 void main() {
     v_uv = a_pos;
@@ -85,17 +90,20 @@ void main() {
     off = vec2(off.x * cs - off.y * sn, off.x * sn + off.y * cs);
     off.x /= u_aspect;
     vec2 p = c + off;
-    gl_Position = vec4(p.x * 2.0 - 1.0, 1.0 - p.y * 2.0, 0.0, 1.0);
+    float y = u_screen > 0.5 ? 1.0 - p.y * 2.0 : p.y * 2.0 - 1.0;
+    gl_Position = vec4(p.x * 2.0 - 1.0, y, 0.0, 1.0);
 }"#;
 
 const QUAD_VS: &str = r#"#version 330 core
 layout(location=0) in vec2 a_pos;
 uniform vec4 u_rect; // x,y,w,h in 0..1, y-down "screen" space
+uniform float u_screen;
 out vec2 v_uv;
 void main() {
     v_uv = a_pos;
     vec2 p = u_rect.xy + a_pos * u_rect.zw;   // 0..1 y-down
-    gl_Position = vec4(p.x * 2.0 - 1.0, 1.0 - p.y * 2.0, 0.0, 1.0);
+    float y = u_screen > 0.5 ? 1.0 - p.y * 2.0 : p.y * 2.0 - 1.0;
+    gl_Position = vec4(p.x * 2.0 - 1.0, y, 0.0, 1.0);
 }"#;
 
 const HSV_HELPERS: &str = r#"
@@ -169,7 +177,7 @@ const PRESENT_FS: &str = r#"#version 330 core
 in vec2 v_uv; out vec4 frag;
 uniform sampler2D u_tex;
 void main() {
-    vec4 c = texture(u_tex, vec2(v_uv.x, 1.0 - v_uv.y));
+    vec4 c = texture(u_tex, v_uv);
     frag = vec4(c.rgb, 1.0);
 }"#;
 
@@ -192,6 +200,34 @@ void main() {{
     float ns = max(hsv.y, u_amount * u_amount * 0.5 * min(hsv.z, 1.0));
     rgb = hsv2rgb(vec3(nh / 360.0, ns, hsv.z));
     frag = vec4(rgb * a, c.a);
+}}"#
+    )
+}
+
+/// Mirrors `fx::video_tune`: snap each hue to the nearest key color.
+fn tune_fs() -> String {
+    format!(
+        r#"#version 330 core
+in vec2 v_uv; out vec4 frag;
+uniform sampler2D u_tex;
+uniform float u_hues[12];  // degrees
+uniform int u_nh;
+uniform float u_amount;
+{HSV_HELPERS}
+void main() {{
+    vec4 c = texture(u_tex, v_uv);
+    float a = max(c.a, 1e-5);
+    vec3 hsv = rgb2hsv(c.rgb / a);
+    float h = hsv.x * 360.0;
+    float best = 0.0;
+    float best_abs = 1e9;
+    for (int i = 0; i < 12; i++) {{
+        if (i >= u_nh) break;
+        float d = mod(u_hues[i] - h + 540.0, 360.0) - 180.0;
+        if (abs(d) < best_abs) {{ best_abs = abs(d); best = d; }}
+    }}
+    float nh = mod(h + best * u_amount + 360.0, 360.0);
+    frag = vec4(hsv2rgb(vec3(nh / 360.0, hsv.y, hsv.z)) * a, c.a);
 }}"#
     )
 }
@@ -431,6 +467,7 @@ impl GpuPreview {
             programs.insert("present", compile(gl, QUAD_VS, PRESENT_FS)?);
             programs.insert("crush", compile(gl, QUAD_VS, CRUSH_FS)?);
             programs.insert("tint", compile(gl, QUAD_VS, &tint_fs())?);
+            programs.insert("tune", compile(gl, QUAD_VS, &tune_fs())?);
             programs.insert("delay", compile(gl, QUAD_VS, DELAY_FS)?);
             programs.insert("racc", compile(gl, QUAD_VS, REVERB_ACCUM_FS)?);
             programs.insert("rmix", compile(gl, QUAD_VS, REVERB_MIX_FS)?);
@@ -643,6 +680,30 @@ impl GpuPreview {
                         gl.bind_texture(glow::TEXTURE_2D, Some(cur));
                         self.set_i(gl, p, "u_tex", 0);
                         self.set_f(gl, p, "u_hue", hue);
+                        self.set_f(gl, p, "u_amount", (amount * fx.video).clamp(0.0, 1.0));
+                        self.set_4f(gl, p, "u_rect", [0.0, 0.0, 1.0, 1.0]);
+                        self.draw_quad(gl);
+                        cur = out.tex;
+                    }
+                    EffectKind::Tune { root, scale, amount, .. } => {
+                        let out = if cur == self.ping.as_ref().unwrap().tex {
+                            self.pong.as_ref().unwrap()
+                        } else {
+                            self.ping.as_ref().unwrap()
+                        };
+                        self.bind_target(gl, out, None);
+                        let p = self.use_program(gl, "tune");
+                        gl.active_texture(glow::TEXTURE0);
+                        gl.bind_texture(glow::TEXTURE_2D, Some(cur));
+                        self.set_i(gl, p, "u_tex", 0);
+                        let hues = chromagrain_core::fx::key_hues(root, scale);
+                        let mut arr = [0.0f32; 12];
+                        for (a, h) in arr.iter_mut().zip(&hues) {
+                            *a = *h;
+                        }
+                        let loc = gl.get_uniform_location(p, "u_hues");
+                        gl.uniform_1_f32_slice(loc.as_ref(), &arr);
+                        self.set_i(gl, p, "u_nh", hues.len().min(12) as i32);
                         self.set_f(gl, p, "u_amount", (amount * fx.video).clamp(0.0, 1.0));
                         self.set_4f(gl, p, "u_rect", [0.0, 0.0, 1.0, 1.0]);
                         self.draw_quad(gl);
@@ -1151,6 +1212,7 @@ impl GpuPreview {
             gl.active_texture(glow::TEXTURE0);
             gl.bind_texture(glow::TEXTURE_2D, Some(final_tex));
             self.set_i(gl, p, "u_tex", 0);
+            self.set_f(gl, p, "u_screen", 1.0);
             self.set_4f(gl, p, "u_rect", [0.0, 0.0, 1.0, 1.0]);
             self.draw_quad(gl);
 

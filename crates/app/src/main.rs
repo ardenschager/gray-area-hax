@@ -94,12 +94,20 @@ fn main() -> eframe::Result<()> {
             .with_drag_and_drop(true),
         ..Default::default()
     };
+    // `chromagrain clip.mp4 other.mov` — open with those files placed on
+    // their own tracks at the start.
+    let open: Vec<PathBuf> =
+        args.iter().skip(1).map(PathBuf::from).filter(|p| p.is_file()).collect();
     eframe::run_native(
         "chromagrain",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             theme::apply(&cc.egui_ctx);
-            Ok(Box::new(App::new()))
+            let mut app = App::new();
+            for p in open {
+                app.import_path(p, Some(Place { track: 0, new_track: true, beat: 0.0 }));
+            }
+            Ok(Box::new(app))
         }),
     )
 }
@@ -259,6 +267,9 @@ pub struct App {
     imported: HashMap<PathBuf, usize>,
     /// Paths queued/decoding right now (avoid double-queueing).
     loading: HashSet<PathBuf>,
+    /// Preview fills the whole screen (F / esc / double-click).
+    fullscreen: bool,
+    gizmo: Option<ui_timeline::GizmoDrag>,
 }
 
 impl App {
@@ -315,6 +326,8 @@ impl App {
             browser,
             imported: HashMap::new(),
             loading: HashSet::new(),
+            fullscreen: false,
+            gizmo: None,
         }
     }
 
@@ -903,6 +916,11 @@ impl App {
         self.pump_jobs();
     }
 
+    pub(crate) fn toggle_fullscreen(&mut self, ctx: &egui::Context) {
+        self.fullscreen = !self.fullscreen;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+    }
+
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         // Files dropped from the Finder/Explorer go straight to the library.
         let dropped: Vec<PathBuf> =
@@ -913,17 +931,22 @@ impl App {
         if ctx.wants_keyboard_input() {
             return;
         }
-        let (space, del, dup, esc, home) = ctx.input(|i| {
+        let (space, del, dup, esc, home, f) = ctx.input(|i| {
             (
                 i.key_pressed(egui::Key::Space),
                 i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace),
                 i.modifiers.command && i.key_pressed(egui::Key::D),
                 i.key_pressed(egui::Key::Escape),
                 i.key_pressed(egui::Key::Home) || i.key_pressed(egui::Key::Enter),
+                i.key_pressed(egui::Key::F) && !i.modifiers.command,
             )
         });
         if space {
             self.toggle_play();
+        }
+        if f || (esc && self.fullscreen) {
+            self.toggle_fullscreen(ctx);
+            return;
         }
         if home {
             self.seek(if self.loop_on { self.loop_start } else { 0.0 });
@@ -975,6 +998,13 @@ impl eframe::App for App {
             ctx.request_repaint();
         } else if self.busy.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+
+        if self.fullscreen {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(egui::Color32::BLACK))
+                .show(ctx, |ui| self.preview_ui(ui));
+            return;
         }
 
         egui::TopBottomPanel::top("transport")

@@ -11,6 +11,9 @@
 //! | Reverb   | Freeverb-style comb/allpass    | frame persistence + blur smear |
 //! | Compress | FFT spectral quantization      | JPEG-style 8x8 DCT block       |
 //! |          | (transform-domain crunch)      | quantization (same idea!)      |
+//! | Tint     | resonant band at one frequency | every hue smushed to one hue   |
+//! | Tune     | resonators on every note of a  | every hue snapped to the key's |
+//! |          | key (frequencies → the key)    | colors (pitch class ↔ hue)     |
 //!
 //! Correspondence is the default but configurable per effect: `audio` and
 //! `video` are independent 0..1 amount dials. audio=1, video=1 means both
@@ -39,6 +42,13 @@ pub enum EffectKind {
     /// frequency (audio) — the shared hue<->freq axis in `synth`.
     /// `amount` 0 = off, 1 = fully monochrome / fully resonant.
     Tint { hue: f32, amount: f32 },
+    /// Quantize frequencies to a key: a bank of resonators on every note
+    /// of the key (audio) pulls any sound — speech, noise, field audio —
+    /// onto those pitches; every hue snaps to the key's colors (video),
+    /// pitch class ↔ hue wheel (C = red, 30° per semitone).
+    /// `root` pitch class 0..11, `amount` 0..1 wet, `focus` 0..1 how
+    /// narrow (and ringing) the resonators are.
+    Tune { root: f32, scale: crate::music::ScaleKind, amount: f32, focus: f32 },
 }
 
 impl EffectKind {
@@ -58,6 +68,12 @@ impl EffectKind {
             "reverb" | "smear" => EffectKind::Reverb { size: 0.6, damp: 0.4, mix: 0.35 },
             "compress" | "compression" | "codec" => EffectKind::Compress { quality: 0.25 },
             "tint" | "smush" | "chroma" => EffectKind::Tint { hue: 8.0, amount: 0.6 },
+            "tune" | "quantize" | "key" | "harmonize" => EffectKind::Tune {
+                root: 9.0,
+                scale: crate::music::ScaleKind::MinorPentatonic,
+                amount: 0.8,
+                focus: 0.5,
+            },
             _ => return None,
         })
     }
@@ -69,8 +85,29 @@ impl EffectKind {
             EffectKind::Reverb { .. } => "reverb",
             EffectKind::Compress { .. } => "compress",
             EffectKind::Tint { .. } => "tint",
+            EffectKind::Tune { .. } => "tune",
         }
     }
+}
+
+/// Hue (degrees) of a pitch class on the shared pitch-class ↔ hue wheel.
+pub fn pitch_class_hue(pc: i32) -> f32 {
+    pc.rem_euclid(12) as f32 * 30.0
+}
+
+/// The hues of every note in a key (for the video side of `Tune`).
+pub fn key_hues(root: f32, scale: crate::music::ScaleKind) -> Vec<f32> {
+    let r = root.round() as i32;
+    scale.intervals().iter().map(|iv| pitch_class_hue(r + iv)).collect()
+}
+
+/// Frequencies of every note of a key between A1 (55 Hz) and A7.
+pub fn key_freqs(root: f32, scale: crate::music::ScaleKind) -> Vec<f32> {
+    let r = root.round() as i32;
+    (33..=105)
+        .filter(|m: &i32| scale.intervals().contains(&(m - r).rem_euclid(12)))
+        .map(|m| crate::music::midi_to_hz(m as f32))
+        .collect()
 }
 
 /// One effect in a chain: a kind plus the two correspondence dials.
@@ -131,6 +168,12 @@ impl AvEffect {
                 "amount" => *amount = value.clamp(0.0, 1.0),
                 _ => return Err(format!("tint has no parameter '{name}'")),
             },
+            EffectKind::Tune { root, amount, focus, .. } => match key.as_str() {
+                "root" => *root = value.round().rem_euclid(12.0),
+                "amount" | "mix" => *amount = value.clamp(0.0, 1.0),
+                "focus" | "q" => *focus = value.clamp(0.0, 1.0),
+                _ => return Err(format!("tune has no parameter '{name}'")),
+            },
         }
         Ok(())
     }
@@ -154,6 +197,7 @@ pub enum AudioFxState {
     Reverb { channels: [ReverbChannel; 2] },
     Compress { channels: [SpectralState; 2] },
     Tint { bq: [crate::dsp::Biquad; 2] },
+    Tune { bank: Vec<[crate::dsp::Biquad; 2]>, env_in: [f32; 2], env_wet: [f32; 2], coef: f32 },
 }
 
 /// Build fresh states for a chain. Rebuild whenever the chain's shape or
@@ -190,6 +234,21 @@ pub fn audio_chain_states(chain: &[AvEffect], sample_rate: u32) -> Vec<AudioFxSt
                     )
                 };
                 AudioFxState::Tint { bq: [mk(), mk()] }
+            }
+            EffectKind::Tune { root, scale, focus, .. } => {
+                let q = 6.0 + focus.clamp(0.0, 1.0) * 60.0;
+                let sr = sample_rate as f32;
+                let bank = key_freqs(root, scale)
+                    .into_iter()
+                    .filter(|f| *f < sr * 0.45)
+                    .map(|f| {
+                        let mk = || crate::dsp::Biquad::new(crate::dsp::FilterKind::BandPass, sr, f, q);
+                        [mk(), mk()]
+                    })
+                    .collect();
+                // ~60 ms level followers for the auto-gain.
+                let coef = (-1.0 / (0.06 * sr)).exp();
+                AudioFxState::Tune { bank, env_in: [0.0; 2], env_wet: [0.0; 2], coef }
             }
         })
         .collect()
@@ -274,6 +333,26 @@ pub fn process_audio_chain(
                     for x in ch.iter_mut() {
                         let wet = bq[c].process(*x) * makeup;
                         *x = *x * (1.0 - mix) + wet * mix;
+                    }
+                }
+            }
+            (EffectKind::Tune { amount, .. }, AudioFxState::Tune { bank, env_in, env_wet, coef }) => {
+                let mix = (amount * fx.audio).clamp(0.0, 1.0);
+                let c = *coef;
+                for (ch_i, ch) in [&mut *left, &mut *right].into_iter().enumerate() {
+                    for x in ch.iter_mut() {
+                        let dry = *x;
+                        let mut wet = 0.0;
+                        for bq in bank.iter_mut() {
+                            wet += bq[ch_i].process(dry);
+                        }
+                        // Auto-gain: the narrow bank passes a sliver of the
+                        // spectrum; bring it back up to the input's level.
+                        env_in[ch_i] = env_in[ch_i] * c + dry * dry * (1.0 - c);
+                        env_wet[ch_i] = env_wet[ch_i] * c + wet * wet * (1.0 - c);
+                        let g = (env_in[ch_i] / env_wet[ch_i].max(1e-12)).sqrt().min(24.0);
+                        let wet = (wet * g).clamp(-1.5, 1.5);
+                        *x = dry * (1.0 - mix) + wet * mix;
                     }
                 }
             }
@@ -573,9 +652,10 @@ pub fn video_chain_states(chain: &[AvEffect], fps: f32) -> Vec<VideoFxState> {
                 delay_frames: ((time * fps).round() as usize).max(1),
             },
             EffectKind::Reverb { .. } => VideoFxState::Reverb { acc: Vec::new() },
-            EffectKind::Crush { .. } | EffectKind::Compress { .. } | EffectKind::Tint { .. } => {
-                VideoFxState::Stateless
-            }
+            EffectKind::Crush { .. }
+            | EffectKind::Compress { .. }
+            | EffectKind::Tint { .. }
+            | EffectKind::Tune { .. } => VideoFxState::Stateless,
         })
         .collect()
 }
@@ -629,8 +709,46 @@ pub fn apply_video_chain(
             EffectKind::Tint { hue, amount } => {
                 video_tint(frame, hue, amount * fx.video);
             }
+            EffectKind::Tune { root, scale, amount, .. } => {
+                video_tune(frame, &key_hues(root, scale), amount * fx.video);
+            }
         }
     }
+}
+
+/// Snap every pixel's hue to the nearest of `hues` (the key's colors);
+/// `amount` blends from untouched to fully snapped.
+fn video_tune(frame: &mut Frame, hues: &[f32], amount: f32) {
+    use crate::video::{hsv_to_rgb, rgb_to_hsv};
+    let amount = amount.clamp(0.0, 1.0);
+    if amount <= 0.002 || hues.is_empty() {
+        return;
+    }
+    for px in frame.data.chunks_exact_mut(4) {
+        let (h, s, v) = rgb_to_hsv(px[0], px[1], px[2]);
+        let d = nearest_hue_delta(h, hues);
+        let (r, g, b) = hsv_to_rgb((h + d * amount).rem_euclid(360.0), s, v);
+        px[0] = r;
+        px[1] = g;
+        px[2] = b;
+    }
+}
+
+/// Signed shortest hue move from `h` to the nearest of `hues`.
+pub fn nearest_hue_delta(h: f32, hues: &[f32]) -> f32 {
+    let mut best = 0.0f32;
+    let mut best_abs = f32::INFINITY;
+    for &t in hues {
+        let mut d = (t - h).rem_euclid(360.0);
+        if d > 180.0 {
+            d -= 360.0;
+        }
+        if d.abs() < best_abs {
+            best_abs = d.abs();
+            best = d;
+        }
+    }
+    best
 }
 
 /// Smush every pixel's hue toward `hue`; at high amounts even grey pixels
@@ -1387,4 +1505,52 @@ mod tests {
         assert!(fx.set_param("nonsense", 1.0).is_err());
         assert!(EffectKind::parse("flanger").is_none());
     }
+
+    fn goertzel(x: &[f32], sr: f32, f: f32) -> f32 {
+        let w = 2.0 * std::f32::consts::PI * f / sr;
+        let c = 2.0 * w.cos();
+        let (mut s1, mut s2) = (0.0f32, 0.0f32);
+        for &v in x {
+            let s0 = v + c * s1 - s2;
+            s2 = s1;
+            s1 = s0;
+        }
+        s1 * s1 + s2 * s2 - c * s1 * s2
+    }
+
+    #[test]
+    fn tune_pulls_noise_onto_the_key() {
+        let sr = 48_000u32;
+        let n = sr as usize;
+        let mut seed = 12345u32;
+        let mut noise = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        let mut l: Vec<f32> = (0..n).map(|_| noise() * 0.3).collect();
+        let mut r = l.clone();
+        let chain = [AvEffect::new(EffectKind::parse("tune").unwrap())]; // A minor pentatonic
+        let mut st = audio_chain_states(&chain, sr);
+        process_audio_chain(&mut l, &mut r, &chain, &mut st);
+        let tail = &l[n / 2..];
+        assert!(tail.iter().all(|v| v.is_finite()));
+        let on = goertzel(tail, sr as f32, 440.0); // A4, in key
+        let off = goertzel(tail, sr as f32, 466.16); // A#4, not in key
+        assert!(on > off * 8.0, "on {on} off {off}");
+        // Auto-gain keeps it roughly as loud as the input.
+        let rms = (tail.iter().map(|v| v * v).sum::<f32>() / tail.len() as f32).sqrt();
+        assert!(rms > 0.05 && rms < 0.6, "rms {rms}");
+    }
+
+    #[test]
+    fn tune_snaps_hues_to_key_colors() {
+        let hues = key_hues(0.0, crate::music::ScaleKind::Major); // C major
+        assert_eq!(hues, vec![0.0, 60.0, 120.0, 150.0, 210.0, 270.0, 330.0]);
+        assert_eq!(nearest_hue_delta(100.0, &hues), 20.0);
+        assert_eq!(nearest_hue_delta(350.0, &hues), 10.0);
+        assert_eq!(key_freqs(9.0, crate::music::ScaleKind::MinorPentatonic)[0], 55.0);
+    }
 }
+

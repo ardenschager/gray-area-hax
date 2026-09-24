@@ -211,15 +211,24 @@ The window has three places, and every thing lives in exactly one of them:
    inspector only shows the controls that mode uses; key, canvas, effects,
    filters, automation and sound↔picture links fold away below.
 5. **Arrange**: drag clips (across tracks too), drag their right edge to
-   resize, right-click for more; ⌘D duplicates, ⌫ deletes. Drag or scroll
-   on the preview to place the selected clip's picture (which also pans it).
-6. **Sequence**: with a pattern clip selected, click/drag steps in the grid
+   resize, right-click for more; ⌘D duplicates, ⌫ deletes.
+6. **Place the picture** right on the preview: drag to move, drag a corner
+   to size, drag the knob to rotate (shift snaps to 15°); scroll = size,
+   shift+scroll = rotate. The inspector's *picture* section has the same
+   plus one-click 50% / 100% / fill / ±90° / center / reset. **F** (or
+   double-click the preview) goes fullscreen; esc comes back.
+7. **Put it in a key**: the inspector's *key* section picks a root + scale
+   once and uses it two ways — *snap notes* re-pitches every grain/hit to
+   the key; *tune the sound* runs a resonator bank on every note of the key
+   so ANY audio (speech, noise, field recordings) is pulled onto it, while
+   the picture's hues snap to the key's colors.
+8. **Sequence**: with a pattern clip selected, click/drag steps in the grid
    under the timeline, give a row its own step count for polymeter, flip a
    row to *loop*, or drop media on the grid for a new row.
-7. **Play it like a sampler**: *midi* in the top bar — pick a port, use the
+9. **Play it like a sampler**: *midi* in the top bar — pick a port, use the
    pads, and map knobs (*learn*, then twist). Notes play the selected clip
    (C4 = unity), even with the transport stopped.
-8. **Render** from *export* in the top bar — mp4 or wav, rendered by the
+10. **Render** from *export* in the top bar — mp4 or wav, rendered by the
    deterministic offline engine.
 
 ### Browse — every video on this Mac

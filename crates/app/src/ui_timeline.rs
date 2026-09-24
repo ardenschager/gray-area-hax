@@ -30,6 +30,76 @@ pub fn clip_color(c: &Clip) -> Color32 {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GizmoMode {
+    Move,
+    Scale,
+    Rotate,
+}
+
+/// An in-progress drag on the preview (values at grab time).
+#[derive(Debug, Clone, Copy)]
+pub struct GizmoDrag {
+    pub mode: GizmoMode,
+    pub start: Pos2,
+    pub tr: chromagrain_core::timeline::ClipTransform,
+}
+
+/// On-screen geometry of a clip's picture box (mirrors
+/// `video::grain_draws`: scale + rotate about the canvas center, then
+/// translate by half-canvas units; positive rotation is clockwise).
+struct Gizmo {
+    center: Pos2,
+    corners: [Pos2; 4],
+    knob: Pos2,
+    top_mid: Pos2,
+}
+
+impl Gizmo {
+    fn new(canvas: Rect, tr: &chromagrain_core::timeline::ClipTransform) -> Gizmo {
+        let (w, h) = (canvas.width(), canvas.height());
+        let center = canvas.center() + egui::vec2(tr.x * 0.5 * w, tr.y * 0.5 * h);
+        let (sn, cs) = tr.rotation.to_radians().sin_cos();
+        let rot = |v: egui::Vec2| egui::vec2(v.x * cs - v.y * sn, v.x * sn + v.y * cs);
+        let hx = 0.5 * w * tr.scale;
+        let hy = 0.5 * h * tr.scale;
+        let corners = [(-hx, -hy), (hx, -hy), (hx, hy), (-hx, hy)].map(|(x, y)| center + rot(egui::vec2(x, y)));
+        Gizmo {
+            center,
+            corners,
+            knob: center + rot(egui::vec2(0.0, -hy + 22.0)),
+            top_mid: center + rot(egui::vec2(0.0, -hy)),
+        }
+    }
+
+    fn hit(&self, p: Pos2) -> GizmoMode {
+        if (p - self.knob).length() < 12.0 {
+            GizmoMode::Rotate
+        } else if self.corners.iter().any(|c| (p - *c).length() < 12.0) {
+            GizmoMode::Scale
+        } else {
+            GizmoMode::Move
+        }
+    }
+
+    fn paint(&self, painter: &egui::Painter, active: Option<GizmoMode>) {
+        let line = Stroke::new(1.0, Color32::from_white_alpha(140));
+        let hot = Stroke::new(1.5, ACCENT);
+        let box_stroke = if active == Some(GizmoMode::Move) { hot } else { line };
+        for i in 0..4 {
+            painter.line_segment([self.corners[i], self.corners[(i + 1) % 4]], box_stroke);
+        }
+        let scale_hot = active == Some(GizmoMode::Scale);
+        for c in self.corners {
+            painter.rect_filled(Rect::from_center_size(c, egui::vec2(9.0, 9.0)), 2.0, if scale_hot { ACCENT } else { Color32::WHITE });
+        }
+        let rot_hot = active == Some(GizmoMode::Rotate);
+        painter.line_segment([self.top_mid, self.knob], if rot_hot { hot } else { line });
+        painter.circle(self.knob, 6.0, if rot_hot { ACCENT } else { Color32::WHITE }, Stroke::new(1.0, Color32::BLACK));
+        painter.circle_filled(self.center, 2.5, Color32::from_white_alpha(160));
+    }
+}
+
 /// Everything needed to draw one clip, copied out of the project lock.
 struct ClipView {
     ti: usize,
@@ -59,7 +129,11 @@ impl App {
             (p.width.max(1) as f32, p.height.max(1) as f32)
         };
         let avail_w = ui.available_width();
-        let max_h = (ui.available_height() * 0.42).clamp(150.0, 520.0);
+        let max_h = if self.fullscreen {
+            ui.available_height()
+        } else {
+            (ui.available_height() * 0.42).clamp(150.0, 520.0)
+        };
         let mut w = avail_w;
         let mut h = w * ph / pw;
         if h > max_h {
@@ -115,30 +189,110 @@ impl App {
         });
         ui.painter().add(egui::PaintCallback { rect, callback: Arc::new(cb) });
 
-        // Direct manipulation: drag the canvas to move the selected clip,
-        // scroll to scale it. (Placement is audible: x pans, y tilts
-        // brightness, scale is distance.)
-        let Some((ti, ci)) = self.selected_clip() else { return };
-        let hovered = resp.hovered() && rect.contains(ui.input(|i| i.pointer.hover_pos()).unwrap_or_default());
+        // Fullscreen toggle, top-right of the canvas.
+        let label = if self.fullscreen { "exit fullscreen  esc" } else { "fullscreen  F" };
+        let btn = Rect::from_min_size(rect.right_top() + egui::vec2(-128.0, 6.0), egui::vec2(122.0, 20.0));
+        let b = ui.interact(btn, ui.id().with("fullscreen_btn"), egui::Sense::click());
+        ui.painter().rect_filled(btn, 4.0, Color32::from_black_alpha(if b.hovered() { 210 } else { 140 }));
+        ui.painter().text(
+            btn.center(),
+            egui::Align2::CENTER_CENTER,
+            label,
+            egui::FontId::proportional(11.0),
+            if b.hovered() { TEXT } else { TEXT_DIM },
+        );
+        if b.on_hover_text("double-click the picture also toggles").clicked() {
+            self.toggle_fullscreen(ui.ctx());
+        }
+        if resp.double_clicked() {
+            self.toggle_fullscreen(ui.ctx());
+        }
+
+        // Direct manipulation of the selected clip's picture: drag to move,
+        // corner handles to size, the top knob to rotate (shift = 15° steps),
+        // scroll to size, shift+scroll to rotate. (Placement is audible:
+        // x pans, y tilts brightness, size is distance.)
+        let Some((ti, ci)) = self.selected_clip() else {
+            self.gizmo = None;
+            return;
+        };
+        let Some(tr0) = self.project.lock().unwrap().tracks.get(ti).and_then(|t| t.clips.get(ci)).map(|c| c.transform)
+        else {
+            return;
+        };
+        let g = Gizmo::new(rect, &tr0);
+        let painter = ui.painter_at(full.expand(4.0));
+        let pointer = ui.input(|i| i.pointer.hover_pos());
+        let hit = pointer.map(|p| g.hit(p)).unwrap_or(GizmoMode::Move);
+        g.paint(&painter, self.gizmo.map(|d| d.mode).or(pointer.filter(|p| full.contains(*p)).map(|_| hit)));
+
+        let hovered = pointer.is_some_and(|p| full.contains(p));
+        if hovered && self.gizmo.is_none() {
+            ui.ctx().set_cursor_icon(match hit {
+                GizmoMode::Move => egui::CursorIcon::Move,
+                GizmoMode::Scale => egui::CursorIcon::ResizeNwSe,
+                GizmoMode::Rotate => egui::CursorIcon::Alias,
+            });
+        }
+        if resp.drag_started() {
+            if let Some(p) = resp.interact_pointer_pos() {
+                self.gizmo = Some(GizmoDrag { mode: g.hit(p), start: p, tr: tr0 });
+            }
+        }
+        if !resp.dragged() && !resp.drag_started() {
+            self.gizmo = None;
+        }
+        let mut tr = tr0;
+        if let (Some(d), Some(p)) = (self.gizmo, resp.interact_pointer_pos()) {
+            let g0 = Gizmo::new(rect, &d.tr);
+            match d.mode {
+                GizmoMode::Move => {
+                    tr.x = (d.tr.x + (p.x - d.start.x) / w * 2.0).clamp(-1.5, 1.5);
+                    tr.y = (d.tr.y + (p.y - d.start.y) / h * 2.0).clamp(-1.5, 1.5);
+                }
+                GizmoMode::Scale => {
+                    let r0 = (d.start - g0.center).length().max(4.0);
+                    let r1 = (p - g0.center).length();
+                    tr.scale = (d.tr.scale * r1 / r0).clamp(0.1, 2.5);
+                }
+                GizmoMode::Rotate => {
+                    let a0 = (d.start - g0.center).angle();
+                    let a1 = (p - g0.center).angle();
+                    let mut deg = d.tr.rotation + (a1 - a0).to_degrees();
+                    if ui.input(|i| i.modifiers.shift) {
+                        deg = (deg / 15.0).round() * 15.0;
+                    }
+                    tr.rotation = (deg + 180.0).rem_euclid(360.0) - 180.0;
+                }
+            }
+        }
         if hovered {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
+            let (dx, dy, shift) = ui.input(|i| (i.smooth_scroll_delta.x, i.smooth_scroll_delta.y, i.modifiers.shift));
+            if shift || ui.input(|i| i.modifiers.alt) {
+                let d = dx + dy;
+                if d != 0.0 {
+                    tr.rotation = ((tr.rotation + d * 0.15) + 180.0).rem_euclid(360.0) - 180.0;
+                }
+            } else if dy != 0.0 {
+                tr.scale = (tr.scale * (1.0 + dy * 0.002)).clamp(0.1, 2.5);
+            }
             let tip_pos = rect.left_bottom() + egui::vec2(8.0, -8.0);
             ui.painter().text(
                 tip_pos,
                 egui::Align2::LEFT_BOTTOM,
-                "drag to place the selected clip · scroll to scale",
+                format!(
+                    "drag = move · corners = size · knob = rotate (shift snaps) · scroll = size    {:.0}%  {:.0}°",
+                    tr.scale * 100.0,
+                    tr.rotation
+                ),
                 egui::FontId::proportional(11.0),
-                Color32::from_white_alpha(150),
+                Color32::from_white_alpha(170),
             );
         }
-        let drag = resp.drag_delta();
-        let scroll = if hovered { ui.input(|i| i.smooth_scroll_delta.y) } else { 0.0 };
-        if drag != egui::Vec2::ZERO || scroll != 0.0 {
+        if tr != tr0 {
             let mut p = self.project.lock().unwrap();
             if let Some(c) = p.tracks.get_mut(ti).and_then(|t| t.clips.get_mut(ci)) {
-                c.transform.x = (c.transform.x + drag.x / w * 2.0).clamp(-1.5, 1.5);
-                c.transform.y = (c.transform.y + drag.y / h * 2.0).clamp(-1.5, 1.5);
-                c.transform.scale = (c.transform.scale * (1.0 + scroll * 0.002)).clamp(0.1, 2.5);
+                c.transform = tr;
             }
             drop(p);
             self.mark();

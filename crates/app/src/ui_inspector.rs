@@ -255,6 +255,8 @@ impl App {
                 .changed();
         });
 
+        changed |= picture_section(ui, &mut clip.transform);
+
         // Mode-specific sound shaping.
         let g = &mut clip.grains;
         match mode {
@@ -327,53 +329,12 @@ impl App {
             }
         }
 
-        // Key.
-        let key_on = clip.key.is_some();
-        crate::theme::group(ui, if key_on { "Key  ♪" } else { "Key" }, key_on, |ui| {
-            let mut has_key = clip.key.is_some();
-            if ui.checkbox(&mut has_key, "snap pitches to a key").changed() {
-                clip.key = has_key.then_some(Key::new(9, ScaleKind::MinorPentatonic));
-                changed = true;
-            }
-            if let Some(key) = &mut clip.key {
-                ui.horizontal(|ui| {
-                    egui::ComboBox::from_id_salt("key_root")
-                        .selected_text(PITCH_CLASS_NAMES[key.root.rem_euclid(12) as usize])
-                        .width(50.0)
-                        .show_ui(ui, |ui| {
-                            for (i, name) in PITCH_CLASS_NAMES.iter().enumerate() {
-                                changed |= ui.selectable_value(&mut key.root, i as i32, *name).changed();
-                            }
-                        });
-                    egui::ComboBox::from_id_salt("key_scale")
-                        .selected_text(scale_name(key.scale))
-                        .width(140.0)
-                        .show_ui(ui, |ui| {
-                            for s in SCALES {
-                                changed |= ui.selectable_value(&mut key.scale, s, scale_name(s)).changed();
-                            }
-                        });
-                });
-                changed |= param("strength", 0.0, 1.0).tip("1 = hard snap · 0 = free").show(ui, &mut clip.grains.quantize_amount);
-            }
-        });
-
-        crate::theme::group(ui, "Canvas", false, |ui| {
-            theme::hint(ui, "tip: drag / scroll on the preview to place the selected clip");
-            let tr = &mut clip.transform;
-            changed |= param("x", -1.5, 1.5).tip("also pans the audio").show(ui, &mut tr.x);
-            changed |= param("y", -1.5, 1.5).tip("also tilts brightness (up = airy)").show(ui, &mut tr.y);
-            changed |= param("scale", 0.1, 2.5).tip("also distance: smaller = quieter").show(ui, &mut tr.scale);
-            changed |= param("rotation", -180.0, 180.0).suffix("°").show(ui, &mut tr.rotation);
-            if ui.small_button("reset").clicked() {
-                *tr = Default::default();
-                changed = true;
-            }
-        });
+        // Key: one key drives both note snapping and frequency tuning.
+        changed |= key_section(ui, clip);
 
         let n_fx = clip.effects.len();
         crate::theme::group(ui, &count_title("Effects", n_fx), n_fx > 0, |ui| {
-            changed |= effects_chain_ui(ui, &mut clip.effects, "clip_fx");
+            changed |= effects_chain_ui(ui, &mut clip.effects, "clip_fx", true);
         });
 
         let n_filters = clip.audio_filters.len() + clip.color_filter.is_some() as usize;
@@ -480,7 +441,7 @@ impl App {
 
         theme::section(ui, "track effects");
         theme::hint(ui, "processes everything on this track, sound and picture");
-        changed |= effects_chain_ui(ui, &mut track.effects, "track_fx");
+        changed |= effects_chain_ui(ui, &mut track.effects, "track_fx", false);
         drop(p);
 
         theme::section(ui, "arrange");
@@ -511,7 +472,7 @@ impl App {
         theme::hint(ui, "effects here process the final mix and the final picture");
         let mut effects = std::mem::take(&mut self.project.lock().unwrap().master_effects);
         theme::section(ui, "effects");
-        let changed = effects_chain_ui(ui, &mut effects, "master_fx");
+        let changed = effects_chain_ui(ui, &mut effects, "master_fx", false);
         self.project.lock().unwrap().master_effects = effects;
         if changed {
             self.mark();
@@ -729,8 +690,165 @@ fn automation_ui(ui: &mut egui::Ui, automation: &mut Vec<chromagrain_core::auto:
     changed
 }
 
+/// Always-visible picture placement: sliders plus one-click presets.
+fn picture_section(ui: &mut egui::Ui, tr: &mut chromagrain_core::timeline::ClipTransform) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        theme::section(ui, "picture");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.small_button("reset").on_hover_text("center, 100%, upright").clicked() {
+                *tr = Default::default();
+                changed = true;
+            }
+        });
+    });
+    theme::hint(ui, "or on the preview: drag = move · corners = size · top knob = rotate");
+    changed |= param("x", -1.5, 1.5).tip("also pans the audio").show(ui, &mut tr.x);
+    changed |= param("y", -1.5, 1.5).tip("also tilts brightness (up = airy)").show(ui, &mut tr.y);
+    let mut pct = tr.scale * 100.0;
+    if param("size", 10.0, 250.0).suffix("%").tip("also distance: smaller = quieter").show(ui, &mut pct) {
+        tr.scale = pct / 100.0;
+        changed = true;
+    }
+    changed |= param("rotate", -180.0, 180.0).suffix("°").show(ui, &mut tr.rotation);
+    ui.horizontal_wrapped(|ui| {
+        for (label, s) in [("50%", 0.5f32), ("100%", 1.0), ("fill 135%", 1.35)] {
+            if ui.small_button(label).clicked() {
+                tr.scale = s;
+                changed = true;
+            }
+        }
+        ui.separator();
+        for (label, d) in [("-90°", -90.0f32), ("+90°", 90.0)] {
+            if ui.small_button(label).clicked() {
+                tr.rotation = wrap_deg(tr.rotation + d);
+                changed = true;
+            }
+        }
+        if ui.small_button("center").clicked() {
+            tr.x = 0.0;
+            tr.y = 0.0;
+            changed = true;
+        }
+    });
+    changed
+}
+
+fn wrap_deg(d: f32) -> f32 {
+    (d + 180.0).rem_euclid(360.0) - 180.0
+}
+
+/// The clip's key, used both to snap notes and to tune the sound itself.
+fn key_section(ui: &mut egui::Ui, clip: &mut chromagrain_core::timeline::Clip) -> bool {
+    let mut changed = false;
+    let tune_idx = clip.effects.iter().position(|e| matches!(e.kind, EffectKind::Tune { .. }));
+    let (mut root, mut scale) = clip
+        .key
+        .map(|k| (k.root, k.scale))
+        .or_else(|| {
+            tune_idx.and_then(|i| match clip.effects[i].kind {
+                EffectKind::Tune { root, scale, .. } => Some((root.round() as i32, scale)),
+                _ => None,
+            })
+        })
+        .unwrap_or((9, ScaleKind::MinorPentatonic));
+    let mut snap = clip.key.is_some();
+    let mut tune = tune_idx.is_some();
+    let active = snap || tune;
+
+    theme::section(ui, if active { "key  ♪" } else { "key" });
+    let mut key_changed = false;
+    ui.horizontal(|ui| {
+        key_changed |= key_pickers(ui, "clip_key", &mut root, &mut scale);
+        key_colors(ui, root, scale);
+    });
+    ui.horizontal(|ui| {
+        if ui
+            .checkbox(&mut snap, "snap notes")
+            .on_hover_text("every grain / snippet / hit is re-pitched to the nearest note (needs the media's base pitch)")
+            .changed()
+        {
+            key_changed = true;
+        }
+        if ui
+            .checkbox(&mut tune, "tune the sound")
+            .on_hover_text("resonators on every note of the key pull ALL frequencies — speech, noise, field audio — onto it. Picture hues snap to the key's colors too.")
+            .changed()
+        {
+            match (tune, tune_idx) {
+                (true, None) => clip.effects.insert(
+                    0,
+                    AvEffect::new(EffectKind::Tune { root: root as f32, scale, amount: 0.8, focus: 0.5 }),
+                ),
+                (false, Some(i)) => {
+                    clip.effects.remove(i);
+                }
+                _ => {}
+            }
+            changed = true;
+        }
+    });
+    if snap {
+        changed |= param("snap strength", 0.0, 1.0).tip("1 = hard snap · 0 = free").show(ui, &mut clip.grains.quantize_amount);
+    }
+    if let Some(fx) = clip.effects.iter_mut().find(|e| matches!(e.kind, EffectKind::Tune { .. })) {
+        if let EffectKind::Tune { amount, focus, .. } = &mut fx.kind {
+            changed |= param("tune amount", 0.0, 1.0).tip("how much of the sound is pulled onto the key").show(ui, amount);
+            changed |= param("focus", 0.0, 1.0).tip("narrow = pure ringing notes · wide = more of the original").show(ui, focus);
+        }
+        changed |= param("colors too", 0.0, 1.0).tip("how much picture hues snap to the key's colors").show(ui, &mut fx.video);
+    }
+    if key_changed {
+        clip.key = snap.then_some(Key::new(root, scale));
+        for fx in &mut clip.effects {
+            if let EffectKind::Tune { root: r, scale: s, .. } = &mut fx.kind {
+                *r = root as f32;
+                *s = scale;
+            }
+        }
+        changed = true;
+    }
+    changed
+}
+
+fn key_pickers(ui: &mut egui::Ui, salt: &str, root: &mut i32, scale: &mut ScaleKind) -> bool {
+    let mut changed = false;
+    egui::ComboBox::from_id_salt((salt, "root"))
+        .selected_text(PITCH_CLASS_NAMES[root.rem_euclid(12) as usize])
+        .width(46.0)
+        .show_ui(ui, |ui| {
+            for (i, name) in PITCH_CLASS_NAMES.iter().enumerate() {
+                changed |= ui.selectable_value(root, i as i32, *name).changed();
+            }
+        });
+    egui::ComboBox::from_id_salt((salt, "scale"))
+        .selected_text(scale_name(*scale))
+        .width(130.0)
+        .show_ui(ui, |ui| {
+            for s in SCALES {
+                changed |= ui.selectable_value(scale, s, scale_name(s)).changed();
+            }
+        });
+    changed
+}
+
+/// Twelve pitch-class swatches; the key's notes are lit (its palette).
+fn key_colors(ui: &mut egui::Ui, root: i32, scale: ScaleKind) {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(12.0 * 7.0, 14.0), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    for pc in 0..12 {
+        let on = scale.intervals().contains(&(pc - root).rem_euclid(12));
+        let hue = chromagrain_core::fx::pitch_class_hue(pc) / 360.0;
+        let c: egui::Color32 = egui::ecolor::Hsva::new(hue, if on { 0.8 } else { 0.25 }, if on { 0.95 } else { 0.3 }, 1.0).into();
+        let r = egui::Rect::from_min_size(rect.min + egui::vec2(pc as f32 * 7.0, if on { 0.0 } else { 4.0 }), egui::vec2(6.0, if on { 14.0 } else { 6.0 }));
+        painter.rect_filled(r, 1.5, c);
+    }
+    resp.on_hover_text("the key's notes as colors (C = red, 30° per semitone)");
+}
+
 /// Editor for an AV effect chain. Returns true when anything changed.
-fn effects_chain_ui(ui: &mut egui::Ui, effects: &mut Vec<AvEffect>, salt: &str) -> bool {
+/// `key_locked`: a clip chain, whose tune key is set in the Key section.
+fn effects_chain_ui(ui: &mut egui::Ui, effects: &mut Vec<AvEffect>, salt: &str, key_locked: bool) -> bool {
     let mut changed = false;
     let mut remove: Option<usize> = None;
     for (i, fx) in effects.iter_mut().enumerate() {
@@ -774,6 +892,20 @@ fn effects_chain_ui(ui: &mut egui::Ui, effects: &mut Vec<AvEffect>, salt: &str) 
                             changed |= param("hue", 0.0, 330.0).tip("red = low rumble … violet = high air").show(ui, hue);
                             changed |= param("smush", 0.0, 1.0).show(ui, amount);
                         }
+                        EffectKind::Tune { root, scale, amount, focus } => {
+                            let mut r = root.round() as i32;
+                            ui.horizontal(|ui| {
+                                if key_locked {
+                                    theme::hint(ui, "key: set in the key section above");
+                                } else if key_pickers(ui, &format!("{salt}_tune{i}"), &mut r, scale) {
+                                    *root = r as f32;
+                                    changed = true;
+                                }
+                                key_colors(ui, r, *scale);
+                            });
+                            changed |= param("amount", 0.0, 1.0).show(ui, amount);
+                            changed |= param("focus", 0.0, 1.0).tip("narrow = ringing notes · wide = more original").show(ui, focus);
+                        }
                     }
                     changed |= param("on sound", 0.0, 1.0).show(ui, &mut fx.audio);
                     changed |= param("on picture", 0.0, 1.0).show(ui, &mut fx.video);
@@ -785,7 +917,7 @@ fn effects_chain_ui(ui: &mut egui::Ui, effects: &mut Vec<AvEffect>, salt: &str) 
         changed = true;
     }
     ui.horizontal_wrapped(|ui| {
-        for name in ["crush", "delay", "reverb", "compress", "tint"] {
+        for name in ["tune", "crush", "delay", "reverb", "compress", "tint"] {
             if ui.small_button(format!("+ {name}")).clicked() {
                 effects.push(AvEffect::new(EffectKind::parse(name).unwrap()));
                 changed = true;
@@ -802,6 +934,7 @@ fn effect_blurb(k: &EffectKind) -> &'static str {
         EffectKind::Reverb { .. } => "space ↔ smear",
         EffectKind::Compress { .. } => "codec crunch ↔ jpeg blocks",
         EffectKind::Tint { .. } => "resonance ↔ color",
+        EffectKind::Tune { .. } => "frequencies → key ↔ hues → key colors",
     }
 }
 
