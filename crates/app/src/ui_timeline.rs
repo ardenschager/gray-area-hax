@@ -165,6 +165,7 @@ impl App {
                 t,
                 live: self.live_events.clone(),
                 live_t: self.app_clock.elapsed().as_secs_f64(),
+                parked: !self.playback.is_playing(),
             });
         }
         let gpu_slot = self.gpu.clone();

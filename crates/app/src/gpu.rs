@@ -13,7 +13,7 @@
 use chromagrain_core::fx::{AvEffect, EffectKind};
 use chromagrain_core::render::ClipPlan;
 use chromagrain_core::timeline::Project;
-use chromagrain_core::video::{grain_draws, ColorFilterMode, VisualGrainStyle};
+use chromagrain_core::video::{grain_draws, grain_draws_opts, ColorFilterMode, VisualGrainStyle};
 use eframe::glow::{self, HasContext};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -26,6 +26,8 @@ pub struct Scene {
     /// Live pad hits (MIDI / on-screen), timed on the app clock.
     pub live: Vec<(usize, chromagrain_core::grain::GrainEvent)>,
     pub live_t: f64,
+    /// Transport stopped: long events ignore fades so the still frame shows.
+    pub parked: bool,
 }
 
 const MAX_SRC_W: u32 = 256;
@@ -1018,7 +1020,7 @@ impl GpuPreview {
                                 (gsrc.tex, gsrc.layers, gsrc.duration.max(1e-6));
                             let style: VisualGrainStyle = cp.style;
                             let aspect = self.size.0 as f32 / self.size.1.max(1) as f32;
-                            let draws = grain_draws(
+                            let draws = grain_draws_opts(
                                 evs,
                                 &style,
                                 &clip.link,
@@ -1026,6 +1028,7 @@ impl GpuPreview {
                                 dur,
                                 t,
                                 aspect,
+                                scene.parked,
                             );
                             let p = self.use_program(gl, "grain");
                             gl.active_texture(glow::TEXTURE0);

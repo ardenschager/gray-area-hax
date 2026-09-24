@@ -387,6 +387,23 @@ pub fn grain_draws(
     t: f64,
     aspect: f32,
 ) -> Vec<GrainDraw> {
+    grain_draws_opts(events, style, link, transform, source_duration, t, aspect, false)
+}
+
+/// [`grain_draws`] with a `parked` flag for the stopped preview: long events
+/// (snippets, slow grains) ignore their fade-in/out so a playhead parked at
+/// a clip's start shows the picture instead of black.
+#[allow(clippy::too_many_arguments)]
+pub fn grain_draws_opts(
+    events: &[GrainEvent],
+    style: &VisualGrainStyle,
+    link: &AvLink,
+    transform: &crate::timeline::ClipTransform,
+    source_duration: f64,
+    t: f64,
+    aspect: f32,
+    parked: bool,
+) -> Vec<GrainDraw> {
     let mut out = Vec::new();
     let rot = transform.rotation.to_radians();
     let (sin_r, cos_r) = rot.sin_cos();
@@ -397,9 +414,11 @@ pub fn grain_draws(
             continue;
         }
         let phase = ((t - ev.onset) / ev.duration as f64) as f32;
-        let env_part = 1.0
-            + (grain_env_skewed(phase, ev.envelope, ev.env_skew) - 1.0)
-                * link.envelope_to_opacity;
+        let mut env = grain_env_skewed(phase, ev.envelope, ev.env_skew);
+        if parked && ev.duration >= 0.25 {
+            env = env.max(grain_env_skewed(0.5, ev.envelope, ev.env_skew));
+        }
+        let env_part = 1.0 + (env - 1.0) * link.envelope_to_opacity;
         let gain_part = 1.0 + (ev.gain.min(1.5) - 1.0) * link.gain_to_opacity;
         let alpha = (env_part * gain_part).clamp(0.0, 1.0);
         if alpha <= 0.003 {
