@@ -31,6 +31,7 @@ pub mod media;
 pub mod music;
 pub mod realtime;
 pub mod render;
+pub mod sc;
 pub mod script;
 pub mod seq;
 pub mod stretch;

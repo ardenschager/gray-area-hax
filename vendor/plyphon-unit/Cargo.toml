@@ -1,0 +1,23 @@
+[package]
+name = "plyphon-unit"
+version = "0.1.1"
+description = "The plyphon unit-generator abstraction (vendored into chromagrain with a MulAdd audio-rate fix; see PATCHES.md)."
+authors = ["nannou-org"]
+edition = "2024"
+homepage = "https://github.com/nannou-org/plyphon"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/nannou-org/plyphon"
+
+[features]
+default = ["std", "fft"]
+std = ["plyphon-dsp/std", "thiserror/std"]
+# FFT/spectral units (FFT/IFFT/PV_*). Depends on `std`; propagates to the `FftTables` plans.
+fft = ["std", "plyphon-dsp/fft"]
+
+[dependencies]
+bytemuck = { version = "1", features = ["derive"] }
+# `default-hasher` (foldhash, dependency-free) gives `HashMap::new()`; the other default
+# features (allocator-api2, equivalent, ...) are not needed and stay off.
+hashbrown = { version = "0.17", default-features = false, features = ["default-hasher"] }
+plyphon-dsp = { git = "https://github.com/nannou-org/plyphon", rev = "4e3cd234421271724e48b9012835746b0dbb33fc", default-features = false }
+thiserror = { version = "2", default-features = false }

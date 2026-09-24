@@ -11,3 +11,4 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 rhai = { version = "1.25", features = ["sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+plyphon = { git = "https://github.com/nannou-org/plyphon", rev = "4e3cd234421271724e48b9012835746b0dbb33fc" }
