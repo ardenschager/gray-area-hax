@@ -105,6 +105,16 @@ fn centroid_hz(window: &[f32], sample_rate: f32) -> f32 {
 /// Audio-reactive video: an oscilloscope trace of the actual waveform,
 /// hue = spectral centroid (the hue<->freq axis), glow = loudness.
 pub fn scope_video(audio: &AudioClip, width: u32, height: u32, fps: f32) -> VideoClip {
+    scope(audio, width, height, fps, false)
+}
+
+/// Like [`scope_video`] but only the glowing trace, on a transparent
+/// background — sits on top of other video instead of hiding it.
+pub fn scope_overlay(audio: &AudioClip, width: u32, height: u32, fps: f32) -> VideoClip {
+    scope(audio, width, height, fps, true)
+}
+
+fn scope(audio: &AudioClip, width: u32, height: u32, fps: f32, transparent: bool) -> VideoClip {
     let n_frames = ((audio.duration() * fps as f64).ceil() as usize).max(1);
     let sr = audio.sample_rate as f32;
     let win_len = (sr / fps).max(2.0) as usize;
@@ -122,11 +132,15 @@ pub fn scope_video(audio: &AudioClip, width: u32, height: u32, fps: f32) -> Vide
         let (tr, tg, tb) = hsv_to_rgb(hue, 0.55, bright);
 
         let mut frame = Frame::black(width, height);
-        // Dim spectral wash as the background.
+        // Dim spectral wash as the background (or nothing at all).
         for px in frame.data.chunks_exact_mut(4) {
-            px[0] = br;
-            px[1] = bg;
-            px[2] = bb;
+            if transparent {
+                px.copy_from_slice(&[tr, tg, tb, 0]);
+            } else {
+                px[0] = br;
+                px[1] = bg;
+                px[2] = bb;
+            }
         }
         // The trace.
         let half = height as f32 / 2.0;
@@ -144,16 +158,17 @@ pub fn scope_video(audio: &AudioClip, width: u32, height: u32, fps: f32) -> Vide
                     continue;
                 }
                 let px = frame.get(x, y as u32);
-                frame.put(
-                    x,
-                    y as u32,
+                let rgba = if transparent {
+                    [tr, tg, tb, px[3].max((a * 255.0) as u8)]
+                } else {
                     [
                         (px[0] as f32 + tr as f32 * a).min(255.0) as u8,
                         (px[1] as f32 + tg as f32 * a).min(255.0) as u8,
                         (px[2] as f32 + tb as f32 * a).min(255.0) as u8,
                         255,
-                    ],
-                );
+                    ]
+                };
+                frame.put(x, y as u32, rgba);
             }
         }
         frames.push(frame);

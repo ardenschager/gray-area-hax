@@ -423,6 +423,15 @@ impl App {
                         }
                     });
                     ui.separator();
+                    if ui.button("cut out people").on_hover_text("background removed around people; the pad switches to the cut-out").clicked() {
+                        menu_action = Some((i, PadAction::CutOut("person")));
+                        ui.close();
+                    }
+                    if ui.button("cut out subject").clicked() {
+                        menu_action = Some((i, PadAction::CutOut("subject")));
+                        ui.close();
+                    }
+                    ui.separator();
                     if ui.button("clear pad").clicked() {
                         menu_action = Some((i, PadAction::Clear));
                         ui.close();
@@ -444,7 +453,7 @@ impl App {
 
         theme::hint(
             ui,
-            "click a pad to start / stop it  ·  keys 1-4 Q-R A-F Z-V  ·  shift-click to edit without launching  ·  right-click for length & mode  ·  shift-F fullscreen  ·  tab = arrange",
+            "click a pad to start / stop it  ·  keys 1-4 Q-R A-F Z-V  ·  shift-click to edit without launching  ·  right-click: length, mode, cut out people  ·  shift-F fullscreen  ·  tab = arrange",
         );
 
         // ---- apply interactions (after drawing, lock-free)
@@ -465,6 +474,7 @@ impl App {
             }
             Some((i, PadAction::Len(b))) => self.set_pad_len(i, b),
             Some((i, PadAction::Clear)) => self.clear_pad(i),
+            Some((i, PadAction::CutOut(what))) => self.cut_out_clip(i, 0, what),
             None => {}
         }
         if let Some((pad, src)) = drop_src {
@@ -479,6 +489,7 @@ impl App {
 enum PadAction {
     Mode(PlayMode),
     Len(f64),
+    CutOut(&'static str),
     Clear,
 }
 

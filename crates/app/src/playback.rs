@@ -30,6 +30,23 @@ struct Shared {
     transport_cmd: Mutex<Option<TransportCmd>>,
     /// Live pad hits waiting for the engine (onset filled engine-side).
     live_queue: Mutex<Vec<(usize, GrainEvent)>>,
+    /// One-shot preview sounds (instrument note auditions), mixed in after
+    /// the engine at the project rate: (samples, read position).
+    auditions: Mutex<Vec<(Arc<Vec<f32>>, usize)>>,
+}
+
+/// Send-able handle for firing audition sounds from worker threads.
+#[derive(Clone)]
+pub struct Auditioner(Arc<Shared>);
+
+impl Auditioner {
+    pub fn play(&self, samples: Arc<Vec<f32>>) {
+        let mut a = self.0.auditions.lock().unwrap();
+        if a.len() >= 6 {
+            a.remove(0);
+        }
+        a.push((samples, 0));
+    }
 }
 
 pub struct Playback {
@@ -53,6 +70,7 @@ impl Playback {
             loop_region: Mutex::new(None),
             transport_cmd: Mutex::new(None),
             live_queue: Mutex::new(Vec::new()),
+            auditions: Mutex::new(Vec::new()),
         });
         let (producer, consumer) = rtrb::RingBuffer::<f32>::new(RING_CAPACITY);
         let mut pb = Playback {
@@ -160,6 +178,11 @@ impl Playback {
         self.shared.live_queue.lock().unwrap().push((source, event));
     }
 
+    /// Handle for playing one-shot preview sounds (see [`Auditioner`]).
+    pub fn auditioner(&self) -> Auditioner {
+        Auditioner(self.shared.clone())
+    }
+
     /// Current playhead in project seconds (loop-folded).
     pub fn playhead_secs(&self, project: &Project) -> f64 {
         let consumed = match &self.wall_start {
@@ -233,6 +256,19 @@ fn producer_loop(device_rate: u32, mut producer: rtrb::Producer<f32>, shared: Ar
 
         if pending.is_empty() {
             engine.next_block(&mut left, &mut right);
+            {
+                let mut aud = shared.auditions.lock().unwrap();
+                for (buf, pos) in aud.iter_mut() {
+                    let n = BLOCK.min(buf.len().saturating_sub(*pos));
+                    for i in 0..n {
+                        let v = buf[*pos + i] * 0.7;
+                        left[i] += v;
+                        right[i] += v;
+                    }
+                    *pos += n;
+                }
+                aud.retain(|(buf, pos)| *pos < buf.len());
+            }
             // Resample to device rate, interleaved.
             let mut i = 0usize;
             while i < BLOCK {

@@ -29,6 +29,7 @@ mod ui_browse;
 mod ui_inspector;
 mod ui_library;
 mod ui_perform;
+mod ui_synth;
 mod ui_timeline;
 mod ui_topbar;
 
@@ -335,6 +336,12 @@ pub struct App {
     fill_rev: u64,
     /// Look-ahead playhead last frame (to spot boundary crossings).
     prev_launch_t: Option<f64>,
+
+    /// SuperCollider instrument parts: renders, auditions, editor state.
+    synth: ui_synth::SynthState,
+    /// A one-click cut-out in progress: (track, clip, original source) —
+    /// the clip switches to the cut-out when it arrives.
+    pending_cutout: Option<(usize, usize, usize)>,
 }
 
 impl App {
@@ -400,6 +407,8 @@ impl App {
             launch_q: LaunchQ::Bar,
             fill_rev: 0,
             prev_launch_t: None,
+            synth: ui_synth::SynthState::new(),
+            pending_cutout: None,
         }
     }
 
@@ -686,8 +695,16 @@ impl App {
                 }
             }
         }
+        p.synth_parts.retain(|s| s.source != src);
+        for s in &mut p.synth_parts {
+            if s.source > src {
+                s.source -= 1;
+            }
+        }
         let name = p.sources.remove(src).name;
         drop(p);
+        self.synth.reset_ids();
+        self.pending_cutout = None;
         self.imported.retain(|_, id| *id != src);
         for id in self.imported.values_mut() {
             if *id > src {
@@ -890,27 +907,28 @@ impl App {
         });
     }
 
-    fn add_synth(&mut self, which: &str) {
-        let mut p = self.project.lock().unwrap();
-        let sr = p.sample_rate;
-        let src = match which {
-            "fm" => chromagrain_core::synth::fm_source(110.0, 2.0, 1.5, 4.0, sr),
-            "noise" => chromagrain_core::synth::noise_source(0.5, 4.0, sr),
-            _ => Source {
-                name: "test pattern (saw)".into(),
-                audio: Some(Arc::new(chromagrain_core::audio::AudioClip::saw_stack(110.0, 4.0, sr))),
-                video: Some(Arc::new(chromagrain_core::video::VideoClip::test_pattern(
-                    240, 136, 12.0, 4.0,
-                ))),
-                base_hz: 110.0,
-            },
+    /// One click: cut `prompt` ("person", "subject", …) out of a clip's
+    /// video; when it's done the clip plays the cut-out instead.
+    pub(crate) fn cut_out_clip(&mut self, ti: usize, ci: usize, prompt: &str) {
+        if let Some(b) = &self.busy {
+            self.status = format!("busy — {b}");
+            return;
+        }
+        let src = {
+            let p = self.project.lock().unwrap();
+            let Some(c) = p.tracks.get(ti).and_then(|t| t.clips.get(ci)) else { return };
+            if matches!(c.kind, ClipKind::Pattern(_)) {
+                return;
+            }
+            if p.sources.get(c.source).is_none_or(|s| s.video.is_none()) {
+                drop(p);
+                self.status = "this clip has no video to cut out of".into();
+                return;
+            }
+            c.source
         };
-        let name = src.name.clone();
-        let id = p.add_source(src);
-        drop(p);
-        self.select(Sel::Source(id));
-        self.status = format!("added '{name}' to the library");
-        self.mark_now();
+        self.pending_cutout = Some((ti, ci, src));
+        self.start_segment(src, prompt.to_string());
     }
 
     fn start_script(&mut self) {
@@ -968,6 +986,22 @@ impl App {
                     let name = src.name.clone();
                     let hz = src.base_hz;
                     let id = self.project.lock().unwrap().add_source(src);
+                    if let Some((ti, ci, orig)) = self.pending_cutout.take() {
+                        // One-click cut-out: the clip that asked for it
+                        // now plays the cut-out; the original stays in
+                        // the library.
+                        let mut p = self.project.lock().unwrap();
+                        if let Some(c) = p.tracks.get_mut(ti).and_then(|t| t.clips.get_mut(ci)) {
+                            if c.source == orig && !matches!(c.kind, ClipKind::Pattern(_)) {
+                                c.source = id;
+                                drop(p);
+                                self.select(Sel::Clip(ti, ci));
+                                self.mark_now();
+                                self.status = format!("cut out → '{name}' (original kept in the library)");
+                                continue;
+                            }
+                        }
+                    }
                     self.select(Sel::Source(id));
                     self.mark_now();
                     self.status = if hz > 0.0 {
@@ -976,7 +1010,10 @@ impl App {
                         format!("added '{name}' — drag it onto a track")
                     };
                 }
-                WorkerMsg::Source(Err(e)) => self.status = format!("couldn't add media: {e}"),
+                WorkerMsg::Source(Err(e)) => {
+                    self.pending_cutout = None;
+                    self.status = format!("couldn't add media: {e}");
+                }
                 WorkerMsg::Loaded(path, place, res) => {
                     self.loading.remove(&path);
                     match res {
@@ -1120,6 +1157,7 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_midi();
         self.poll_workers();
+        self.synth_update(ctx);
         self.browser.poll(ctx);
         self.handle_shortcuts(ctx);
 
@@ -1180,6 +1218,20 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::BG).inner_margin(egui::Margin::same(10)))
             .show(ctx, |ui| {
+                // The instrument editor docks at the bottom (resizable) so
+                // the preview and timeline shrink to make room for it.
+                if let Some(pi) = self.selected_part() {
+                    egui::TopBottomPanel::bottom("synth_editor")
+                        .resizable(true)
+                        .default_height(360.0)
+                        .height_range(200.0..=640.0)
+                        .frame(egui::Frame::new().fill(theme::BG).inner_margin(egui::Margin { top: 8, ..Default::default() }))
+                        .show_inside(ui, |ui| {
+                            egui::ScrollArea::vertical().id_salt("synth_scroll").show(ui, |ui| {
+                                self.synth_editor_ui(ui, pi);
+                            });
+                        });
+                }
                 self.preview_ui(ui);
                 ui.add_space(8.0);
                 if self.mode == AppMode::Perform {
@@ -1200,6 +1252,7 @@ impl eframe::App for App {
                         self.pattern_editor_ui(ui, ti, ci, pid);
                     }
                 }
+
             });
 
         self.paint_drag_ghost(ctx);

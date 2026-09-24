@@ -227,6 +227,9 @@ pub struct Project {
     pub master_effects: Vec<AvEffect>,
     /// UI snap grid in beats (0.25 = sixteenths at x/4).
     pub quantize: f64,
+    /// SuperCollider instrument parts; each renders into one library
+    /// source (`part.source`), which clips and pads use like any media.
+    pub synth_parts: Vec<crate::sc::SynthPart>,
 }
 
 impl Default for Project {
@@ -242,6 +245,7 @@ impl Default for Project {
             patterns: Vec::new(),
             master_effects: Vec::new(),
             quantize: 0.25,
+            synth_parts: Vec::new(),
         }
     }
 }

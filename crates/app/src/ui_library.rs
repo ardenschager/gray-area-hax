@@ -129,19 +129,18 @@ impl App {
             }
         });
         theme::hint(ui, "first 90s, up to 480p (needs yt-dlp)");
-        theme::section(ui, "synths");
-        ui.horizontal(|ui| {
-            if ui.button("FM tone").clicked() {
-                self.add_synth("fm");
-                ui.close();
-            }
-            if ui.button("noise").clicked() {
-                self.add_synth("noise");
-                ui.close();
-            }
-            if ui.button("test pattern").clicked() {
-                self.add_synth("demo");
-                ui.close();
+        theme::section(ui, "instruments");
+        theme::hint(ui, "SuperCollider synths — each one starts with a playable loop");
+        egui::Grid::new("instrument_grid").num_columns(2).spacing([6.0, 6.0]).show(ui, |ui| {
+            for (n, inst) in chromagrain_core::sc::INSTRUMENTS.iter().enumerate() {
+                let b = egui::Button::new(format!("♪ {}", inst.label)).min_size(egui::vec2(112.0, 24.0));
+                if ui.add(b).on_hover_text(inst.blurb).clicked() {
+                    self.add_instrument(inst.id);
+                    ui.close();
+                }
+                if n % 2 == 1 {
+                    ui.end_row();
+                }
             }
         });
     }

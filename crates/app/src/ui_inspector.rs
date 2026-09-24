@@ -47,10 +47,11 @@ impl App {
         ui.label(egui::RichText::new("Nothing selected").heading().color(TEXT));
         ui.add_space(6.0);
         for line in [
-            "1  + add media in the Library (or drop files anywhere)",
+            "1  + add media or a ♪ instrument in the Library (or drop files anywhere)",
             "2  drag it onto a track — it lands as a snippet",
             "3  click the clip: flip it to grains or pattern, shape it here",
             "4  space to play, drag the preview to place visuals",
+            "5  cut out people / effects: the LOOK buttons at the top of any clip",
         ] {
             ui.label(egui::RichText::new(line).color(TEXT_DIM));
         }
@@ -144,17 +145,27 @@ impl App {
             }
             ui.add(egui::DragValue::new(&mut self.stretch_factor).range(2.0..=64.0).speed(0.25).prefix("×"));
         });
-        ui.horizontal(|ui| {
-            let go = ui
-                .button("cut out")
-                .on_hover_text("SAM 3: cut the prompted object out of the video, tracked (needs tools/segment.py)")
-                .clicked();
-            ui.add(egui::TextEdit::singleline(&mut self.segment_prompt).hint_text("object, e.g. cat").desired_width(140.0));
-            if go {
-                let p = self.segment_prompt.clone();
-                self.start_segment(i, p);
-            }
-        });
+        if info.2 {
+            ui.horizontal(|ui| {
+                if ui.button("cut out people").on_hover_text("new media: just the people, background removed").clicked() {
+                    self.start_segment(i, "person".into());
+                }
+                if ui.button("cut out subject").on_hover_text("new media: whatever stands out in front").clicked() {
+                    self.start_segment(i, "subject".into());
+                }
+            });
+            ui.horizontal(|ui| {
+                let go = ui
+                    .button("cut out…")
+                    .on_hover_text("anything else by name — on macOS words other than people pick the main subject; SAM 3 (tools/segment.py) handles any text prompt")
+                    .clicked();
+                ui.add(egui::TextEdit::singleline(&mut self.segment_prompt).hint_text("e.g. dancer, dog").desired_width(140.0));
+                if go {
+                    let p = self.segment_prompt.clone();
+                    self.start_segment(i, p);
+                }
+            });
+        }
         theme::hint(ui, "results appear as new cards in the library");
 
         theme::section(ui, &format!("used by {} clip{}", users.len(), if users.len() == 1 { "" } else { "s" }));
@@ -226,8 +237,63 @@ impl App {
 
         let mut changed = false;
         let mut goto_source: Option<usize> = None;
+        let mut cutout: Option<&'static str> = None;
         let mut p = self.project.lock().unwrap();
+        let (has_video, is_part) = {
+            let s = p.tracks[ti].clips[ci].source;
+            let v = mode != PlayMode::Pattern && p.sources.get(s).is_some_and(|s| s.video.is_some());
+            (v, mode != PlayMode::Pattern && crate::ui_synth::part_of(&p, s).is_some())
+        };
+        let cutting = self.pending_cutout.is_some_and(|(t, c, _)| t == ti && c == ci);
         let clip = &mut p.tracks[ti].clips[ci];
+
+        if is_part {
+            ui.add_space(2.0);
+            ui.label(egui::RichText::new("♪ instrument — notes & knobs are in the editor under the timeline").color(theme::POLY).size(11.5));
+        }
+
+        // Look: the visual tricks, one click each, always in view.
+        theme::section(ui, "look");
+        if has_video && !is_part {
+            ui.horizontal(|ui| {
+                if cutting {
+                    ui.add(egui::Spinner::new().size(14.0));
+                    ui.label(egui::RichText::new("cutting out… (a few seconds per 10 s of video)").color(TEXT_DIM));
+                } else {
+                    if ui
+                        .add(egui::Button::new("cut out people").min_size(egui::vec2(0.0, 26.0)))
+                        .on_hover_text("remove the background around people — the clip switches to the cut-out (original stays in the library)")
+                        .clicked()
+                    {
+                        cutout = Some("person");
+                    }
+                    if ui
+                        .add(egui::Button::new("cut out subject").min_size(egui::vec2(0.0, 26.0)))
+                        .on_hover_text("keep whatever stands out in front (objects, animals, people)")
+                        .clicked()
+                    {
+                        cutout = Some("subject");
+                    }
+                }
+            });
+        }
+        ui.horizontal_wrapped(|ui| {
+            for (name, label) in [("tune", "tune to key"), ("crush", "crush"), ("delay", "echo trails"), ("reverb", "smear"), ("compress", "jpeg crunch"), ("tint", "tint")] {
+                let Some(kind) = EffectKind::parse(name) else { continue };
+                let on = clip.effects.iter().position(|f| f.kind.name() == kind.name());
+                let b = egui::Button::selectable(on.is_some(), label).min_size(egui::vec2(0.0, 24.0));
+                if ui.add(b).on_hover_text(effect_blurb(&kind)).clicked() {
+                    match on {
+                        Some(i) => {
+                            clip.effects.remove(i);
+                        }
+                        None => clip.effects.push(AvEffect::new(kind)),
+                    }
+                    changed = true;
+                }
+            }
+        });
+        theme::hint(ui, "each works on sound and picture together · fine-tune under Effects below");
 
         theme::section(ui, "placement");
         ui.horizontal(|ui| {
@@ -380,6 +446,9 @@ impl App {
             changed |= param("y scatter", 0.0, 1.0).show(ui, &mut v.scatter_y);
         });
         drop(p);
+        if let Some(what) = cutout {
+            self.cut_out_clip(ti, ci, what);
+        }
 
         ui.add_space(12.0);
         ui.separator();

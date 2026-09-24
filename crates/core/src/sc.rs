@@ -449,7 +449,41 @@ pub fn render_part(part: &SynthPart, bpm: f64, sample_rate: u32) -> Result<Audio
     let sr = sample_rate as f64;
     let spb = 60.0 / bpm.max(1.0);
     let loop_n = ((part.length_beats.max(0.25) * spb) * sr).round() as usize;
-    let total_n = loop_n + (TAIL_SECS * sr) as usize;
+    let out = render_raw(part, inst, bpm, sample_rate, loop_n + (TAIL_SECS * sr) as usize)?;
+    // Fold the tail back onto the loop start: seamless looping.
+    let mut samples = out[..loop_n].to_vec();
+    for (i, s) in out[loop_n..].iter().enumerate() {
+        samples[i % loop_n] += *s;
+    }
+    finish_level(&mut samples, inst.trim);
+    Ok(AudioClip::new(samples, sample_rate))
+}
+
+/// One note of a part's instrument (with its current knobs), for
+/// auditioning while editing. Not looped; trailing silence trimmed.
+pub fn render_note(part: &SynthPart, pitch: u8, vel: f32, bpm: f64, sample_rate: u32) -> Result<Vec<f32>, String> {
+    let inst = instrument(&part.instrument).ok_or_else(|| format!("unknown instrument '{}'", part.instrument))?;
+    let spb = 60.0 / bpm.max(1.0);
+    let len = if inst.kit { 0.25 } else { 1.0 };
+    let mut p = part.clone();
+    p.notes = vec![Note { start: 0.0, len, pitch, vel }];
+    p.length_beats = 64.0;
+    let secs = len * spb + if inst.kit { 1.0 } else { 2.5 };
+    let mut out = render_raw(&p, inst, bpm, sample_rate, (secs * sample_rate as f64) as usize)?;
+    let last = out.iter().rposition(|v| v.abs() > 1e-4).unwrap_or(0);
+    out.truncate((last + 1).max(64));
+    let fade = (0.03 * sample_rate as f64) as usize;
+    let n = out.len();
+    for i in 0..fade.min(n) {
+        out[n - 1 - i] *= i as f32 / fade as f32;
+    }
+    finish_level(&mut out, inst.trim * 0.8);
+    Ok(out)
+}
+
+fn render_raw(part: &SynthPart, inst: &Instrument, bpm: f64, sample_rate: u32, total_n: usize) -> Result<Vec<f32>, String> {
+    let sr = sample_rate as f64;
+    let spb = 60.0 / bpm.max(1.0);
 
     let (mut ctl, mut nrt, mut world) = engine(Options {
         sample_rate: sr,
@@ -561,14 +595,20 @@ pub fn render_part(part: &SynthPart, bpm: f64, sample_rate: u32) -> Result<Audio
         }
         pos += 64;
     }
+    Ok(out)
+}
 
-    // Fold the tail back onto the loop start: seamless looping.
-    let mut samples = out[..loop_n].to_vec();
-    for (i, s) in out[loop_n..].iter().enumerate() {
-        samples[i % loop_n] += *s;
-    }
-    finish_level(&mut samples, inst.trim);
-    Ok(AudioClip::new(samples, sample_rate))
+/// Library media for a rendered part: the audio plus a glowing
+/// oscilloscope trace of it on a transparent background, so the part has
+/// a picture like any other clip without hiding the video underneath.
+pub fn part_media(audio: AudioClip) -> (std::sync::Arc<AudioClip>, std::sync::Arc<crate::video::VideoClip>) {
+    let video = crate::synth::scope_overlay(&audio, 240, 136, 12.0);
+    (std::sync::Arc::new(audio), std::sync::Arc::new(video))
+}
+
+/// Display name for a part's library card.
+pub fn part_name(part: &SynthPart) -> String {
+    format!("♪ {}", instrument(&part.instrument).map(|i| i.label).unwrap_or("synth"))
 }
 
 /// Bring every render to a consistent loudness with a soft ceiling, so
@@ -652,6 +692,17 @@ mod tests {
             assert!(peak <= 1.0, "{} clips: {peak}", inst.id);
             assert!(a.samples.iter().all(|v| v.is_finite()), "{} has NaN", inst.id);
             eprintln!("{:>16}: rms {r:.3} peak {peak:.2} in {:?}", inst.label, t.elapsed());
+        }
+    }
+
+    #[test]
+    fn single_note_audition() {
+        for id in ["cg_pluck", "kit"] {
+            let part = SynthPart::new(id, 0);
+            let v = render_note(&part, if id == "kit" { 38 } else { 60 }, 0.8, 120.0, 48000).unwrap();
+            let peak = v.iter().fold(0f32, |m, x| m.max(x.abs()));
+            assert!(peak > 0.1 && peak <= 1.0, "{id}: peak {peak}");
+            assert!(v.len() < 48000 * 4, "{id}: not trimmed ({} samples)", v.len());
         }
     }
 

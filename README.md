@@ -85,13 +85,14 @@ versa). It will be crunchy.
   follows the same shape); onsets can **beat-sync** to a 1/32–1/4 grid for
   rhythmic clouds; and each grain can stack up to 4 **harmony voices** at
   a chosen interval (octaves, fifths…), key-quantized, detuned and spread.
-- **Synth engines** — pure FM (carrier/modulator ratio + index) and
-  colored noise (white → pink → brown) render as sources whose video is
-  generated FROM their own audio: an oscilloscope trace whose hue follows
-  the spectral centroid on the shared hue↔frequency axis (red = low,
-  violet = high). Synths get everything samples get: granular clips,
-  snippets, sequencer rows, MIDI pads, key quantize, effect chains,
-  canvas transforms.
+- **SuperCollider instruments, inside the app** — warm pad, electric
+  piano, pluck, bass, acid, bell, supersaw lead, choir, drone and a drum
+  kit, written as real SuperCollider SynthDefs (`assets/synthdefs/build.scd`)
+  and run in-process by [plyphon](https://github.com/nannou-org/plyphon), a
+  pure-Rust scsynth. No server to launch, nothing routed: each part renders
+  into a library source (with an oscilloscope trace as its picture), so it
+  gets everything samples get — grains, snippets, patterns, pads, key
+  quantize, the AV effect chain and export. See *Instruments* below.
 - **Tint (spectral smush)** — a fifth AV effect: smush every hue toward a
   target color while a narrowing resonant bandpass smushes the audio
   spectrum toward the corresponding frequency on the same hue↔freq axis.
@@ -134,8 +135,11 @@ versa). It will be crunchy.
   source + grain settings + key + filters; drag clips, click to seek.
 - **YouTube scraping** — `yt-dlp`-powered import (capped at 480p / 90s),
   decoded through ffmpeg into grain-ready audio + frames.
-- **Object segmentation (SAM 3)** — type "cat", and Meta's Segment
-  Anything 3 cuts every cat out of the video, tracked across frames
+- **Cut out people** — one click (*cut out people* / *cut out subject* in
+  the LOOK row at the top of any clip, or right-click a pad) removes the
+  background, tracked across frames; the clip switches to the cut-out and
+  the original stays in the library. With SAM 3 installed you can also type
+  any object ("cat") and Meta's Segment Anything 3 cuts it out, tracked
   through occlusions. The mask is baked into the alpha channel of a
   derived source (feathered edges), so the cat — and only the cat —
   granulates, sequences, transforms and composites over your other
@@ -217,14 +221,15 @@ The window has three places, and every thing lives in exactly one of them:
 
 | where | what lives there |
 |-------|------------------|
-| **Library** (left) | all media — files, YouTube scrapes, synths, and derived artifacts (paulstretch washes, cutouts). Each gets a color that follows it everywhere. |
-| **Timeline** (center) | tracks, clips and the master bus. Selecting a pattern clip opens its step grid right below. |
+| **Library** (left) | all media — files, YouTube scrapes, ♪ instruments, and derived artifacts (paulstretch washes, cutouts). Each gets a color that follows it everywhere. |
+| **Timeline** (center) | tracks, clips and the master bus. Selecting a pattern clip opens its step grid right below; selecting an instrument (or any clip/pad playing it) opens its editor — knobs + piano roll — docked below. |
 | **Inspector** (right) | edits whatever you selected — media, clip, track or master. |
 
 1. The app opens with a demo project. Press **space** — playback is live
    (GPU-rendered video, streaming audio); tweak anything while it runs.
 2. **Add media**: *+ add* in the library (files, a YouTube link, or a
-   synth) — or just drop files onto the window. Base pitch is auto-detected.
+   ♪ instrument) — or just drop files onto the window. Base pitch is
+   auto-detected.
 3. **Use it**: drag a library card onto a track (or below the last track
    for a new one). It lands as a *snippet*.
 4. **Choose how it plays**: click the clip and flip *snippet / grains /
@@ -233,23 +238,27 @@ The window has three places, and every thing lives in exactly one of them:
    filters, automation and sound↔picture links fold away below.
 5. **Arrange**: drag clips (across tracks too), drag their right edge to
    resize, right-click for more; ⌘D duplicates, ⌫ deletes.
-6. **Place the picture** right on the preview: drag to move, drag a corner
+6. **Change the look**: the LOOK row at the top of every clip is one click
+   each — *cut out people*, *cut out subject*, *tune to key*, *crush*,
+   *echo trails*, *smear*, *jpeg crunch*, *tint* (all of them act on sound
+   and picture together; their dials are under *Effects*).
+7. **Place the picture** right on the preview: drag to move, drag a corner
    to size, drag the knob to rotate (shift snaps to 15°); scroll = size,
    shift+scroll = rotate. The inspector's *picture* section has the same
    plus one-click 50% / 100% / fill / ±90° / center / reset. **F** (or
    double-click the preview) goes fullscreen; esc comes back.
-7. **Put it in a key**: the inspector's *key* section picks a root + scale
+8. **Put it in a key**: the inspector's *key* section picks a root + scale
    once and uses it two ways — *snap notes* re-pitches every grain/hit to
    the key; *tune the sound* runs a resonator bank on every note of the key
    so ANY audio (speech, noise, field recordings) is pulled onto it, while
    the picture's hues snap to the key's colors.
-8. **Sequence**: with a pattern clip selected, click/drag steps in the grid
+9. **Sequence**: with a pattern clip selected, click/drag steps in the grid
    under the timeline, give a row its own step count for polymeter, flip a
    row to *loop*, or drop media on the grid for a new row.
-9. **Play it like a sampler**: *midi* in the top bar — pick a port, use the
+10. **Play it like a sampler**: *midi* in the top bar — pick a port, use the
    pads, and map knobs (*learn*, then twist). Notes play the selected clip
    (C4 = unity), even with the transport stopped.
-10. **Render** from *export* in the top bar — mp4 or wav, rendered by the
+11. **Render** from *export* in the top bar — mp4 or wav, rendered by the
    deterministic offline engine.
 
 ### Browse — every video on this Mac
@@ -301,6 +310,35 @@ opens straight into it.
   tracks; media, patterns and the master bus are shared.
 - **stop all** silences everything. In perform mode **F** is a pad, so
   fullscreen is **shift-F** (or the button on the preview).
+
+### Instruments — SuperCollider, built in
+
+![instrument editor](docs/instruments.png)
+
+*+ add → instruments* drops a playable loop on a new track (or the next
+empty pad in perform mode) and opens its editor under the timeline:
+
+- **Pick the instrument** from the dropdown — switching keeps your notes.
+- **Knobs**: drag up/down (shift = fine), double-click to reset. *shuffle
+  sound* randomizes, *reset* goes back to the preset.
+- **Piano roll**: click to add a note (drag to draw it longer), drag to
+  move, drag the right edge to resize, right-click to delete, scroll on a
+  note for velocity, scroll elsewhere to move up/down an octave. Click the
+  piano keys (or any note) to hear it. The drum kit gets kick / snare /
+  hat / open-hat rows instead. Rows in the selected clip's key are lit.
+- **Loop**: 1, 2, 4 or 8 bars — lengthening repeats what you wrote.
+- Every edit re-renders in the background in a few milliseconds and swaps
+  into the same library source, so every clip and pad playing the part
+  follows, in time with the project tempo. The editor is the one place the
+  part is edited — the clip inspector still does the clip things (mode,
+  picture, key, effects).
+- The sound: 12 SynthDefs in `assets/synthdefs/build.scd`; rebuild the
+  `.scsyndef` files with
+  `/Applications/SuperCollider.app/Contents/MacOS/sclang assets/synthdefs/build.scd`.
+  plyphon is vendored with two fixes (`vendor/plyphon-unit/PATCHES.md`):
+  audio-rate `MulAdd` operands and control-rate operands of binary ops
+  are now interpolated across the block like scsynth, which removes a
+  750 Hz zipper from most SynthDefs. Renders are mono for now.
 
 ### Headless / scripted
 
@@ -407,7 +445,10 @@ crates/core        chromagrain-core (headless, fully tested)
   timeline.rs      Source / Clip (granular|snippet|pattern) / Track / Project
   render.rs        offline renderer: clip -> track -> master, z-ordered
   realtime.rs      streaming performance engine (loop region, live edits)
-  media.rs         wav/png IO, ffmpeg decode/encode, yt-dlp fetch
+  media.rs         wav/png IO, ffmpeg decode/encode, yt-dlp fetch,
+                   segmentation sidecars (Apple Vision / SAM 3)
+  sc.rs            SuperCollider instruments via plyphon: catalog, parts,
+                   seamless-loop + single-note offline renders
   script.rs        rhai bindings over all of the above
 crates/app         chromagrain (desktop app)
   main.rs          eframe GUI: preview, timeline, sequencer, inspector
@@ -416,7 +457,19 @@ crates/app         chromagrain (desktop app)
   playback.rs      always-on engine: lock-free ring into cpal, transport
                    start/stop, live pad triggers any time
   midi.rs          midir input, note pads, CC mappings with learn
+  ui_synth.rs      instrument editor (knobs + piano roll), debounced
+                   background re-renders, note auditions
+assets/synthdefs   the SynthDefs (build.scd) + compiled .scsyndef files
+tools/             segment_vision.swift (Vision) and segment.py (SAM 3)
+vendor/            plyphon-unit with block-interpolation fixes
 ```
 
 The renderer is deterministic: a project + seeds always produces the same
 grains, samples, and pixels — renders are reproducible and testable.
+
+## License
+
+chromagrain's own code is MIT. The built app links
+[plyphon](https://github.com/nannou-org/plyphon) (GPL-3.0-or-later, partly
+vendored in `vendor/plyphon-unit`) for the SuperCollider instruments, so
+distributed binaries fall under the GPL-3.0.
