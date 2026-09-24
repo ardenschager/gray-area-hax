@@ -15,6 +15,10 @@
 //!   A selected pattern clip opens its step grid right under the timeline.
 //! * **Inspector** (right) — edits whatever is selected (source, clip,
 //!   track or master). Nothing is editable in two places.
+//! * **Perform** (top-bar switch) — the timeline becomes a 4×4 grid of
+//!   looping pads. Each pad is a track whose first clip loops forever;
+//!   pads start/stop on the next beat or bar. Sources, patterns and the
+//!   master bus are shared with the arrangement.
 
 mod browser;
 mod gpu;
@@ -24,6 +28,7 @@ mod theme;
 mod ui_browse;
 mod ui_inspector;
 mod ui_library;
+mod ui_perform;
 mod ui_timeline;
 mod ui_topbar;
 
@@ -95,7 +100,9 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
     // `chromagrain clip.mp4 other.mov` — open with those files placed on
-    // their own tracks at the start.
+    // their own tracks at the start. `--perform` opens on the pads (the
+    // files land on pads instead).
+    let perform = args.iter().any(|a| a == "--perform");
     let open: Vec<PathBuf> =
         args.iter().skip(1).map(PathBuf::from).filter(|p| p.is_file()).collect();
     eframe::run_native(
@@ -104,6 +111,9 @@ fn main() -> eframe::Result<()> {
         Box::new(move |cc| {
             theme::apply(&cc.egui_ctx);
             let mut app = App::new();
+            if perform {
+                app.set_mode(AppMode::Perform);
+            }
             for p in open {
                 app.import_path(p, Some(Place { track: 0, new_track: true, beat: 0.0 }));
             }
@@ -177,6 +187,47 @@ pub struct Place {
 pub enum LibTab {
     Project,
     Browse,
+}
+
+/// Arrange = tracks on a timeline. Perform = looping pads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppMode {
+    Arrange,
+    Perform,
+}
+
+/// When a pad you press actually starts/stops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchQ {
+    Now,
+    Beat,
+    Bar,
+}
+
+impl LaunchQ {
+    pub fn label(self) -> &'static str {
+        match self {
+            LaunchQ::Now => "now",
+            LaunchQ::Beat => "next beat",
+            LaunchQ::Bar => "next bar",
+        }
+    }
+    fn beats(self) -> f64 {
+        match self {
+            LaunchQ::Now => 0.0,
+            LaunchQ::Beat => 1.0,
+            LaunchQ::Bar => 4.0,
+        }
+    }
+}
+
+/// Pads in perform mode (a 4×4 grid). Pad i is track i.
+pub const PADS: usize = 16;
+
+/// Snap a loop length to 1, 2, 4 … 32 beats (nearest, in log terms).
+pub fn pow2_beats(b: f64) -> f64 {
+    let b = b.clamp(1.0, 32.0);
+    2f64.powf(b.log2().round())
 }
 
 enum Job {
@@ -270,6 +321,20 @@ pub struct App {
     /// Preview fills the whole screen (F / esc / double-click).
     fullscreen: bool,
     gizmo: Option<ui_timeline::GizmoDrag>,
+
+    mode: AppMode,
+    /// The tracks of whichever mode is NOT showing (arrangement tracks
+    /// while performing, pad tracks while arranging).
+    other_tracks: Vec<chromagrain_core::timeline::Track>,
+    /// Loop settings of the mode that is not showing.
+    other_loop: (bool, f64, f64),
+    /// Pads waiting for the next launch boundary: (pad, turn on?).
+    pending: Vec<(usize, bool)>,
+    launch_q: LaunchQ,
+    /// project_rev the pad loops were last rebuilt for.
+    fill_rev: u64,
+    /// Look-ahead playhead last frame (to spot boundary crossings).
+    prev_launch_t: Option<f64>,
 }
 
 impl App {
@@ -328,6 +393,13 @@ impl App {
             loading: HashSet::new(),
             fullscreen: false,
             gizmo: None,
+            mode: AppMode::Arrange,
+            other_tracks: Vec::new(),
+            other_loop: (true, 0.0, 4.0),
+            pending: Vec::new(),
+            launch_q: LaunchQ::Bar,
+            fill_rev: 0,
+            prev_launch_t: None,
         }
     }
 
@@ -423,6 +495,20 @@ impl App {
 
     /// Put a source on a track as a clip in the given mode.
     fn place_source(&mut self, src: usize, track: usize, beat: f64, mode: PlayMode) {
+        if self.mode == AppMode::Perform {
+            // Target pad if it's empty, else the first empty pad.
+            let pad = {
+                let p = self.project.lock().unwrap();
+                let empty = |i: usize| p.tracks.get(i).is_none_or(|t| t.clips.is_empty());
+                if track < PADS && empty(track) {
+                    track
+                } else {
+                    (0..PADS).find(|&i| empty(i)).unwrap_or(track.min(PADS - 1))
+                }
+            };
+            self.load_pad(src, pad, mode);
+            return;
+        }
         let mut p = self.project.lock().unwrap();
         if src >= p.sources.len() {
             return;
@@ -431,21 +517,7 @@ impl App {
             p.add_track("track 1");
         }
         let t = track.min(p.tracks.len() - 1);
-        let secs = p.sources[src].duration();
-        let media_beats = p.secs_to_beats(secs);
-        let q = p.quantize.max(0.0625);
-        let clip = match mode {
-            PlayMode::Snippet => {
-                let len = ((media_beats / q).round() * q).clamp(1.0, 32.0);
-                Clip::new_snippet(src, beat, len)
-            }
-            PlayMode::Grains => Clip::new(src, beat, 4.0),
-            PlayMode::Pattern => {
-                let pat = new_pattern_for(&p.sources[src].name, src);
-                let pid = p.add_pattern(pat);
-                Clip::new_pattern(pid, beat, 4.0)
-            }
-        };
+        let clip = build_clip(&mut p, src, beat, mode);
         p.tracks[t].clips.push(clip);
         let ci = p.tracks[t].clips.len() - 1;
         let name = p.sources[src].name.clone();
@@ -585,6 +657,16 @@ impl App {
     /// Remove an unused source, shifting every later source id down.
     fn delete_source(&mut self, src: usize) {
         let mut p = self.project.lock().unwrap();
+        let hidden_use = self.other_tracks.iter().flat_map(|t| &t.clips).any(|c| match c.kind {
+            ClipKind::Pattern(pid) => p.patterns.get(pid).is_some_and(|pat| pat.rows.iter().any(|r| r.source == src)),
+            _ => c.source == src,
+        });
+        if hidden_use {
+            drop(p);
+            let other = if self.mode == AppMode::Perform { "arrangement" } else { "perform pads" };
+            self.status = format!("still used in the {other}");
+            return;
+        }
         if src >= p.sources.len() || !Self::source_users(&p, src).is_empty() {
             return;
         }
@@ -597,7 +679,7 @@ impl App {
                 }
             }
         }
-        for t in &mut p.tracks {
+        for t in p.tracks.iter_mut().chain(self.other_tracks.iter_mut()) {
             for c in &mut t.clips {
                 if !matches!(c.kind, ClipKind::Pattern(_)) && c.source > src {
                     c.source -= 1;
@@ -663,7 +745,13 @@ impl App {
     fn handle_midi(&mut self) {
         for msg in self.midi.poll() {
             match msg {
-                midi::MidiMsg::NoteOn { note, velocity } => self.trigger_note(note, velocity),
+                midi::MidiMsg::NoteOn { note, velocity } => {
+                    if self.mode == AppMode::Perform && (36..36 + PADS as u8).contains(&note) {
+                        self.toggle_pad((note - 36) as usize);
+                    } else {
+                        self.trigger_note(note, velocity)
+                    }
+                }
                 midi::MidiMsg::NoteOff { .. } => {}
                 midi::MidiMsg::Cc { cc, value } => {
                     if let Some(m) = self.cc_mappings.iter_mut().find(|m| m.cc.is_none()) {
@@ -711,6 +799,15 @@ impl App {
     }
 
     fn place_at(&mut self, src: usize, pl: Place) {
+        self.last_source = src;
+        if self.mode == AppMode::Perform {
+            if pl.new_track {
+                self.place_source(src, PADS, 0.0, PlayMode::Snippet); // first empty pad
+            } else {
+                self.load_pad(src, pl.track.min(PADS - 1), PlayMode::Snippet);
+            }
+            return;
+        }
         let track = if pl.new_track {
             let mut p = self.project.lock().unwrap();
             let n = p.tracks.len();
@@ -718,7 +815,6 @@ impl App {
         } else {
             pl.track
         };
-        self.last_source = src;
         self.place_source(src, track, pl.beat, PlayMode::Snippet);
     }
 
@@ -938,7 +1034,7 @@ impl App {
                 i.modifiers.command && i.key_pressed(egui::Key::D),
                 i.key_pressed(egui::Key::Escape),
                 i.key_pressed(egui::Key::Home) || i.key_pressed(egui::Key::Enter),
-                i.key_pressed(egui::Key::F) && !i.modifiers.command,
+                i.key_pressed(egui::Key::F) && !i.modifiers.command && (self.mode != AppMode::Perform || i.modifiers.shift),
             )
         });
         if space {
@@ -954,12 +1050,57 @@ impl App {
         if esc {
             self.sel = Sel::None;
         }
+        if ctx.input(|i| i.key_pressed(egui::Key::Tab) && !i.modifiers.any()) {
+            let m = if self.mode == AppMode::Perform { AppMode::Arrange } else { AppMode::Perform };
+            self.set_mode(m);
+            return;
+        }
+        if self.mode == AppMode::Perform {
+            let hit: Vec<usize> = ctx.input(|i| {
+                if i.modifiers.command || i.modifiers.ctrl || i.modifiers.alt {
+                    return Vec::new();
+                }
+                ui_perform::PAD_KEYS
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (k, _))| i.key_pressed(*k))
+                    .map(|(n, _)| n)
+                    .collect()
+            });
+            for pad in hit {
+                self.toggle_pad(pad);
+            }
+            if del {
+                if let Sel::Clip(ti, _) | Sel::Track(ti) = self.sel {
+                    self.clear_pad(ti);
+                }
+            }
+            return;
+        }
         if let Some((ti, ci)) = self.selected_clip() {
             if del {
                 self.delete_clip(ti, ci);
             } else if dup {
                 self.duplicate_clip(ti, ci);
             }
+        }
+    }
+}
+
+/// A fresh clip of `src` in the given play mode.
+fn build_clip(p: &mut Project, src: usize, beat: f64, mode: PlayMode) -> Clip {
+    let media_beats = p.secs_to_beats(p.sources[src].duration());
+    let q = p.quantize.max(0.0625);
+    match mode {
+        PlayMode::Snippet => {
+            let len = ((media_beats / q).round() * q).clamp(1.0, 32.0);
+            Clip::new_snippet(src, beat, len)
+        }
+        PlayMode::Grains => Clip::new(src, beat, 4.0),
+        PlayMode::Pattern => {
+            let pat = new_pattern_for(&p.sources[src].name, src);
+            let pid = p.add_pattern(pat);
+            Clip::new_pattern(pid, beat, 4.0)
         }
     }
 }
@@ -981,6 +1122,16 @@ impl eframe::App for App {
         self.poll_workers();
         self.browser.poll(ctx);
         self.handle_shortcuts(ctx);
+
+        if self.playback.is_playing() {
+            let p = self.project.lock().unwrap();
+            self.playhead_beats = p.secs_to_beats(self.playback.playhead_secs(&p));
+            drop(p);
+            ctx.request_repaint();
+        } else if self.busy.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        self.perform_update();
         self.sync_project();
 
         let now = self.app_clock.elapsed().as_secs_f64();
@@ -990,14 +1141,6 @@ impl eframe::App for App {
         }
         if self.project_rev != self.plan_rev {
             ctx.request_repaint_after(std::time::Duration::from_millis(90));
-        }
-        if self.playback.is_playing() {
-            let p = self.project.lock().unwrap();
-            self.playhead_beats = p.secs_to_beats(self.playback.playhead_secs(&p));
-            drop(p);
-            ctx.request_repaint();
-        } else if self.busy.is_some() {
-            ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
         if self.fullscreen {
@@ -1039,7 +1182,11 @@ impl eframe::App for App {
             .show(ctx, |ui| {
                 self.preview_ui(ui);
                 ui.add_space(8.0);
-                self.timeline_ui(ui);
+                if self.mode == AppMode::Perform {
+                    self.perform_ui(ui);
+                } else {
+                    self.timeline_ui(ui);
+                }
                 if let Some((ti, ci)) = self.selected_clip() {
                     let pid = {
                         let p = self.project.lock().unwrap();
@@ -1076,3 +1223,17 @@ s.step(p, r, 0, true); s.step(p, r, 6, true); s.step(p, r, 10, true);
 s.pattern_clip(t, p, 16.0, 8.0);
 print("scripted content added");
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::pow2_beats;
+
+    #[test]
+    fn loop_lengths_snap_to_powers_of_two() {
+        assert_eq!(pow2_beats(0.3), 1.0);
+        assert_eq!(pow2_beats(3.0), 4.0);
+        assert_eq!(pow2_beats(5.0), 4.0);
+        assert_eq!(pow2_beats(6.0), 8.0);
+        assert_eq!(pow2_beats(100.0), 32.0);
+    }
+}

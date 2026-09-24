@@ -190,7 +190,13 @@ impl App {
         ui.painter().add(egui::PaintCallback { rect, callback: Arc::new(cb) });
 
         // Fullscreen toggle, top-right of the canvas.
-        let label = if self.fullscreen { "exit fullscreen  esc" } else { "fullscreen  F" };
+        let label = if self.fullscreen {
+            "exit fullscreen  esc"
+        } else if self.mode == crate::AppMode::Perform {
+            "fullscreen  shift-F"
+        } else {
+            "fullscreen  F"
+        };
         let btn = Rect::from_min_size(rect.right_top() + egui::vec2(-128.0, 6.0), egui::vec2(122.0, 20.0));
         let b = ui.interact(btn, ui.id().with("fullscreen_btn"), egui::Sense::click());
         ui.painter().rect_filled(btn, 4.0, Color32::from_black_alpha(if b.hovered() { 210 } else { 140 }));

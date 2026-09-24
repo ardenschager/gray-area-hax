@@ -44,7 +44,14 @@ impl App {
             self.browse_ui(ui);
             return;
         }
-        theme::hint(ui, "drag media onto a track · drop files anywhere");
+        theme::hint(
+            ui,
+            if self.mode == crate::AppMode::Perform {
+                "drag media onto a pad · double-click loads the next empty pad"
+            } else {
+                "drag media onto a track · drop files anywhere"
+            },
+        );
         ui.add_space(4.0);
 
         let items: Vec<(usize, Source, usize)> = {
@@ -265,7 +272,7 @@ impl App {
     }
 
     /// Cached thumbnail texture for a source's middle video frame.
-    fn thumbnail(&mut self, ctx: &egui::Context, src: &Source) -> Option<egui::TextureId> {
+    pub(crate) fn thumbnail(&mut self, ctx: &egui::Context, src: &Source) -> Option<egui::TextureId> {
         let video = src.video.as_ref()?;
         let key = Arc::as_ptr(video) as usize;
         if let Some(t) = self.thumbs.get(&key) {
@@ -276,7 +283,7 @@ impl App {
             return None;
         }
         // Downscale to keep texture memory tiny.
-        let (tw, th) = (96usize, (96.0 * frame.height as f32 / frame.width as f32).max(1.0) as usize);
+        let (tw, th) = (192usize, (192.0 * frame.height as f32 / frame.width as f32).max(1.0) as usize);
         let mut px = Vec::with_capacity(tw * th * 4);
         for y in 0..th {
             for x in 0..tw {

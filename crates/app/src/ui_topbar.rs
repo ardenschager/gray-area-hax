@@ -8,6 +8,25 @@ impl App {
     pub(crate) fn transport_ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("chromagrain").size(17.0).strong().color(ACCENT));
+            ui.add_space(10.0);
+
+            // Mode switch.
+            for (m, label, tip) in [
+                (crate::AppMode::Arrange, "arrange", "tracks on a timeline  (tab)"),
+                (crate::AppMode::Perform, "perform", "loop pads you start and stop live  (tab)"),
+            ] {
+                let on = self.mode == m;
+                let b = egui::Button::new(egui::RichText::new(label).strong().color(if on {
+                    egui::Color32::BLACK
+                } else {
+                    theme::TEXT
+                }))
+                .fill(if on { ACCENT } else { theme::RAISED })
+                .min_size(egui::vec2(74.0, 24.0));
+                if ui.add(b).on_hover_text(tip).clicked() {
+                    self.set_mode(m);
+                }
+            }
             ui.add_space(14.0);
 
             // Transport.
@@ -23,21 +42,23 @@ impl App {
             if ui.add(play).on_hover_text("space").clicked() {
                 self.toggle_play();
             }
-            let mut loop_on = self.loop_on;
-            if ui.toggle_value(&mut loop_on, "⟲ loop").on_hover_text("loop a range of beats").changed() {
-                self.loop_on = loop_on;
-                self.playback.set_loop(self.loop_region());
-            }
-            if self.loop_on {
-                let mut changed = false;
-                changed |= ui
-                    .add(egui::DragValue::new(&mut self.loop_start).speed(0.25).range(0.0..=512.0).prefix("from "))
-                    .changed();
-                changed |= ui
-                    .add(egui::DragValue::new(&mut self.loop_end).speed(0.25).range(0.0..=512.0).prefix("to "))
-                    .changed();
-                if changed {
+            if self.mode == crate::AppMode::Arrange {
+                let mut loop_on = self.loop_on;
+                if ui.toggle_value(&mut loop_on, "⟲ loop").on_hover_text("loop a range of beats").changed() {
+                    self.loop_on = loop_on;
                     self.playback.set_loop(self.loop_region());
+                }
+                if self.loop_on {
+                    let mut changed = false;
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut self.loop_start).speed(0.25).range(0.0..=512.0).prefix("from "))
+                        .changed();
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut self.loop_end).speed(0.25).range(0.0..=512.0).prefix("to "))
+                        .changed();
+                    if changed {
+                        self.playback.set_loop(self.loop_region());
+                    }
                 }
             }
             ui.add_space(8.0);

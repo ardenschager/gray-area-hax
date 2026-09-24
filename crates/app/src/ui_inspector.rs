@@ -246,14 +246,27 @@ impl App {
                 }
             }
         });
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("start").color(TEXT_DIM));
-            changed |= ui.add(egui::DragValue::new(&mut clip.start_beat).speed(0.1).range(0.0..=4096.0)).changed();
-            ui.label(egui::RichText::new("length").color(TEXT_DIM));
-            changed |= ui
-                .add(egui::DragValue::new(&mut clip.length_beats).speed(0.1).range(0.25..=256.0).suffix(" beats"))
-                .changed();
-        });
+        if self.mode == crate::AppMode::Perform {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("loop").color(TEXT_DIM));
+                for b in [1.0, 2.0, 4.0, 8.0, 16.0, 32.0] {
+                    let label = crate::ui_perform::len_label(b);
+                    if ui.selectable_label(clip.length_beats == b, label).clicked() {
+                        clip.length_beats = b;
+                        changed = true;
+                    }
+                }
+            });
+        } else {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("start").color(TEXT_DIM));
+                changed |= ui.add(egui::DragValue::new(&mut clip.start_beat).speed(0.1).range(0.0..=4096.0)).changed();
+                ui.label(egui::RichText::new("length").color(TEXT_DIM));
+                changed |= ui
+                    .add(egui::DragValue::new(&mut clip.length_beats).speed(0.1).range(0.25..=256.0).suffix(" beats"))
+                    .changed();
+            });
+        }
 
         changed |= picture_section(ui, &mut clip.transform);
 

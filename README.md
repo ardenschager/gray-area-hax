@@ -252,6 +252,35 @@ The library's **Browse** tab turns every folder of videos under
 - Thumbnails are grabbed by ffmpeg in the background and cached in
   `~/Library/Caches/chromagrain/thumbs`.
 
+### Perform — a looper you play live
+
+![perform mode](docs/perform.png)
+
+Hit **perform** in the top bar (or **tab**) and the timeline becomes a 4×4
+grid of loop pads, Koala-sampler style. `chromagrain --perform clip.mp4 …`
+opens straight into it.
+
+- **Click a pad** (or press its key: `1 2 3 4 / Q W E R / A S D F / Z X C V`)
+  to start it; press again to stop. Pads start/stop on the **next bar**,
+  **next beat**, or **now** (header switch) — a queued pad blinks until it
+  lands. Pressing a queued pad again cancels. MIDI notes 36–51 (the usual
+  pad-controller range) play pads 1–16.
+- **Loops run until you stop them.** Each pad's loop is 1 beat – 8 bars
+  (right-click the pad, or the *loop* buttons in the inspector); shorter
+  pads repeat inside the longest one. The dots in the header count the bar.
+- **Tweak while it plays**: clicking a pad also selects it, so the
+  inspector edits its sound, picture, key and effects live. Shift-click
+  selects without launching.
+- **Load pads** by dragging library cards or Browse tiles onto them
+  (replaces what's there), or double-click a card to fill the next empty
+  pad. Right-click → snippet / grains / pattern, length, or *clear pad*
+  (or **delete**).
+- The first time you switch, your arrangement's clips are dealt onto the
+  pads so there's something to play. Arrange and perform keep separate
+  tracks; media, patterns and the master bus are shared.
+- **stop all** silences everything. In perform mode **F** is a pad, so
+  fullscreen is **shift-F** (or the button on the preview).
+
 ### Headless / scripted
 
 ```sh
