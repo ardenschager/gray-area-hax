@@ -324,14 +324,69 @@ impl App {
                 }
             });
         } else {
+            let looping = clip.is_looping();
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("start").color(TEXT_DIM));
                 changed |= ui.add(egui::DragValue::new(&mut clip.start_beat).speed(0.1).range(0.0..=4096.0)).changed();
-                ui.label(egui::RichText::new("length").color(TEXT_DIM));
-                changed |= ui
-                    .add(egui::DragValue::new(&mut clip.length_beats).speed(0.1).range(0.25..=256.0).suffix(" beats"))
+                ui.label(egui::RichText::new(if looping { "total" } else { "length" }).color(TEXT_DIM));
+                let r = ui
+                    .add_enabled(
+                        !clip.loop_forever,
+                        egui::DragValue::new(&mut clip.length_beats).speed(0.1).range(0.25..=1024.0).suffix(" beats"),
+                    )
                     .changed();
+                changed |= r;
             });
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("repeat").color(TEXT_DIM))
+                    .on_hover_text("play this clip again and again without copying it — the grid shows each pass");
+                if ui.selectable_label(!looping, "off").clicked() && looping {
+                    clip.clear_repeat();
+                    changed = true;
+                }
+                for n in [2u32, 4, 8, 16] {
+                    let on = looping && !clip.loop_forever && (clip.repeat_count() - n as f64).abs() < 1e-6;
+                    if ui.selectable_label(on, format!("×{n}")).clicked() {
+                        clip.set_repeat(Some(n));
+                        changed = true;
+                    }
+                }
+                if ui
+                    .selectable_label(clip.loop_forever, "forever")
+                    .on_hover_text("keeps going until the next clip on this track")
+                    .clicked()
+                    && !clip.loop_forever
+                {
+                    clip.set_repeat(None);
+                    changed = true;
+                }
+            });
+            if looping {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("each pass").color(TEXT_DIM));
+                    let mut pass = clip.pass_beats();
+                    if ui
+                        .add(egui::DragValue::new(&mut pass).speed(0.05).range(0.25..=256.0).suffix(" beats"))
+                        .on_hover_text("length of one pass — what gets repeated")
+                        .changed()
+                    {
+                        let times = clip.repeat_count();
+                        clip.loop_beats = Some(pass);
+                        if !clip.loop_forever {
+                            clip.length_beats = (pass * times).max(pass);
+                        }
+                        changed = true;
+                    }
+                    if !clip.loop_forever {
+                        ui.label(egui::RichText::new("times").color(TEXT_DIM));
+                        let mut times = clip.repeat_count().round().max(1.0) as u32;
+                        if ui.add(egui::DragValue::new(&mut times).speed(0.1).range(1..=256)).changed() {
+                            clip.set_repeat(Some(times));
+                            changed = true;
+                        }
+                    }
+                });
+            }
         }
 
         changed |= picture_section(ui, &mut clip.transform);

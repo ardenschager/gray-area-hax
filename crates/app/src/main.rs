@@ -22,6 +22,7 @@
 
 mod browser;
 mod gpu;
+mod history;
 mod midi;
 mod playback;
 mod theme;
@@ -249,6 +250,8 @@ enum WorkerMsg {
 #[derive(Debug, Clone, Copy)]
 pub struct ClipDrag {
     pub resize: bool,
+    /// Dragging the repeat tab: the edge grows in whole passes.
+    pub repeat: bool,
     pub ti: usize,
     pub ci: usize,
     /// Pointer beat minus clip start at grab time.
@@ -342,6 +345,16 @@ pub struct App {
     /// A one-click cut-out in progress: (track, clip, original source) —
     /// the clip switches to the cut-out when it arrives.
     pending_cutout: Option<(usize, usize, usize)>,
+
+    /// Undo / redo (whole-project snapshots, one step per gesture).
+    history: history::History,
+    /// Copied clip (+ its pattern, for pattern clips).
+    clipboard: Option<(Clip, Option<StepPattern>)>,
+    /// Put a marker on the OS clipboard next frame so ⌘V reaches us.
+    os_copy: bool,
+    /// Files dropped on the timeline that are still decoding: drawn as
+    /// placeholders where they'll land (path, place, length in beats).
+    drops: Vec<(PathBuf, Place, f64)>,
 }
 
 impl App {
@@ -409,6 +422,10 @@ impl App {
             prev_launch_t: None,
             synth: ui_synth::SynthState::new(),
             pending_cutout: None,
+            history: history::History::default(),
+            clipboard: None,
+            os_copy: false,
+            drops: Vec::new(),
         }
     }
 
@@ -439,7 +456,11 @@ impl App {
         }
         self.last_sync = std::time::Instant::now();
         self.plan_rev = self.project_rev;
-        let p = self.project.lock().unwrap().clone();
+        let p = {
+            let mut g = self.project.lock().unwrap();
+            g.resolve_forever();
+            g.clone()
+        };
         self.plan = Arc::new(plan_project(&p));
         self.plan_project = p.clone();
         self.playback.set_project(p);
@@ -609,6 +630,105 @@ impl App {
         self.sel = Sel::Track(ti);
         self.clip_drag = None;
         self.mark_now();
+    }
+
+    /// Copy a clip to the app clipboard.
+    fn copy_clip(&mut self, ti: usize, ci: usize) {
+        let p = self.project.lock().unwrap();
+        let Some(c) = p.tracks.get(ti).and_then(|t| t.clips.get(ci)).cloned() else { return };
+        let pat = match c.kind {
+            ClipKind::Pattern(pid) => p.patterns.get(pid).cloned(),
+            _ => None,
+        };
+        drop(p);
+        self.clipboard = Some((c, pat));
+        self.os_copy = true;
+        self.status = "copied — ⌘V pastes at the playhead".into();
+    }
+
+    /// Paste the clipboard clip at the playhead on the focused track, then
+    /// move the playhead to its end so repeated pastes line up.
+    fn paste_clip(&mut self) {
+        let Some((mut c, pat)) = self.clipboard.clone() else {
+            self.status = "nothing copied yet — select a clip and press ⌘C".into();
+            return;
+        };
+        if self.mode == AppMode::Perform {
+            self.status = "paste works on the arrangement (tab)".into();
+            return;
+        }
+        let beat = self.snap(self.playhead_beats);
+        let mut p = self.project.lock().unwrap();
+        if p.tracks.is_empty() {
+            p.add_track("track 1");
+        }
+        let ti = self.focus_track.min(p.tracks.len() - 1);
+        if let Some(pat) = pat {
+            c.kind = ClipKind::Pattern(p.add_pattern(pat));
+        }
+        if c.source >= p.sources.len() && !matches!(c.kind, ClipKind::Pattern(_)) {
+            return;
+        }
+        c.start_beat = beat;
+        let end = c.end_beat();
+        p.tracks[ti].clips.push(c);
+        let ci = p.tracks[ti].clips.len() - 1;
+        drop(p);
+        self.select(Sel::Clip(ti, ci));
+        if !self.playback.is_playing() {
+            self.playhead_beats = end;
+        }
+        self.status = "pasted".into();
+        self.mark_now();
+    }
+
+    fn undo(&mut self) {
+        self.history.flush(self.project_rev, &self.project);
+        match self.history.undo() {
+            Some(p) => {
+                self.restore(p);
+                self.status = "undo".into();
+            }
+            None => self.status = "nothing to undo".into(),
+        }
+    }
+
+    fn redo(&mut self) {
+        self.history.flush(self.project_rev, &self.project);
+        match self.history.redo() {
+            Some(p) => {
+                self.restore(p);
+                self.status = "redo".into();
+            }
+            None => self.status = "nothing to redo".into(),
+        }
+    }
+
+    /// Install a project snapshot from the history and tidy app state that
+    /// points into it.
+    fn restore(&mut self, p: Project) {
+        let n_src = p.sources.len();
+        let n_tracks = p.tracks.len();
+        let sel_ok = match self.sel {
+            Sel::Clip(t, c) => p.tracks.get(t).is_some_and(|tr| c < tr.clips.len()),
+            Sel::Track(t) => t < n_tracks,
+            Sel::Source(i) => i < n_src,
+            _ => true,
+        };
+        *self.project.lock().unwrap() = p;
+        if !sel_ok {
+            self.sel = Sel::None;
+        }
+        self.focus_track = self.focus_track.min(n_tracks.saturating_sub(1));
+        self.last_source = self.last_source.min(n_src.saturating_sub(1));
+        self.imported.retain(|_, i| *i < n_src);
+        self.pending_cutout = None;
+        self.pending.clear();
+        self.clip_drag = None;
+        self.cc_mappings.clear();
+        self.synth.reset_ids();
+        self.mark_now();
+        self.history.rebase(self.project_rev);
     }
 
     fn add_track(&mut self) {
@@ -811,8 +931,28 @@ impl App {
         if !self.loading.insert(path.clone()) && place.is_none() {
             return; // already on its way
         }
+        if let (Some(pl), AppMode::Arrange) = (place, self.mode) {
+            let beats = self.browse_len_beats(&path);
+            self.drops.push((path.clone(), pl, beats));
+        }
         self.jobs.push_back(Job::Load(path.display().to_string(), place));
         self.pump_jobs();
+    }
+
+    /// How long a Browse file will be on the timeline, in beats (the same
+    /// rule new snippet clips use), from its known duration.
+    pub(crate) fn browse_len_beats(&self, path: &std::path::Path) -> f64 {
+        let dur = self.browser.clip_by_path(path).map(|c| c.dur as f64).unwrap_or(0.0);
+        self.media_len_beats(dur)
+    }
+
+    pub(crate) fn media_len_beats(&self, secs: f64) -> f64 {
+        let p = self.project.lock().unwrap();
+        if secs <= 0.0 {
+            return 4.0;
+        }
+        let q = p.quantize.max(0.0625);
+        ((p.secs_to_beats(secs) / q).round() * q).clamp(1.0, 32.0)
     }
 
     fn place_at(&mut self, src: usize, pl: Place) {
@@ -965,8 +1105,12 @@ impl App {
         let project = self.project.clone();
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            let p = project.lock().unwrap().clone();
-            let end = p.end_beat().max(1.0);
+            let p = {
+                let mut g = project.lock().unwrap();
+                g.resolve_forever();
+                g.clone()
+            };
+            let end = p.song_end_beat().max(1.0);
             let out = render_project(&p, 0.0, end);
             let res = if ext == "wav" {
                 media::save_wav(&path, &out.audio).map(|_| path.display().to_string())
@@ -1016,6 +1160,9 @@ impl App {
                 }
                 WorkerMsg::Loaded(path, place, res) => {
                     self.loading.remove(&path);
+                    if let Some(i) = self.drops.iter().position(|d| d.0 == path) {
+                        self.drops.remove(i);
+                    }
                     match res {
                         Ok(src) => {
                             let name = src.name.clone();
@@ -1087,6 +1234,16 @@ impl App {
         if esc {
             self.sel = Sel::None;
         }
+        let (undo, redo) = ctx.input(|i| {
+            let z = i.modifiers.command && i.key_pressed(egui::Key::Z);
+            (z && !i.modifiers.shift, (z && i.modifiers.shift) || (i.modifiers.command && i.key_pressed(egui::Key::Y)))
+        });
+        if undo {
+            self.undo();
+        }
+        if redo {
+            self.redo();
+        }
         if ctx.input(|i| i.key_pressed(egui::Key::Tab) && !i.modifiers.any()) {
             let m = if self.mode == AppMode::Perform { AppMode::Arrange } else { AppMode::Perform };
             self.set_mode(m);
@@ -1120,6 +1277,31 @@ impl App {
             } else if dup {
                 self.duplicate_clip(ti, ci);
             }
+        }
+        let (copy, cut, paste) = ctx.input(|i| {
+            let mut r = (false, false, false);
+            for e in &i.events {
+                match e {
+                    egui::Event::Copy => r.0 = true,
+                    egui::Event::Cut => r.1 = true,
+                    egui::Event::Paste(_) => r.2 = true,
+                    _ => {}
+                }
+            }
+            // With an empty OS clipboard ⌘V arrives as a plain key.
+            r.2 |= i.modifiers.command && i.key_pressed(egui::Key::V);
+            r
+        });
+        if let Some((ti, ci)) = self.selected_clip() {
+            if copy || cut {
+                self.copy_clip(ti, ci);
+            }
+            if cut {
+                self.delete_clip(ti, ci);
+            }
+        }
+        if paste {
+            self.paste_clip();
         }
     }
 }
@@ -1155,9 +1337,13 @@ fn new_pattern_for(name: &str, src: usize) -> StepPattern {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let rev0 = self.project_rev;
+        let mut bg = 0;
         self.handle_midi();
         self.poll_workers();
+        let r = self.project_rev;
         self.synth_update(ctx);
+        bg += self.project_rev - r;
         self.browser.poll(ctx);
         self.handle_shortcuts(ctx);
 
@@ -1169,8 +1355,19 @@ impl eframe::App for App {
         } else if self.busy.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
+        let r = self.project_rev;
         self.perform_update();
+        bg += self.project_rev - r;
+        let r = self.project_rev;
         self.sync_project();
+        bg += self.project_rev - r;
+        // History: one step per finished gesture; background jobs don't count.
+        let user_changed = self.project_rev - rev0 > bg;
+        let busy = ctx.input(|i| i.pointer.any_down()) || ctx.wants_keyboard_input();
+        self.history.observe(self.project_rev, user_changed, busy, &self.project);
+        if std::mem::take(&mut self.os_copy) {
+            ctx.copy_text("chromagrain clip".into());
+        }
 
         let now = self.app_clock.elapsed().as_secs_f64();
         self.live_events.retain(|(_, e)| e.end() + 0.5 > now);

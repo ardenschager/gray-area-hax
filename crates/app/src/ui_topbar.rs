@@ -114,6 +114,13 @@ impl App {
                     .on_hover_text("drive the whole engine with rhai scripts");
                 let midi_label = if self.midi.connected.is_some() { "midi (on)" } else { "midi" };
                 ui.menu_button(midi_label, |ui| self.midi_menu(ui));
+                ui.add_space(8.0);
+                if ui.add_enabled(self.history.can_redo(), egui::Button::new("redo")).on_hover_text("⌘ shift Z").clicked() {
+                    self.redo();
+                }
+                if ui.add_enabled(self.history.can_undo(), egui::Button::new("undo")).on_hover_text("⌘Z").clicked() {
+                    self.undo();
+                }
                 if let Some(b) = &self.busy {
                     ui.label(egui::RichText::new(b.clone()).color(TEXT_DIM));
                     ui.spinner();
@@ -244,7 +251,7 @@ impl App {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
                     egui::RichText::new(
-                        "space play · del delete · ⌘D duplicate · esc deselect · ⌘scroll zoom · drop files anywhere",
+                        "space play · ⌘Z undo · ⌘C ⌘V copy/paste · ⌘D duplicate · del delete · esc deselect · ⌘scroll zoom",
                     )
                     .size(11.0)
                     .color(theme::TEXT_FAINT),

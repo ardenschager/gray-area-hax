@@ -237,7 +237,17 @@ The window has three places, and every thing lives in exactly one of them:
    inspector only shows the controls that mode uses; key, canvas, effects,
    filters, automation and sound↔picture links fold away below.
 5. **Arrange**: drag clips (across tracks too), drag their right edge to
-   resize, right-click for more; ⌘D duplicates, ⌫ deletes.
+   resize, right-click for more; ⌘D duplicates, ⌫ deletes. ⌘C / ⌘X / ⌘V
+   copy, cut and paste (paste lands at the playhead on the focused track and
+   moves the playhead to its end, so ⌘V ⌘V ⌘V lays copies end to end).
+   ⌘Z undoes, ⌘⇧Z / ⌘Y redoes (also *undo* / *redo* in the top bar); a
+   whole drag or slider move is one step.
+   **Repeat a clip** without copying it: drag the little loop tab at its
+   top-right corner to the right (it grows in whole passes; shift = free),
+   or pick *repeat off / ×2 / ×4 / ×8 / ×16 / forever* in the inspector or
+   right-click menu. The grid draws every pass. *Forever* runs until the
+   next clip on the track (or 16 bars past the end of the song; export
+   stops at the song's end).
 6. **Change the look**: the LOOK row at the top of every clip is one click
    each — *cut out people*, *cut out subject*, *tune to key*, *crush*,
    *echo trails*, *smear*, *jpeg crunch*, *tint* (all of them act on sound
@@ -268,8 +278,9 @@ The library's **Browse** tab turns every folder of videos under
 `~/Screencaps` into one sample library, grouped by folder (skipping
 `node_modules`, build output, app bundles, etc.).
 
-- **Drag a tile onto a track** — it's imported on drop and lands there as a
-  snippet. Double-click drops it at the playhead; *add to library* just
+- **Drag a tile onto a track** — the drop ghost shows the clip's real
+  length; it's imported on drop (a pulsing placeholder marks the spot while
+  it decodes) and lands there as a snippet. Double-click drops it at the playhead; *add to library* just
   imports it. A file is only ever decoded once: using it again reuses the
   same library source ("in project" badge).
 - **Search by meaning**: projects that ship a semantic corpus

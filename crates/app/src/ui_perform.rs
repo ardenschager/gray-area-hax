@@ -97,6 +97,8 @@ impl App {
         self.other_loop = cur;
         self.mode = m;
         self.cc_mappings.clear();
+        // Arrange and perform swap whole track lists: history can't span both.
+        self.history.request_clear();
         self.sel = Sel::None;
         self.clip_drag = None;
         self.context_clip = None;

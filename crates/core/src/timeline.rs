@@ -97,6 +97,13 @@ pub struct Clip {
     /// Canvas placement of this clip's visuals — and, through the AV link,
     /// of its audio: x drives pan, scale drives distance loudness.
     pub transform: ClipTransform,
+    /// Repeat: the clip's content is one pass this many beats long,
+    /// repeated to fill `length_beats`. `None` = plays once, no repeat.
+    pub loop_beats: Option<f64>,
+    /// Keep repeating until the next clip on the same track (or well past
+    /// the end of the song). `length_beats` is kept in sync by
+    /// [`Project::resolve_forever`].
+    pub loop_forever: bool,
 }
 
 impl Clip {
@@ -115,6 +122,8 @@ impl Clip {
             effects: Vec::new(),
             automation: Vec::new(),
             transform: ClipTransform::default(),
+            loop_beats: None,
+            loop_forever: false,
         }
     }
 
@@ -136,7 +145,50 @@ impl Clip {
     pub fn end_beat(&self) -> f64 {
         self.start_beat + self.length_beats
     }
+
+    /// Length of one pass of the content (the whole clip when not looping).
+    pub fn pass_beats(&self) -> f64 {
+        match self.loop_beats {
+            Some(l) if l > 1e-6 => l.min(self.length_beats.max(1e-6)),
+            _ => self.length_beats,
+        }
+    }
+
+    /// Whether the content repeats inside the clip.
+    pub fn is_looping(&self) -> bool {
+        self.loop_beats.is_some() || self.loop_forever
+    }
+
+    /// How many passes fit (fractional when the last pass is cut short).
+    pub fn repeat_count(&self) -> f64 {
+        self.length_beats / self.pass_beats().max(1e-6)
+    }
+
+    /// Turn repeating on with the current length as one pass, playing it
+    /// `times` in total (`None` = forever).
+    pub fn set_repeat(&mut self, times: Option<u32>) {
+        let pass = self.pass_beats();
+        self.loop_beats = Some(pass);
+        match times {
+            Some(n) => {
+                self.loop_forever = false;
+                self.length_beats = pass * n.max(1) as f64;
+            }
+            None => self.loop_forever = true,
+        }
+    }
+
+    /// Back to a single pass.
+    pub fn clear_repeat(&mut self) {
+        self.length_beats = self.pass_beats();
+        self.loop_beats = None;
+        self.loop_forever = false;
+    }
 }
+
+/// How far a "forever" clip runs past the end of the song when nothing
+/// follows it on its track.
+pub const FOREVER_TAIL_BEATS: f64 = 64.0;
 
 /// A track: clips, a level fader, and its own AV effect chain. Track order
 /// is also the video compositing order — later tracks render ON TOP.
@@ -281,6 +333,63 @@ impl Project {
             .flat_map(|t| t.clips.iter())
             .map(|c| c.end_beat())
             .fold(0.0, f64::max)
+    }
+
+    fn finite_end_beat(&self) -> f64 {
+        self.tracks
+            .iter()
+            .flat_map(|t| t.clips.iter())
+            .filter(|c| !c.loop_forever)
+            .map(|c| c.end_beat())
+            .fold(0.0, f64::max)
+    }
+
+    /// End of the song for export: the last finite clip's end (forever
+    /// clips don't stretch it), or the last clip's end if all repeat forever.
+    pub fn song_end_beat(&self) -> f64 {
+        let finite = self.finite_end_beat();
+        if finite > 0.0 {
+            finite
+        } else {
+            self.end_beat()
+        }
+    }
+
+    /// Stretch every forever-repeating clip up to the next clip on its
+    /// track, or [`FOREVER_TAIL_BEATS`] past the end of the song (the end
+    /// of every *other*, finite clip). Idempotent; returns true if any
+    /// length changed.
+    pub fn resolve_forever(&mut self) -> bool {
+        let song_end = self.finite_end_beat();
+        let mut changed = false;
+        for t in &mut self.tracks {
+            let starts: Vec<f64> = t.clips.iter().map(|c| c.start_beat).collect();
+            for (ci, c) in t.clips.iter_mut().enumerate() {
+                if !c.loop_forever {
+                    continue;
+                }
+                let next = starts
+                    .iter()
+                    .enumerate()
+                    .filter(|&(j, &s)| j != ci && s > c.start_beat + 1e-6)
+                    .map(|(_, &s)| s)
+                    .fold(f64::INFINITY, f64::min);
+                let end = if next.is_finite() {
+                    next
+                } else {
+                    song_end.max(c.start_beat) + FOREVER_TAIL_BEATS
+                };
+                let len = (end - c.start_beat).max(0.0625);
+                if (len - c.length_beats).abs() > 1e-9 {
+                    if c.loop_beats.is_none() {
+                        c.loop_beats = Some(c.length_beats);
+                    }
+                    c.length_beats = len;
+                    changed = true;
+                }
+            }
+        }
+        changed
     }
 
     /// A ready-to-play demo project built from procedural sources — used by

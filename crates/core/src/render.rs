@@ -114,6 +114,28 @@ fn snippet_events(
     events
 }
 
+/// Repeat one pass of events (`pass` seconds from `t0`) until `total`
+/// seconds; grains crossing the end are shortened so nothing plays past
+/// the clip.
+fn tile_events(pass_evs: &[GrainEvent], t0: f64, pass: f64, total: f64) -> Vec<GrainEvent> {
+    let end = t0 + total;
+    let n = (total / pass.max(1e-6)).ceil() as usize;
+    let mut out = Vec::with_capacity(pass_evs.len() * n);
+    for k in 0..n {
+        let off = k as f64 * pass;
+        for e in pass_evs {
+            let mut e = e.clone();
+            e.onset += off;
+            if e.onset >= end {
+                continue;
+            }
+            e.duration = e.duration.min((end - e.onset) as f32);
+            out.push(e);
+        }
+    }
+    out
+}
+
 /// Schedule every clip in the project (absolute timeline seconds). Shared
 /// by the offline renderer, the realtime engine, and live previews.
 pub fn plan_project(project: &Project) -> Vec<ClipPlan> {
@@ -122,7 +144,9 @@ pub fn plan_project(project: &Project) -> Vec<ClipPlan> {
     for (ti, track) in project.tracks.iter().enumerate() {
         for (ci, clip) in track.clips.iter().enumerate() {
             let clip_t0 = project.beats_to_secs(clip.start_beat);
-            let clip_len = project.beats_to_secs(clip.length_beats);
+            let full_len = project.beats_to_secs(clip.length_beats);
+            // Repeating clips plan one pass, then tile it (below).
+            let clip_len = project.beats_to_secs(clip.pass_beats());
             let (parts, style) = match clip.kind {
                 ClipKind::Granular => {
                     let Some(source) = project.sources.get(clip.source) else { continue };
@@ -165,6 +189,14 @@ pub fn plan_project(project: &Project) -> Vec<ClipPlan> {
                     );
                     (parts, clip.visual)
                 }
+            };
+            let parts = if full_len > clip_len + 1e-9 {
+                parts
+                    .into_iter()
+                    .map(|(sid, evs)| (sid, tile_events(&evs, clip_t0, clip_len, full_len)))
+                    .collect()
+            } else {
+                parts
             };
             plans.push(ClipPlan { track: ti, clip_index: ci, parts, style });
         }
@@ -403,6 +435,53 @@ mod tests {
         // Video: mid-frame shows the source video full-frame (bright).
         let mid = &out.frames[out.frames.len() / 2];
         assert!(mid.mean_luma() > 20.0, "snippet fills frame: {}", mid.mean_luma());
+    }
+
+    #[test]
+    fn repeating_clip_tiles_its_first_pass() {
+        let mut p = snippet_project();
+        // 1 beat pass (0.5 s at 120 bpm), played 4 times.
+        let c = &mut p.tracks[0].clips[0];
+        c.length_beats = 1.0;
+        c.set_repeat(Some(4));
+        assert_eq!(c.length_beats, 4.0);
+        assert!((c.repeat_count() - 4.0).abs() < 1e-9);
+        let plan = plan_project(&p);
+        let evs = &plan[0].parts[0].1;
+        assert_eq!(evs.len(), 4, "one snippet grain per pass");
+        for (k, e) in evs.iter().enumerate() {
+            assert!((e.onset - 0.5 * k as f64).abs() < 1e-9);
+            assert!((e.source_pos - evs[0].source_pos).abs() < 1e-9, "every pass restarts the media");
+        }
+        // Audio: pass 2 is sample-identical to pass 1.
+        let out = render_project(&p, 0.0, 2.0);
+        let n = (0.5 * p.sample_rate as f64) as usize;
+        let d: f32 = (100..n - 100).map(|i| (out.audio.left[i] - out.audio.left[i + n]).abs()).sum();
+        assert!(d < 1e-3, "passes differ by {d}");
+        // Off again: back to one pass.
+        let c = &mut p.tracks[0].clips[0];
+        c.clear_repeat();
+        assert_eq!(c.length_beats, 1.0);
+        assert!(!c.is_looping());
+    }
+
+    #[test]
+    fn forever_runs_to_the_next_clip_or_past_the_song() {
+        let mut p = snippet_project();
+        let sid = 0;
+        p.tracks[0].clips[0].length_beats = 2.0;
+        p.tracks[0].clips[0].set_repeat(None);
+        p.tracks[0].clips.push(Clip::new_snippet(sid, 10.0, 2.0));
+        assert!(p.resolve_forever());
+        assert_eq!(p.tracks[0].clips[0].length_beats, 10.0, "stops at the next clip");
+        assert_eq!(p.tracks[0].clips[0].pass_beats(), 2.0);
+        assert!(!p.resolve_forever(), "idempotent");
+        // Nothing after it: runs FOREVER_TAIL_BEATS past the song's end.
+        p.tracks[0].clips.pop();
+        let t = p.add_track("other");
+        p.tracks[t].clips.push(Clip::new_snippet(sid, 0.0, 16.0));
+        p.resolve_forever();
+        assert_eq!(p.tracks[0].clips[0].length_beats, 16.0 + crate::timeline::FOREVER_TAIL_BEATS);
     }
 
     #[test]
