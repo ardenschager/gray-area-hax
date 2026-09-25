@@ -138,20 +138,27 @@ impl App {
             (p.width.max(1) as f32, p.height.max(1) as f32)
         };
         let avail_w = ui.available_width();
-        let max_h = if self.fullscreen {
-            ui.available_height()
+        let (full, resp, rect) = if self.fullscreen {
+            // Truly full screen: cover the whole display (crop the overflow
+            // rather than leave bars), no chrome, no cursor.
+            let (full, resp) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click());
+            let scale = (full.width() / pw).max(full.height() / ph);
+            let rect = Rect::from_center_size(full.center(), egui::vec2(pw * scale, ph * scale));
+            ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+            (full, resp, rect)
         } else {
-            (ui.available_height() * 0.42).clamp(150.0, 520.0)
+            let max_h = (ui.available_height() * 0.42).clamp(150.0, 520.0);
+            let mut w = avail_w;
+            let mut h = w * ph / pw;
+            if h > max_h {
+                h = max_h;
+                w = h * pw / ph;
+            }
+            let (full, resp) = ui.allocate_exact_size(egui::vec2(avail_w, h), egui::Sense::click_and_drag());
+            let rect = Rect::from_center_size(full.center(), egui::vec2(w, h));
+            ui.painter().rect_filled(rect.expand(1.0), 4.0, LINE);
+            (full, resp, rect)
         };
-        let mut w = avail_w;
-        let mut h = w * ph / pw;
-        if h > max_h {
-            h = max_h;
-            w = h * pw / ph;
-        }
-        let (full, resp) = ui.allocate_exact_size(egui::vec2(avail_w, h), egui::Sense::click_and_drag());
-        let rect = Rect::from_center_size(full.center(), egui::vec2(w, h));
-        ui.painter().rect_filled(rect.expand(1.0), 4.0, LINE);
 
         if self.gpu_failed.load(Ordering::Relaxed) {
             ui.painter().rect_filled(rect, 3.0, Color32::from_gray(14));
@@ -199,10 +206,16 @@ impl App {
         });
         ui.painter().add(egui::PaintCallback { rect, callback: Arc::new(cb) });
 
+        if self.fullscreen {
+            // Nothing drawn over the picture; esc / F / double-click exit.
+            if resp.double_clicked() {
+                self.toggle_fullscreen(ui.ctx());
+            }
+            return;
+        }
+
         // Fullscreen toggle, top-right of the canvas.
-        let label = if self.fullscreen {
-            "exit fullscreen  esc"
-        } else if self.mode == crate::AppMode::Perform {
+        let label = if self.mode == crate::AppMode::Perform {
             "fullscreen  shift-F"
         } else {
             "fullscreen  F"
@@ -263,8 +276,8 @@ impl App {
             let g0 = Gizmo::new(rect, &d.tr);
             match d.mode {
                 GizmoMode::Move => {
-                    tr.x = (d.tr.x + (p.x - d.start.x) / w * 2.0).clamp(-1.5, 1.5);
-                    tr.y = (d.tr.y + (p.y - d.start.y) / h * 2.0).clamp(-1.5, 1.5);
+                    tr.x = (d.tr.x + (p.x - d.start.x) / rect.width() * 2.0).clamp(-1.5, 1.5);
+                    tr.y = (d.tr.y + (p.y - d.start.y) / rect.height() * 2.0).clamp(-1.5, 1.5);
                 }
                 GizmoMode::Scale => {
                     let r0 = (d.start - g0.center).length().max(4.0);
