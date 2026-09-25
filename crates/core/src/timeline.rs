@@ -37,6 +37,39 @@ impl Source {
             440.0
         }
     }
+
+    /// A new source holding `[start, start + len)` seconds of this one
+    /// (audio and video alike, wrapping past the end like the read head).
+    pub fn slice(&self, start: f64, len: f64) -> Source {
+        let dur = self.duration().max(1e-6);
+        let start = start.rem_euclid(dur);
+        let len = len.clamp(0.01, dur);
+        let audio = self.audio.as_ref().map(|a| {
+            if a.samples.is_empty() {
+                return a.clone();
+            }
+            let sr = a.sample_rate as f64;
+            let n = a.samples.len().max(1);
+            let i0 = (start * sr) as usize;
+            let cnt = ((len * sr) as usize).max(1);
+            let take = |v: &Vec<f32>| -> Vec<f32> { (0..cnt).map(|i| v[(i0 + i) % n]).collect() };
+            std::sync::Arc::new(AudioClip {
+                samples: take(&a.samples),
+                sample_rate: a.sample_rate,
+                side: a.side.as_ref().map(take),
+            })
+        });
+        let video = self.video.as_ref().map(|v| {
+            let n = v.frames.len().max(1);
+            let i0 = (start * v.fps as f64) as usize;
+            let cnt = ((len * v.fps as f64).round() as usize).max(1);
+            std::sync::Arc::new(VideoClip {
+                frames: (0..cnt).filter_map(|i| v.frames.get((i0 + i) % n).cloned()).collect(),
+                fps: v.fps,
+            })
+        });
+        Source { name: self.name.clone(), audio, video, base_hz: self.base_hz }
+    }
 }
 
 /// What a clip does with its source.
@@ -104,6 +137,18 @@ pub struct Clip {
     /// the end of the song). `length_beats` is kept in sync by
     /// [`Project::resolve_forever`].
     pub loop_forever: bool,
+    /// Silence between passes, beats (negative = passes overlap).
+    pub loop_gap: f64,
+    /// Which passes play, cycling (empty = all). A step sequencer of
+    /// repeats: [on, on, off, on] skips every 3rd of 4.
+    pub loop_mask: Vec<bool>,
+    /// How far each repeat moves through the media, in passes: 0 = the
+    /// same bit every time, 1 = carry on where the last pass ended,
+    /// -1 = walk backwards, 0.5 = overlapping slices.
+    pub loop_advance: f32,
+    /// Pass and gap lengths snap to the beat grid when edited (off = free,
+    /// e.g. the media's natural length).
+    pub loop_sync: bool,
 }
 
 impl Clip {
@@ -124,6 +169,10 @@ impl Clip {
             transform: ClipTransform::default(),
             loop_beats: None,
             loop_forever: false,
+            loop_gap: 0.0,
+            loop_mask: Vec::new(),
+            loop_advance: 0.0,
+            loop_sync: true,
         }
     }
 
@@ -149,9 +198,28 @@ impl Clip {
     /// Length of one pass of the content (the whole clip when not looping).
     pub fn pass_beats(&self) -> f64 {
         match self.loop_beats {
-            Some(l) if l > 1e-6 => l.min(self.length_beats.max(1e-6)),
+            Some(l) if l > 1e-6 => l,
             _ => self.length_beats,
         }
+    }
+
+    /// Pass start to next pass start, beats (pass + gap).
+    pub fn period_beats(&self) -> f64 {
+        let pass = self.pass_beats();
+        if self.loop_beats.is_none() {
+            return pass.max(1e-6);
+        }
+        (pass + self.loop_gap).max(pass * 0.1).max(1e-3)
+    }
+
+    /// Whether pass `k` plays (the repeat mask cycles).
+    pub fn pass_on(&self, k: usize) -> bool {
+        self.loop_mask.is_empty() || self.loop_mask[k % self.loop_mask.len()]
+    }
+
+    /// Clip start of pass `k`, beats from the clip start.
+    pub fn pass_offset(&self, k: usize) -> f64 {
+        k as f64 * self.period_beats()
     }
 
     /// Whether the content repeats inside the clip.
@@ -161,7 +229,20 @@ impl Clip {
 
     /// How many passes fit (fractional when the last pass is cut short).
     pub fn repeat_count(&self) -> f64 {
-        self.length_beats / self.pass_beats().max(1e-6)
+        if self.loop_beats.is_none() {
+            return 1.0;
+        }
+        let pass = self.pass_beats();
+        if self.length_beats <= pass {
+            return self.length_beats / pass.max(1e-6);
+        }
+        1.0 + (self.length_beats - pass) / self.period_beats()
+    }
+
+    /// Total length for `n` whole passes (no trailing gap).
+    pub fn length_for(&self, n: u32) -> f64 {
+        let n = n.max(1) as f64;
+        ((n - 1.0) * self.period_beats() + self.pass_beats()).max(self.pass_beats())
     }
 
     /// Turn repeating on with the current length as one pass, playing it
@@ -172,7 +253,7 @@ impl Clip {
         match times {
             Some(n) => {
                 self.loop_forever = false;
-                self.length_beats = pass * n.max(1) as f64;
+                self.length_beats = self.length_for(n);
             }
             None => self.loop_forever = true,
         }
@@ -180,9 +261,12 @@ impl Clip {
 
     /// Back to a single pass.
     pub fn clear_repeat(&mut self) {
-        self.length_beats = self.pass_beats();
+        self.length_beats = self.pass_beats().min(self.length_beats);
         self.loop_beats = None;
         self.loop_forever = false;
+        self.loop_gap = 0.0;
+        self.loop_mask.clear();
+        self.loop_advance = 0.0;
     }
 }
 

@@ -272,6 +272,22 @@ impl Default for VisualGrainStyle {
 }
 
 impl VisualGrainStyle {
+    /// Blend from full-frame (`t` = 0) to `cloud` (`t` = 1) — the picture
+    /// side of the sample <-> grains morph.
+    pub fn morph(additive: f32, cloud: &VisualGrainStyle, t: f32) -> VisualGrainStyle {
+        let t = t.clamp(0.0, 1.0);
+        let full = VisualGrainStyle::full_frame(additive);
+        let lin = |a: f32, b: f32| a + (b - a) * t;
+        let log = |a: f32, b: f32| (a.max(1e-3).ln() + (b.max(1e-3).ln() - a.max(1e-3).ln()) * t).exp();
+        VisualGrainStyle {
+            size_scale: log(full.size_scale, cloud.size_scale),
+            min_size: lin(full.min_size, cloud.min_size),
+            max_size: lin(full.max_size, cloud.max_size),
+            additive: lin(additive, cloud.additive),
+            scatter_y: lin(0.0, cloud.scatter_y),
+        }
+    }
+
     /// Style for snippet clips: the patch is the whole frame.
     pub fn full_frame(additive: f32) -> VisualGrainStyle {
         VisualGrainStyle {

@@ -121,6 +121,12 @@ struct ClipView {
     /// One pass of the content when the clip repeats (== len otherwise).
     pass: f64,
     forever: bool,
+    /// Repeat shape: whether it repeats, pass start-to-start, which passes
+    /// play, and how far each pass walks through the media (in passes).
+    looping: bool,
+    period: f64,
+    mask: Vec<bool>,
+    advance: f32,
 }
 
 impl App {
@@ -543,6 +549,10 @@ impl App {
                         },
                         pass: c.pass_beats(),
                         forever: c.loop_forever,
+                        looping: c.loop_beats.is_some(),
+                        period: c.period_beats(),
+                        mask: c.loop_mask.clone(),
+                        advance: c.loop_advance,
                     })
                 })
                 .collect();
@@ -686,10 +696,20 @@ impl App {
         ));
 
         // ---------------------------------------------------- interaction
-        let hit = |pos: Pos2| -> Option<(usize, usize, bool)> {
+        // Edge: 0 = body, 1 = right edge (length), 2 = left edge (trim start).
+        let hit = |pos: Pos2| -> Option<(usize, usize, u8)> {
             views.iter().rev().find_map(|v| {
                 let r = clip_rect(v);
-                r.contains(pos).then(|| (v.ti, v.ci, pos.x > r.max.x - 7.0))
+                r.contains(pos).then(|| {
+                    let edge = if pos.x > r.max.x - 7.0 {
+                        1
+                    } else if pos.x < r.min.x + 6.0 && r.width() > 24.0 && pos.y > r.min.y + 15.0 {
+                        2
+                    } else {
+                        0
+                    };
+                    (v.ti, v.ci, edge)
+                })
             })
         };
         // The little repeat tab at a clip's top-right corner.
@@ -697,6 +717,7 @@ impl App {
             views.iter().rev().find_map(|v| repeat_tab(clip_rect(v)).expand(2.0).contains(pos).then_some((v.ti, v.ci)))
         };
         let shift = ui.input(|i| i.modifiers.shift);
+        let alt = ui.input(|i| i.modifiers.alt);
         let snap = |b: f64| if shift { b.max(0.0) } else { ((b / q).round() * q).max(0.0) };
 
         if let Some(pos) = resp.hover_pos() {
@@ -709,7 +730,11 @@ impl App {
                     painter.galley(r.min + egui::vec2(5.0, 2.0), tip, Color32::BLACK);
                 } else {
                 match hit(pos) {
-                    Some((_, _, true)) => ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal),
+                    Some((_, _, 1)) => ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal),
+                    Some((_, _, 2)) => ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeColumn),
+                    Some((ti, ci, _)) if alt && views.iter().any(|v| v.ti == ti && v.ci == ci && v.looping) => {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand)
+                    }
                     Some(_) => ui.ctx().set_cursor_icon(egui::CursorIcon::Grab),
                     None => {}
                 }
@@ -723,11 +748,23 @@ impl App {
                 self.scrubbing = true;
             } else if let Some((ti, ci)) = hit_repeat(origin_pos) {
                 self.select(Sel::Clip(ti, ci));
-                self.clip_drag = Some(ClipDrag { resize: true, repeat: true, ti, ci, grab: 0.0 });
+                self.clip_drag = Some(ClipDrag { resize: true, repeat: true, ti, ci, grab: 0.0, trim_left: false, orig: (0.0, 0.0, 0.0) });
             } else if let Some((ti, ci, edge)) = hit(origin_pos) {
                 self.select(Sel::Clip(ti, ci));
-                let start = views.iter().find(|v| v.ti == ti && v.ci == ci).map(|v| v.start).unwrap_or(0.0);
-                self.clip_drag = Some(ClipDrag { resize: edge, repeat: false, ti, ci, grab: beat_at(origin_pos.x) - start });
+                let (start, len, pos0) = views
+                    .iter()
+                    .find(|v| v.ti == ti && v.ci == ci)
+                    .map(|v| (v.start, v.len, v.position))
+                    .unwrap_or((0.0, 1.0, 0.0));
+                self.clip_drag = Some(ClipDrag {
+                    resize: edge == 1,
+                    repeat: false,
+                    ti,
+                    ci,
+                    grab: beat_at(origin_pos.x) - start,
+                    trim_left: edge == 2,
+                    orig: (start, len, pos0),
+                });
             } else {
                 self.scrubbing = true;
             }
@@ -737,7 +774,7 @@ impl App {
                 if self.scrubbing {
                     self.playhead_beats = snap(beat_at(pos.x));
                 } else if let Some(mut d) = self.clip_drag {
-                    ui.ctx().set_cursor_icon(if d.resize {
+                    ui.ctx().set_cursor_icon(if d.resize || d.trim_left {
                         egui::CursorIcon::ResizeHorizontal
                     } else {
                         egui::CursorIcon::Grabbing
@@ -753,14 +790,43 @@ impl App {
                                 // Repeating clips grow in whole passes (shift = free).
                                 c.loop_forever = false;
                                 let pass = c.loop_beats.unwrap_or(c.length_beats).max(q);
+                                c.loop_beats = Some(pass);
+                                let period = c.period_beats();
                                 let raw = beat_at(pos.x) - c.start_beat;
                                 c.length_beats = if shift {
                                     raw.max(q)
                                 } else {
-                                    (raw / pass).round().max(1.0) * pass
+                                    let n = ((raw - pass) / period).round().max(0.0) as u32 + 1;
+                                    c.length_for(n)
                                 };
                             } else {
                                 c.length_beats = (snap(beat_at(pos.x)) - c.start_beat).max(q);
+                            }
+                        }
+                    } else if d.trim_left {
+                        let (s0, l0, p0) = d.orig;
+                        let min_len = q.min(l0);
+                        let new_start = snap(beat_at(pos.x)).clamp(0.0, s0 + l0 - min_len);
+                        let delta = new_start - s0;
+                        let spb = 60.0 / p.bpm;
+                        let (ti, ci) = (d.ti, d.ci);
+                        let dur = p
+                            .tracks
+                            .get(ti)
+                            .and_then(|t| t.clips.get(ci))
+                            .and_then(|c| p.sources.get(c.source))
+                            .map(|s| s.duration())
+                            .unwrap_or(0.0);
+                        if let Some(c) = p.tracks.get_mut(ti).and_then(|t| t.clips.get_mut(ci)) {
+                            c.start_beat = new_start;
+                            c.length_beats = (l0 - delta).max(min_len);
+                            let rate = match c.kind {
+                                ClipKind::Snippet => c.grains.speed as f64,
+                                ClipKind::Granular => c.grains.scan_speed as f64,
+                                ClipKind::Pattern(_) => 0.0,
+                            };
+                            if dur > 0.0 {
+                                c.grains.position = (p0 as f64 + delta * spb * rate / dur).clamp(0.0, 1.0) as f32;
                             }
                         }
                     } else {
@@ -800,6 +866,26 @@ impl App {
                 if pos.y >= lanes_top {
                     if let Some((ti, ci, _)) = hit(pos) {
                         self.select(Sel::Clip(ti, ci));
+                        if alt {
+                            let beat = beat_at(pos.x);
+                            let mut p = self.project.lock().unwrap();
+                            if let Some(c) = p.tracks.get_mut(ti).and_then(|t| t.clips.get_mut(ci)) {
+                                if c.loop_beats.is_some() {
+                                    let k = ((beat - c.start_beat) / c.period_beats()).floor().max(0.0) as usize;
+                                    if c.loop_mask.is_empty() {
+                                        let n = (c.repeat_count().ceil() as usize).clamp(2, 16);
+                                        c.loop_mask = vec![true; n];
+                                    }
+                                    let n = c.loop_mask.len();
+                                    c.loop_mask[k % n] = !c.loop_mask[k % n];
+                                    if c.loop_mask.iter().all(|&b| b) {
+                                        c.loop_mask.clear();
+                                    }
+                                    drop(p);
+                                    self.mark_now();
+                                }
+                            }
+                        }
                     } else {
                         let r = row_at(pos.y);
                         if r >= 0 && (r as usize) < n_tracks {
@@ -1181,20 +1267,58 @@ fn draw_clip(
     let body = Rect::from_min_max(egui::pos2(rect.min.x + 3.0, head.max.y + 2.0), rect.max - egui::vec2(3.0, 3.0));
     let clip_painter = painter.with_clip_rect(rect);
     // Content is drawn once per pass; repeats are slightly dimmer with a
-    // divider, so the grid shows exactly what plays.
-    let looping = v.pass + 1e-6 < v.len;
-    let pass = if looping { v.pass.max(1e-3) } else { v.len };
-    let n_pass = ((v.len / pass).ceil() as usize).clamp(1, 512);
+    // divider, gaps are empty, muted passes are dashed ghosts — so the
+    // grid shows exactly what plays.
+    let looping = v.looping || v.forever;
+    let pass = if v.looping { v.pass.max(1e-3) } else { v.len };
+    let period = if v.looping { v.period.max(1e-3) } else { v.len.max(1e-3) };
+    let n_pass = if v.looping { ((v.len / period).ceil() as usize).clamp(1, 512) } else { 1 };
+    // Media walked per pass, as a fraction of the source.
+    let walk = match (&v.source, v.mode) {
+        (Some(src), PlayMode::Snippet) if v.looping => {
+            (v.advance as f64 * pass * secs_per_beat * v.speed as f64 / src.duration().max(1e-6)) as f32
+        }
+        _ => 0.0,
+    };
+    if v.looping && period > pass + 1e-6 {
+        // Gaps: darken the space between passes.
+        for k in 0..n_pass {
+            let g0 = rect.min.x + ((k as f64 * period + pass) * beat_w as f64) as f32;
+            let g1 = (rect.min.x + ((k + 1) as f64 * period * beat_w as f64) as f32).min(rect.max.x);
+            if g0 < g1 {
+                clip_painter.rect_filled(
+                    Rect::from_x_y_ranges(g0..=g1, head.max.y..=rect.max.y),
+                    0.0,
+                    Color32::from_black_alpha(110),
+                );
+            }
+        }
+    }
     for k in 0..n_pass {
-        let x0 = rect.min.x + (k as f64 * pass) as f32 * beat_w;
+        let x0 = rect.min.x + (k as f64 * period) as f32 * beat_w;
         if x0 > rect.max.x {
             break;
         }
-        let pass_rect = Rect::from_min_max(egui::pos2(x0, rect.min.y), egui::pos2((x0 + pass as f32 * beat_w).min(rect.max.x), rect.max.y));
+        let x1 = (x0 + pass as f32 * beat_w).min(rect.max.x);
+        let pass_rect = Rect::from_min_max(egui::pos2(x0, rect.min.y), egui::pos2(x1, rect.max.y));
+        let on = v.mask.is_empty() || v.mask[k % v.mask.len()];
+        if !on {
+            let r = Rect::from_min_max(egui::pos2(x0 + 2.0, body.min.y), egui::pos2(x1 - 2.0, body.max.y));
+            clip_painter.rect_filled(r, 3.0, Color32::from_black_alpha(120));
+            let dash = Stroke::new(1.0, c.linear_multiply(0.35));
+            clip_painter.add(egui::Shape::dashed_line(
+                &[r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()],
+                dash,
+                4.0,
+                3.0,
+            ));
+            continue;
+        }
         let pbody = Rect::from_min_max(egui::pos2(x0 + 3.0, body.min.y), egui::pos2(x0 + pass as f32 * beat_w - 3.0, body.max.y));
         let pp = clip_painter.with_clip_rect(pass_rect.intersect(rect));
         let tint = if k == 0 { 1.0 } else { 0.6 };
-        draw_content(&pp, pbody, x0, pass, v, peaks, secs_per_beat, beat_w, tint);
+        let from = (v.position + k as f32 * walk).rem_euclid(1.0);
+        draw_content(&pp, pbody, x0, pass, v, from, peaks, secs_per_beat, beat_w, tint);
         if k > 0 {
             painter.line_segment(
                 [egui::pos2(x0, rect.min.y + 1.0), egui::pos2(x0, rect.max.y - 1.0)],
@@ -1213,8 +1337,8 @@ fn draw_clip(
     }
     if v.forever {
         label.push_str("  · forever");
-    } else if looping {
-        let n = v.len / pass;
+    } else if v.looping {
+        let n = if v.len <= pass { v.len / pass } else { 1.0 + (v.len - pass) / period };
         if (n - n.round()).abs() < 1e-3 {
             label.push_str(&format!("  ×{}", n.round() as u32));
         } else {
@@ -1268,6 +1392,7 @@ fn draw_content(
     origin_x: f32,
     len: f64,
     v: &ClipView,
+    from: f32,
     peaks: Option<&[f32]>,
     secs_per_beat: f64,
     beat_w: f32,
@@ -1278,7 +1403,6 @@ fn draw_content(
         PlayMode::Snippet => {
             if let (Some(peaks), Some(src)) = (peaks, &v.source) {
                 let dur = src.duration().max(1e-6) as f32;
-                let from = v.position;
                 let span = (len * secs_per_beat) as f32 * v.speed.max(0.01) / dur;
                 draw_peaks(&clip_painter, body, peaks, from, from + span, c.linear_multiply(0.75));
             }

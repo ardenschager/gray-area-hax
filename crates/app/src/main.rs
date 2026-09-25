@@ -256,6 +256,10 @@ pub struct ClipDrag {
     pub ci: usize,
     /// Pointer beat minus clip start at grab time.
     pub grab: f64,
+    /// Dragging the LEFT edge: trims the start (media start moves with it).
+    pub trim_left: bool,
+    /// At grab time: (start beat, length beats, media position 0..1).
+    pub orig: (f64, f64, f32),
 }
 
 pub struct App {
@@ -345,6 +349,9 @@ pub struct App {
     /// A one-click cut-out in progress: (track, clip, original source) —
     /// the clip switches to the cut-out when it arrives.
     pending_cutout: Option<(usize, usize, usize)>,
+    /// A per-clip paulstretch in progress: (track, clip, original source,
+    /// factor) — the clip swaps to the stretched region when it arrives.
+    pub(crate) pending_stretch: Option<(usize, usize, usize, f32)>,
 
     /// Undo / redo (whole-project snapshots, one step per gesture).
     history: history::History,
@@ -422,6 +429,7 @@ impl App {
             prev_launch_t: None,
             synth: ui_synth::SynthState::new(),
             pending_cutout: None,
+            pending_stretch: None,
             history: history::History::default(),
             clipboard: None,
             os_copy: false,
@@ -580,6 +588,7 @@ impl App {
                 c.source = src;
                 c.grains.envelope = fresh.grains.envelope;
                 c.grains.pan_spread = fresh.grains.pan_spread;
+                c.grains.texture = 0.0;
             }
             PlayMode::Grains => {
                 let fresh = Clip::new(src, 0.0, 1.0);
@@ -723,6 +732,7 @@ impl App {
         self.last_source = self.last_source.min(n_src.saturating_sub(1));
         self.imported.retain(|_, i| *i < n_src);
         self.pending_cutout = None;
+        self.pending_stretch = None;
         self.pending.clear();
         self.clip_drag = None;
         self.cc_mappings.clear();
@@ -825,6 +835,7 @@ impl App {
         drop(p);
         self.synth.reset_ids();
         self.pending_cutout = None;
+        self.pending_stretch = None;
         self.imported.retain(|_, id| *id != src);
         for id in self.imported.values_mut() {
             if *id > src {
@@ -1071,6 +1082,39 @@ impl App {
         self.start_segment(src, prompt.to_string());
     }
 
+    /// One click: paulstretch exactly the bit of media this clip plays
+    /// (one pass) by `factor`; the clip then plays the wash, `factor`×
+    /// longer (repeats and their count are kept).
+    pub(crate) fn stretch_clip(&mut self, ti: usize, ci: usize, factor: f32) {
+        if let Some(b) = &self.busy {
+            self.status = format!("busy — {b}");
+            return;
+        }
+        let (orig, region) = {
+            let p = self.project.lock().unwrap();
+            let Some(c) = p.tracks.get(ti).and_then(|t| t.clips.get(ci)) else { return };
+            let Some(src) = p.sources.get(c.source) else { return };
+            let rate = match c.kind {
+                ClipKind::Snippet => c.grains.speed as f64,
+                ClipKind::Granular => (c.grains.scan_speed.abs() as f64).max(0.1),
+                ClipKind::Pattern(_) => return,
+            };
+            let dur = src.duration();
+            if dur <= 0.0 {
+                return;
+            }
+            let len = (p.beats_to_secs(c.pass_beats()) * rate).clamp(0.25, dur);
+            (c.source, src.slice(c.grains.position as f64 * dur, len))
+        };
+        self.pending_stretch = Some((ti, ci, orig, factor));
+        self.busy = Some(format!("paulstretching the clip ×{factor:.0}…"));
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let res = Ok(chromagrain_core::stretch::paulstretch_source(&region, factor));
+            let _ = tx.send(WorkerMsg::Source(res));
+        });
+    }
+
     fn start_script(&mut self) {
         if self.busy.is_some() {
             return;
@@ -1130,6 +1174,32 @@ impl App {
                     let name = src.name.clone();
                     let hz = src.base_hz;
                     let id = self.project.lock().unwrap().add_source(src);
+                    if let Some((ti, ci, orig, factor)) = self.pending_stretch.take() {
+                        let mut p = self.project.lock().unwrap();
+                        if let Some(c) = p.tracks.get_mut(ti).and_then(|t| t.clips.get_mut(ci)) {
+                            if c.source == orig {
+                                let times = c.repeat_count().round().max(1.0) as u32;
+                                let pass = (c.pass_beats() * factor as f64).min(64.0);
+                                c.source = id;
+                                c.grains.position = 0.0;
+                                if c.loop_beats.is_some() {
+                                    c.loop_beats = Some(pass);
+                                    if !c.loop_forever {
+                                        c.length_beats = c.length_for(times);
+                                    }
+                                } else {
+                                    c.length_beats = pass;
+                                }
+                                drop(p);
+                                self.select(Sel::Clip(ti, ci));
+                                self.mark_now();
+                                self.status = format!(
+                                    "stretched ×{factor:.0} → '{name}' (original kept in the library)"
+                                );
+                                continue;
+                            }
+                        }
+                    }
                     if let Some((ti, ci, orig)) = self.pending_cutout.take() {
                         // One-click cut-out: the clip that asked for it
                         // now plays the cut-out; the original stays in
@@ -1156,6 +1226,7 @@ impl App {
                 }
                 WorkerMsg::Source(Err(e)) => {
                     self.pending_cutout = None;
+                    self.pending_stretch = None;
                     self.status = format!("couldn't add media: {e}");
                 }
                 WorkerMsg::Loaded(path, place, res) => {

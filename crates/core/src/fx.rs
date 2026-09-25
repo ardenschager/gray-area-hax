@@ -14,6 +14,9 @@
 //! | Tint     | resonant band at one frequency | every hue smushed to one hue   |
 //! | Tune     | resonators on every note of a  | every hue snapped to the key's |
 //! |          | key (frequencies → the key)    | colors (pitch class ↔ hue)     |
+//! | Tile     | short multi-tap "tiling" of    | picture repeated as an N×N     |
+//! |          | the sound (N-1 taps, mirror =  | grid (mirror = kaleidoscope    |
+//! |          | taps ping-pong L/R)            | flips, turn = grid rotation)   |
 //!
 //! Correspondence is the default but configurable per effect: `audio` and
 //! `video` are independent 0..1 amount dials. audio=1, video=1 means both
@@ -49,6 +52,13 @@ pub enum EffectKind {
     /// `root` pitch class 0..11, `amount` 0..1 wet, `focus` 0..1 how
     /// narrow (and ringing) the resonators are.
     Tune { root: f32, scale: crate::music::ScaleKind, amount: f32, focus: f32 },
+    /// Tiling. Video: the picture repeats as a `count`×`count` grid
+    /// (1..8, fractional ok; 1 = passthrough); `mirror` >= 0.5 flips
+    /// alternate tiles (seamless kaleidoscope); `spin` rotates the grid
+    /// about the center, in turns (-0.5..0.5). Audio: `count` N adds N-1
+    /// short decaying taps within ~40–120 ms (a "tiled" sound), mirror
+    /// ping-pongs alternate taps L/R. count 1 = exact passthrough.
+    Tile { count: f32, mirror: f32, spin: f32 },
 }
 
 impl EffectKind {
@@ -74,6 +84,8 @@ impl EffectKind {
                 amount: 0.8,
                 focus: 0.5,
             },
+            "tile" | "tiles" | "grid" => EffectKind::Tile { count: 2.0, mirror: 0.0, spin: 0.0 },
+            "kaleido" | "kaleidoscope" => EffectKind::Tile { count: 3.0, mirror: 1.0, spin: 0.0 },
             _ => return None,
         })
     }
@@ -86,6 +98,24 @@ impl EffectKind {
             EffectKind::Compress { .. } => "compress",
             EffectKind::Tint { .. } => "tint",
             EffectKind::Tune { .. } => "tune",
+            EffectKind::Tile { .. } => "tile",
+        }
+    }
+
+    /// Canonical parse names of every effect kind, in UI order (each one
+    /// round-trips through [`EffectKind::parse`] to its default).
+    pub const KINDS: [&'static str; 7] = ["tune", "crush", "delay", "reverb", "compress", "tint", "tile"];
+
+    /// One-line "audio ↔ video" description for UIs.
+    pub fn blurb(&self) -> &'static str {
+        match self {
+            EffectKind::Crush { .. } => "bitcrush ↔ pixelate",
+            EffectKind::Delay { .. } => "echo ↔ ghost frames",
+            EffectKind::Reverb { .. } => "space ↔ smear",
+            EffectKind::Compress { .. } => "codec crunch ↔ jpeg blocks",
+            EffectKind::Tint { .. } => "resonance ↔ color",
+            EffectKind::Tune { .. } => "frequencies → key ↔ hues → key colors",
+            EffectKind::Tile { .. } => "multi-tap echoes ↔ tiled / kaleidoscope picture",
         }
     }
 }
@@ -174,6 +204,12 @@ impl AvEffect {
                 "focus" | "q" => *focus = value.clamp(0.0, 1.0),
                 _ => return Err(format!("tune has no parameter '{name}'")),
             },
+            EffectKind::Tile { count, mirror, spin } => match key.as_str() {
+                "tiles" | "count" | "n" | "grid" => *count = value.clamp(1.0, 8.0),
+                "mirror" | "kaleido" => *mirror = value.clamp(0.0, 1.0),
+                "turn" | "spin" | "rotate" | "rotation" => *spin = value.clamp(-0.5, 0.5),
+                _ => return Err(format!("tile has no parameter '{name}'")),
+            },
         }
         Ok(())
     }
@@ -198,6 +234,46 @@ pub enum AudioFxState {
     Compress { channels: [SpectralState; 2] },
     Tint { bq: [crate::dsp::Biquad; 2] },
     Tune { bank: Vec<[crate::dsp::Biquad; 2]>, env_in: [f32; 2], env_wet: [f32; 2], coef: f32 },
+    /// Dry-input history for the multi-tap tiling (feed-forward, so the
+    /// tap times can move freely with `count` without rebuilding).
+    Tile { ring: [Vec<f32>; 2], pos: usize, sr: f32 },
+}
+
+/// Longest Tile span (seconds), used at count = 8. With the fractional
+/// "next tap fading in", taps can reach ~1.05× this; the ring holds 1.5×.
+const TILE_MAX_SPAN: f32 = 0.12;
+/// Shortest Tile span (seconds), used at count = 2.
+const TILE_MIN_SPAN: f32 = 0.04;
+/// Wet level at count = 8 (scaled by (N-1)/7 below that).
+const TILE_WET: f32 = 0.35;
+/// Per-tap decay.
+const TILE_DECAY: f32 = 0.75;
+
+/// Tap layout for count `n`: (delay seconds, gain) per tap, gains
+/// normalized to sum to 1. The last tap fades in with the fractional part
+/// of `n`, so sweeping `count` never pops a tap in at full level.
+fn tile_taps(n: f32) -> Vec<(f32, f32)> {
+    let extra = (n.clamp(1.0, 8.0) - 1.0).max(0.0);
+    if extra <= 1e-4 {
+        return Vec::new();
+    }
+    let k_max = extra.ceil() as usize;
+    let span = TILE_MIN_SPAN + (TILE_MAX_SPAN - TILE_MIN_SPAN) * ((extra - 1.0).max(0.0) / 6.0);
+    let spacing = span / extra.max(1.0);
+    let mut taps: Vec<(f32, f32)> = (1..=k_max)
+        .map(|k| {
+            let mut g = TILE_DECAY.powi(k as i32 - 1);
+            if k == k_max {
+                g *= extra - (k_max - 1) as f32;
+            }
+            (spacing * k as f32, g)
+        })
+        .collect();
+    let sum: f32 = taps.iter().map(|t| t.1).sum::<f32>().max(1e-6);
+    for t in taps.iter_mut() {
+        t.1 /= sum;
+    }
+    taps
 }
 
 /// Build fresh states for a chain. Rebuild whenever the chain's shape or
@@ -249,6 +325,11 @@ pub fn audio_chain_states(chain: &[AvEffect], sample_rate: u32) -> Vec<AudioFxSt
                 // ~60 ms level followers for the auto-gain.
                 let coef = (-1.0 / (0.06 * sr)).exp();
                 AudioFxState::Tune { bank, env_in: [0.0; 2], env_wet: [0.0; 2], coef }
+            }
+            EffectKind::Tile { .. } => {
+                let sr = sample_rate as f32;
+                let len = (TILE_MAX_SPAN * 1.5 * sr).ceil() as usize + 4;
+                AudioFxState::Tile { ring: [vec![0.0; len], vec![0.0; len]], pos: 0, sr }
             }
         })
         .collect()
@@ -356,9 +437,66 @@ pub fn process_audio_chain(
                     }
                 }
             }
+            (EffectKind::Tile { count, mirror, .. }, AudioFxState::Tile { ring, pos, sr }) => {
+                process_tile(left, right, ring, pos, *sr, count, mirror, fx.audio);
+            }
             _ => debug_assert!(false, "chain/state mismatch — rebuild states"),
         }
     }
+}
+
+/// Multi-tap "tiling": each output sample adds N-1 decaying copies of the
+/// recent dry input. Feed-forward (no feedback) so it can never run away,
+/// and fractional (linear-interp) tap reads so sweeping `count` glides.
+#[allow(clippy::too_many_arguments)]
+fn process_tile(
+    left: &mut [f32],
+    right: &mut [f32],
+    ring: &mut [Vec<f32>; 2],
+    pos: &mut usize,
+    sr: f32,
+    count: f32,
+    mirror: f32,
+    amount: f32,
+) {
+    let len = ring[0].len();
+    let taps = tile_taps(count);
+    let extra = (count.clamp(1.0, 8.0) - 1.0).max(0.0);
+    let wet = TILE_WET * (extra / 7.0) * amount.clamp(0.0, 1.0);
+    let cross = mirror >= 0.5;
+    // Precompute tap read offsets in samples (kept inside the ring).
+    let taps: Vec<(f32, f32, bool)> = taps
+        .iter()
+        .enumerate()
+        .map(|(k, &(d, g))| ((d * sr).clamp(1.0, (len - 2) as f32), g, cross && k % 2 == 0))
+        .collect();
+    let mut p = *pos;
+    for i in 0..left.len() {
+        let (dl, dr) = (left[i], right[i]);
+        ring[0][p] = dl;
+        ring[1][p] = dr;
+        if wet > 0.0 && !taps.is_empty() {
+            let mut acc = [0.0f32; 2];
+            for &(d, g, swap) in &taps {
+                let rd = p as f32 + len as f32 - d;
+                let i0 = rd.floor();
+                let f = rd - i0;
+                let a = i0 as usize % len;
+                let b = (a + 1) % len;
+                for (c, out) in acc.iter_mut().enumerate() {
+                    // Mirror: alternate taps come from the opposite side,
+                    // so the echoes ping-pong L/R like flipped tiles.
+                    let src = if swap { 1 - c } else { c };
+                    let h = &ring[src];
+                    *out += g * (h[a] + (h[b] - h[a]) * f);
+                }
+            }
+            left[i] = dl + acc[0] * wet;
+            right[i] = dr + acc[1] * wet;
+        }
+        p = (p + 1) % len;
+    }
+    *pos = p;
 }
 
 /// One-shot convenience: process a whole buffer, compensating for any
@@ -655,7 +793,8 @@ pub fn video_chain_states(chain: &[AvEffect], fps: f32) -> Vec<VideoFxState> {
             EffectKind::Crush { .. }
             | EffectKind::Compress { .. }
             | EffectKind::Tint { .. }
-            | EffectKind::Tune { .. } => VideoFxState::Stateless,
+            | EffectKind::Tune { .. }
+            | EffectKind::Tile { .. } => VideoFxState::Stateless,
         })
         .collect()
 }
@@ -712,6 +851,64 @@ pub fn apply_video_chain(
             EffectKind::Tune { root, scale, amount, .. } => {
                 video_tune(frame, &key_hues(root, scale), amount * fx.video);
             }
+            EffectKind::Tile { count, mirror, spin } => {
+                let (n, turn) = tile_video_params(count, spin, fx.video);
+                video_tile(frame, n, mirror, turn);
+            }
+        }
+    }
+}
+
+/// Effective (count, turn) for the Tile video side at picture dial
+/// `video`: the dial glides count from 1 and turn from 0. Shared with the
+/// GPU preview so both paths agree.
+pub fn tile_video_params(count: f32, spin: f32, video: f32) -> (f32, f32) {
+    let v = video.clamp(0.0, 1.0);
+    (lerp(1.0, count.clamp(1.0, 8.0), v), spin.clamp(-0.5, 0.5) * v)
+}
+
+/// Where output uv (0..1, y-down, pixel centers) samples the source for
+/// the Tile effect. `aspect` = width / height keeps rotation undistorted.
+/// This is the exact math of the GPU `tile` shader.
+pub fn tile_source_uv(u: f32, v: f32, count: f32, mirror: f32, turn: f32, aspect: f32) -> (f32, f32) {
+    let (mut u, mut v) = (u, v);
+    if turn.abs() > 1e-6 {
+        let (s, c) = (turn * std::f32::consts::TAU).sin_cos();
+        let dx = (u - 0.5) * aspect;
+        let dy = v - 0.5;
+        u = (dx * c - dy * s) / aspect + 0.5;
+        v = dx * s + dy * c + 0.5;
+    }
+    let tile = |t: f32| -> f32 {
+        let q = t * count;
+        let i = q.floor();
+        let f = q - i;
+        if mirror >= 0.5 && (i as i64).rem_euclid(2) == 1 { 1.0 - f } else { f }
+    };
+    (tile(u), tile(v))
+}
+
+/// Repeat the picture as a `count`×`count` grid (nearest sampling, like
+/// `video_crush`). Whole RGBA pixels are copied, so alpha cut-outs tile.
+fn video_tile(frame: &mut Frame, count: f32, mirror: f32, turn: f32) {
+    if (count - 1.0).abs() < 1e-4 && turn.abs() < 1e-6 {
+        return;
+    }
+    let (w, h) = (frame.width as usize, frame.height as usize);
+    if w == 0 || h == 0 {
+        return;
+    }
+    let src = frame.data.clone();
+    let aspect = w as f32 / h as f32;
+    for y in 0..h {
+        let v = (y as f32 + 0.5) / h as f32;
+        for x in 0..w {
+            let u = (x as f32 + 0.5) / w as f32;
+            let (su, sv) = tile_source_uv(u, v, count, mirror, turn, aspect);
+            let sx = ((su * w as f32) as usize).min(w - 1);
+            let sy = ((sv * h as f32) as usize).min(h - 1);
+            let (di, si) = ((y * w + x) * 4, (sy * w + sx) * 4);
+            frame.data[di..di + 4].copy_from_slice(&src[si..si + 4]);
         }
     }
 }
@@ -1551,6 +1748,173 @@ mod tests {
         assert_eq!(nearest_hue_delta(100.0, &hues), 20.0);
         assert_eq!(nearest_hue_delta(350.0, &hues), 10.0);
         assert_eq!(key_freqs(9.0, crate::music::ScaleKind::MinorPentatonic)[0], 55.0);
+    }
+
+    /// 16x8 frame: left half opaque white, right half transparent black.
+    fn half_frame() -> Frame {
+        let mut f = Frame::black(16, 8);
+        for y in 0..8 {
+            for x in 0..16 {
+                let px = if x < 8 { [255, 255, 255, 255] } else { [0, 0, 0, 0] };
+                f.put(x, y, px);
+            }
+        }
+        f
+    }
+
+    fn run_tile(f: &mut Frame, count: f32, mirror: f32, spin: f32) {
+        let chain = [AvEffect::new(EffectKind::Tile { count, mirror, spin })];
+        let mut st = video_chain_states(&chain, 30.0);
+        apply_video_chain(f, &chain, &mut st);
+    }
+
+    #[test]
+    fn tile_count_one_is_passthrough() {
+        let orig = VideoClip::test_pattern(64, 48, 10.0, 0.2).frames[0].clone();
+        for mirror in [0.0, 1.0] {
+            let mut f = orig.clone();
+            run_tile(&mut f, 1.0, mirror, 0.0);
+            assert_eq!(orig.data, f.data);
+        }
+        // Audio: count 1 is bit-exact, mirror or not.
+        let sr = 48_000u32;
+        let src: Vec<f32> = (0..4800).map(|i| ((i as f32) * 0.37).sin() * 0.5).collect();
+        for mirror in [0.0, 1.0] {
+            let (mut l, mut r) = (src.clone(), src.iter().map(|v| -v).collect::<Vec<_>>());
+            let r0 = r.clone();
+            let chain = [AvEffect::new(EffectKind::Tile { count: 1.0, mirror, spin: 0.0 })];
+            let mut st = audio_chain_states(&chain, sr);
+            process_audio_chain(&mut l, &mut r, &chain, &mut st);
+            assert_eq!(l, src);
+            assert_eq!(r, r0);
+        }
+    }
+
+    #[test]
+    fn tile_two_repeats_columns_and_carries_alpha() {
+        let mut f = half_frame();
+        run_tile(&mut f, 2.0, 0.0, 0.0);
+        for y in 0..8 {
+            for x in 0..16 {
+                let want = if (x / 4) % 2 == 0 { [255, 255, 255, 255] } else { [0, 0, 0, 0] };
+                assert_eq!(f.get(x, y), want, "x {x} y {y}");
+            }
+        }
+    }
+
+    #[test]
+    fn tile_mirror_flips_alternate_tiles() {
+        // Horizontal gradient with a vertical alpha ramp.
+        let mut src = Frame::black(16, 8);
+        for y in 0..8 {
+            for x in 0..16 {
+                src.put(x, y, [(x * 16) as u8, 0, (y * 30) as u8, (y * 32 + 3) as u8]);
+            }
+        }
+        let mut plain = src.clone();
+        run_tile(&mut plain, 2.0, 0.0, 0.0);
+        let mut mir = src.clone();
+        run_tile(&mut mir, 2.0, 1.0, 0.0);
+        for y in 0..8 {
+            for k in 0..8 {
+                // Top-left tile identical; the next tile is its mirror.
+                if y < 4 {
+                    assert_eq!(mir.get(k, y), plain.get(k, y));
+                }
+                assert_eq!(mir.get(8 + k, y), mir.get(7 - k, y), "k {k} y {y}");
+            }
+            // Alpha rides along with its pixel: output row y samples source
+            // row 2r+1 (r = y in the first tile row, mirrored in the second).
+            let r = if y < 4 { y } else { 7 - y };
+            assert_eq!(mir.get(0, y)[3], src.get(1, 2 * r + 1)[3]);
+            assert_eq!(mir.get(0, y), src.get(1, 2 * r + 1));
+        }
+        // Vertical tiles flip too (rows 4..8 mirror rows 0..4).
+        for x in 0..16 {
+            for y in 0..4 {
+                assert_eq!(mir.get(x, 4 + y), mir.get(x, 3 - y));
+            }
+        }
+        // Seamless: the mirrored grid has no hard jump at the tile seam.
+        let seam = (mir.get(7, 0)[0] as i32 - mir.get(8, 0)[0] as i32).abs();
+        assert_eq!(seam, 0);
+    }
+
+    #[test]
+    fn tile_half_turn_rotates_180() {
+        let src = VideoClip::test_pattern(32, 16, 10.0, 0.2).frames[0].clone();
+        let mut f = src.clone();
+        run_tile(&mut f, 1.0, 0.0, 0.5);
+        for y in 0..16 {
+            for x in 0..32 {
+                assert_eq!(f.get(x, y), src.get(31 - x, 15 - y), "x {x} y {y}");
+            }
+        }
+    }
+
+    #[test]
+    fn tile_audio_taps_and_mirror_pingpong() {
+        let sr = 48_000u32;
+        let n = sr as usize / 4;
+        // Left-only impulse.
+        let mut l = vec![0.0f32; n];
+        let mut r = vec![0.0f32; n];
+        l[0] = 1.0;
+        let chain = [AvEffect::new(EffectKind::Tile { count: 3.0, mirror: 0.0, spin: 0.0 })];
+        let mut st = audio_chain_states(&chain, sr);
+        process_audio_chain(&mut l, &mut r, &chain, &mut st);
+        assert_eq!(l[0], 1.0);
+        assert!(r.iter().all(|v| *v == 0.0), "no cross-feed without mirror");
+        let taps: Vec<usize> = (1..n).filter(|&i| l[i].abs() > 1e-4).collect();
+        assert!(!taps.is_empty());
+        assert!(taps.iter().all(|&i| i < (0.13 * sr as f32) as usize), "taps within ~120 ms");
+        let wet: f32 = l[1..].iter().sum();
+        assert!(wet > 0.05 && wet < 0.2, "subtle wet {wet}"); // 0.35 * 2/7 = 0.1
+        // Mirror: the first echo lands on the opposite side.
+        let (mut l, mut r) = (vec![0.0f32; n], vec![0.0f32; n]);
+        l[0] = 1.0;
+        let chain = [AvEffect::new(EffectKind::Tile { count: 3.0, mirror: 1.0, spin: 0.0 })];
+        let mut st = audio_chain_states(&chain, sr);
+        process_audio_chain(&mut l, &mut r, &chain, &mut st);
+        assert!(r.iter().map(|v| v.abs()).sum::<f32>() > 0.01);
+        assert!(l.iter().chain(&r).all(|v| v.is_finite()));
+        // Block-size independence (streaming state).
+        let src: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.05).sin()).collect();
+        let (mut a, mut b) = (src.clone(), src.clone());
+        let chain = [AvEffect::new(EffectKind::Tile { count: 5.5, mirror: 1.0, spin: 0.0 })];
+        let mut st = audio_chain_states(&chain, sr);
+        process_audio_chain(&mut a, &mut b, &chain, &mut st);
+        let (mut c, mut d) = (src.clone(), src.clone());
+        let mut st = audio_chain_states(&chain, sr);
+        for (cc, dd) in c.chunks_mut(333).zip(d.chunks_mut(333)) {
+            process_audio_chain(cc, dd, &chain, &mut st);
+        }
+        assert_eq!(a, c);
+        assert_eq!(b, d);
+    }
+
+    #[test]
+    fn tile_parse_and_params() {
+        assert_eq!(
+            EffectKind::parse("tile"),
+            Some(EffectKind::Tile { count: 2.0, mirror: 0.0, spin: 0.0 })
+        );
+        assert_eq!(EffectKind::parse("grid"), EffectKind::parse("tiles"));
+        assert_eq!(
+            EffectKind::parse("kaleido"),
+            Some(EffectKind::Tile { count: 3.0, mirror: 1.0, spin: 0.0 })
+        );
+        let mut fx = AvEffect::new(EffectKind::parse("tile").unwrap());
+        fx.set_param("tiles", 12.0).unwrap();
+        fx.set_param("mirror", 1.0).unwrap();
+        fx.set_param("turn", 0.125).unwrap();
+        assert_eq!(fx.kind, EffectKind::Tile { count: 8.0, mirror: 1.0, spin: 0.125 });
+        assert!(fx.set_param("hue", 1.0).is_err());
+        for name in EffectKind::KINDS {
+            let k = EffectKind::parse(name).unwrap();
+            assert_eq!(k.name(), name);
+            assert!(!k.blurb().is_empty());
+        }
     }
 }
 

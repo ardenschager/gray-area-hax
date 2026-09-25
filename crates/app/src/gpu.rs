@@ -249,6 +249,38 @@ void main() {
     frag = c;
 }"#;
 
+/// Mirrors `fx::tile_source_uv` + `fx::video_tile`: repeat the picture as
+/// a count×count grid, optional mirror flips, rotation in turns. Nearest
+/// texel fetch so it matches the CPU export pixel-for-pixel; the whole
+/// (premultiplied) texel is copied, so alpha cut-outs tile too.
+const TILE_FS: &str = r#"#version 330 core
+in vec2 v_uv; out vec4 frag;
+uniform sampler2D u_tex;
+uniform vec2 u_res;
+uniform float u_count;
+uniform float u_mirror;
+uniform float u_turn;   // turns
+float tile1(float t) {
+    float q = t * u_count;
+    float i = floor(q);
+    float f = q - i;
+    if (u_mirror >= 0.5 && mod(i, 2.0) >= 0.5) f = 1.0 - f;
+    return f;
+}
+void main() {
+    vec2 uv = v_uv;
+    if (abs(u_turn) > 1e-6) {
+        float aspect = u_res.x / u_res.y;
+        float a = u_turn * 6.283185307;
+        float s = sin(a), c = cos(a);
+        vec2 d = vec2((uv.x - 0.5) * aspect, uv.y - 0.5);
+        uv = vec2((d.x * c - d.y * s) / aspect + 0.5, d.x * s + d.y * c + 0.5);
+    }
+    vec2 suv = vec2(tile1(uv.x), tile1(uv.y));
+    ivec2 px = min(ivec2(suv * u_res), ivec2(u_res) - 1);
+    frag = texelFetch(u_tex, px, 0);
+}"#;
+
 const DELAY_FS: &str = r#"#version 330 core
 in vec2 v_uv; out vec4 frag;
 uniform sampler2D u_tex;
@@ -470,6 +502,7 @@ impl GpuPreview {
             programs.insert("crush", compile(gl, QUAD_VS, CRUSH_FS)?);
             programs.insert("tint", compile(gl, QUAD_VS, &tint_fs())?);
             programs.insert("tune", compile(gl, QUAD_VS, &tune_fs())?);
+            programs.insert("tile", compile(gl, QUAD_VS, TILE_FS)?);
             programs.insert("delay", compile(gl, QUAD_VS, DELAY_FS)?);
             programs.insert("racc", compile(gl, QUAD_VS, REVERB_ACCUM_FS)?);
             programs.insert("rmix", compile(gl, QUAD_VS, REVERB_MIX_FS)?);
@@ -707,6 +740,29 @@ impl GpuPreview {
                         gl.uniform_1_f32_slice(loc.as_ref(), &arr);
                         self.set_i(gl, p, "u_nh", hues.len().min(12) as i32);
                         self.set_f(gl, p, "u_amount", (amount * fx.video).clamp(0.0, 1.0));
+                        self.set_4f(gl, p, "u_rect", [0.0, 0.0, 1.0, 1.0]);
+                        self.draw_quad(gl);
+                        cur = out.tex;
+                    }
+                    EffectKind::Tile { count, mirror, spin } => {
+                        let (n, turn) = chromagrain_core::fx::tile_video_params(count, spin, fx.video);
+                        if (n - 1.0).abs() < 1e-4 && turn.abs() < 1e-6 {
+                            continue;
+                        }
+                        let out = if cur == self.ping.as_ref().unwrap().tex {
+                            self.pong.as_ref().unwrap()
+                        } else {
+                            self.ping.as_ref().unwrap()
+                        };
+                        self.bind_target(gl, out, None);
+                        let p = self.use_program(gl, "tile");
+                        gl.active_texture(glow::TEXTURE0);
+                        gl.bind_texture(glow::TEXTURE_2D, Some(cur));
+                        self.set_i(gl, p, "u_tex", 0);
+                        self.set_2f(gl, p, "u_res", w, h);
+                        self.set_f(gl, p, "u_count", n);
+                        self.set_f(gl, p, "u_mirror", mirror);
+                        self.set_f(gl, p, "u_turn", turn);
                         self.set_4f(gl, p, "u_rect", [0.0, 0.0, 1.0, 1.0]);
                         self.draw_quad(gl);
                         cur = out.tex;

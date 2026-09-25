@@ -62,6 +62,9 @@ fn snippet_events(
     };
 
     let base_ratio = quantized(g.pitch, g);
+    if g.texture > 1e-3 {
+        return textured_events(clip, source_len, clip_t0, clip_len, secs_per_beat, &quantized);
+    }
     if clip.automation.is_empty() && (g.speed - base_ratio).abs() < 1e-3 {
         // Record-player coupling: a single unbroken grain.
         return vec![GrainEvent {
@@ -114,20 +117,116 @@ fn snippet_events(
     events
 }
 
-/// Repeat one pass of events (`pass` seconds from `t0`) until `total`
-/// seconds; grains crossing the end are shortened so nothing plays past
-/// the clip.
-fn tile_events(pass_evs: &[GrainEvent], t0: f64, pass: f64, total: f64) -> Vec<GrainEvent> {
+/// The sample <-> grains morph (`texture` > 0): a grain train whose read
+/// head follows the media at `speed` like a snippet, but whose grains
+/// shrink, scatter (onset, position, pitch, pan) and thin out toward the
+/// clip's grain settings as `texture` -> 1. Loudness stays roughly level:
+/// coherent overlap-add at low texture, power-normalized cloud at high.
+fn textured_events(
+    clip: &Clip,
+    source_len: f64,
+    clip_t0: f64,
+    clip_len: f64,
+    secs_per_beat: f64,
+    quantized: &dyn Fn(f32, &crate::grain::GrainSettings) -> f32,
+) -> Vec<GrainEvent> {
+    let g = &clip.grains;
+    let mut rng = crate::dsp::Rng::new(g.seed ^ 0x7E47_0E55);
+    let mut events = Vec::new();
+    let mut head = g.position as f64 * source_len;
+    let mut t = 0.0f64;
+    let mut k = 0u64;
+    while t < clip_len {
+        let eff = if clip.automation.is_empty() {
+            g.clone()
+        } else {
+            crate::auto::settings_at(g, &clip.automation, t / secs_per_beat.max(1e-9))
+        };
+        let tex = eff.texture.clamp(0.0, 1.0);
+        let grain_dur = eff.duration.clamp(0.01, 2.0);
+        // Grain length: long, smooth windows -> the clip's grain size.
+        let dur = (0.30f32.ln() + (grain_dur.ln() - 0.30f32.ln()) * tex).exp()
+            * (1.0 + tex * eff.duration_jitter * rng.bipolar());
+        let dur = dur.max(0.005) as f64;
+        // Hop: 50% overlap (seamless) -> the clip's density.
+        let cloud_hop = 1.0 / eff.density.max(0.5) as f64;
+        let hop = (dur / 2.0 + (cloud_hop - dur / 2.0) * tex as f64).max(0.002);
+        let jitter = tex as f64 * hop * 0.5 * rng.bipolar() as f64;
+        let onset_t = (t + jitter).max(0.0);
+        let pos = head + tex as f64 * eff.spray as f64 * rng.bipolar() as f64;
+        let st = eff.pitch + tex * eff.pitch_jitter * rng.bipolar();
+        let pan = eff.pan + tex * eff.pan_spread.clamp(0.0, 1.0) * rng.bipolar();
+        let reverse = if tex < 0.5 {
+            eff.reverse_prob >= 0.5
+        } else {
+            rng.next_f32() < eff.reverse_prob
+        };
+        // Overlap factor 2 = unity OLA; normalize toward sqrt as grains
+        // decorrelate so the cloud doesn't swell.
+        let overlap = (dur / hop).max(0.25) as f32;
+        let norm = (overlap * 0.5).powf(-(1.0 - 0.5 * tex));
+        if onset_t < clip_len {
+            events.push(GrainEvent {
+                onset: clip_t0 + onset_t,
+                source_pos: pos.rem_euclid(source_len.max(1e-6)),
+                duration: dur.min(clip_len - onset_t + hop) as f32,
+                pitch_ratio: quantized(st, &eff),
+                gain: eff.gain * norm,
+                pan: pan.clamp(-1.0, 1.0),
+                envelope: 1.0,
+                env_skew: tex * eff.env_skew,
+                reverse,
+                id: g.seed.wrapping_add(k),
+            });
+        }
+        head += hop * eff.speed.max(0.05) as f64;
+        t += hop;
+        k += 1;
+    }
+    events
+}
+
+/// How a repeating clip lays its passes out, seconds.
+struct PassLayout {
+    pass: f64,
+    period: f64,
+    /// Media seconds each pass moves the read head (0 = same bit).
+    advance: f64,
+    source_len: f64,
+}
+
+/// Repeat one pass of events (`pass` seconds from `t0`) every `period`
+/// seconds until `total`, skipping masked-off passes and walking the read
+/// head by `advance` per pass. Grains crossing the clip end are shortened
+/// so nothing plays past the clip.
+fn tile_events(
+    pass_evs: &[GrainEvent],
+    clip: &Clip,
+    t0: f64,
+    lay: &PassLayout,
+    total: f64,
+) -> Vec<GrainEvent> {
     let end = t0 + total;
-    let n = (total / pass.max(1e-6)).ceil() as usize;
+    let n = (total / lay.period.max(1e-6)).ceil().max(1.0) as usize;
     let mut out = Vec::with_capacity(pass_evs.len() * n);
     for k in 0..n {
-        let off = k as f64 * pass;
+        if !clip.pass_on(k) {
+            continue;
+        }
+        let off = k as f64 * lay.period;
+        let shift = k as f64 * lay.advance;
         for e in pass_evs {
+            // Events are planned for exactly one pass.
+            if e.onset >= t0 + lay.pass {
+                continue;
+            }
             let mut e = e.clone();
             e.onset += off;
             if e.onset >= end {
                 continue;
+            }
+            if shift != 0.0 && lay.source_len > 0.0 {
+                e.source_pos = (e.source_pos + shift).rem_euclid(lay.source_len);
             }
             e.duration = e.duration.min((end - e.onset) as f32);
             out.push(e);
@@ -173,7 +272,11 @@ pub fn plan_project(project: &Project) -> Vec<ClipPlan> {
                     let evs = snippet_events(clip, source, clip_t0, clip_len, secs_per_beat);
                     (
                         vec![(clip.source, evs)],
-                        VisualGrainStyle::full_frame(clip.visual.additive),
+                        VisualGrainStyle::morph(
+                            clip.visual.additive,
+                            &clip.visual,
+                            clip.grains.texture,
+                        ),
                     )
                 }
                 ClipKind::Pattern(pid) => {
@@ -190,10 +293,29 @@ pub fn plan_project(project: &Project) -> Vec<ClipPlan> {
                     (parts, clip.visual)
                 }
             };
-            let parts = if full_len > clip_len + 1e-9 {
+            let parts = if clip.loop_beats.is_some() {
+                let period = project.beats_to_secs(clip.period_beats());
+                // Media per pass: snippets read at `speed`, clouds scan.
+                let rate = match clip.kind {
+                    ClipKind::Snippet => clip.grains.speed as f64,
+                    ClipKind::Granular => clip.grains.scan_speed as f64,
+                    ClipKind::Pattern(_) => 0.0,
+                };
                 parts
                     .into_iter()
-                    .map(|(sid, evs)| (sid, tile_events(&evs, clip_t0, clip_len, full_len)))
+                    .map(|(sid, evs)| {
+                        let lay = PassLayout {
+                            pass: clip_len,
+                            period,
+                            advance: clip.loop_advance as f64 * clip_len * rate,
+                            source_len: project
+                                .sources
+                                .get(sid)
+                                .map(|s| s.duration())
+                                .unwrap_or(0.0),
+                        };
+                        (sid, tile_events(&evs, clip, clip_t0, &lay, full_len))
+                    })
                     .collect()
             } else {
                 parts
@@ -482,6 +604,58 @@ mod tests {
         p.tracks[t].clips.push(Clip::new_snippet(sid, 0.0, 16.0));
         p.resolve_forever();
         assert_eq!(p.tracks[0].clips[0].length_beats, 16.0 + crate::timeline::FOREVER_TAIL_BEATS);
+    }
+
+    #[test]
+    fn repeat_gap_mask_and_advance_shape_the_passes() {
+        let mut p = snippet_project();
+        let c = &mut p.tracks[0].clips[0];
+        c.length_beats = 1.0;
+        c.set_repeat(Some(1));
+        c.loop_gap = 1.0; // pass 1 beat, rest 1 beat
+        c.loop_mask = vec![true, false, true];
+        c.loop_advance = 1.0;
+        let len = c.length_for(4);
+        c.length_beats = len;
+        assert_eq!(len, 7.0, "3 periods of 2 + one pass");
+        assert!((c.repeat_count() - 4.0).abs() < 1e-9);
+        let plan = plan_project(&p);
+        let evs = &plan[0].parts[0].1;
+        // Passes 0,1,2,3 at 0,1,2,3 s; mask drops pass 1.
+        let onsets: Vec<f64> = evs.iter().map(|e| e.onset).collect();
+        assert_eq!(onsets, vec![0.0, 2.0, 3.0]);
+        // Advance 1: pass k starts k * 0.5 s further into the media.
+        for e in evs {
+            let k = (e.onset / 1.0).round();
+            assert!((e.source_pos - k * 0.5).abs() < 1e-9, "pos {} at {}", e.source_pos, e.onset);
+        }
+        // Negative gap overlaps passes and still counts right.
+        let c = &mut p.tracks[0].clips[0];
+        c.loop_gap = -0.5;
+        c.length_beats = c.length_for(3);
+        assert!((c.length_beats - 2.0).abs() < 1e-9);
+        assert!((c.repeat_count() - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn texture_morphs_a_snippet_into_grains_at_level_loudness() {
+        let render_tex = |tex: f32| {
+            let mut p = snippet_project();
+            p.tracks[0].clips[0].grains.texture = tex;
+            let plan = plan_project(&p);
+            let n = plan[0].parts[0].1.len();
+            let out = render_project(&p, 0.5, 3.5);
+            (n, out.audio.rms())
+        };
+        let (n0, r0) = render_tex(0.0);
+        let (n1, r1) = render_tex(0.3);
+        let (n2, r2) = render_tex(1.0);
+        assert_eq!(n0, 1, "texture 0 is the pristine single grain");
+        assert!(n1 > 5 && n2 > n1, "grain counts {n0} {n1} {n2}");
+        for (r, name) in [(r1, "0.3"), (r2, "1.0")] {
+            let db = 20.0 * (r / r0).log10();
+            assert!(db.abs() < 4.0, "texture {name} loudness {db:.1} dB");
+        }
     }
 
     #[test]

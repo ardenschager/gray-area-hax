@@ -248,10 +248,29 @@ The window has three places, and every thing lives in exactly one of them:
    right-click menu. The grid draws every pass. *Forever* runs until the
    next clip on the track (or 16 bars past the end of the song; export
    stops at the song's end).
+   **Shape the repeat** (inspector, under *repeat*): *gap* rests between
+   passes (negative = passes overlap); *plays* is a step row of which
+   passes sound — click cells, +/- sets the cycle, or ⌥-click a pass right
+   on the timeline (muted passes show dashed); *walk* moves each pass
+   through the media (0 = same bit, 1 = carry on, ½ = overlapping slices,
+   −1 = backwards). *snap* keeps lengths and gaps on 1/16 notes; turn it
+   off for the media's natural timing.
+   **Choose what plays**: the *what plays* strip shows the whole media with
+   the bit one pass plays lit up — drag it to move, drag its edges to trim,
+   click to jump; *to the end* plays to the media's natural end. Walking
+   repeats show where later passes will read. On the timeline, dragging a
+   clip's **left** edge trims its start (the media start moves with it).
+   **Sample ↔ grains** is one slider, not two worlds: on a snippet it
+   dissolves the straight media into a grain cloud that still follows the
+   media (grain size, density, scatter, random pitch and spread appear as
+   you raise it); on a grains clip, sliding it down turns it back into a
+   snippet. **Paulstretch ×4 / ×8 / ×16** (snippets) smears exactly the
+   lit bit into a slow wash, sound and picture, and the clip grows to fit.
 6. **Change the look**: the LOOK row at the top of every clip is one click
    each — *cut out people*, *cut out subject*, *tune to key*, *crush*,
-   *echo trails*, *smear*, *jpeg crunch*, *tint* (all of them act on sound
-   and picture together; their dials are under *Effects*).
+   *echo trails*, *smear*, *jpeg crunch*, *tint*, *tile* (2×2 … 6×6 grids;
+   *kaleido* mirrors alternate tiles, and the sound gets matching short echo
+   taps). All act on sound and picture together; dials are under *Effects*.
 7. **Place the picture** right on the preview: drag to move, drag a corner
    to size, drag the knob to rotate (shift snaps to 15°); scroll = size,
    shift+scroll = rotate. The inspector's *picture* section has the same

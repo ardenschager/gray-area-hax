@@ -238,7 +238,17 @@ impl App {
         let mut changed = false;
         let mut goto_source: Option<usize> = None;
         let mut cutout: Option<&'static str> = None;
+        let mut stretch: Option<f32> = None;
+        let media_src = {
+            let p = self.project.lock().unwrap();
+            let s = p.tracks[ti].clips[ci].source;
+            (mode != PlayMode::Pattern).then(|| p.sources.get(s).cloned()).flatten()
+        };
+        let media_peaks = media_src.as_ref().and_then(|s| self.peaks_for(s));
+        let media_dur = media_src.as_ref().map(|s| s.duration()).unwrap_or(0.0);
+        let stretching = self.pending_stretch.is_some_and(|(t, c, _, _)| t == ti && c == ci);
         let mut p = self.project.lock().unwrap();
+        let spb = p.beats_to_secs(1.0);
         let (has_video, is_part) = {
             let s = p.tracks[ti].clips[ci].source;
             let v = mode != PlayMode::Pattern && p.sources.get(s).is_some_and(|s| s.video.is_some());
@@ -278,7 +288,7 @@ impl App {
             });
         }
         ui.horizontal_wrapped(|ui| {
-            for (name, label) in [("tune", "tune to key"), ("crush", "crush"), ("delay", "echo trails"), ("reverb", "smear"), ("compress", "jpeg crunch"), ("tint", "tint")] {
+            for (name, label) in [("tune", "tune to key"), ("crush", "crush"), ("delay", "echo trails"), ("reverb", "smear"), ("compress", "jpeg crunch"), ("tint", "tint"), ("tile", "tile")] {
                 let Some(kind) = EffectKind::parse(name) else { continue };
                 let on = clip.effects.iter().position(|f| f.kind.name() == kind.name());
                 let b = egui::Button::selectable(on.is_some(), label).min_size(egui::vec2(0.0, 24.0));
@@ -293,6 +303,24 @@ impl App {
                 }
             }
         });
+        if let Some(EffectKind::Tile { count, mirror, .. }) =
+            clip.effects.iter_mut().map(|f| &mut f.kind).find(|k| matches!(k, EffectKind::Tile { .. }))
+        {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("tiles").color(TEXT_DIM));
+                for n in [2.0f32, 3.0, 4.0, 6.0] {
+                    if ui.selectable_label((*count - n).abs() < 0.01, format!("{n:.0}×{n:.0}")).clicked() {
+                        *count = n;
+                        changed = true;
+                    }
+                }
+                let mut m = *mirror >= 0.5;
+                if ui.checkbox(&mut m, "kaleido").on_hover_text("mirror alternate tiles").changed() {
+                    *mirror = if m { 1.0 } else { 0.0 };
+                    changed = true;
+                }
+            });
+        }
         theme::hint(ui, "each works on sound and picture together · fine-tune under Effects below");
 
         theme::section(ui, "placement");
@@ -370,10 +398,10 @@ impl App {
                         .on_hover_text("length of one pass — what gets repeated")
                         .changed()
                     {
-                        let times = clip.repeat_count();
+                        let times = clip.repeat_count().round().max(1.0) as u32;
                         clip.loop_beats = Some(pass);
                         if !clip.loop_forever {
-                            clip.length_beats = (pass * times).max(pass);
+                            clip.length_beats = clip.length_for(times);
                         }
                         changed = true;
                     }
@@ -381,22 +409,81 @@ impl App {
                         ui.label(egui::RichText::new("times").color(TEXT_DIM));
                         let mut times = clip.repeat_count().round().max(1.0) as u32;
                         if ui.add(egui::DragValue::new(&mut times).speed(0.1).range(1..=256)).changed() {
-                            clip.set_repeat(Some(times));
+                            clip.length_beats = clip.length_for(times);
                             changed = true;
                         }
                     }
                 });
+                changed |= repeat_shape_ui(ui, clip);
             }
+        }
+
+        // What plays: the media region of one pass, dragged directly.
+        if let (Some(_), true) = (&media_src, media_dur > 0.0) {
+            let rate = match mode {
+                PlayMode::Snippet => clip.grains.speed as f64,
+                _ => clip.grains.scan_speed.abs().max(0.05) as f64,
+            };
+            let mut start = clip.grains.position as f64 * media_dur;
+            let mut len = (clip.pass_beats() * spb * rate).min(media_dur);
+            let times = clip.repeat_count().ceil().max(1.0) as usize;
+            let walk = clip.loop_advance as f64 * len;
+            let ghosts: Vec<(f64, bool)> = if clip.loop_beats.is_some() && walk.abs() > 1e-6 {
+                (1..times.min(8)).map(|k| (start + k as f64 * walk, clip.pass_on(k))).collect()
+            } else {
+                Vec::new()
+            };
+            let snap = clip.loop_sync.then_some(0.25 * spb * rate);
+            theme::section(ui, "what plays");
+            let resizable = mode == PlayMode::Snippet;
+            if media_strip(ui, media_peaks.as_deref().map(|v| v.as_slice()), media_dur, &mut start, &mut len, snap, resizable, &ghosts) {
+                clip.grains.position = (start / media_dur).clamp(0.0, 1.0) as f32;
+                if resizable {
+                    let pass = (len / rate / spb).max(0.05);
+                    set_pass(clip, pass);
+                }
+                changed = true;
+            }
+            ui.horizontal(|ui| {
+                theme::hint(ui, &format!("{} to {}  ({:.2} s of {:.1} s)", fmt_secs(start), fmt_secs(start + len), len, media_dur));
+                if resizable
+                    && ui
+                        .small_button("to the end")
+                        .on_hover_text("play from here to the end of the media (its natural length)")
+                        .clicked()
+                {
+                    set_pass(clip, ((media_dur - start) / rate / spb).max(0.05));
+                    changed = true;
+                }
+                changed |= ui
+                    .checkbox(&mut clip.loop_sync, "snap")
+                    .on_hover_text("lengths and gaps snap to 1/16 notes — off for the media's natural timing")
+                    .changed();
+            });
         }
 
         changed |= picture_section(ui, &mut clip.transform);
 
         // Mode-specific sound shaping.
+        let mut to_snippet: Option<f32> = None;
         let g = &mut clip.grains;
         match mode {
             PlayMode::Snippet => {
                 theme::section(ui, "playback");
-                changed |= param("start in media", 0.0, 1.0).tip("where in the media playback begins").show(ui, &mut g.position);
+                let was = g.texture;
+                changed |= param("sample ↔ grains", 0.0, 1.0)
+                    .tip("0 = the media plays straight · up = it dissolves into a grain cloud that still follows the media")
+                    .show(ui, &mut g.texture);
+                if was <= 1e-3 && g.texture > 1e-3 && g.pan_spread <= 0.0 {
+                    g.pan_spread = 0.5; // a cloud wants some width
+                }
+                if g.texture > 1e-3 {
+                    changed |= param("grain size", 0.01, 1.0).log().suffix(" s").tip("where the grains end up at full texture").show(ui, &mut g.duration);
+                    changed |= param("density", 1.0, 100.0).log().suffix("/s").show(ui, &mut g.density);
+                    changed |= param("scatter", 0.0, 2.0).suffix(" s").tip("how far grains stray from the read head").show(ui, &mut g.spray);
+                    changed |= param("random pitch", 0.0, 12.0).suffix(" st").show(ui, &mut g.pitch_jitter);
+                    changed |= param("stereo spread", 0.0, 1.0).show(ui, &mut g.pan_spread);
+                }
                 changed |= param("speed", 0.25, 4.0).log().tip("tempo only — pitch stays").suffix("×").show(ui, &mut g.speed);
                 changed |= param("pitch", -24.0, 24.0).tip("transpose — tempo stays").suffix(" st").show(ui, &mut g.pitch);
                 changed |= param("fine tune", -100.0, 100.0).suffix(" ct").show(ui, &mut g.detune_cents);
@@ -408,9 +495,31 @@ impl App {
                     g.reverse_prob = if rev { 1.0 } else { 0.0 };
                     changed = true;
                 }
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("paulstretch").color(TEXT_DIM))
+                        .on_hover_text("smear exactly this bit into a slow wash (sound + picture) — the clip gets that much longer; the original stays in the library");
+                    if stretching {
+                        ui.add(egui::Spinner::new().size(14.0));
+                        ui.label(egui::RichText::new("stretching…").color(TEXT_DIM));
+                    } else {
+                        for f in [4.0f32, 8.0, 16.0] {
+                            if ui.button(format!("×{f:.0}")).clicked() {
+                                stretch = Some(f);
+                            }
+                        }
+                    }
+                });
             }
             PlayMode::Grains => {
                 theme::section(ui, "cloud");
+                let mut tex = 1.0f32;
+                if param("sample ↔ grains", 0.0, 1.0)
+                    .tip("slide down to pull the cloud back toward the plain media (switches to snippet playback, grains kept)")
+                    .show(ui, &mut tex)
+                    && tex < 0.999
+                {
+                    to_snippet = Some(tex);
+                }
                 changed |= param("density", 0.5, 200.0).log().suffix("/s").tip("grains per second").show(ui, &mut g.density);
                 changed |= param("grain length", 0.005, 1.5).log().suffix(" s").show(ui, &mut g.duration);
                 changed |= param("length jitter", 0.0, 1.0).show(ui, &mut g.duration_jitter);
@@ -463,6 +572,13 @@ impl App {
             }
         }
 
+        if let Some(tex) = to_snippet {
+            clip.kind = chromagrain_core::timeline::ClipKind::Snippet;
+            clip.grains.texture = tex;
+            clip.grains.speed = clip.grains.scan_speed.abs().clamp(0.25, 4.0);
+            changed = true;
+        }
+
         // Key: one key drives both note snapping and frequency tuning.
         changed |= key_section(ui, clip);
 
@@ -503,6 +619,9 @@ impl App {
         drop(p);
         if let Some(what) = cutout {
             self.cut_out_clip(ti, ci, what);
+        }
+        if let Some(f) = stretch {
+            self.stretch_clip(ti, ci, f);
         }
 
         ui.add_space(12.0);
@@ -1043,6 +1162,11 @@ fn effects_chain_ui(ui: &mut egui::Ui, effects: &mut Vec<AvEffect>, salt: &str, 
                             changed |= param("amount", 0.0, 1.0).show(ui, amount);
                             changed |= param("focus", 0.0, 1.0).tip("narrow = ringing notes · wide = more original").show(ui, focus);
                         }
+                        EffectKind::Tile { count, mirror, spin } => {
+                            changed |= param("tiles", 1.0, 8.0).tip("copies across and down (1 = off)").show(ui, count);
+                            changed |= param("mirror", 0.0, 1.0).tip("past half: alternate tiles flip — kaleidoscope").show(ui, mirror);
+                            changed |= param("turn", -0.5, 0.5).tip("rotate the whole grid (turns)").show(ui, spin);
+                        }
                     }
                     changed |= param("on sound", 0.0, 1.0).show(ui, &mut fx.audio);
                     changed |= param("on picture", 0.0, 1.0).show(ui, &mut fx.video);
@@ -1054,7 +1178,7 @@ fn effects_chain_ui(ui: &mut egui::Ui, effects: &mut Vec<AvEffect>, salt: &str, 
         changed = true;
     }
     ui.horizontal_wrapped(|ui| {
-        for name in ["tune", "crush", "delay", "reverb", "compress", "tint"] {
+        for name in EffectKind::KINDS {
             if ui.small_button(format!("+ {name}")).clicked() {
                 effects.push(AvEffect::new(EffectKind::parse(name).unwrap()));
                 changed = true;
@@ -1065,13 +1189,228 @@ fn effects_chain_ui(ui: &mut egui::Ui, effects: &mut Vec<AvEffect>, salt: &str, 
 }
 
 fn effect_blurb(k: &EffectKind) -> &'static str {
-    match k {
-        EffectKind::Crush { .. } => "bitcrush ↔ pixelate",
-        EffectKind::Delay { .. } => "echo ↔ ghost frames",
-        EffectKind::Reverb { .. } => "space ↔ smear",
-        EffectKind::Compress { .. } => "codec crunch ↔ jpeg blocks",
-        EffectKind::Tint { .. } => "resonance ↔ color",
-        EffectKind::Tune { .. } => "frequencies → key ↔ hues → key colors",
+    k.blurb()
+}
+
+fn fmt_secs(s: f64) -> String {
+    let s = s.max(0.0);
+    format!("{}:{:04.1}", (s / 60.0) as u32, s % 60.0)
+}
+
+/// Set one pass's length (beats), keeping the repeat count (or, for a
+/// clip that plays once, its length).
+fn set_pass(clip: &mut chromagrain_core::timeline::Clip, pass: f64) {
+    if clip.loop_beats.is_some() {
+        let times = clip.repeat_count().round().max(1.0) as u32;
+        clip.loop_beats = Some(pass);
+        if !clip.loop_forever {
+            clip.length_beats = clip.length_for(times);
+        }
+    } else {
+        clip.length_beats = pass;
     }
+}
+
+/// The shape of a repeat: rest between passes, which passes play (a step
+/// row), how far each pass walks through the media, and grid snapping.
+fn repeat_shape_ui(ui: &mut egui::Ui, clip: &mut chromagrain_core::timeline::Clip) -> bool {
+    let mut changed = false;
+    let times = clip.repeat_count().round().max(1.0) as u32;
+    let pass = clip.pass_beats();
+    let step = if clip.loop_sync { 0.25 } else { 0.0 };
+    let snap = |v: f64| if step > 0.0 { (v / step).round() * step } else { v };
+
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("gap").color(TEXT_DIM))
+            .on_hover_text("rest between passes · negative = passes overlap");
+        let mut gap = clip.loop_gap;
+        let lo = -(pass * 0.9);
+        if ui
+            .add(egui::DragValue::new(&mut gap).speed(0.05).range(lo..=64.0).suffix(" beats"))
+            .changed()
+        {
+            clip.loop_gap = snap(gap).max(lo);
+            if !clip.loop_forever {
+                clip.length_beats = clip.length_for(times);
+            }
+            changed = true;
+        }
+        for (label, g) in [("none", 0.0), ("1/2", 0.5), ("1", 1.0), ("2", 2.0)] {
+            if ui.selectable_label((clip.loop_gap - g).abs() < 1e-6, label).clicked() {
+                clip.loop_gap = g;
+                if !clip.loop_forever {
+                    clip.length_beats = clip.length_for(times);
+                }
+                changed = true;
+            }
+        }
+    });
+
+    // Pattern: which passes play, cycling. Click cells; +/- sets the cycle.
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("plays").color(TEXT_DIM))
+            .on_hover_text("which passes play — the row repeats (⌥-click a pass on the timeline too)");
+        let n = if clip.loop_mask.is_empty() { times.clamp(2, 8) as usize } else { clip.loop_mask.len() };
+        for k in 0..n {
+            let on = clip.loop_mask.get(k).copied().unwrap_or(true);
+            let (r, resp) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
+            let fill = if on { ACCENT } else { theme::RAISED_HI };
+            ui.painter().rect_filled(r.shrink(1.5), 3.0, fill);
+            if resp.hovered() {
+                ui.painter().rect_stroke(r.shrink(1.0), 3.0, egui::Stroke::new(1.0, TEXT), egui::StrokeKind::Inside);
+            }
+            if resp.clicked() {
+                if clip.loop_mask.is_empty() {
+                    clip.loop_mask = vec![true; n];
+                }
+                clip.loop_mask[k] = !clip.loop_mask[k];
+                if clip.loop_mask.iter().all(|&b| b) {
+                    clip.loop_mask.clear();
+                }
+                changed = true;
+            }
+        }
+        if ui.small_button("-").on_hover_text("shorter cycle").clicked() && n > 1 {
+            let mut m = if clip.loop_mask.is_empty() { vec![true; n] } else { clip.loop_mask.clone() };
+            m.truncate(n - 1);
+            clip.loop_mask = if m.iter().all(|&b| b) { Vec::new() } else { m };
+            changed = true;
+        }
+        if ui.small_button("+").on_hover_text("longer cycle").clicked() && n < 16 {
+            let mut m = if clip.loop_mask.is_empty() { vec![true; n] } else { clip.loop_mask.clone() };
+            m.push(true);
+            clip.loop_mask = m;
+            changed = true;
+        }
+        if !clip.loop_mask.is_empty() && ui.small_button("all").clicked() {
+            clip.loop_mask.clear();
+            changed = true;
+        }
+    });
+
+    changed |= param("walk", -1.0, 2.0)
+        .tip("how far each pass moves through the media · 0 = same bit · 1 = carry on · -1 = backwards")
+        .suffix(" pass")
+        .show(ui, &mut clip.loop_advance);
+    ui.horizontal(|ui| {
+        for (label, a) in [("same", 0.0f32), ("carry on", 1.0), ("half step", 0.5), ("backwards", -1.0)] {
+            if ui.selectable_label((clip.loop_advance - a).abs() < 1e-4, label).clicked() {
+                clip.loop_advance = a;
+                changed = true;
+            }
+        }
+    });
+    changed
+}
+
+/// Media overview with the region one pass plays: drag the body to move
+/// it, the edges to trim (when `resizable`). `snap` is the length grid in
+/// media seconds. `ghosts` outline where later passes read when the
+/// repeat walks (dim when that pass is muted). Returns true on change.
+#[allow(clippy::too_many_arguments)]
+fn media_strip(
+    ui: &mut egui::Ui,
+    peaks: Option<&[f32]>,
+    dur: f64,
+    start: &mut f64,
+    len: &mut f64,
+    snap: Option<f64>,
+    resizable: bool,
+    ghosts: &[(f64, bool)],
+) -> bool {
+    #[derive(Clone, Copy)]
+    enum Grab {
+        Body,
+        Left,
+        Right,
+    }
+    let w = ui.available_width().max(120.0);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 46.0), egui::Sense::click_and_drag());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 4.0, theme::RAISED);
+    if let Some(pk) = peaks {
+        crate::ui_library::draw_peaks(&painter, rect.shrink2(egui::vec2(0.0, 5.0)), pk, 0.0, 1.0, theme::TEXT_FAINT);
+    }
+    let x_of = |t: f64| rect.min.x + (t / dur).clamp(0.0, 1.0) as f32 * rect.width();
+    for &(gs, on) in ghosts {
+        let gs = gs.rem_euclid(dur);
+        let r = egui::Rect::from_x_y_ranges(x_of(gs)..=x_of(gs + *len), rect.y_range());
+        let c = if on { ACCENT.gamma_multiply(0.45) } else { theme::TEXT_FAINT };
+        painter.rect_stroke(r.shrink(2.0), 3.0, egui::Stroke::new(1.0, c), egui::StrokeKind::Inside);
+    }
+    let region = egui::Rect::from_x_y_ranges(x_of(*start)..=x_of(*start + *len).max(x_of(*start) + 3.0), rect.y_range());
+    painter.rect_filled(region, 3.0, ACCENT.gamma_multiply(0.22));
+    painter.rect_stroke(region, 3.0, egui::Stroke::new(1.5, ACCENT), egui::StrokeKind::Inside);
+    if let Some(pk) = peaks {
+        let (f0, f1) = ((*start / dur) as f32, ((*start + *len) / dur) as f32);
+        crate::ui_library::draw_peaks(&painter, region.shrink2(egui::vec2(0.0, 5.0)), pk, f0, f1, TEXT);
+    }
+    let handle = 7.0;
+    if resizable {
+        for x in [region.min.x, region.max.x] {
+            painter.rect_filled(
+                egui::Rect::from_center_size(egui::pos2(x, rect.center().y), egui::vec2(4.0, 22.0)),
+                2.0,
+                ACCENT,
+            );
+        }
+    }
+
+    let id = resp.id.with("grab");
+    let near = |pos: egui::Pos2| -> Grab {
+        if resizable && (pos.x - region.min.x).abs() < handle {
+            Grab::Left
+        } else if resizable && (pos.x - region.max.x).abs() < handle {
+            Grab::Right
+        } else {
+            Grab::Body
+        }
+    };
+    if let Some(pos) = resp.hover_pos() {
+        let icon = match near(pos) {
+            Grab::Body => egui::CursorIcon::Grab,
+            _ => egui::CursorIcon::ResizeColumn,
+        };
+        ui.ctx().set_cursor_icon(icon);
+    }
+    let mut changed = false;
+    if resp.drag_started() {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            ui.data_mut(|d| d.insert_temp(id, (near(pos) as u8, pos.x, *start, *len)));
+        }
+    }
+    if resp.dragged() {
+        if let (Some((g, x0, s0, l0)), Some(pos)) =
+            (ui.data(|d| d.get_temp::<(u8, f32, f64, f64)>(id)), resp.interact_pointer_pos())
+        {
+            let dt = (pos.x - x0) as f64 / rect.width() as f64 * dur;
+            let q = |v: f64| match snap {
+                Some(s) if s > 1e-6 => ((v / s).round() * s).max(s),
+                _ => v.max(0.01),
+            };
+            match g {
+                1 => {
+                    // Left edge: end stays put.
+                    let end = s0 + l0;
+                    let l = q((l0 - dt).clamp(0.01, end));
+                    *len = l.min(end);
+                    *start = (end - *len).max(0.0);
+                }
+                2 => *len = q((l0 + dt).clamp(0.01, dur - s0)).min(dur - s0),
+                _ => *start = (s0 + dt).clamp(0.0, (dur - l0).max(0.0)),
+            }
+            changed = true;
+        }
+    }
+    if resp.clicked() && !resp.dragged() {
+        // Click to jump the region there (centered).
+        if let Some(pos) = resp.interact_pointer_pos() {
+            let t = ((pos.x - rect.min.x) / rect.width()) as f64 * dur;
+            *start = (t - *len * 0.5).clamp(0.0, (dur - *len).max(0.0));
+            changed = true;
+        }
+    }
+    resp.on_hover_text("drag the lit region to choose what plays · drag its edges to trim · click to jump");
+    changed
 }
 

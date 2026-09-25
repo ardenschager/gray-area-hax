@@ -62,6 +62,12 @@ pub struct GrainSettings {
     pub voice_detune: f32,
     /// RNG seed; same seed -> identical grain cloud.
     pub seed: u64,
+    /// Sample <-> grains morph for media clips: 0 = the media plays
+    /// straight, 1 = it dissolves into a grain cloud that still follows the
+    /// read head. Everything in between is a smooth blend (grain length,
+    /// overlap, spray, pitch/pan scatter and patch size all follow it).
+    #[serde(default)]
+    pub texture: f32,
 }
 
 impl GrainSettings {
@@ -92,6 +98,7 @@ impl GrainSettings {
             "voice_interval" => self.voice_interval = x.clamp(-24.0, 24.0),
             "voice_detune" => self.voice_detune = x.clamp(0.0, 2.0),
             "seed" => self.seed = value as u64,
+            "texture" | "grain" | "grainy" => self.texture = x.clamp(0.0, 1.0),
             _ => return Err(()),
         }
         Ok(())
@@ -123,6 +130,7 @@ impl Default for GrainSettings {
             voice_interval: 12.0,
             voice_detune: 0.0,
             seed: 0xC0FFEE,
+            texture: 0.0,
         }
     }
 }
