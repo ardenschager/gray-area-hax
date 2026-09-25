@@ -225,8 +225,10 @@ The window has three places, and every thing lives in exactly one of them:
 | **Timeline** (center) | tracks, clips and the master bus. Selecting a pattern clip opens its step grid right below; selecting an instrument (or any clip/pad playing it) opens its editor — knobs + piano roll — docked below. |
 | **Inspector** (right) | edits whatever you selected — media, clip, track or master. |
 
-1. The app opens with a demo project. Press **space** — playback is live
-   (GPU-rendered video, streaming audio); tweak anything while it runs.
+1. The app opens on a blank canvas (`chromagrain --demo` opens the demo
+   project instead; `chromagrain clip.mp4 …` opens with those files on
+   tracks). Press **space** — playback is live (GPU-rendered video,
+   streaming audio); tweak anything while it runs.
 2. **Add media**: *+ add* in the library (files, a YouTube link, or a
    ♪ instrument) — or just drop files onto the window. Base pitch is
    auto-detected.
@@ -381,6 +383,7 @@ balance control. Mono files stay mono at no extra cost.
 ```sh
 chromagrain --script examples/sequencer.rhai   # build + render a composition from a script
 chromagrain --script examples/crunchy.rhai
+chromagrain --demo                             # open the app on the demo project
 chromagrain --render-demo out.mp4              # render the built-in demo project
 ```
 

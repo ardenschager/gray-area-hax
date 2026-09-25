@@ -103,8 +103,9 @@ fn main() -> eframe::Result<()> {
     };
     // `chromagrain clip.mp4 other.mov` — open with those files placed on
     // their own tracks at the start. `--perform` opens on the pads (the
-    // files land on pads instead).
+    // files land on pads instead). Starts blank; `--demo` loads the demo.
     let perform = args.iter().any(|a| a == "--perform");
+    let demo = args.iter().any(|a| a == "--demo");
     let open: Vec<PathBuf> =
         args.iter().skip(1).map(PathBuf::from).filter(|p| p.is_file()).collect();
     eframe::run_native(
@@ -112,7 +113,7 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| {
             theme::apply(&cc.egui_ctx);
-            let mut app = App::new();
+            let mut app = App::new(demo);
             if perform {
                 app.set_mode(AppMode::Perform);
             }
@@ -365,9 +366,10 @@ pub struct App {
 }
 
 impl App {
-    fn new() -> App {
+    /// A blank canvas (`demo` = the built-in demo project instead).
+    fn new(demo: bool) -> App {
         let (tx, rx) = mpsc::channel();
-        let project = Project::demo();
+        let project = if demo { Project::demo() } else { Project::default() };
         let plan = Arc::new(plan_project(&project));
         let mut browser = browser::Browser::new();
         browser.ensure_started();
@@ -377,7 +379,7 @@ impl App {
             plan,
             project_rev: 1,
             plan_rev: 1,
-            sel: Sel::Clip(0, 0),
+            sel: if demo { Sel::Clip(0, 0) } else { Sel::None },
             focus_track: 0,
             last_source: 0,
             playback: playback::Playback::new(),
@@ -392,7 +394,11 @@ impl App {
             jobs: VecDeque::new(),
             rx,
             tx,
-            status: "demo project loaded — press space to play".into(),
+            status: if demo {
+                "demo project loaded — press space to play".into()
+            } else {
+                "blank canvas — drop video or audio anywhere, or drag from Browse".into()
+            },
             midi: midi::Midi::new(),
             midi_port: 0,
             cc_mappings: Vec::new(),
