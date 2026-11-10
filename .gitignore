@@ -7,3 +7,8 @@ youtube-grains.*
 crunchy-out.*
 sequencer-out.*
 seq-out.*
+
+# rendered media in versioned output folders (notes are committed)
+outputs/**/*.mp4
+outputs/**/*.wav
+outputs/**/*.png
