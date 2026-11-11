@@ -273,6 +273,20 @@ bool cg_instrument_post_source_pcm_rgba(const CgInstrument *inst,
 bool cg_instrument_post_key(const CgInstrument *inst, int32_t root, uint32_t scale);
 
 /**
+ * Realtime-safe, any thread (e.g. a key parameter event on the render
+ * thread): ask for a key change without building anything. The next
+ * [`cg_instrument_service`] call (on a non-realtime thread) does the
+ * work.
+ */
+void cg_instrument_request_key(const CgInstrument *inst, int32_t root, uint32_t scale);
+
+/**
+ * Non-realtime housekeeping, e.g. from a ~30 ms timer: posts a requested
+ * key change and frees garbage. Returns true if a key change was posted.
+ */
+bool cg_instrument_service(const CgInstrument *inst);
+
+/**
  * Thread-safe: set a macro from the next block on.
  */
 void cg_instrument_post_macro(const CgInstrument *inst, uint32_t m, float value);

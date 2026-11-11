@@ -62,6 +62,16 @@ struct Mail {
     dirty: AtomicU32,
     gain: AtomicU32,
     sources: AtomicUsize,
+    /// Key asked for by [`cg_instrument_request_key`] / last posted
+    /// (packed by [`pack_key`]; NO_KEY_REQUEST = nothing asked).
+    wanted_key: AtomicU32,
+    posted_key: AtomicU32,
+}
+
+const NO_KEY_REQUEST: u32 = u32::MAX;
+
+fn pack_key(root: i32, scale: u32) -> u32 {
+    ((root.clamp(-1, 11) + 1) as u32) << 8 | scale.min(255)
 }
 
 impl Rt {
@@ -241,6 +251,8 @@ pub extern "C" fn cg_instrument_new(sample_rate: u32) -> *mut CgInstrument {
             dirty: AtomicU32::new(0),
             gain: AtomicU32::new(1f32.to_bits()),
             sources: AtomicUsize::new(0),
+            wanted_key: AtomicU32::new(NO_KEY_REQUEST),
+            posted_key: AtomicU32::new(pack_key(-1, 0)),
         },
         rt: Rt { inst, inbox, trash, gain: 1.0 },
     }))
@@ -504,7 +516,34 @@ pub unsafe extern "C" fn cg_instrument_post_source_pcm_rgba(
 pub unsafe extern "C" fn cg_instrument_post_key(inst: *const CgInstrument, root: i32, scale: u32) -> bool {
     let Some(m) = mail(inst) else { return false };
     let key = (root >= 0).then(|| Key::new(root, SCALES.get(scale as usize).copied().unwrap_or(ScaleKind::Chromatic)));
+    m.posted_key.store(pack_key(root, scale), Ordering::Release);
     m.post(Msg::Key(KeyFx::prepare(key, m.sample_rate.load(Ordering::Acquire))))
+}
+
+/// Realtime-safe, any thread (e.g. a key parameter event on the render
+/// thread): ask for a key change without building anything. The next
+/// [`cg_instrument_service`] call (on a non-realtime thread) does the
+/// work.
+#[no_mangle]
+pub unsafe extern "C" fn cg_instrument_request_key(inst: *const CgInstrument, root: i32, scale: u32) {
+    if let Some(m) = mail(inst) {
+        m.wanted_key.store(pack_key(root, scale), Ordering::Release);
+    }
+}
+
+/// Non-realtime housekeeping, e.g. from a ~30 ms timer: posts a requested
+/// key change and frees garbage. Returns true if a key change was posted.
+#[no_mangle]
+pub unsafe extern "C" fn cg_instrument_service(inst: *const CgInstrument) -> bool {
+    let Some(m) = mail(inst) else { return false };
+    let wanted = m.wanted_key.swap(NO_KEY_REQUEST, Ordering::AcqRel);
+    let posted = if wanted != NO_KEY_REQUEST && wanted != m.posted_key.load(Ordering::Acquire) {
+        cg_instrument_post_key(inst, (wanted >> 8) as i32 - 1, wanted & 0xff)
+    } else {
+        false
+    };
+    m.collect();
+    posted
 }
 
 /// Thread-safe: set a macro from the next block on.
@@ -621,6 +660,13 @@ mod tests {
             assert_eq!((cg_instrument_key_root(i), cg_instrument_key_scale(i)), (2, CgScale::Dorian as u32));
             assert_eq!(cg_instrument_macro_value(i, CgMacro::Smear as u32), 0.25);
             assert_eq!(cg_instrument_collect_garbage(i), 1, "the old key state came back to be freed");
+            // Render-thread key request, serviced elsewhere.
+            cg_instrument_request_key(i, 2, CgScale::Dorian as u32);
+            assert!(!cg_instrument_service(i), "same key: nothing to do");
+            cg_instrument_request_key(i, -1, 0);
+            assert!(cg_instrument_service(i));
+            cg_instrument_process(i, l.as_mut_ptr(), r.as_mut_ptr(), l.len());
+            assert_eq!(cg_instrument_key_root(i), -1);
             cg_instrument_free(i);
             // NULL is tolerated everywhere.
             cg_instrument_note_on(std::ptr::null_mut(), 60, 1.0);
