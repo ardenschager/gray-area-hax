@@ -146,7 +146,7 @@ function initAudio() {
     send.connect(conv).connect(master);
     send.connect(dly); dly.connect(fb).connect(dly); dly.connect(dlyOut).connect(master);
     Object.assign(A, { ctx, master, send, dly });
-    SOURCES.forEach(s => {
+    if (location.protocol !== 'file:') SOURCES.forEach(s => {
       fetch(`media/${s.id}.mp4`).then(r => r.arrayBuffer()).then(b => ctx.decodeAudioData(b)).then(buf => {
         // only use real audio if the clip actually has some energy
         const d = buf.getChannelData(0); let e = 0; for (let i = 0; i < d.length; i += 64) e += d[i] * d[i];
@@ -347,11 +347,11 @@ vgrid.addEventListener('pointerdown', ev => {
   moveEm(em, px, py); em.on = true; em.mk.classList.add('dragging'); placeEmitters();
 });
 vgrid.addEventListener('pointermove', ev => { const em = touches.get(ev.pointerId); if (!em) return; const { r } = gridGeom(); moveEm(em, ev.clientX - r.left, ev.clientY - r.top); placeEmitters(); });
-const endTouch = ev => { const em = touches.get(ev.pointerId); if (!em) return; touches.delete(ev.pointerId); em.on = false; em.mk.classList.remove('dragging'); placeEmitters(); };
+const endTouch = ev => { const em = touches.get(ev.pointerId); if (!em) return; touches.delete(ev.pointerId); em.on = false; em.mk.classList.remove('dragging'); placeEmitters(); refreshEmitterButtons(); };
 vgrid.addEventListener('pointerup', endTouch); vgrid.addEventListener('pointercancel', endTouch);
 function moveEm(em, px, py) {
   const { r, cw } = gridGeom(); let col = clamp(Math.floor(px / cw), 0, 7); if (!GRID_COLS[col]) col = em.col;
-  em.col = col; em.y = clamp(py / r.height, 0.001, 0.999); em.lastCol = col;
+  const changed = em.col !== col; em.col = col; em.y = clamp(py / r.height, 0.001, 0.999); em.lastCol = col; if (changed) refreshEmitterButtons();
   if (S.recording) S.recEvents.push([now() - S.recT0, em.i, col, em.y]);
 }
 /* emission: runs every frame for each held emitter */
@@ -463,7 +463,7 @@ function buildLanes() {
   lanesEl.innerHTML = '';
   LANES.forEach(l => {
     const row = el('div', 'lane'); row.dataset.l = l.i;
-    const head = el('button', 'lane-head', `<span class="sw" style="background:${SRC[l.src].sw}"></span><span class="len">${l.len}</span>`);
+    const head = el('button', 'lane-head', `<span class="sw" style="background:${SRC[l.src].sw}"></span><span class="len">${l.len === 16 ? '' : l.len}</span>`);
     head.style.backgroundImage = `url(media/${l.src}_poster.jpg)`;
     head.title = `${SRC[l.src].name} · tap to mute, hold for lane page`;
     let ht, held = false;
