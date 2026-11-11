@@ -247,6 +247,17 @@ impl Studio {
         } else {
             self.fonts_ready = true;
         }
+        if let Some(m) = host.shared_macros() {
+            for e in self.emitters.iter_mut() {
+                e.macros = m;
+            }
+        }
+        if let Some(k) = host.shared_key() {
+            if k != self.key {
+                self.key = k;
+                self.key_changed(host);
+            }
+        }
         self.sync_columns(host);
         self.seq_ensure(host);
         self.seq_build_arrangement(host);
@@ -652,6 +663,9 @@ impl Studio {
 
     pub fn key_changed(&mut self, host: &mut dyn Host) {
         let k = self.key;
+        if host.shared_key() != Some(k) {
+            host.set_shared_key(k);
+        }
         let mut p = host.project().lock().unwrap();
         for pid in self.seq.scene_pats.iter().flatten() {
             if let Some(pat) = p.patterns.get_mut(*pid) {

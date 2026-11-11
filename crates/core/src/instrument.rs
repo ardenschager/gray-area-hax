@@ -368,6 +368,9 @@ pub struct Instrument {
     looks: Vec<Option<AvEffect>>,
     look_states: Vec<Vec<AudioFxState>>,
     scratch: StereoBuffer,
+    /// Step lanes played in sync with the host transport.
+    pattern: Option<crate::seq::StepPattern>,
+    pat_rng: Rng,
 }
 
 impl Instrument {
@@ -404,6 +407,8 @@ impl Instrument {
             looks,
             look_states: Vec::new(),
             scratch: StereoBuffer { left: Vec::new(), right: Vec::new(), sample_rate },
+            pattern: None,
+            pat_rng: Rng::new(0x5E9_0E9C),
         };
         inst.rebuild_fx();
         inst
@@ -681,6 +686,79 @@ impl Instrument {
         self.looks[look].as_ref().map(|fx| fx::audio_chain_latency(std::slice::from_ref(fx))).unwrap_or(0)
     }
 
+    /// Play a one-shot grain now (an emitter on the editor's grid, a pad).
+    /// It runs through SMEAR and LOOK like note grains. Allocation-free;
+    /// dropped when the grain pool is full.
+    pub fn trigger(&mut self, source: SourceId, mut ev: GrainEvent) {
+        if self.grains.len() >= MAX_GRAINS || self.sources.get(source).is_none() {
+            return;
+        }
+        ev.onset = self.now_secs();
+        self.grains.push(LiveGrain { source, voice: 0, ev });
+    }
+
+    /// Install step lanes (a `StepPattern`: rows = lanes, steps with
+    /// slice / pitch / length / chance) that play in sync with the host
+    /// transport while it runs. Swaps, so the caller frees the old one off
+    /// the audio thread.
+    pub fn swap_pattern(&mut self, pattern: Option<crate::seq::StepPattern>) -> Option<crate::seq::StepPattern> {
+        std::mem::replace(&mut self.pattern, pattern)
+    }
+
+    pub fn pattern(&self) -> Option<&crate::seq::StepPattern> {
+        self.pattern.as_ref()
+    }
+
+    /// Fire the pattern's steps whose boundary falls in `[t0, t1)`.
+    fn sequence(&mut self, t0: f64, t1: f64) {
+        let Some(pat) = self.pattern.as_ref() else { return };
+        if !self.transport.playing || pat.rows.is_empty() {
+            return;
+        }
+        let spb = pat.steps_per_beat.max(1) as f64;
+        let (b0, b1) = (self.beat_at(t0), self.beat_at(t1));
+        let mut k = (b0 * spb - 1e-9).ceil() as i64;
+        while (k as f64) / spb < b1 {
+            let t = self.grid_time(k as f64 / spb).clamp(t0, t1);
+            for (ri, row) in pat.rows.iter().enumerate() {
+                if row.muted || row.steps.is_empty() {
+                    continue;
+                }
+                let Some(src) = self.sources.get(row.source) else { continue };
+                let len = src.duration();
+                if len <= 0.0 {
+                    continue;
+                }
+                let step = row.steps[k.rem_euclid(row.steps.len() as i64) as usize];
+                let roll = self.pat_rng.next_f32();
+                let jit = self.pat_rng.bipolar();
+                if !step.on || roll >= step.chance || self.grains.len() >= MAX_GRAINS {
+                    continue;
+                }
+                let g = &row.grains;
+                let key = row.key.or(self.key);
+                let st = g.pitch + step.pitch + g.pitch_jitter * jit;
+                let ratio = crate::music::effective_ratio(st, key.as_ref(), src.effective_base_hz(), g.quantize_amount, g.detune_cents);
+                let at = if step.slice >= 0.0 { step.slice.min(1.0) } else { g.position };
+                let ev = GrainEvent {
+                    onset: t,
+                    source_pos: (at as f64 * len).rem_euclid(len.max(1e-6)),
+                    duration: (g.duration * step.length.max(0.05)).clamp(0.01, 5.0),
+                    pitch_ratio: ratio,
+                    gain: g.gain * step.gain,
+                    pan: g.pan.clamp(-1.0, 1.0),
+                    envelope: g.envelope,
+                    env_skew: g.env_skew,
+                    reverse: g.reverse_prob >= 0.5,
+                    id: (1u64 << 62) | ((ri as u64) << 40) | (k as u64 & 0xFF_FFFF_FFFF),
+                };
+                let source = row.source;
+                self.grains.push(LiveGrain { source, voice: 0, ev });
+            }
+            k += 1;
+        }
+    }
+
     // ------------------------------------------------------------ audio
 
     /// Fill one stereo block. `left` and `right` must be the same length.
@@ -698,6 +776,7 @@ impl Instrument {
         let map = self.macro_map();
 
         self.schedule(t1 + LOOKAHEAD, &map);
+        self.sequence(t0, t1);
 
         // Grains -> scratch (exactly n samples, no realloc in steady state).
         self.scratch.left.clear();
@@ -917,6 +996,58 @@ mod tests {
     fn pitch_hz(x: &[f32]) -> f32 {
         let crossings = x.windows(2).filter(|w| w[0] <= 0.0 && w[1] > 0.0).count();
         crossings as f32 * SR as f32 / x.len() as f32
+    }
+
+    #[test]
+    fn step_lanes_play_in_sync_with_the_host_transport() {
+        let mut i = inst_with_sine();
+        let mut pat = crate::seq::StepPattern::new("lanes");
+        let r = pat.add_row(0);
+        for k in (0..16).step_by(4) {
+            pat.rows[r].steps[k].on = true;
+        }
+        pat.rows[r].grains.duration = 0.1;
+        assert!(i.swap_pattern(Some(pat)).is_none());
+        // Stopped: nothing.
+        let (l, _) = run(&mut i, 0.5, 256);
+        assert_eq!(rms(&l), 0.0, "transport stopped: silent");
+        // 120 bpm from beat 0: hits every 0.5 s.
+        i.set_transport(Transport { bpm: 120.0, playing: true, beat: 0.0 });
+        let grains = collect(&mut i, 2.0, 256);
+        let onsets: Vec<f64> = grains.iter().map(|e| e.onset - 0.5).collect();
+        assert_eq!(onsets.len(), 4, "{onsets:?}");
+        for (n, o) in onsets.iter().enumerate() {
+            assert!((o - n as f64 * 0.5).abs() < 1e-6, "hit {n} at {o}");
+        }
+        // The host jumps to beat 2 (a loop): the next hit is on beat 2.
+        i.set_transport(Transport { bpm: 120.0, playing: true, beat: 1.9 });
+        let t = i.now_secs();
+        let g = collect(&mut i, 0.2, 128);
+        assert!(g.iter().any(|e| (e.onset - (t + 0.05)).abs() < 1e-6), "beat 2 lands 0.05 s after 1.9");
+        let old = i.swap_pattern(None);
+        assert!(old.is_some());
+    }
+
+    #[test]
+    fn triggered_grains_sound_through_the_macros() {
+        let mut i = inst_with_sine();
+        let ev = GrainEvent {
+            onset: 123.0, // ignored: plays now
+            source_pos: 0.5,
+            duration: 0.2,
+            pitch_ratio: 1.0,
+            gain: 0.8,
+            pan: 0.0,
+            envelope: 0.5,
+            env_skew: 0.0,
+            reverse: false,
+            id: 9,
+        };
+        i.trigger(0, ev.clone());
+        i.trigger(7, ev); // unknown source: ignored
+        let (l, _) = run(&mut i, 0.3, 256);
+        assert!(rms(&l[..9600]) > 0.01);
+        assert_eq!(i.frame().grains.len(), 0, "finished");
     }
 
     #[test]

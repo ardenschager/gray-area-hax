@@ -3,7 +3,6 @@
 use chromagrain_core::instrument::{Macro, MacroMap, LOOKS};
 use chromagrain_core::music::{Key, ScaleKind};
 use nih_plug::prelude::*;
-use nih_plug_egui::EguiState;
 use std::sync::{Arc, Mutex};
 
 #[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,8 +103,9 @@ impl SyncDiv {
 
 #[derive(Params)]
 pub struct CgParams {
-    #[persist = "editor-state"]
-    pub editor_state: Arc<EguiState>,
+    /// Editor window size (logical points), remembered with the session.
+    #[persist = "editor-size"]
+    pub editor_size: Arc<Mutex<(u32, u32)>>,
     /// Loaded media, as file paths (decoded again when the state loads).
     #[persist = "sources"]
     pub sources: Mutex<Vec<String>>,
@@ -140,7 +140,7 @@ fn macro_param(m: Macro, name: &str) -> FloatParam {
 impl Default for CgParams {
     fn default() -> Self {
         Self {
-            editor_state: EguiState::from_size(560, 420),
+            editor_size: Arc::new(Mutex::new(crate::editor::DEFAULT_SIZE)),
             sources: Mutex::new(Vec::new()),
             grain: macro_param(Macro::Grain, "Grain"),
             pitch: FloatParam::new("Pitch", Macro::Pitch.default_value(), FloatRange::Linear { min: 0.0, max: 1.0 })

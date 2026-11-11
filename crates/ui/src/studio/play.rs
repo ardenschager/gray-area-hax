@@ -246,25 +246,38 @@ impl Studio {
         let more = Rect::from_min_max(egui::pos2(foot.right() - fh, foot.top()), foot.max);
         let recr = Rect::from_min_max(foot.min, egui::pos2(more.left() - 8.0, foot.bottom()));
         let recording = self.rec.is_some();
-        if chip(ui, recr, ui.id().with("rec-big"), "rec", false, false).clicked() {
-            self.toggle_rec(host);
-        }
-        let rc = egui::pos2(recr.left() + 22.0, recr.center().y);
-        if recording {
-            p.rect_filled(recr, r(10), Color32::from_rgba_unmultiplied(229, 72, 77, 26));
-            p.circle_filled(rc, 6.0, REC);
+        if !host.caps().rec {
+            // No takes here (a plugin): the foot loads clips instead.
+            if chip(ui, recr, ui.id().with("load-clip"), "load a clip", false, false).clicked() {
+                host.import_media();
+            }
+            draw_icon(&p, Icon::Plus, egui::pos2(recr.left() + 22.0, recr.center().y), 14.0, INK2);
+            p.text(egui::pos2(recr.left() + 38.0, recr.center().y), Align2::LEFT_CENTER, "Load clip", font_medium(13.0), INK);
+            if let Some(b) = host.busy() {
+                p.text(egui::pos2(recr.right() - 16.0, recr.center().y), Align2::RIGHT_CENTER, short(&b, 32), font(11.0), INK3);
+            }
         } else {
-            p.circle_stroke(rc, 6.0, Stroke::new(1.5, INK2));
+            let recording = self.rec.is_some();
+            if chip(ui, recr, ui.id().with("rec-big"), "rec", false, false).clicked() {
+                self.toggle_rec(host);
+            }
+            let rc = egui::pos2(recr.left() + 22.0, recr.center().y);
+            if recording {
+                p.rect_filled(recr, r(10), Color32::from_rgba_unmultiplied(229, 72, 77, 26));
+                p.circle_filled(rc, 6.0, REC);
+            } else {
+                p.circle_stroke(rc, 6.0, Stroke::new(1.5, INK2));
+            }
+            p.text(egui::pos2(rc.x + 16.0, rc.y), Align2::LEFT_CENTER, if recording { "Stop" } else { "Rec" }, font_medium(13.0), INK);
+            let secs = self.rec.as_ref().map(|r| host.clock() - r.t0).unwrap_or(0.0);
+            p.text(
+                egui::pos2(recr.right() - 16.0, rc.y),
+                Align2::RIGHT_CENTER,
+                format!("{}:{:02}", (secs / 60.0) as u32, secs as u32 % 60),
+                mono(12.0),
+                if recording { INK } else { INK3 },
+            );
         }
-        p.text(egui::pos2(rc.x + 16.0, rc.y), Align2::LEFT_CENTER, if recording { "Stop" } else { "Rec" }, font_medium(13.0), INK);
-        let secs = self.rec.as_ref().map(|r| host.clock() - r.t0).unwrap_or(0.0);
-        p.text(
-            egui::pos2(recr.right() - 16.0, rc.y),
-            Align2::RIGHT_CENTER,
-            format!("{}:{:02}", (secs / 60.0) as u32, secs as u32 % 60),
-            mono(12.0),
-            if recording { INK } else { INK3 },
-        );
         if chip(ui, more, ui.id().with("more"), "emitter settings", false, false).clicked() {
             self.deep = Some((DeepTarget::Emitter(self.sel_emitter), DeepTab::Links));
         }
@@ -285,8 +298,12 @@ impl Studio {
             let c = egui::pos2(ka.left() + colw * (k as f32 + 0.5), cy);
             let mut v = self.emitters[sel].macros[*mi];
             let detents = if *mi == 3 { chromagrain_core::instrument::LOOKS.len() } else { 0 };
+            let before = v;
             knob(ui, c, rad, ui.id().with(("knob", k)), name, &mut v, *default, detents);
             self.emitters[sel].macros[*mi] = v;
+            if v != before {
+                host.set_shared_macro(*mi, v);
+            }
             let map = MacroMap::resolve(&self.emitters[sel].macros, Some(&key));
             let value = match mi {
                 0 => format!("{:.0}", v * 100.0),

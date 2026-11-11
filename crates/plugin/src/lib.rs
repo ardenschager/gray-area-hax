@@ -13,6 +13,7 @@
 pub mod editor;
 pub mod engine;
 pub mod params;
+pub mod ui_host;
 
 use chromagrain_core::instrument::Transport;
 use engine::{AudioSide, Ev, Job, Shared};

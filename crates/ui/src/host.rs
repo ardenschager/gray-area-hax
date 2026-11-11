@@ -140,6 +140,17 @@ pub trait Host {
     fn bounce_take(&mut self, _events: Vec<(usize, GrainEvent)>, _len: f64, _beat: f64) {}
     /// Deep drawer tabs other than Links (the app hosts its classic editors).
     fn deep_tab(&mut self, _tab: DeepTab, _target: DeepTarget, _ui: &mut egui::Ui) {}
+    /// Macros owned by the host (a plugin's automatable GRAIN / PITCH /
+    /// SMEAR / LOOK parameters): every emitter shows and edits these.
+    fn shared_macros(&self) -> Option<[f32; 4]> {
+        None
+    }
+    fn set_shared_macro(&mut self, _i: usize, _v: f32) {}
+    /// The global key, when the host owns it (plugin key / scale params).
+    fn shared_key(&self) -> Option<chromagrain_core::music::Key> {
+        None
+    }
+    fn set_shared_key(&mut self, _key: chromagrain_core::music::Key) {}
     /// Busy line (e.g. "bouncing the take…").
     fn busy(&self) -> Option<String> {
         None

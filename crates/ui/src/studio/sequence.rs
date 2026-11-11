@@ -494,6 +494,9 @@ impl Studio {
     fn song_column(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, col: Rect) {
         let stage = Rect::from_min_size(col.min, egui::vec2(col.width(), (col.width() * 9.0 / 16.0).floor()));
         self.stage(host, ui, stage, 12.0);
+        if !host.caps().scenes {
+            return; // one looping scene; the host arranges
+        }
         let (cur, _) = self.seq_current(host);
         let g = 8.0;
         let sw = (col.width() - g * 3.0) / 4.0;
@@ -510,6 +513,9 @@ impl Studio {
         let h = strip.height();
         let stage = Rect::from_min_size(strip.min, egui::vec2(h * 16.0 / 9.0, h));
         self.stage(host, ui, stage, 10.0);
+        if !host.caps().scenes {
+            return;
+        }
         let (cur, _) = self.seq_current(host);
         let cell = (h * 0.47).clamp(36.0, 48.0);
         let y = strip.center().y - cell / 2.0;

@@ -13,7 +13,14 @@ crate-type = ["cdylib", "lib"]
 [dependencies]
 chromagrain-core = { path = "../core" }
 nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", rev = "de421011f41a6d10fc8c7a6084e4f4dee0143683", features = ["assert_process_allocs"] }
-nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git", rev = "de421011f41a6d10fc8c7a6084e4f4dee0143683" }
+chromagrain-ui = { path = "../ui" }
+egui = "0.32"
+# The editor: baseview for the child window + events (the windowing shim
+# nih-plug's editors use), egui + wgpu on its raw handle (chromagrain-ui).
+baseview = { git = "https://github.com/RustAudio/baseview.git", rev = "9a0b42c09d712777b2edb4c5e0cb6baf21e988f0" }
+keyboard-types = { version = "0.6.1", default-features = false }
+raw-window-handle-05 = { package = "raw-window-handle", version = "0.5" }
+raw-window-handle = "0.6"
 rtrb = "0.3"
 rfd = "0.15"
 
@@ -23,3 +30,4 @@ rfd = "0.15"
 # audio path.
 assert_no_alloc = { git = "https://github.com/robbert-vdh/rust-assert-no-alloc.git", branch = "feature/nested-permit-forbid" }
 hound = "3.5"
+egui_kittest = { version = "0.32", features = ["wgpu", "snapshot"] }

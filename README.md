@@ -436,9 +436,12 @@ automatable). Loaded videos are saved in the plugin state as file paths
 and decoded again on a background thread when a session opens; decoded
 media and key changes reach the audio thread over wait-free rings, and
 `process` never allocates or locks (nih-plug's `assert_process_allocs`
-aborts debug builds if it does). The editor is a deliberately thin egui
-placeholder (load a video, the macros, a canvas) until the real UI is
-embedded.
+aborts debug builds if it does). The editor is the studio UI itself
+(crates/ui) on egui + wgpu: **Play** (grid + emitters; the four knobs are
+the automatable macro parameters) and **Sequence** (one scene of step
+lanes the instrument plays in sync with the DAW's transport). Perform,
+Rec takes, scenes/song chain and export stay in the standalone app — the
+DAW arranges.
 
 ```sh
 cargo xtask bundle chromagrain-plugin --release   # -> target/bundled/chromagrain.{vst3,clap}
@@ -560,14 +563,22 @@ crates/core        chromagrain-core (headless, fully tested)
   sc_defs.rs       the 12 instrument SynthDefs, in Rust
   sc_graph.rs      SuperCollider-style SynthDef builder for plyphon
   script.rs        rhai bindings over all of the above
-crates/app         chromagrain (desktop app)
-  main.rs          eframe GUI: preview, timeline, sequencer, inspector
+crates/ui          chromagrain-ui (shared by the app and the plugin)
+  studio/          the play-first studio UI: play / sequence / perform
+                   views, deep drawer — drawn against a Host trait
+  host.rs          Host / PerformHost / Caps: what the UI needs from its
+                   host (document, transport, live grains, canvas, ...)
   gpu.rs           wgpu realtime pipeline (Metal/D3D12/Vulkan): grain
                    quads + WGSL effect passes + track compositing + live
-                   pad layer; renders once per frame, any window presents
-  studio/          the play-first studio UI: play / sequence / perform
-                   views, deep drawer, theme (Geist, graphite), widgets,
-                   frame atlases, headless kittest snapshot + touch tests
+                   buses; renders once per frame, any window presents
+  surface.rs       egui + wgpu on a raw window / CAMetalLayer (plugin
+                   editor, future AUv3) or offscreen
+  theme.rs, widgets.rs, atlas.rs   Geist + graphite, custom widgets,
+                   per-clip frame atlases
+crates/app         chromagrain (desktop app)
+  main.rs          eframe GUI: preview, timeline, sequencer, inspector
+  studio_host.rs   the app as a studio Host (pads, output, classic editors)
+  studio_tests.rs  headless kittest snapshots + touch tests
   ui_output.rs     performance output window (second viewport)
   displays.rs      which displays are attached (CoreGraphics on macOS)
   playback.rs      always-on engine: lock-free ring into cpal, transport
@@ -579,7 +590,10 @@ crates/plugin      chromagrain-plugin (VST3 + CLAP via nih-plug)
   lib.rs           Plugin impl: params -> Instrument, host transport, MIDI
   engine.rs        audio side (lock-free hand-off) + loader thread
   params.rs        macros, key/scale, sync, gain; persisted media paths
-  editor.rs        thin egui editor (placeholder for the real UI)
+  editor.rs        nih-plug Editor: baseview child window + wgpu surface
+                   on its raw handle, baseview input -> egui
+  ui_host.rs       the plugin as a studio Host (Play + Sequence over the
+                   Instrument; knobs = params; lanes follow host transport)
 xtask/             nih-plug bundler (cargo xtask bundle ...)
 tools/             segment_vision.swift (Vision) and segment.py (SAM 3)
 vendor/            plyphon-unit with block-interpolation fixes

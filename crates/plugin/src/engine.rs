@@ -17,9 +17,11 @@
 use crate::params::CgParams;
 use chromagrain_core::instrument::{Instrument, KeyFx, Macro, Transport, MAX_SOURCES};
 use chromagrain_core::music::Key;
+use chromagrain_core::grain::GrainEvent;
+use chromagrain_core::seq::StepPattern;
 use chromagrain_core::timeline::Source;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -34,12 +36,17 @@ pub enum ToAudio {
     Add(Source),
     /// Install key-dependent look state.
     Key(KeyFx),
+    /// A one-shot grain from the editor (an emitter on the Play grid).
+    Fire(usize, GrainEvent),
+    /// New step lanes from the editor's Sequence view.
+    Pattern(Box<StepPattern>),
 }
 
 /// Audio -> loader: replaced things, to be dropped off the audio thread.
 pub enum Trash {
     Source(Source),
     Key(KeyFx),
+    Pattern(Box<StepPattern>),
 }
 
 /// Work for the loader thread.
@@ -48,6 +55,9 @@ pub enum Job {
     Load(PathBuf),
     /// Already-decoded media (a host with its own decoder, or tests).
     Decoded(Box<Source>),
+    /// Editor -> audio (via this thread, the ring's only producer).
+    Fire(usize, GrainEvent),
+    Pattern(Box<StepPattern>),
     Stop,
 }
 
@@ -65,6 +75,13 @@ pub struct Shared {
     pub visible_grains: AtomicUsize,
     /// Sources the instrument holds (written by the audio thread).
     pub sources: AtomicUsize,
+    /// Decoded media, in load order, for the editor's thumbnails and
+    /// canvas (Arc'd: no second copy of the frames).
+    pub ui_sources: Mutex<Vec<Source>>,
+    /// Host transport as the audio thread last saw it.
+    pub playing: AtomicBool,
+    pub beat_bits: AtomicU64,
+    pub bpm_bits: AtomicU64,
 }
 
 impl Shared {
@@ -76,7 +93,31 @@ impl Shared {
         self.status.lock().map(|s| s.clone()).unwrap_or_default()
     }
 
-    fn set_status(&self, s: String) {
+    pub fn playing(&self) -> bool {
+        self.playing.load(Ordering::Relaxed)
+    }
+    pub fn beat(&self) -> f64 {
+        f64::from_bits(self.beat_bits.load(Ordering::Relaxed))
+    }
+    pub fn bpm(&self) -> f64 {
+        f64::from_bits(self.bpm_bits.load(Ordering::Relaxed))
+    }
+
+    /// Keep the editor's copy in step with the instrument (which recycles
+    /// its newest slot when full).
+    fn mirror_source(&self, src: &Source) {
+        if let Ok(mut u) = self.ui_sources.lock() {
+            if u.len() >= MAX_SOURCES {
+                if let Some(last) = u.last_mut() {
+                    *last = src.clone();
+                }
+            } else {
+                u.push(src.clone());
+            }
+        }
+    }
+
+    pub fn set_status(&self, s: String) {
         if let Ok(mut st) = self.status.lock() {
             *st = s;
         }
@@ -118,6 +159,10 @@ pub fn spawn(params: Arc<CgParams>, sample_rate: u32) -> (AudioSide, Arc<Shared>
         status: Mutex::new(String::from("no video loaded")),
         visible_grains: AtomicUsize::new(0),
         sources: AtomicUsize::new(0),
+        ui_sources: Mutex::new(Vec::new()),
+        playing: AtomicBool::new(false),
+        beat_bits: AtomicU64::new(0f64.to_bits()),
+        bpm_bits: AtomicU64::new(120f64.to_bits()),
     });
     let loader = Loader { params, shared: shared.clone(), jobs: job_rx, to_audio, trash: trash_rx, key: None, key_rate: sample_rate, pending: Vec::new() };
     std::thread::Builder::new()
@@ -202,6 +247,10 @@ impl AudioSide {
         let now = inst.now_secs();
         self.shared.visible_grains.store(inst.video_frame_events(now).count(), Ordering::Relaxed);
         self.shared.sources.store(inst.sources().len(), Ordering::Relaxed);
+        let t = inst.transport();
+        self.shared.playing.store(t.playing, Ordering::Relaxed);
+        self.shared.beat_bits.store(t.beat.to_bits(), Ordering::Relaxed);
+        self.shared.bpm_bits.store(t.bpm.to_bits(), Ordering::Relaxed);
     }
 
     /// Take everything the loader has sent.
@@ -222,6 +271,14 @@ impl AudioSide {
                     }
                 }
                 ToAudio::Key(fx) => Some(Trash::Key(self.inst.swap_key(fx))),
+                ToAudio::Fire(src, ev) => {
+                    self.inst.trigger(src, ev);
+                    None
+                }
+                ToAudio::Pattern(p) => {
+                    let old = self.inst.swap_pattern(Some(*p));
+                    old.map(|o| Trash::Pattern(Box::new(o)))
+                }
             };
             if let Some(t) = old {
                 // The trash ring only fills if the loader is stuck; then
@@ -258,7 +315,16 @@ impl Loader {
             match self.jobs.recv_timeout(Duration::from_millis(15)) {
                 Ok(Job::Stop) | Err(RecvTimeoutError::Disconnected) => break,
                 Ok(Job::Load(path)) => self.load(path),
-                Ok(Job::Decoded(src)) => self.pending.push(ToAudio::Add(*src)),
+                Ok(Job::Decoded(src)) => {
+                    self.shared.mirror_source(&src);
+                    self.pending.push(ToAudio::Add(*src));
+                }
+                Ok(Job::Fire(src, ev)) => self.pending.push(ToAudio::Fire(src, ev)),
+                Ok(Job::Pattern(p)) => {
+                    // Only the newest pattern matters.
+                    self.pending.retain(|m| !matches!(m, ToAudio::Pattern(_)));
+                    self.pending.push(ToAudio::Pattern(p));
+                }
                 Err(RecvTimeoutError::Timeout) => {}
             }
             self.watch_key();
@@ -288,6 +354,7 @@ impl Loader {
                     }
                 }
                 self.shared.set_status(format!("{name} ({:.1} s)", src.duration()));
+                self.shared.mirror_source(&src);
                 self.pending.push(ToAudio::Add(src));
             }
             Err(e) => self.shared.set_status(format!("{name}: {e}")),
