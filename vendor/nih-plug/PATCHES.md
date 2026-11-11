@@ -27,4 +27,14 @@ through the patch. Changes:
    `set_state` path already did this, so there it now rescans twice, which
    is harmless.
 
-Drop this directory and the `[patch]` once the fix is upstream.
+4. Host-driven editor resizing (`src/editor.rs`, `src/wrapper/vst3/view.rs`,
+   `src/wrapper/clap/wrapper.rs`): upstream editors are fixed-size (every
+   resize entry point is a `TODO`). `Editor` gains three default methods,
+   `can_resize()` (false), `constrain_size(w, h)` and `set_size(w, h)`
+   (logical pixels), so existing editors behave as before. For an editor
+   that opts in, VST3 `canResize` / `checkSizeConstraint` / `onSize` and
+   CLAP `can_resize` / `get_resize_hints` / `adjust_size` / `set_size` ask
+   it (unscaling by the host DPI factor on Windows/Linux). chromagrain's
+   editor clamps to 960×600..3840×2400.
+
+Drop this directory and the `[patch]` once the fixes are upstream.

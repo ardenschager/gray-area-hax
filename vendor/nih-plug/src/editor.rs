@@ -54,6 +54,28 @@ pub trait Editor: Send {
     /// there.
     fn set_scale_factor(&self, factor: f32) -> bool;
 
+    /// Whether the host may resize the editor (chromagrain patch, see
+    /// PATCHES.md). Upstream editors are fixed-size; the default keeps that.
+    fn can_resize(&self) -> bool {
+        false
+    }
+
+    /// The nearest size (logical pixels) the editor accepts for a host's
+    /// proposed `(width, height)`, e.g. clamped to a minimum. Only asked
+    /// when [`can_resize()`][Self::can_resize()] is true.
+    fn constrain_size(&self, width: u32, height: u32) -> (u32, u32) {
+        (width, height)
+    }
+
+    /// The host resized the editor to `(width, height)` logical pixels (a
+    /// size [`constrain_size()`][Self::constrain_size()] returned).
+    /// Afterwards [`size()`][Self::size()] must report it. Return false to
+    /// refuse. Only called when [`can_resize()`][Self::can_resize()] is true.
+    fn set_size(&self, width: u32, height: u32) -> bool {
+        let _ = (width, height);
+        false
+    }
+
     /// Called whenever a specific parameter's value has changed while the editor is open. You don't
     /// need to do anything with this, but this can be used to force a redraw when the host sends a
     /// new value for a parameter or when a parameter change sent to the host gets processed.

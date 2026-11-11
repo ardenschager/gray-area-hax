@@ -364,3 +364,44 @@ fn offline_the_editor_drives_the_instrument() {
     }
     assert!(heard > 0.01, "the held emitter sounds ({heard})");
 }
+
+/// Host-driven resizing (VST3 onSize / CLAP set_size go through these
+/// `Editor` methods in the patched nih-plug): sizes clamp to the 960×600
+/// minimum, persist with the session, and the studio lays out at any of
+/// them.
+#[test]
+fn the_host_can_resize_the_editor_down_to_960x600() {
+    use chromagrain_plugin::editor::{self, MIN_SIZE};
+    let p = plugin_with(vec![sine()]);
+    let ed = editor::create(p.params_ref().clone(), p.shared().clone()).unwrap();
+    assert!(ed.can_resize());
+    assert_eq!(ed.size(), editor::DEFAULT_SIZE);
+    assert_eq!(ed.constrain_size(640, 480), MIN_SIZE, "never below the minimum");
+    assert_eq!(ed.constrain_size(1500, 580), (1500, 600));
+    assert!(ed.set_size(1440, 900));
+    assert_eq!(ed.size(), (1440, 900));
+    assert_eq!(*p.params_ref().editor_size.lock().unwrap(), (1440, 900), "persisted");
+    assert!(ed.set_size(100, 100));
+    assert_eq!(ed.size(), MIN_SIZE);
+    // A state saved by an older build with a smaller size opens at the minimum.
+    *p.params_ref().editor_size.lock().unwrap() = (800, 500);
+    assert_eq!(ed.size(), MIN_SIZE);
+
+    // The studio at each size: every view lays out, the pads stay tappable.
+    let mut h = harness((960.0, 600.0), editor_ui(&p));
+    h.run_steps(2);
+    for (w, hh) in [(960.0, 600.0), (1440.0, 900.0), (2560.0, 1440.0), (1024.0, 768.0)] {
+        h.set_size(egui::vec2(w, hh));
+        for view in [View::Play, View::Sequence, View::Perform] {
+            {
+                let ui = h.state_mut();
+                ui.studio.set_view(&mut ui.host, view);
+            }
+            h.run_steps(2);
+            let r = h.ctx.screen_rect();
+            assert_eq!((r.width(), r.height()), (w, hh));
+        }
+        let pad = h.get_by_label("pad 16").rect();
+        assert!(pad.right() <= w + 0.5 && pad.bottom() <= hh + 0.5 && pad.width() >= 44.0, "{w}x{hh}: {pad:?}");
+    }
+}

@@ -5,7 +5,7 @@ use std::ffi::{c_void, CStr};
 use std::mem;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use vst3_sys::base::{kInvalidArgument, kNotImplemented, kResultFalse, kResultOk, tresult, TBool};
+use vst3_sys::base::{kInvalidArgument, kNotImplemented, kResultFalse, kResultOk, kResultTrue, tresult, TBool};
 use vst3_sys::gui::{IPlugFrame, IPlugView, IPlugViewContentScaleSupport, ViewRect};
 use vst3_sys::utils::SharedVstPtr;
 use vst3_sys::VST3;
@@ -376,7 +376,18 @@ impl<P: Vst3Plugin> IPlugView for WrapperView<P> {
     unsafe fn on_size(&self, new_size: *mut ViewRect) -> tresult {
         check_null_ptr!(new_size);
 
-        // TODO: Implement Host->Plugin resizing
+        // Host->Plugin resizing for editors that opt in (chromagrain patch).
+        {
+            let editor = self.editor.lock();
+            if editor.can_resize() {
+                let scaling_factor = self.scaling_factor.load(Ordering::Relaxed);
+                let width = ((*new_size).right - (*new_size).left).max(1) as f32 / scaling_factor;
+                let height = ((*new_size).bottom - (*new_size).top).max(1) as f32 / scaling_factor;
+                let (w, h) = editor.constrain_size(width.round() as u32, height.round() as u32);
+                return if editor.set_size(w, h) { kResultOk } else { kResultFalse };
+            }
+        }
+
         let (unscaled_width, unscaled_height) = self.editor.lock().size();
         let scaling_factor = self.scaling_factor.load(Ordering::Relaxed);
         let (editor_width, editor_height) = (
@@ -425,14 +436,31 @@ impl<P: Vst3Plugin> IPlugView for WrapperView<P> {
     }
 
     unsafe fn can_resize(&self) -> tresult {
-        // TODO: Implement Host->Plugin resizing
-        kResultFalse
+        if self.editor.lock().can_resize() {
+            kResultTrue
+        } else {
+            kResultFalse
+        }
     }
 
     unsafe fn check_size_constraint(&self, rect: *mut ViewRect) -> tresult {
         check_null_ptr!(rect);
 
-        // TODO: Implement Host->Plugin resizing
+        {
+            let editor = self.editor.lock();
+            if editor.can_resize() {
+                // Snap the proposed rect to a size the editor accepts.
+                let scaling_factor = self.scaling_factor.load(Ordering::Relaxed);
+                let rect = &mut *rect;
+                let width = (rect.right - rect.left).max(1) as f32 / scaling_factor;
+                let height = (rect.bottom - rect.top).max(1) as f32 / scaling_factor;
+                let (w, h) = editor.constrain_size(width.round() as u32, height.round() as u32);
+                rect.right = rect.left + (w as f32 * scaling_factor).round() as i32;
+                rect.bottom = rect.top + (h as f32 * scaling_factor).round() as i32;
+                return kResultOk;
+            }
+        }
+
         if (*rect).right - (*rect).left > 0 && (*rect).bottom - (*rect).top > 0 {
             kResultOk
         } else {

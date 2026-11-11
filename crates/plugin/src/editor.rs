@@ -9,6 +9,11 @@
 //! (`chromagrain_ui::surface::SurfacePainter` — the same abstraction an
 //! AUv3 will use on its `CAMetalLayer`), translate baseview input into
 //! egui events, and run [`PluginUi`] every frame.
+//!
+//! The host may resize the editor (VST3 `IPlugView::onSize`, CLAP
+//! `gui.set_size`; nih-plug is patched for it, see vendor/nih-plug/PATCHES.md)
+//! down to the 960×600 minimum the studio layout holds; the size persists
+//! with the session.
 
 use crate::engine::Shared;
 use crate::params::CgParams;
@@ -29,9 +34,24 @@ use std::time::Instant;
 /// Default editor size (logical points): the design's iPad-landscape
 /// layout; it holds down to the 960×600 plugin minimum.
 pub const DEFAULT_SIZE: (u32, u32) = (1180, 820);
+/// Smallest editor the layout holds (the design's minimum).
+pub const MIN_SIZE: (u32, u32) = (960, 600);
+/// Largest (a 4K screen at 1×).
+pub const MAX_SIZE: (u32, u32) = (3840, 2400);
+
+/// The size the editor takes for a host's proposal.
+pub fn constrain(width: u32, height: u32) -> (u32, u32) {
+    (width.clamp(MIN_SIZE.0, MAX_SIZE.0), height.clamp(MIN_SIZE.1, MAX_SIZE.1))
+}
 
 pub fn create(params: Arc<CgParams>, shared: Arc<Shared>) -> Option<Box<dyn Editor>> {
-    Some(Box::new(StudioEditor { params, shared, scale: Mutex::new(None), open: Arc::new(AtomicBool::new(false)) }))
+    Some(Box::new(StudioEditor {
+        params,
+        shared,
+        scale: Mutex::new(None),
+        open: Arc::new(AtomicBool::new(false)),
+        resize: Arc::new(Mutex::new(None)),
+    }))
 }
 
 struct StudioEditor {
@@ -40,6 +60,8 @@ struct StudioEditor {
     /// Host-reported DPI scale (Windows/Linux; macOS scales natively).
     scale: Mutex<Option<f32>>,
     open: Arc<AtomicBool>,
+    /// A host resize for the open window to apply on its next frame.
+    resize: Arc<Mutex<Option<(u32, u32)>>>,
 }
 
 /// nih-plug's parent handle in baseview's raw-window-handle (0.5).
@@ -87,6 +109,8 @@ impl Editor for StudioEditor {
         let scale = *self.scale.lock().unwrap();
         let params = self.params.clone();
         let shared = self.shared.clone();
+        let resize = self.resize.clone();
+        *resize.lock().unwrap() = None;
         let window = Window::open_parented(
             &Parent(parent),
             WindowOpenOptions {
@@ -94,14 +118,32 @@ impl Editor for StudioEditor {
                 size: Size::new(w as f64, h as f64),
                 scale: scale.map(|s| WindowScalePolicy::ScaleFactor(s as f64)).unwrap_or(WindowScalePolicy::SystemScaleFactor),
             },
-            move |window| StudioWindow::new(window, params, shared, context, (w, h), scale),
+            move |window| StudioWindow::new(window, params, shared, context, (w, h), scale, resize),
         );
         self.open.store(true, Ordering::Release);
         Box::new(EditorHandle { _window: window, open: self.open.clone() })
     }
 
     fn size(&self) -> (u32, u32) {
-        *self.params.editor_size.lock().unwrap()
+        let (w, h) = *self.params.editor_size.lock().unwrap();
+        constrain(w, h)
+    }
+
+    fn can_resize(&self) -> bool {
+        true
+    }
+
+    fn constrain_size(&self, width: u32, height: u32) -> (u32, u32) {
+        constrain(width, height)
+    }
+
+    fn set_size(&self, width: u32, height: u32) -> bool {
+        let size = constrain(width, height);
+        *self.params.editor_size.lock().unwrap() = size;
+        if self.open.load(Ordering::Acquire) {
+            *self.resize.lock().unwrap() = Some(size);
+        }
+        true
     }
 
     fn set_scale_factor(&self, factor: f32) -> bool {
@@ -153,10 +195,20 @@ struct StudioWindow {
     logical: egui::Vec2,
     scale: f32,
     start: Instant,
+    resize: Arc<Mutex<Option<(u32, u32)>>>,
+    cursor: egui::CursorIcon,
 }
 
 impl StudioWindow {
-    fn new(window: &mut Window, params: Arc<CgParams>, shared: Arc<Shared>, gui: Arc<dyn GuiContext>, size: (u32, u32), scale: Option<f32>) -> StudioWindow {
+    fn new(
+        window: &mut Window,
+        params: Arc<CgParams>,
+        shared: Arc<Shared>,
+        gui: Arc<dyn GuiContext>,
+        size: (u32, u32),
+        scale: Option<f32>,
+        resize: Arc<Mutex<Option<(u32, u32)>>>,
+    ) -> StudioWindow {
         let scale = scale.unwrap_or(1.0);
         let phys = [(size.0 as f32 * scale) as u32, (size.1 as f32 * scale) as u32];
         let painter = handles(window).and_then(|(d, w)| match unsafe { SurfacePainter::for_window(d, w, phys) } {
@@ -180,6 +232,8 @@ impl StudioWindow {
             logical: egui::vec2(size.0 as f32, size.1 as f32),
             scale,
             start: Instant::now(),
+            resize,
+            cursor: egui::CursorIcon::Default,
         }
     }
 
@@ -218,6 +272,15 @@ fn key_of(k: &keyboard_types::Key) -> Option<egui::Key> {
 
 impl WindowHandler for StudioWindow {
     fn on_frame(&mut self, window: &mut Window) {
+        // A host resize: the view (baseview), then our surface. macOS sends
+        // no Resized event for a programmatic resize, so don't wait for one.
+        if let Some((w, h)) = self.resize.lock().ok().and_then(|mut r| r.take()) {
+            window.resize(Size::new(w as f64, h as f64));
+            self.logical = egui::vec2(w as f32, h as f32);
+            if let Some(p) = self.painter.as_mut() {
+                p.resize([(w as f32 * self.scale).round() as u32, (h as f32 * self.scale).round() as u32]);
+            }
+        }
         let mut raw = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, self.logical)),
             time: Some(self.start.elapsed().as_secs_f64()),
@@ -229,15 +292,22 @@ impl WindowHandler for StudioWindow {
         raw.viewports.entry(egui::ViewportId::ROOT).or_default().native_pixels_per_point = Some(self.scale);
         let ui = &mut self.ui;
         let out = self.ctx.run(raw, |ctx| ui.frame(ctx));
-        window.set_mouse_cursor(match out.platform_output.cursor_icon {
-            egui::CursorIcon::None => baseview::MouseCursor::Hidden,
-            egui::CursorIcon::PointingHand => baseview::MouseCursor::Hand,
-            egui::CursorIcon::Grab => baseview::MouseCursor::Hand,
-            egui::CursorIcon::Grabbing => baseview::MouseCursor::HandGrabbing,
-            egui::CursorIcon::Text => baseview::MouseCursor::Text,
-            egui::CursorIcon::ResizeVertical => baseview::MouseCursor::NsResize,
-            _ => baseview::MouseCursor::Default,
-        });
+        let cursor = out.platform_output.cursor_icon;
+        if cursor != self.cursor {
+            self.cursor = cursor;
+            // baseview's macOS `set_mouse_cursor` is `todo!()` (it would
+            // panic inside the host): cursors only on Windows / Linux.
+            #[cfg(not(target_os = "macos"))]
+            window.set_mouse_cursor(match cursor {
+                egui::CursorIcon::None => baseview::MouseCursor::Hidden,
+                egui::CursorIcon::PointingHand => baseview::MouseCursor::Hand,
+                egui::CursorIcon::Grab => baseview::MouseCursor::Hand,
+                egui::CursorIcon::Grabbing => baseview::MouseCursor::HandGrabbing,
+                egui::CursorIcon::Text => baseview::MouseCursor::Text,
+                egui::CursorIcon::ResizeVertical => baseview::MouseCursor::NsResize,
+                _ => baseview::MouseCursor::Default,
+            });
+        }
         if let Some(p) = self.painter.as_mut() {
             if let Err(e) = p.present(&self.ctx, out) {
                 nih_log!("chromagrain editor: present failed: {e}");
