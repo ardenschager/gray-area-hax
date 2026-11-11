@@ -54,7 +54,7 @@ instability (drift, wow, flutter, grit) so nothing sounds like a preset.
   and every kit drum soft and hard, compiles in plyphon and renders finite, audible audio with
   headroom and no DC.
 - New ignored `sc::tests::dump_phrases` (the render tool above).
-- `cargo test`: 137 passed, 4 ignored. `cargo build --release` OK.
+- `cargo test`: 137 passed, 4 ignored (with the sclang defs); 139 passed, 4 ignored after the Rust port. `cargo build --release` OK.
 
 ## plyphon coverage
 No limits hit. The registry has about 250 UGens: Ringz, Klank, Pluck, Formant, Formlet, GrainFM/Sin,
@@ -62,8 +62,31 @@ SinOscFB, VarSaw, Latch, Gendy1, fold2, excess, CombC, AllpassC, PitchShift, Fre
 among others. Not available (and not used): Linen, Vibrato, IRand, and unary random ops
 (`rand`, `rrand` on signals). Use Rand, TRand or TIRand instead.
 
+## No SuperCollider dependency (follow-up on the same branch)
+Arden asked for no SuperCollider dependency at all, not even at build time. The voices above are
+now Rust:
+- `crates/core/src/sc_graph.rs` is a small SuperCollider-style SynthDef builder (~500 lines).
+  UGen helpers take their SC class's inputs in the same order. `+ - * /`, `.tanh()`,
+  `.midiratio()`, `.fold2()` and the like add BinaryOp/UnaryOp units with sclang's identities,
+  constants fold in f64 like sclang, and `Env` and `EnvGen` use sclang's layout. It outputs a
+  `plyphon::SynthDef`, which plyphon compiles directly. There is no SCgf file or sclang
+  anywhere.
+- `crates/core/src/sc_defs.rs` holds the 12 defs, a line-for-line port of the build.scd
+  above.
+- `assets/synthdefs/` (build.scd and the 12 .scsyndef files) is deleted. `sc.rs` builds
+  defs with `sc_defs::build`.
+- **Proof of equivalence**: before deleting, commit 4dce4e0 had the test
+  `rust_defs_match_sclang_defs`. It checked that controls and defaults match exactly. It then
+  rendered every instrument (defaults, plus a knob-extremes variant) both ways, with each
+  random UGen swapped for a deterministic stand-in that still depends on all its inputs, in
+  both graphs. 15 of 19 cases were bit-identical. The rest (choir, drone, kit) differed by
+  at most -132 dB (float summation order). A negative control (one gain changed 0.3 → 0.31)
+  failed it at -47 dB, as expected.
+- Untamed phrase renders through the Rust defs match these v001 renders exactly for the
+  deterministic voices (acid, bass, lead: same peak, RMS and centroid). Noisy voices differ
+  only in their random sequence, which comes from plyphon's per-unit seeding. RMS stays
+  within 0.2 dB and the centroid within 9%.
+
 ## Next
-- Arden: "no SuperCollider dependency at all". The re-voiced defs are being ported to a small
-  Rust graph builder in crates/core that feeds plyphon `SynthDef`s directly (no sclang, no
-  .scsyndef). Before build.scd and the binaries are deleted, a render-equality test will check
-  the port against these defs.
+- Arden listens. Re-voicing is now just editing `sc_defs.rs` and running
+  `cargo test --release -p chromagrain-core sc::tests::dump_phrases -- --ignored`.

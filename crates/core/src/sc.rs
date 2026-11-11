@@ -1,8 +1,9 @@
 //! SuperCollider inside chromagrain.
 //!
-//! Instruments are real SuperCollider SynthDefs (`assets/synthdefs/*.scd`,
-//! compiled by sclang to `.scsyndef` and embedded here) run by
-//! [plyphon](https://github.com/nannou-org/plyphon), a pure-Rust scsynth.
+//! Instruments are real SuperCollider SynthDefs, written in Rust
+//! (`sc_defs`, built with the small `sc_graph` builder; no sclang, no
+//! files) and run by [plyphon](https://github.com/nannou-org/plyphon), a
+//! pure-Rust scsynth.
 //! No separate server, no audio routing: a [`SynthPart`] (an instrument,
 //! its knob settings and a few bars of notes) is rendered straight into
 //! an [`AudioClip`], which then behaves exactly like any other media —
@@ -55,24 +56,6 @@ pub const KIT: &[(u8, &str, f32, &str)] = &[
     (42, "cg_hat", 8000.0, "hat"),
     (46, "cg_hat", 6500.0, "open hat"),
 ];
-
-fn defs_bytes(def: &str) -> Option<&'static [u8]> {
-    Some(match def {
-        "cg_pad" => include_bytes!("../../../assets/synthdefs/cg_pad.scsyndef"),
-        "cg_keys" => include_bytes!("../../../assets/synthdefs/cg_keys.scsyndef"),
-        "cg_pluck" => include_bytes!("../../../assets/synthdefs/cg_pluck.scsyndef"),
-        "cg_bass" => include_bytes!("../../../assets/synthdefs/cg_bass.scsyndef"),
-        "cg_acid" => include_bytes!("../../../assets/synthdefs/cg_acid.scsyndef"),
-        "cg_bell" => include_bytes!("../../../assets/synthdefs/cg_bell.scsyndef"),
-        "cg_lead" => include_bytes!("../../../assets/synthdefs/cg_lead.scsyndef"),
-        "cg_choir" => include_bytes!("../../../assets/synthdefs/cg_choir.scsyndef"),
-        "cg_drone" => include_bytes!("../../../assets/synthdefs/cg_drone.scsyndef"),
-        "cg_kick" => include_bytes!("../../../assets/synthdefs/cg_kick.scsyndef"),
-        "cg_snare" => include_bytes!("../../../assets/synthdefs/cg_snare.scsyndef"),
-        "cg_hat" => include_bytes!("../../../assets/synthdefs/cg_hat.scsyndef"),
-        _ => return None,
-    })
-}
 
 // ------------------------------------------------------------ starters
 // Everything defaults to A minor, i–VI–III–VII (Am F C G), so parts made
@@ -489,11 +472,7 @@ pub fn render_note(part: &SynthPart, pitch: u8, vel: f32, bpm: f64, sample_rate:
 }
 
 fn render_raw(part: &SynthPart, inst: &Instrument, bpm: f64, sample_rate: u32, total_n: usize) -> Result<(Vec<f32>, Vec<f32>), String> {
-    render_raw_with(part, inst, bpm, sample_rate, total_n, &|d| {
-        let bytes = defs_bytes(d).ok_or_else(|| format!("missing synthdef {d}"))?;
-        let mut v = plyphon::synthdef::read::parse(bytes).map_err(|e| format!("{d}: {e:?}"))?;
-        Ok(v.remove(0).0)
-    })
+    render_raw_with(part, inst, bpm, sample_rate, total_n, &|d| crate::sc_defs::build(d).ok_or_else(|| format!("missing synthdef {d}")))
 }
 
 /// [`render_raw`] with the SynthDefs supplied by `load`.
@@ -800,68 +779,6 @@ mod tests {
             assert!(peak < 1.5, "{name}: raw peak {peak} (renders should leave headroom)");
             let dc = (l.iter().sum::<f32>() / l.len() as f32).abs();
             assert!(dc < 0.02, "{name}: DC offset {dc}");
-        }
-    }
-
-    /// The Rust SynthDefs (sc_defs) are a faithful port of the sclang ones:
-    /// same controls and defaults, and the same audio. Randomness can't
-    /// match (plyphon seeds per unit, and the unit order differs), so every
-    /// random UGen in both graphs is swapped for a deterministic stand-in
-    /// that still depends on all its inputs (noise rate -> SinOsc
-    /// frequency, Dust density -> Impulse rate, TRand/TIRand/Rand -> sum
-    /// of their inputs) before rendering; everything must then agree to
-    /// float precision.
-    #[test]
-    fn rust_defs_match_sclang_defs() {
-        fn tame(mut d: plyphon::SynthDef) -> plyphon::SynthDef {
-            use plyphon::InputRef::Constant;
-            for u in &mut d.units {
-                let (name, inputs) = match u.name.as_str() {
-                    "WhiteNoise" | "PinkNoise" => ("DC", vec![Constant(0.37)]),
-                    "LFNoise1" | "LFNoise2" | "LFDNoise3" => ("SinOsc", vec![u.inputs[0], Constant(0.3)]),
-                    "Dust" => ("Impulse", vec![u.inputs[0], Constant(0.0)]),
-                    "TRand" | "TIRand" => ("Sum3", u.inputs.clone()),
-                    "Rand" => {
-                        u.special_index = 0;
-                        ("BinaryOpUGen", u.inputs.clone())
-                    }
-                    _ => continue,
-                };
-                u.name = name.into();
-                u.inputs = inputs;
-            }
-            d
-        }
-        let sclang = |d: &str| -> Result<plyphon::SynthDef, String> { Ok(plyphon::synthdef::read::parse(defs_bytes(d).unwrap()).unwrap().remove(0).0) };
-        let rust = |d: &str| crate::sc_defs::build(d).ok_or_else(|| format!("no rust def {d}"));
-        for d in crate::sc_defs::NAMES {
-            let (a, b) = (sclang(d).unwrap(), rust(d).unwrap());
-            let pa: Vec<_> = a.params.iter().map(|p| (p.name.clone(), p.default)).collect();
-            let pb: Vec<_> = b.params.iter().map(|p| (p.name.clone(), p.default)).collect();
-            assert_eq!(pa, pb, "{d}: controls differ");
-        }
-        let mut cases: Vec<(String, SynthPart)> = Vec::new();
-        for inst in INSTRUMENTS {
-            cases.push((inst.id.to_string(), SynthPart::new(inst.id, 0)));
-            if !inst.kit {
-                let mut p = SynthPart::new(inst.id, 0);
-                for (i, k) in inst.knobs.iter().enumerate() {
-                    p.set_param(k.name, if i % 2 == 0 { k.hi } else { k.lo });
-                }
-                cases.push((format!("{} knobs", inst.id), p));
-            }
-        }
-        for (name, part) in cases {
-            let inst = instrument(&part.instrument).unwrap();
-            let n = 48000 * 4;
-            let (al, ar) = render_raw_with(&part, inst, 120.0, 48000, n, &|d| sclang(d).map(tame)).unwrap();
-            let (bl, br) = render_raw_with(&part, inst, 120.0, 48000, n, &|d| rust(d).map(tame)).unwrap();
-            let peak = al.iter().chain(&ar).fold(0f32, |m, v| m.max(v.abs()));
-            let diff = al.iter().zip(&bl).chain(ar.iter().zip(&br)).fold(0f32, |m, (x, y)| m.max((x - y).abs()));
-            let rel = diff / peak.max(1e-9);
-            eprintln!("{name:>18}: peak {peak:.4} max diff {diff:.2e} ({:.1} dB)", 20.0 * rel.max(1e-12).log10());
-            assert!(peak > 1e-3, "{name}: tamed render is silent, the comparison would be vacuous");
-            assert!(rel < 1e-3, "{name}: Rust def differs from sclang def by {rel:.2e} of peak");
         }
     }
 
