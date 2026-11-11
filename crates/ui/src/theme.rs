@@ -1,7 +1,7 @@
 //! Studio look: neutral graphite + one off-white highlight; colour only
 //! comes from the footage. Tokens mirror design/v001/NOTES.md.
 
-use eframe::egui::{self, Color32, CornerRadius, FontFamily, FontId, Stroke};
+use egui::{self, Color32, CornerRadius, FontFamily, FontId, Stroke};
 
 pub const G0: Color32 = Color32::from_rgb(0x0b, 0x0b, 0x0c);
 pub const G1: Color32 = Color32::from_rgb(0x12, 0x12, 0x13);
@@ -56,11 +56,11 @@ pub fn install(ctx: &egui::Context) {
     let add = |fonts: &mut egui::FontDefinitions, name: &str, bytes: &'static [u8]| {
         fonts.font_data.insert(name.into(), std::sync::Arc::new(egui::FontData::from_static(bytes)));
     };
-    add(&mut fonts, "geist", include_bytes!("../../../../assets/fonts/Geist-Regular.ttf"));
-    add(&mut fonts, "geist-medium", include_bytes!("../../../../assets/fonts/Geist-Medium.ttf"));
-    add(&mut fonts, "geist-semibold", include_bytes!("../../../../assets/fonts/Geist-SemiBold.ttf"));
-    add(&mut fonts, "mono", include_bytes!("../../../../assets/fonts/GeistMono-Regular.ttf"));
-    add(&mut fonts, "mono-medium", include_bytes!("../../../../assets/fonts/GeistMono-Medium.ttf"));
+    add(&mut fonts, "geist", include_bytes!("../../../assets/fonts/Geist-Regular.ttf"));
+    add(&mut fonts, "geist-medium", include_bytes!("../../../assets/fonts/Geist-Medium.ttf"));
+    add(&mut fonts, "geist-semibold", include_bytes!("../../../assets/fonts/Geist-SemiBold.ttf"));
+    add(&mut fonts, "mono", include_bytes!("../../../assets/fonts/GeistMono-Regular.ttf"));
+    add(&mut fonts, "mono-medium", include_bytes!("../../../assets/fonts/GeistMono-Medium.ttf"));
     let fallback: Vec<String> = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
     let with_fallback = |first: &str| {
         let mut v = vec![first.to_string()];

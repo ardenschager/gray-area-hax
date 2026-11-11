@@ -25,8 +25,8 @@ use chromagrain_core::fx::{AvEffect, EffectKind};
 use chromagrain_core::render::ClipPlan;
 use chromagrain_core::timeline::Project;
 use chromagrain_core::video::{grain_draws, grain_draws_opts, ColorFilterMode, VisualGrainStyle};
-use eframe::egui;
-use eframe::egui_wgpu::{self, wgpu};
+
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1270,12 +1270,10 @@ impl GpuPreview {
 }
 
 /// Install the pipeline into egui-wgpu's shared callback resources (once,
-/// at startup). Returns false when there is no wgpu render state.
-pub fn install(cc: &eframe::CreationContext<'_>) -> bool {
-    let Some(rs) = cc.wgpu_render_state.as_ref() else { return false };
+/// at startup).
+pub fn install(rs: &egui_wgpu::RenderState) {
     let g = GpuPreview::new(&rs.device, &rs.queue, rs.target_format);
     rs.renderer.write().callback_resources.insert(g);
-    true
 }
 
 /// Paint callback: shows the current scene in `rect` (any viewport).
@@ -1481,9 +1479,9 @@ mod tests {
             // editor: the preview is a panel inside a bigger window
             ((900u32, 600u32), 1.0f32, r(100.0, 80.0, 400.0, 240.0)),
             // performance output on a 4:3 projector: letterboxed
-            ((1024, 768), 1.0, crate::displays::fit(r(0.0, 0.0, 1024.0, 768.0), aspect)),
+            ((1024, 768), 1.0, crate::fit(r(0.0, 0.0, 1024.0, 768.0), aspect)),
             // retina output window, ppp 2
-            ((1280, 720), 2.0, crate::displays::fit(r(0.0, 0.0, 640.0, 360.0), aspect)),
+            ((1280, 720), 2.0, crate::fit(r(0.0, 0.0, 640.0, 360.0), aspect)),
             // cover fullscreen: rect overflows the window and is cropped
             ((600, 600), 1.0, egui::Rect::from_center_size(egui::pos2(300.0, 300.0), egui::vec2(600.0 * aspect, 600.0))),
         ];

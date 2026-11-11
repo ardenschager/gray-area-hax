@@ -3,15 +3,15 @@
 //! pitch (key degrees), hold opens the step sheet. Scenes 1–8 and a song
 //! chain on the right (top strip when narrow).
 
-use super::atlas;
-use super::theme::*;
-use super::widgets::*;
+use crate::atlas;
+use crate::theme::*;
+use crate::widgets::*;
 use super::{DeepTab, DeepTarget, LANES, SCENES, STEPS};
-use crate::{App, AppMode};
+use super::Studio;
+use crate::host::Host;
 use chromagrain_core::music::Key;
 use chromagrain_core::seq::StepPattern;
-use chromagrain_core::timeline::Clip;
-use eframe::egui::{self, Align2, Color32, Rect, Sense, Stroke, StrokeKind};
+use egui::{self, Align2, Color32, Rect, Sense, Stroke, StrokeKind};
 
 /// Semitones for key degree `d` (0 = root) of `key`'s scale.
 pub fn degree_to_semis(key: &Key, d: i32) -> f32 {
@@ -27,33 +27,33 @@ pub fn semis_to_degree(key: &Key, st: f32) -> i32 {
 
 const LENGTHS: [(f32, &str); 6] = [(0.5, "1/32"), (1.0, "1/16"), (2.0, "1/8"), (4.0, "1/4"), (8.0, "1/2"), (16.0, "1")];
 
-impl App {
+impl Studio {
     // ------------------------------------------------------------ model
 
     /// Scene 1's pattern exists, and every scene pattern has one row per
     /// lane pointing at the lane's clip.
-    pub(crate) fn seq_ensure(&mut self) {
-        let lanes = self.studio.seq.lanes;
+    pub fn seq_ensure(&mut self, host: &mut dyn Host) {
+        let lanes = self.seq.lanes;
         if lanes.iter().all(|l| l.is_none()) {
             return;
         }
-        let key = self.studio.key;
-        let bpm = self.project.lock().unwrap().bpm;
+        let key = self.key;
+        let bpm = host.project().lock().unwrap().bpm;
         let mut created = false;
-        if self.studio.seq.scene_pats[0].is_none() {
+        if self.seq.scene_pats[0].is_none() {
             let mut pat = StepPattern::new("scene 1");
             for lane in lanes.iter() {
                 let r = pat.add_row(lane.unwrap_or(usize::MAX));
                 pat.rows[r].key = Some(key);
                 pat.rows[r].grains.duration = (60.0 / bpm as f32 / 4.0 * 1.5).clamp(0.05, 1.0);
             }
-            let pid = self.project.lock().unwrap().add_pattern(pat);
-            self.studio.seq.scene_pats[0] = Some(pid);
+            let pid = host.project().lock().unwrap().add_pattern(pat);
+            self.seq.scene_pats[0] = Some(pid);
             created = true;
         }
-        let mut p = self.project.lock().unwrap();
+        let mut p = host.project().lock().unwrap();
         let mut changed = false;
-        for pid in self.studio.seq.scene_pats.iter().flatten() {
+        for pid in self.seq.scene_pats.iter().flatten() {
             let Some(pat) = p.patterns.get_mut(*pid) else { continue };
             while pat.rows.len() < LANES {
                 pat.add_row(usize::MAX);
@@ -68,20 +68,19 @@ impl App {
         }
         drop(p);
         if created || changed {
-            self.studio.rev += 1;
-            self.mark();
+            self.rev += 1;
+            host.mark();
         }
     }
 
-    pub(crate) fn seq_pattern(&self, scene: usize) -> Option<usize> {
-        self.studio.seq.scene_pats.get(scene).copied().flatten()
+    pub fn seq_pattern(&self, scene: usize) -> Option<usize> {
+        self.seq.scene_pats.get(scene).copied().flatten()
     }
 
     /// Chain entries with their start beats.
     fn seq_chain_layout(&self) -> Vec<(usize, u32, f64)> {
         let mut b = 0.0;
-        self.studio
-            .seq
+        self.seq
             .chain
             .iter()
             .filter(|(s, _)| self.seq_pattern(*s).is_some())
@@ -94,88 +93,71 @@ impl App {
     }
 
     /// The scene playing at the playhead (or being edited, when stopped).
-    pub(crate) fn seq_current(&self) -> (usize, Option<(usize, f64)>) {
+    pub fn seq_current(&self, host: &dyn Host) -> (usize, Option<(usize, f64)>) {
         let lay = self.seq_chain_layout();
-        let b = self.playhead_beats;
+        let b = host.playhead_beats();
         for (i, (s, n, at)) in lay.iter().enumerate() {
             if b >= *at && b < at + 4.0 * *n as f64 {
-                if self.playback.is_playing() {
+                if host.playing() {
                     return (*s, Some((i, (b - at) / (4.0 * *n as f64))));
                 }
-                return (self.studio.seq.scene, Some((i, (b - at) / (4.0 * *n as f64))));
+                return (self.seq.scene, Some((i, (b - at) / (4.0 * *n as f64))));
             }
         }
-        (self.studio.seq.scene, None)
+        (self.seq.scene, None)
     }
 
     /// Lay the song chain out as pattern clips on the "sequence" track and
     /// loop over it.
-    pub(crate) fn seq_build_arrangement(&mut self) {
-        if self.mode != AppMode::Arrange || self.studio.seq.built_rev == self.studio.rev {
+    pub fn seq_build_arrangement(&mut self, host: &mut dyn Host) {
+        if self.seq.built_rev == self.rev {
             return;
         }
-        let lay = self.seq_chain_layout();
+        let lay: Vec<(usize, f64, f64)> = self
+            .seq_chain_layout()
+            .iter()
+            .filter_map(|(s, n, at)| Some((self.seq.scene_pats[*s]?, *at, 4.0 * *n as f64)))
+            .collect();
         if lay.is_empty() {
             return;
         }
-        self.studio.seq.built_rev = self.studio.rev;
-        let total = lay.iter().map(|(_, n, _)| 4.0 * *n as f64).sum::<f64>();
-        {
-            let mut p = self.project.lock().unwrap();
-            let ti = match p.tracks.iter().position(|t| t.name == "sequence") {
-                Some(t) => t,
-                None => {
-                    p.tracks.insert(0, chromagrain_core::timeline::Track { name: "sequence".into(), ..Default::default() });
-                    0
-                }
-            };
-            p.tracks[ti].clips = lay
-                .iter()
-                .filter_map(|(s, n, at)| {
-                    let pid = self.studio.seq.scene_pats[*s]?;
-                    Some(Clip::new_pattern(pid, *at, 4.0 * *n as f64))
-                })
-                .collect();
+        if host.sequence_changed(&lay) {
+            self.seq.built_rev = self.rev;
         }
-        self.loop_on = true;
-        self.loop_start = 0.0;
-        self.loop_end = total.max(self.loop_end.min(0.0) + total);
-        self.playback.set_loop(self.loop_region());
-        self.mark_now();
     }
 
     /// Queued scenes start on the next bar.
-    pub(crate) fn seq_tick(&mut self) {
-        let Some(q) = self.studio.seq.queued else { return };
-        if !self.playback.is_playing() {
-            self.seq_jump(q);
+    pub fn seq_tick(&mut self, host: &mut dyn Host) {
+        let Some(q) = self.seq.queued else { return };
+        if !host.playing() {
+            self.seq_jump(host, q);
             return;
         }
-        let bar = (self.playhead_beats / 4.0).floor();
-        let prev = self.studio.bar_memo.replace(bar);
+        let bar = (host.playhead_beats() / 4.0).floor();
+        let prev = self.bar_memo.replace(bar);
         if prev.is_some_and(|pb| pb != bar) {
-            self.seq_jump(q);
+            self.seq_jump(host, q);
         }
     }
 
-    fn seq_jump(&mut self, scene: usize) {
-        self.studio.seq.queued = None;
-        self.studio.seq.scene = scene;
-        self.studio.bar_memo = None;
+    fn seq_jump(&mut self, host: &mut dyn Host, scene: usize) {
+        self.seq.queued = None;
+        self.seq.scene = scene;
+        self.bar_memo = None;
         if let Some((_, _, at)) = self.seq_chain_layout().into_iter().find(|(s, _, _)| *s == scene) {
-            self.seek(at);
+            host.seek(at);
         }
     }
 
     /// The most recent hit at or before the playhead in the current scene
     /// (source, media seconds): the Sequence monitor holds it between hits.
-    pub(crate) fn seq_last_hit(&self) -> Option<(usize, f64)> {
-        let (scene, at) = self.seq_current();
+    pub fn seq_last_hit(&self, host: &dyn Host) -> Option<(usize, f64)> {
+        let (scene, at) = self.seq_current(host);
         let pid = self.seq_pattern(scene)?;
         let lay = self.seq_chain_layout();
         let start = at.and_then(|(i, _)| lay.get(i)).map(|e| e.2).unwrap_or(0.0);
-        let slot = ((self.playhead_beats - start).max(0.0) * 4.0).floor() as i64;
-        let p = self.project.lock().unwrap();
+        let slot = ((host.playhead_beats() - start).max(0.0) * 4.0).floor() as i64;
+        let p = host.project().lock().unwrap();
         let pat = p.patterns.get(pid)?;
         let mut best: Option<(i64, usize, f32)> = None;
         for row in pat.rows.iter().filter(|r| !r.muted) {
@@ -202,25 +184,25 @@ impl App {
         Some((src, pos as f64 * len))
     }
 
-    pub(crate) fn seq_step(&self, scene: usize, lane: usize, step: usize) -> Option<chromagrain_core::seq::Step> {
+    pub fn seq_step(&self, host: &dyn Host, scene: usize, lane: usize, step: usize) -> Option<chromagrain_core::seq::Step> {
         let pid = self.seq_pattern(scene)?;
-        let p = self.project.lock().unwrap();
+        let p = host.project().lock().unwrap();
         p.patterns.get(pid)?.rows.get(lane)?.steps.get(step).copied()
     }
 
-    pub(crate) fn seq_edit_step(&mut self, scene: usize, lane: usize, step: usize, f: impl FnOnce(&mut chromagrain_core::seq::Step)) {
+    pub fn seq_edit_step(&mut self, host: &mut dyn Host, scene: usize, lane: usize, step: usize, f: impl FnOnce(&mut chromagrain_core::seq::Step)) {
         let Some(pid) = self.seq_pattern(scene) else { return };
-        let mut p = self.project.lock().unwrap();
+        let mut p = host.project().lock().unwrap();
         if let Some(st) = p.patterns.get_mut(pid).and_then(|pat| pat.rows.get_mut(lane)).and_then(|r| r.steps.get_mut(step)) {
             f(st);
         }
         drop(p);
-        self.mark();
+        host.mark();
     }
 
     /// Tap: toggle a step. Turning one on picks the slice under it.
-    pub(crate) fn seq_toggle(&mut self, scene: usize, lane: usize, step: usize) {
-        self.seq_edit_step(scene, lane, step, |s| {
+    pub fn seq_toggle(&mut self, host: &mut dyn Host, scene: usize, lane: usize, step: usize) {
+        self.seq_edit_step(host, scene, lane, step, |s| {
             s.on = !s.on;
             if s.on && s.slice < 0.0 {
                 s.slice = (step as f32 + 0.5) / STEPS as f32;
@@ -228,61 +210,61 @@ impl App {
         });
     }
 
-    fn lane_len(&self, scene: usize, lane: usize) -> usize {
+    fn lane_len(&self, host: &dyn Host, scene: usize, lane: usize) -> usize {
         let Some(pid) = self.seq_pattern(scene) else { return STEPS };
-        let p = self.project.lock().unwrap();
+        let p = host.project().lock().unwrap();
         p.patterns.get(pid).and_then(|pat| pat.rows.get(lane)).map(|r| r.steps.len()).unwrap_or(STEPS)
     }
 
-    pub(crate) fn lane_muted(&self, scene: usize, lane: usize) -> bool {
+    pub fn lane_muted(&self, host: &dyn Host, scene: usize, lane: usize) -> bool {
         let Some(pid) = self.seq_pattern(scene) else { return false };
-        let p = self.project.lock().unwrap();
+        let p = host.project().lock().unwrap();
         p.patterns.get(pid).and_then(|pat| pat.rows.get(lane)).is_some_and(|r| r.muted)
     }
 
-    pub(crate) fn set_lane_len(&mut self, lane: usize, n: usize) {
-        let mut p = self.project.lock().unwrap();
-        for pid in self.studio.seq.scene_pats.iter().flatten() {
+    pub fn set_lane_len(&mut self, host: &mut dyn Host, lane: usize, n: usize) {
+        let mut p = host.project().lock().unwrap();
+        for pid in self.seq.scene_pats.iter().flatten() {
             if let Some(r) = p.patterns.get_mut(*pid).and_then(|pat| pat.rows.get_mut(lane)) {
                 r.set_steps(n.clamp(1, 64));
             }
         }
         drop(p);
-        self.mark();
+        host.mark();
     }
 
-    fn toggle_lane_mute(&mut self, lane: usize) {
-        let mut p = self.project.lock().unwrap();
-        for pid in self.studio.seq.scene_pats.iter().flatten() {
+    fn toggle_lane_mute(&mut self, host: &mut dyn Host, lane: usize) {
+        let mut p = host.project().lock().unwrap();
+        for pid in self.seq.scene_pats.iter().flatten() {
             if let Some(r) = p.patterns.get_mut(*pid).and_then(|pat| pat.rows.get_mut(lane)) {
                 r.muted = !r.muted;
             }
         }
         drop(p);
-        self.mark();
+        host.mark();
     }
 
     /// Tap a scene: queue it; an empty scene copies the current one.
-    pub(crate) fn seq_scene_tap(&mut self, s: usize) {
+    pub fn seq_scene_tap(&mut self, host: &mut dyn Host, s: usize) {
         if self.seq_pattern(s).is_none() {
-            let (cur, _) = self.seq_current();
+            let (cur, _) = self.seq_current(host);
             let Some(src) = self.seq_pattern(cur) else { return };
-            let mut p = self.project.lock().unwrap();
+            let mut p = host.project().lock().unwrap();
             let mut pat = p.patterns[src].clone();
             pat.name = format!("scene {}", s + 1);
             let pid = p.add_pattern(pat);
             drop(p);
-            self.studio.seq.scene_pats[s] = Some(pid);
-            self.studio.seq.chain.push((s, 2));
-            self.studio.rev += 1;
+            self.seq.scene_pats[s] = Some(pid);
+            self.seq.chain.push((s, 2));
+            self.rev += 1;
         }
-        self.studio.seq.scene = s;
-        self.studio.seq.queued = Some(s);
+        self.seq.scene = s;
+        self.seq.queued = Some(s);
     }
 
     // ------------------------------------------------------------ view
 
-    pub(crate) fn sequence_view(&mut self, ui: &mut egui::Ui, area: Rect) {
+    pub fn sequence_view(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, area: Rect) {
         let narrow = area.width() < 1100.0;
         let (lanes_rect, song) = if narrow {
             let strip_h = (area.height() * 0.17).clamp(70.0, 110.0);
@@ -293,16 +275,16 @@ impl App {
             let song = Rect::from_min_max(egui::pos2(area.right() - rw, area.top()), area.max);
             (Rect::from_min_max(area.min, egui::pos2(song.left() - 24.0, area.bottom())), song)
         };
-        self.seq_lanes(ui, lanes_rect);
+        self.seq_lanes(host, ui, lanes_rect);
         if narrow {
-            self.song_strip(ui, song);
+            self.song_strip(host, ui, song);
         } else {
-            self.song_column(ui, song);
+            self.song_column(host, ui, song);
         }
-        self.step_sheet(ui);
+        self.step_sheet(host, ui);
     }
 
-    fn seq_lanes(&mut self, ui: &mut egui::Ui, area: Rect) {
+    fn seq_lanes(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, area: Rect) {
         let ctx = ui.ctx().clone();
         let p = ui.painter().clone();
         let g = 4.0;
@@ -312,17 +294,17 @@ impl App {
         let group = if area.width() < 900.0 { 4.0 } else { 8.0 };
         let sw = (area.right() - sx - g * 15.0 - group * 3.0) / STEPS as f32;
         let step_x = |s: usize| sx + s as f32 * (sw + g) + (s / 4) as f32 * group;
-        let (scene, playing_at) = self.seq_current();
-        let playing = self.playback.is_playing();
-        let key = self.studio.key;
+        let (scene, playing_at) = self.seq_current(host);
+        let playing = host.playing();
+        let key = self.key;
         let lay = self.seq_chain_layout();
         let clip_start = playing_at.and_then(|(i, _)| lay.get(i)).map(|e| e.2).unwrap_or(0.0);
-        let slot = ((self.playhead_beats - clip_start).max(0.0) * 4.0).floor() as usize;
+        let slot = ((host.playhead_beats() - clip_start).max(0.0) * 4.0).floor() as usize;
         let mut first_empty = true;
         for lane in 0..LANES {
             let y = area.top() + lane as f32 * (lh + g);
             let header = Rect::from_min_size(egui::pos2(area.left(), y), egui::vec2(hw, lh));
-            let src = self.studio.seq.lanes[lane];
+            let src = self.seq.lanes[lane];
             let Some(src) = src else {
                 // Empty lane: the first one is the "drop a video" slot.
                 p.rect_filled(header, r(8), G1);
@@ -332,9 +314,7 @@ impl App {
                     let resp = hit(ui, header, ui.id().with(("lane-add", lane)), Sense::click(), "add a lane");
                     draw_icon(&p, Icon::Plus, header.center(), 16.0, if resp.hovered() { INK2 } else { INK3 });
                     if resp.clicked() {
-                        if let Some(path) = rfd::FileDialog::new().pick_file() {
-                            self.import_path(path, None);
-                        }
+                        host.import_media();
                     }
                 }
                 for s in 0..STEPS {
@@ -343,11 +323,11 @@ impl App {
                 }
                 continue;
             };
-            let len = self.lane_len(scene, lane);
-            let muted = self.lane_muted(scene, lane);
-            let steps: Vec<chromagrain_core::seq::Step> = (0..len).filter_map(|s| self.seq_step(scene, lane, s)).collect();
+            let len = self.lane_len(host, scene, lane);
+            let muted = self.lane_muted(host, scene, lane);
+            let steps: Vec<chromagrain_core::seq::Step> = (0..len).filter_map(|s| self.seq_step(host, scene, lane, s)).collect();
             let silent = steps.iter().all(|s| !s.on);
-            let at = self.atlas(&ctx, src);
+            let at = self.atlas(host, &ctx, src);
             // Header: the clip itself.
             if let Some((tex, a)) = at {
                 tile(&p, header, 8, tex, a.uv_cover(5, hw / lh), gray(if muted { 0.28 } else if silent { 0.5 } else { 0.86 }));
@@ -363,11 +343,11 @@ impl App {
             let hresp = hit(ui, header, ui.id().with(("lane-head", lane)), Sense::click(), &format!("lane {}", lane + 1));
             let h = hold(ui, &hresp, 0.45);
             if h.fired {
-                self.studio.deep = Some((DeepTarget::Lane(lane), DeepTab::Links));
+                self.deep = Some((DeepTarget::Lane(lane), DeepTab::Links));
             } else if hresp.clicked() && !h.held_before {
-                self.toggle_lane_mute(lane);
+                self.toggle_lane_mute(host, lane);
             }
-            let cur = if playing || self.playhead_beats > 0.0 { Some(slot % len.max(1)) } else { None };
+            let cur = if playing || host.playhead_beats() > 0.0 { Some(slot % len.max(1)) } else { None };
             for s in 0..STEPS {
                 let c = Rect::from_min_size(egui::pos2(step_x(s), y), egui::vec2(sw, lh));
                 if s >= len {
@@ -399,26 +379,26 @@ impl App {
                 if cur == Some(s) {
                     p.rect_stroke(c, r(6), Stroke::new(1.5, HI), StrokeKind::Inside);
                 }
-                if self.studio.seq.hold == Some((lane, s)) {
-                    self.studio.hold_rect = Some(c);
+                if self.seq.hold == Some((lane, s)) {
+                    self.hold_rect = Some(c);
                     p.rect_stroke(c.expand(1.0), r(7), Stroke::new(2.0, HI), StrokeKind::Inside);
                 }
                 let resp = hit(ui, c, ui.id().with(("step", lane, s)), Sense::click_and_drag(), &format!("lane {} step {}", lane + 1, s + 1));
                 let h = hold(ui, &resp, 0.45);
                 if h.fired {
-                    self.studio.seq.hold = Some((lane, s));
+                    self.seq.hold = Some((lane, s));
                     if !st.on {
-                        self.seq_toggle(scene, lane, s);
+                        self.seq_toggle(host, scene, lane, s);
                     }
                 } else if resp.clicked() && !h.held_before {
-                    self.seq_toggle(scene, lane, s);
+                    self.seq_toggle(host, scene, lane, s);
                 } else if resp.dragged() && st.on {
                     let acc = ui.data(|d| d.get_temp::<f32>(resp.id).unwrap_or(0.0)) - resp.drag_delta().y;
                     let steps_moved = (acc / 14.0).trunc();
                     if steps_moved != 0.0 {
                         let d = semis_to_degree(&key, st.pitch) + steps_moved as i32;
                         let semis = degree_to_semis(&key, d.clamp(-14, 14));
-                        self.seq_edit_step(scene, lane, s, |x| x.pitch = semis);
+                        self.seq_edit_step(host, scene, lane, s, |x| x.pitch = semis);
                         ui.data_mut(|dd| dd.insert_temp(resp.id, acc - steps_moved * 14.0));
                     } else {
                         ui.data_mut(|dd| dd.insert_temp(resp.id, acc));
@@ -434,7 +414,7 @@ impl App {
         }
     }
 
-    fn scene_cell(&mut self, ui: &mut egui::Ui, rect: Rect, s: usize, current: usize) {
+    fn scene_cell(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, rect: Rect, s: usize, current: usize) {
         let p = ui.painter().clone();
         let exists = self.seq_pattern(s).is_some();
         let on = s == current;
@@ -447,7 +427,7 @@ impl App {
             p.rect_filled(rect, r(10), G1);
             p.rect_stroke(rect, r(10), hair(LINE), StrokeKind::Inside);
         }
-        if self.studio.seq.queued == Some(s) && !on {
+        if self.seq.queued == Some(s) && !on {
             let t = ui.input(|i| i.time);
             if (t * 3.0).fract() < 0.5 {
                 p.rect_stroke(rect, r(10), Stroke::new(1.5, HI), StrokeKind::Inside);
@@ -460,7 +440,7 @@ impl App {
         if exists && !small {
             // A tiny bar per lane: which lanes play in this scene.
             let pid = self.seq_pattern(s).unwrap();
-            let pp = self.project.lock().unwrap();
+            let pp = host.project().lock().unwrap();
             let rows: Vec<bool> = pp.patterns.get(pid).map(|pat| pat.rows.iter().map(|r| r.steps.iter().any(|s| s.on) && !r.muted).collect()).unwrap_or_default();
             drop(pp);
             let n = rows.len().max(1);
@@ -472,14 +452,14 @@ impl App {
             }
         }
         if resp.clicked() {
-            self.seq_scene_tap(s);
+            self.seq_scene_tap(host, s);
         }
     }
 
-    fn chain_row(&mut self, ui: &mut egui::Ui, rect: Rect) {
+    fn chain_row(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, rect: Rect) {
         let p = ui.painter().clone();
         let lay = self.seq_chain_layout();
-        let (_, at) = self.seq_current();
+        let (_, at) = self.seq_current(host);
         let mut x = rect.left();
         let h = rect.height();
         for (i, (s, n, start)) in lay.iter().enumerate() {
@@ -504,68 +484,68 @@ impl App {
                 &[(&(s + 1).to_string(), mono_medium(12.0), if cur { INK } else { INK2 }), (&format!(" ×{n}"), mono(11.0), INK3)],
             );
             if resp.clicked() {
-                self.seek(*start);
+                host.seek(*start);
             }
             x = cr.right() + 5.0;
         }
         draw_loop_glyph(&p, egui::pos2(x + 8.0, rect.center().y), INK3);
     }
 
-    fn song_column(&mut self, ui: &mut egui::Ui, col: Rect) {
+    fn song_column(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, col: Rect) {
         let stage = Rect::from_min_size(col.min, egui::vec2(col.width(), (col.width() * 9.0 / 16.0).floor()));
-        self.stage(ui, stage, 12.0);
-        let (cur, _) = self.seq_current();
+        self.stage(host, ui, stage, 12.0);
+        let (cur, _) = self.seq_current(host);
         let g = 8.0;
         let sw = (col.width() - g * 3.0) / 4.0;
         let sh = 64.0;
         for s in 0..SCENES {
             let rc = Rect::from_min_size(egui::pos2(col.left() + (s % 4) as f32 * (sw + g), stage.bottom() + 14.0 + (s / 4) as f32 * (sh + g)), egui::vec2(sw, sh));
-            self.scene_cell(ui, rc, s, cur);
+            self.scene_cell(host, ui, rc, s, cur);
         }
         let chain = Rect::from_min_size(egui::pos2(col.left(), stage.bottom() + 14.0 + 2.0 * (sh + g) + 8.0), egui::vec2(col.width(), 36.0));
-        self.chain_row(ui, chain);
+        self.chain_row(host, ui, chain);
     }
 
-    fn song_strip(&mut self, ui: &mut egui::Ui, strip: Rect) {
+    fn song_strip(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, strip: Rect) {
         let h = strip.height();
         let stage = Rect::from_min_size(strip.min, egui::vec2(h * 16.0 / 9.0, h));
-        self.stage(ui, stage, 10.0);
-        let (cur, _) = self.seq_current();
+        self.stage(host, ui, stage, 10.0);
+        let (cur, _) = self.seq_current(host);
         let cell = (h * 0.47).clamp(36.0, 48.0);
         let y = strip.center().y - cell / 2.0;
         let mut x = stage.right() + 16.0;
         for s in 0..SCENES {
             let rc = Rect::from_min_size(egui::pos2(x, y), egui::vec2(cell, cell));
-            self.scene_cell(ui, rc, s, cur);
+            self.scene_cell(host, ui, rc, s, cur);
             x += cell + 6.0;
         }
         let chain = Rect::from_min_max(egui::pos2(x + 10.0, strip.center().y - 18.0), egui::pos2(strip.right(), strip.center().y + 18.0));
-        self.chain_row(ui, chain);
+        self.chain_row(host, ui, chain);
     }
 
     /// The step hold sheet: slice picker + pitch / length / chance.
-    fn step_sheet(&mut self, ui: &mut egui::Ui) {
-        let Some((lane, s)) = self.studio.seq.hold else { return };
-        let Some(src) = self.studio.seq.lanes[lane] else {
-            self.studio.seq.hold = None;
+    fn step_sheet(&mut self, host: &mut dyn Host, ui: &mut egui::Ui) {
+        let Some((lane, s)) = self.seq.hold else { return };
+        let Some(src) = self.seq.lanes[lane] else {
+            self.seq.hold = None;
             return;
         };
-        let (scene, _) = self.seq_current();
-        let Some(st) = self.seq_step(scene, lane, s) else { return };
+        let (scene, _) = self.seq_current(host);
+        let Some(st) = self.seq_step(host, scene, lane, s) else { return };
         let ctx = ui.ctx().clone();
         let id = egui::Id::new(("step-sheet", lane, s));
         let screen = ctx.screen_rect();
         let w = 360.0f32.min(screen.width() - 28.0);
         let hgt = 150.0;
         // Place under the step (above if no room).
-        let step_rect = self.studio.hold_rect.unwrap_or(Rect::from_center_size(screen.center(), egui::vec2(10.0, 10.0)));
+        let step_rect = self.hold_rect.unwrap_or(Rect::from_center_size(screen.center(), egui::vec2(10.0, 10.0)));
         let mut pos = egui::pos2(step_rect.center().x - w / 2.0, step_rect.bottom() + 8.0);
         if pos.y + hgt > screen.bottom() - 10.0 {
             pos.y = step_rect.top() - hgt - 8.0;
         }
         pos.x = pos.x.clamp(screen.left() + 14.0, screen.right() - w - 14.0);
         let sheet = Rect::from_min_size(pos, egui::vec2(w, hgt));
-        let at = self.atlas(&ctx, src);
+        let at = self.atlas(host, &ctx, src);
         let mut close = false;
         egui::Area::new(id).fixed_pos(sheet.min).order(egui::Order::Foreground).show(&ctx, |ui| {
             let (rect, _) = ui.allocate_exact_size(sheet.size(), Sense::click());
@@ -587,13 +567,13 @@ impl App {
                     p.rect_stroke(c, r(4), Stroke::new(1.5, HI), StrokeKind::Inside);
                 }
                 if hit(ui, c, id.with(("slice", i)), Sense::click(), &format!("slice {}", i + 1)).clicked() {
-                    self.seq_edit_step(scene, lane, s, |x| x.slice = (i as f32 + 0.5) / 16.0);
+                    self.seq_edit_step(host, scene, lane, s, |x| x.slice = (i as f32 + 0.5) / 16.0);
                 }
             }
             // Params.
             let py = inner.top() + 2.0 * (chh + 4.0) + 6.0;
             let pw = (inner.width() - 2.0 * 8.0) / 3.0;
-            let key = self.studio.key;
+            let key = self.key;
             let degree = semis_to_degree(&key, st.pitch);
             let len_i = LENGTHS.iter().position(|(l, _)| (*l - st.length).abs() < 1e-3).unwrap_or(1);
             let vals = [
@@ -615,15 +595,15 @@ impl App {
                         match k {
                             0 => {
                                 let semis = degree_to_semis(&key, (degree + step).clamp(-14, 14));
-                                self.seq_edit_step(scene, lane, s, |x| x.pitch = semis);
+                                self.seq_edit_step(host, scene, lane, s, |x| x.pitch = semis);
                             }
                             1 => {
                                 let ni = (len_i as i32 + step).clamp(0, LENGTHS.len() as i32 - 1) as usize;
-                                self.seq_edit_step(scene, lane, s, |x| x.length = LENGTHS[ni].0);
+                                self.seq_edit_step(host, scene, lane, s, |x| x.length = LENGTHS[ni].0);
                             }
                             _ => {
                                 let c = (st.chance + step as f32 * 0.05).clamp(0.0, 1.0);
-                                self.seq_edit_step(scene, lane, s, |x| x.chance = c);
+                                self.seq_edit_step(host, scene, lane, s, |x| x.chance = c);
                             }
                         }
                     } else {
@@ -638,7 +618,7 @@ impl App {
             close = true;
         }
         if close {
-            self.studio.seq.hold = None;
+            self.seq.hold = None;
         }
     }
 }

@@ -5,8 +5,11 @@
 //! snapshots as PNGs; without it they render (catching panics / GPU
 //! errors) but nothing is written.
 
-use super::*;
-use crate::{AppOpts, PADS};
+use crate::{App, AppMode, AppOpts, PADS};
+use chromagrain_ui::studio::sequence::{degree_to_semis, semis_to_degree};
+use chromagrain_ui::studio::{EMITTERS, STEPS};
+use chromagrain_ui::{DeepTab, DeepTarget, View};
+use eframe::egui;
 use chromagrain_core::timeline::Source;
 use egui_kittest::kittest::Queryable;
 use egui_kittest::Harness;
@@ -62,9 +65,10 @@ fn harness(size: (f32, f32), view: View, setup: impl FnOnce(&mut App) + 'static)
         .wgpu()
         .build_eframe(move |cc| {
             let mut app = App::new(AppOpts { demo: false, classic: false, headless: true });
-            app.studio_install_theme(&cc.egui_ctx);
-            if !crate::gpu::install(cc) {
-                app.gpu_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+            app.studio.install_theme(&cc.egui_ctx);
+            match cc.wgpu_render_state.as_ref() {
+                Some(rs) => crate::gpu::install(rs),
+                None => app.gpu_failed.store(true, std::sync::atomic::Ordering::Relaxed),
             }
             {
                 let mut p = app.project.lock().unwrap();
@@ -74,9 +78,11 @@ fn harness(size: (f32, f32), view: View, setup: impl FnOnce(&mut App) + 'static)
                 }
             }
             app.mark_now();
-            app.studio_sync_columns();
-            app.seq_ensure();
-            app.studio_set_view(view);
+            app.with_studio(|st, h| {
+                st.sync_columns(h);
+                st.seq_ensure(h);
+                st.set_view(h, view);
+            });
             setup(&mut app);
             app
         })
@@ -104,16 +110,18 @@ fn showcase(app: &mut App) {
     let key = app.studio.key;
     for (lane, (hits, len)) in steps.iter().enumerate() {
         if *len != STEPS {
-            app.set_lane_len(lane, *len);
+            app.with_studio(|st, h| st.set_lane_len(h, lane, *len));
         }
         for (s, deg) in hits.iter() {
-            app.seq_toggle(0, lane, *s);
-            let semis = super::sequence::degree_to_semis(&key, *deg);
-            app.seq_edit_step(0, lane, *s, |x| x.pitch = semis);
+            let semis = degree_to_semis(&key, *deg);
+            app.with_studio(|st, h| {
+                st.seq_toggle(h, 0, lane, *s);
+                st.seq_edit_step(h, 0, lane, *s, |x| x.pitch = semis);
+            });
         }
     }
     for s in 1..4 {
-        app.seq_scene_tap(s);
+        app.with_studio(|st, h| st.seq_scene_tap(h, s));
     }
     app.studio.seq.queued = None;
     app.studio.seq.scene = 0;
@@ -131,6 +139,13 @@ fn shot(h: &mut Harness<'static, App>, name: &str) {
         img.save(&path).unwrap();
         eprintln!("wrote {}", path.display());
     }
+}
+
+fn step_of(h: &Harness<'static, App>, scene: usize, lane: usize, step: usize) -> Option<chromagrain_core::seq::Step> {
+    let app = h.state();
+    let pid = app.studio.seq_pattern(scene)?;
+    let p = app.project.lock().unwrap();
+    p.patterns.get(pid)?.rows.get(lane)?.steps.get(step).copied()
 }
 
 fn push(h: &mut Harness<'static, App>, e: egui::Event) {
@@ -177,20 +192,20 @@ fn snapshots_every_view_at_every_size() {
 fn tapping_a_step_toggles_it() {
     let mut h = harness(SIZES[0], View::Sequence, |_| {});
     h.run_steps(3);
-    assert!(!h.state().seq_step(0, 0, 2).unwrap().on);
+    assert!(!step_of(&h, 0, 0, 2).unwrap().on);
     h.get_by_label("lane 1 step 3").click();
     h.run_steps(2);
-    let st = h.state().seq_step(0, 0, 2).unwrap();
+    let st = step_of(&h, 0, 0, 2).unwrap();
     assert!(st.on, "tap turns the step on");
     assert!(st.slice >= 0.0, "and picks the slice under it");
     h.get_by_label("lane 1 step 3").click();
     h.run_steps(2);
-    assert!(!h.state().seq_step(0, 0, 2).unwrap().on, "tap again turns it off");
+    assert!(!step_of(&h, 0, 0, 2).unwrap().on, "tap again turns it off");
 }
 
 #[test]
 fn holding_a_step_opens_its_sheet_and_dragging_sets_pitch() {
-    let mut h = harness(SIZES[0], View::Sequence, |app| app.seq_toggle(0, 2, 4));
+    let mut h = harness(SIZES[0], View::Sequence, |app| app.with_studio(|st, h| st.seq_toggle(h, 0, 2, 4)));
     h.run_steps(3);
     let rect = h.get_by_label("lane 3 step 5").rect();
     push(&mut h, egui::Event::PointerMoved(rect.center()));
@@ -201,7 +216,7 @@ fn holding_a_step_opens_its_sheet_and_dragging_sets_pitch() {
     assert_eq!(h.state().studio.seq.hold, Some((2, 4)), "hold opens the step sheet");
     push(&mut h, egui::Event::PointerButton { pos: rect.center(), button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
     h.run_steps(2);
-    assert!(h.state().seq_step(0, 2, 4).unwrap().on, "a hold is not a toggle");
+    assert!(step_of(&h, 0, 2, 4).unwrap().on, "a hold is not a toggle");
     // Drag up on an active step: pitch goes up by key degrees.
     h.state_mut().studio.seq.hold = None;
     h.run_steps(1);
@@ -215,11 +230,11 @@ fn holding_a_step_opens_its_sheet_and_dragging_sets_pitch() {
     }
     push(&mut h, egui::Event::PointerButton { pos: c - egui::vec2(0.0, 48.0), button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
     h.run_steps(2);
-    let st = h.state().seq_step(0, 2, 4).unwrap();
+    let st = step_of(&h, 0, 2, 4).unwrap();
     assert!(st.pitch > 0.0, "dragging up raised the pitch ({})", st.pitch);
     let key = h.state().studio.key;
-    let d = super::sequence::semis_to_degree(&key, st.pitch);
-    assert!((super::sequence::degree_to_semis(&key, d) - st.pitch).abs() < 1e-4, "pitch stays on a key degree");
+    let d = semis_to_degree(&key, st.pitch);
+    assert!((degree_to_semis(&key, d) - st.pitch).abs() < 1e-4, "pitch stays on a key degree");
 }
 
 #[test]
@@ -294,7 +309,7 @@ fn knobs_drive_the_shared_macro_map_and_buses() {
         app.studio.emitters[0].macros[2] = 0.8;
     });
     h.run_steps(3);
-    let buses = h.state().studio_buses();
+    let buses = h.state().studio.buses();
     assert_eq!(buses.len(), EMITTERS);
     let names: Vec<&str> = buses[0].effects.iter().map(|f| f.kind.name()).collect();
     assert_eq!(names, ["delay", "reverb", "crush"], "smear echo + reverb, then the look");
@@ -317,7 +332,7 @@ fn knobs_drive_the_shared_macro_map_and_buses() {
 #[test]
 fn rec_bounces_played_grains_into_a_take() {
     let mut h = harness(SIZES[2], View::Play, |app| {
-        app.studio_toggle_rec();
+        app.with_studio(|st, h| st.toggle_rec(h));
         app.studio.emitters[0].held = true;
     });
     h.run_steps(10);
@@ -325,7 +340,7 @@ fn rec_bounces_played_grains_into_a_take() {
     h.run_steps(4);
     h.state_mut().studio.emitters[0].held = false;
     let n0 = h.state().project.lock().unwrap().sources.len();
-    h.state_mut().studio_toggle_rec();
+    h.state_mut().with_studio(|st, h| st.toggle_rec(h));
     for _ in 0..200 {
         h.step();
         if h.state().project.lock().unwrap().sources.len() > n0 {

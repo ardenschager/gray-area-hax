@@ -1,8 +1,8 @@
 //! Studio widgets, custom-painted: segmented switches, chips, knobs,
 //! emitter rings, rounded footage tiles, icons, hold detection.
 
-use super::theme::*;
-use eframe::egui::{
+use crate::theme::*;
+use egui::{
     self, epaint::RectShape, text::LayoutJob, Align2, Color32, FontId, Painter, Pos2, Rect,
     Response, Sense, Shape, Stroke, StrokeKind, TextFormat, TextureId, Ui, Vec2,
 };

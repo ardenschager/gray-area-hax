@@ -821,6 +821,7 @@ name = "chromagrain"
 version = "0.1.0"
 dependencies = [
  "chromagrain-core",
+ "chromagrain-ui",
  "cpal",
  "eframe",
  "egui_kittest",
@@ -856,6 +857,19 @@ dependencies = [
  "nih_plug_egui",
  "rfd",
  "rtrb",
+]
+
+[[package]]
+name = "chromagrain-ui"
+version = "0.1.0"
+dependencies = [
+ "chromagrain-core",
+ "egui 0.32.3",
+ "egui-wgpu",
+ "egui_kittest",
+ "pollster",
+ "raw-window-handle 0.6.2",
+ "wgpu",
 ]
 
 [[package]]
@@ -4879,6 +4893,7 @@ dependencies = [
  "hashbrown 0.15.5",
  "js-sys",
  "log",
+ "naga",
  "parking_lot",
  "portable-atomic",
  "profiling",
@@ -4886,6 +4901,7 @@ dependencies = [
  "smallvec",
  "static_assertions",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "web-sys",
  "wgpu-core",
  "wgpu-hal",

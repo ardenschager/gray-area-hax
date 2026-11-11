@@ -3,7 +3,7 @@
 //! are all UV sub-rects of the footage.
 
 use chromagrain_core::timeline::Source;
-use eframe::egui::{self, Color32, ColorImage, Rect, TextureHandle, TextureOptions};
+use egui::{self, Color32, ColorImage, Rect, TextureHandle, TextureOptions};
 use std::collections::HashMap;
 
 pub const FRAMES: usize = 16;
