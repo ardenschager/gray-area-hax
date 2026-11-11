@@ -551,6 +551,9 @@ pub struct GpuPreview {
     /// Slab index of the last rendered canvas (what `present` samples).
     final_tex: Option<usize>,
     last_frame: Option<u64>,
+    /// Offscreen scene renders so far (one per app frame, however many
+    /// windows present it).
+    pub renders: u64,
 }
 
 fn make_tex(device: &wgpu::Device, w: u32, h: u32, layers: u32, format: wgpu::TextureFormat, target: bool) -> wgpu::Texture {
@@ -702,6 +705,7 @@ impl GpuPreview {
             passes: Vec::new(),
             final_tex: None,
             last_frame: None,
+            renders: 0,
         }
     }
 
@@ -1015,6 +1019,7 @@ impl GpuPreview {
         let (w, h) = (scene.project.width.max(2), scene.project.height.max(2));
         self.ensure_targets(w, h);
         self.passes.clear();
+        self.renders += 1;
 
         // Upload any sources we need.
         let needed: Vec<usize> =
@@ -1372,26 +1377,32 @@ mod tests {
             frame,
         };
         let cb = g.render(&scene);
-        let (w, h) = (p.width, p.height);
+        g.queue.submit([cb]);
+        let tex = &g.targets[g.final_tex.unwrap()].tex;
+        read_tex(&g.device, &g.queue, tex, p.width, p.height)
+    }
+
+    /// Read an RGBA8 texture back to the CPU.
+    fn read_tex(device: &wgpu::Device, queue: &wgpu::Queue, tex: &wgpu::Texture, w: u32, h: u32) -> Frame {
         let row = (w * 4).div_ceil(256) * 256;
-        let buf = g.device.create_buffer(&wgpu::BufferDescriptor {
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size: (row * h) as u64,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        let mut enc = g.device.create_command_encoder(&Default::default());
+        let mut enc = device.create_command_encoder(&Default::default());
         enc.copy_texture_to_buffer(
-            g.targets[g.final_tex.unwrap()].tex.as_image_copy(),
+            tex.as_image_copy(),
             wgpu::TexelCopyBufferInfo {
                 buffer: &buf,
                 layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(h) },
             },
             wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
         );
-        g.queue.submit([cb, enc.finish()]);
+        queue.submit([enc.finish()]);
         buf.slice(..).map_async(wgpu::MapMode::Read, |r| r.unwrap());
-        g.device.poll(wgpu::PollType::Wait).unwrap();
+        device.poll(wgpu::PollType::Wait).unwrap();
         let data = buf.slice(..).get_mapped_range();
         let mut out = Frame::black(w, h);
         for y in 0..h as usize {
@@ -1399,6 +1410,141 @@ mod tests {
             out.data[y * w as usize * 4..(y + 1) * w as usize * 4].copy_from_slice(src);
         }
         out
+    }
+
+    fn px_close(a: [u8; 4], b: [u8; 4], tol: i32) -> bool {
+        (0..3).all(|c| (a[c] as i32 - b[c] as i32).abs() <= tol)
+    }
+
+    /// The multi-window path exactly as egui-wgpu drives it: for each
+    /// "window" (an offscreen surface), `prepare` then `paint` inside a
+    /// render pass whose viewport/scissor egui would set. Two windows of
+    /// different sizes show the same frame: one offscreen render, both
+    /// presents letterboxed in their rects, nothing drawn outside them;
+    /// a rect larger than the window (cover fullscreen) is cropped, not
+    /// squeezed.
+    #[test]
+    fn every_window_presents_one_shared_render() {
+        use egui_wgpu::CallbackTrait;
+        let Some((device, queue)) = device() else {
+            eprintln!("no wgpu adapter: skipping multi-window present test");
+            return;
+        };
+        let mut res = egui_wgpu::CallbackResources::default();
+        res.insert(GpuPreview::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm));
+        let p = project(None);
+        let scene = Arc::new(Mutex::new(Some(Scene {
+            project: p.clone(),
+            plan: Arc::new(plan_project(&p)),
+            t: 1.25,
+            live: Vec::new(),
+            live_t: 0.0,
+            parked: false,
+            frame: 7,
+        })));
+        let aspect = p.width as f32 / p.height as f32;
+        let r = |x: f32, y: f32, w: f32, h: f32| egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h));
+        // (window size px, pixels_per_point, canvas rect in points)
+        let windows = [
+            // editor: the preview is a panel inside a bigger window
+            ((900u32, 600u32), 1.0f32, r(100.0, 80.0, 400.0, 240.0)),
+            // performance output on a 4:3 projector: letterboxed
+            ((1024, 768), 1.0, crate::displays::fit(r(0.0, 0.0, 1024.0, 768.0), aspect)),
+            // retina output window, ppp 2
+            ((1280, 720), 2.0, crate::displays::fit(r(0.0, 0.0, 640.0, 360.0), aspect)),
+            // cover fullscreen: rect overflows the window and is cropped
+            ((600, 600), 1.0, egui::Rect::from_center_size(egui::pos2(300.0, 300.0), egui::vec2(600.0 * aspect, 600.0))),
+        ];
+        let marker = [255u8, 0, 255, 255];
+        let mut shots = Vec::new();
+        for ((w, h), ppp, rect) in windows {
+            let surface = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("fake window"),
+                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let view = surface.create_view(&Default::default());
+            let cb = PreviewCallback { scene: scene.clone(), rect, slot: AtomicUsize::new(usize::MAX) };
+            let sd = egui_wgpu::ScreenDescriptor { size_in_pixels: [w, h], pixels_per_point: ppp };
+            let mut enc = device.create_command_encoder(&Default::default());
+            let mut cmds = cb.prepare(&device, &queue, &sd, &mut enc, &mut res);
+            {
+                let mut rp = enc
+                    .begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: None,
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color { r: 1.0, g: 0.0, b: 1.0, a: 1.0 }),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        ..Default::default()
+                    })
+                    .forget_lifetime();
+                let info = egui::PaintCallbackInfo {
+                    viewport: rect,
+                    clip_rect: rect,
+                    pixels_per_point: ppp,
+                    screen_size_px: [w, h],
+                };
+                let vp = info.viewport_in_pixels();
+                let clip = info.clip_rect_in_pixels();
+                rp.set_viewport(vp.left_px as f32, vp.top_px as f32, vp.width_px as f32, vp.height_px as f32, 0.0, 1.0);
+                rp.set_scissor_rect(clip.left_px as u32, clip.top_px as u32, clip.width_px as u32, clip.height_px as u32);
+                cb.paint(info, &mut rp, &res);
+            }
+            cmds.push(enc.finish());
+            queue.submit(cmds);
+            shots.push(((w, h), ppp, rect, read_tex(&device, &queue, &surface, w, h)));
+        }
+        let g = res.get::<GpuPreview>().unwrap();
+        assert_eq!(g.renders, 1, "four windows, one frame: rendered once");
+        let canvas = read_tex(&device, &queue, &g.targets[g.final_tex.unwrap()].tex, p.width, p.height);
+        let canvas_center = canvas.get(p.width / 2, p.height / 2);
+        assert!(canvas.mean_luma() > 10.0);
+
+        for ((w, h), ppp, rect, shot) in &shots {
+            let px = |pt: egui::Pos2| ((pt.x * ppp) as u32, (pt.y * ppp) as u32);
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(*w as f32 / ppp, *h as f32 / ppp));
+            let vis = rect.intersect(screen);
+            // The canvas centre lands at the rect centre (also when cropped).
+            let (cx, cy) = px(rect.center());
+            assert!(px_close(shot.get(cx, cy), canvas_center, 24), "{w}x{h}: centre {:?} vs canvas {canvas_center:?}", shot.get(cx, cy));
+            // Inside the rect: picture. Outside: untouched.
+            let inside = px(vis.shrink(3.0).left_top());
+            assert_ne!(shot.get(inside.0, inside.1), marker, "{w}x{h}: picture fills its rect");
+            if vis.min.x > 3.0 {
+                let (ox, oy) = px(egui::pos2(vis.min.x - 3.0, vis.center().y));
+                assert_eq!(shot.get(ox, oy), marker, "{w}x{h}: nothing drawn outside the rect");
+            }
+            if vis.min.y > 3.0 {
+                let (ox, oy) = px(egui::pos2(vis.center().x, vis.min.y - 3.0));
+                assert_eq!(shot.get(ox, oy), marker, "{w}x{h}: letterbox bars stay clear");
+            }
+        }
+        // Cover: the window shows the middle of the canvas at full height —
+        // its left edge is the canvas column at the crop offset, not col 0.
+        let ((w, h), _, rect, shot) = &shots[3];
+        let crop_x0 = (0.0 - rect.min.x) / rect.width();
+        let col = ((crop_x0 * p.width as f32) as u32).min(p.width - 1);
+        let want = canvas.get(col, p.height / 2);
+        assert!(px_close(shot.get(1, h / 2), want, 40), "cover crops: {:?} vs canvas col {col} {want:?} ({w}x{h})", shot.get(1, h / 2));
+
+        // A new app frame renders again (temporal effects step once per frame).
+        scene.lock().unwrap().as_mut().unwrap().frame = 8;
+        let cb = PreviewCallback { scene: scene.clone(), rect: shots[0].2, slot: AtomicUsize::new(usize::MAX) };
+        let mut enc = device.create_command_encoder(&Default::default());
+        let sd = egui_wgpu::ScreenDescriptor { size_in_pixels: [900, 600], pixels_per_point: 1.0 };
+        let cmds = cb.prepare(&device, &queue, &sd, &mut enc, &mut res);
+        queue.submit(cmds);
+        assert_eq!(res.get::<GpuPreview>().unwrap().renders, 2);
     }
 
     fn mean_abs_diff(a: &Frame, b: &Frame) -> f32 {
