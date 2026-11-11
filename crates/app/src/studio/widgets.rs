@@ -238,7 +238,7 @@ pub fn draw_icon(p: &Painter, icon: Icon, c: Pos2, size: f32, col: Color32) {
             p.rect_filled(Rect::from_min_max(pt(7.0, 7.0), pt(17.0, 17.0)), r(2), col);
         }
         Icon::Square => {
-            p.rect_stroke(Rect::from_min_max(pt(6.5, 6.5), pt(17.5, 17.5)), r(2), st, StrokeKind::Middle);
+            p.rect_stroke(Rect::from_min_max(pt(5.5, 5.5), pt(18.5, 18.5)), r(1), Stroke::new(1.5, col), StrokeKind::Middle);
         }
         Icon::Deep => {
             for (y, x1) in [(7.0, 20.0), (12.0, 14.0), (17.0, 10.0)] {

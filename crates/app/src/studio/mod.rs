@@ -148,6 +148,8 @@ pub struct Studio {
     pub(crate) seeded_pads: bool,
     pub(crate) bar_memo: Option<f64>,
     pub(crate) hold_rect: Option<Rect>,
+    /// Fingers on the Play grid: (touch id, emitter).
+    pub(crate) touches: Vec<(u64, usize)>,
     fonts_installed: bool,
     /// Fonts set via `set_fonts` apply from the next frame on.
     fonts_ready: bool,
@@ -181,6 +183,7 @@ impl Default for Studio {
             seeded_pads: false,
             bar_memo: None,
             hold_rect: None,
+            touches: Vec::new(),
             fonts_installed: false,
             fonts_ready: false,
             rev: 1,
@@ -273,7 +276,13 @@ impl App {
     /// What the canvas shows under the grains in the Play view: the
     /// selected emitter's tile of footage, playing.
     pub(crate) fn studio_backdrop(&self) -> Option<(usize, f64)> {
-        if self.classic || self.studio.view != View::Play {
+        if self.classic {
+            return None;
+        }
+        if self.studio.view == View::Sequence {
+            return self.seq_last_hit();
+        }
+        if self.studio.view != View::Play {
             return None;
         }
         let e = &self.studio.emitters[self.studio.sel_emitter];
