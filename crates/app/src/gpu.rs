@@ -1,8 +1,19 @@
-//! GPU preview pipeline (glow / OpenGL 3.3): renders the composition in
-//! real time for performance playback. Grains are textured quads shaded
-//! with hue-shift + HSV color filtering; effect chains run as fragment
-//! passes (pixelate/posterize, ghost-history delay, persistence+blur
-//! reverb, separable 8x8 DCT compression); tracks composite in z-order.
+//! GPU preview pipeline (wgpu: Metal on macOS/iOS, D3D12/Vulkan on
+//! Windows/Linux, GL as a fallback): renders the composition in real time
+//! for performance playback. Grains are textured quads shaded with
+//! hue-shift + HSV color filtering; effect chains run as fragment passes
+//! (pixelate/posterize, ghost-history delay, persistence+blur reverb,
+//! separable 8x8 DCT compression, tint, tune, tile); tracks composite in
+//! z-order.
+//!
+//! Structure (multi-viewport friendly): the whole scene renders ONCE per
+//! app frame into an offscreen texture during the egui-wgpu `prepare`
+//! step (guarded by `Scene::frame`, so temporal effects advance once even
+//! when several windows show the picture); every viewport that shows the
+//! canvas then just samples that texture in its `paint` step. egui-wgpu
+//! shares one device and one callback-resource map across viewports, so
+//! the editor window and the performance output window draw the same
+//! texture.
 //!
 //! The CPU renderer (render_project) stays the deterministic reference
 //! used for export; this pipeline mirrors it closely enough to perform
@@ -14,9 +25,11 @@ use chromagrain_core::fx::{AvEffect, EffectKind};
 use chromagrain_core::render::ClipPlan;
 use chromagrain_core::timeline::Project;
 use chromagrain_core::video::{grain_draws, grain_draws_opts, ColorFilterMode, VisualGrainStyle};
-use eframe::glow::{self, HasContext};
+use eframe::egui;
+use eframe::egui_wgpu::{self, wgpu};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// What the pipeline draws each frame (cheap to clone: media is Arc'd).
 pub struct Scene {
@@ -28,19 +41,452 @@ pub struct Scene {
     pub live_t: f64,
     /// Transport stopped: long events ignore fades so the still frame shows.
     pub parked: bool,
+    /// App frame counter: the scene is rendered once per distinct value,
+    /// however many viewports present it.
+    pub frame: u64,
 }
 
 const MAX_SRC_W: u32 = 256;
 const MAX_SRC_LAYERS: usize = 192;
 const MAX_HISTORY: usize = 40;
+/// Dynamic-offset stride for per-draw uniforms (WebGPU's guaranteed
+/// minimum uniform offset alignment).
+const UNI_STRIDE: u64 = 256;
+/// Present uniforms ring (one slot per canvas shown per frame).
+const PRESENT_SLOTS: usize = 16;
+const RGBA8: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+const RGBA16F: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
+// Slab indices of the fixed render targets.
+const MASTER: usize = 0;
+const TRACK: usize = 1;
+const CLIP: usize = 2;
+const PING: usize = 3;
+const PONG: usize = 4;
+const FPING: usize = 5;
+const FPONG: usize = 6;
+const FIXED_TARGETS: usize = 7;
+
+/// Per-draw uniforms: one struct shared by every pass (unused fields are
+/// ignored). Mirrors `struct U` in the WGSL below.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Uni {
+    /// Destination rect x,y,w,h in 0..1, y-down.
+    rect: [f32; 4],
+    /// Source patch (grains) / source uv crop (present).
+    patch: [f32; 4],
+    /// Color filter: center_deg, half_width_deg, softness, sat_min.
+    cf: [f32; 4],
+    /// rot (rad), aspect, layer, alpha.
+    a: [f32; 4],
+    /// hue (deg), cf_mode, cf_valmin, additive.
+    b: [f32; 4],
+    /// opacity, alpha_mul, mix, amount.
+    c: [f32; 4],
+    /// res.xy, shift.xy.
+    res: [f32; 4],
+    /// Pass-specific params (see each fragment entry point).
+    d: [f32; 4],
+    hues: [f32; 12],
+}
+
+impl Default for Uni {
+    fn default() -> Self {
+        Uni {
+            rect: [0.0, 0.0, 1.0, 1.0],
+            patch: [0.0, 0.0, 1.0, 1.0],
+            cf: [0.0; 4],
+            a: [0.0, 1.0, 0.0, 1.0],
+            b: [0.0; 4],
+            c: [1.0, 1.0, 0.0, 0.0],
+            res: [0.0; 4],
+            d: [0.0; 4],
+            hues: [0.0; 12],
+        }
+    }
+}
+
+const UNI_SIZE: u64 = std::mem::size_of::<Uni>() as u64;
+
+fn uni_bytes(u: &Uni) -> &[u8] {
+    // SAFETY: Uni is repr(C), all f32, no padding.
+    unsafe { std::slice::from_raw_parts(u as *const Uni as *const u8, std::mem::size_of::<Uni>()) }
+}
+
+// Vertical convention: every texture stores rows y-down with v = 0 at the
+// top (same as uploaded source frames), and wgpu's framebuffer row 0 is
+// the top too, so every pass maps y-down 0..1 to NDC with one flip and
+// full-screen passes sample `uv` directly.
+const SHADER: &str = r#"
+struct U {
+    rect: vec4f,
+    patch_r: vec4f,
+    cf: vec4f,
+    a: vec4f,
+    b: vec4f,
+    c: vec4f,
+    res: vec4f,
+    d: vec4f,
+    hues: array<vec4f, 3>,
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(1) @binding(0) var t0: texture_2d<f32>;
+@group(1) @binding(1) var t1: texture_2d<f32>;
+@group(1) @binding(2) var samp: sampler;
+@group(1) @binding(3) var tarr: texture_2d_array<f32>;
+
+struct VOut {
+    @builtin(position) pos: vec4f,
+    @location(0) uv: vec2f,
+};
+
+@vertex
+fn vs(@builtin(vertex_index) vi: u32) -> VOut {
+    var corners = array<vec2f, 6>(
+        vec2f(0.0, 0.0), vec2f(1.0, 0.0), vec2f(1.0, 1.0),
+        vec2f(0.0, 0.0), vec2f(1.0, 1.0), vec2f(0.0, 1.0));
+    let a_pos = corners[vi];
+    // Rect + rotation about its center in aspect-corrected space (the
+    // grain transform; rot = 0 reduces to a plain rect).
+    let c = u.rect.xy + 0.5 * u.rect.zw;
+    var off = (a_pos - 0.5) * u.rect.zw;
+    off.x *= u.a.y;
+    let cs = cos(u.a.x);
+    let sn = sin(u.a.x);
+    off = vec2f(off.x * cs - off.y * sn, off.x * sn + off.y * cs);
+    off.x /= u.a.y;
+    let p = c + off;
+    var o: VOut;
+    o.pos = vec4f(p.x * 2.0 - 1.0, 1.0 - p.y * 2.0, 0.0, 1.0);
+    o.uv = a_pos;
+    return o;
+}
+
+fn gmod(x: f32, y: f32) -> f32 { return x - y * floor(x / y); }
+
+fn rgb2hsv(c: vec3f) -> vec3f {
+    let K = vec4f(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
+    let p = mix(vec4f(c.bg, K.wz), vec4f(c.gb, K.xy), step(c.b, c.g));
+    let q = mix(vec4f(p.xyw, c.r), vec4f(c.r, p.yzx), step(p.x, c.r));
+    let d = q.x - min(q.w, q.y);
+    let e = 1.0e-10;
+    return vec3f(abs(q.z + (q.w - q.y) / (6.0 * d + e)), d / (q.x + e), q.x);
+}
+
+fn hsv2rgb(c: vec3f) -> vec3f {
+    let K = vec4f(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+    let p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+    return c.z * mix(K.xxx, clamp(p - K.xxx, vec3f(0.0), vec3f(1.0)), c.y);
+}
+
+fn tex0(uv: vec2f) -> vec4f { return textureSampleLevel(t0, samp, uv, 0.0); }
+fn tex1(uv: vec2f) -> vec4f { return textureSampleLevel(t1, samp, uv, 0.0); }
+
+// Grain: a patch of one source frame, color-filtered and hue-rotated,
+// premultiplied; `additive` lowers alpha toward pure glow.
+@fragment
+fn fs_grain(i: VOut) -> @location(0) vec4f {
+    let suv = u.patch_r.xy + i.uv * u.patch_r.zw;
+    let texel = textureSampleLevel(tarr, samp, suv, i32(u.a.z + 0.5), 0.0);
+    var rgb = texel.rgb;
+    // Source alpha participates: segmented sources are transparent
+    // outside the tracked object, matching the CPU compositor.
+    var a = u.a.w * texel.a;
+    var hsv = rgb2hsv(rgb);
+    let mode = i32(u.b.y + 0.5);
+    if (mode != 0) {
+        let h = hsv.x * 360.0;
+        let d = abs(gmod(h - u.cf.x + 540.0, 360.0) - 180.0);
+        let halfw = max(u.cf.y, 0.001);
+        let soft = max(halfw * u.cf.z, 0.001);
+        let inband = clamp(1.0 - (d - (halfw - soft)) / (2.0 * soft), 0.0, 1.0);
+        let colored = select(0.0, 1.0, hsv.y >= u.cf.w && hsv.z >= u.b.z);
+        let band = inband * colored;
+        a *= select(1.0 - band, band, mode == 1);
+    }
+    if (abs(u.b.x) > 0.5) {
+        hsv.x = fract(hsv.x + u.b.x / 360.0 + 10.0);
+        rgb = hsv2rgb(hsv);
+    }
+    return vec4f(rgb * a, a * (1.0 - u.b.w));
+}
+
+// Blit: c.x opacity, c.y extra alpha scale, b.w additive.
+@fragment
+fn fs_blit(i: VOut) -> @location(0) vec4f {
+    let c = tex0(i.uv);
+    return vec4f(c.rgb * u.c.x, c.a * u.c.x * u.c.y * (1.0 - u.b.w));
+}
+
+// Present: the composited canvas, opaque, through a uv crop (patch_r).
+@fragment
+fn fs_present(i: VOut) -> @location(0) vec4f {
+    let c = tex0(u.patch_r.xy + i.uv * u.patch_r.zw);
+    return vec4f(c.rgb, 1.0);
+}
+
+// Tint: d.x target hue (deg), c.w amount.
+@fragment
+fn fs_tint(i: VOut) -> @location(0) vec4f {
+    let c = tex0(i.uv);
+    let a = max(c.a, 1e-5);
+    let hsv = rgb2hsv(c.rgb / a);
+    let h = hsv.x * 360.0;
+    let d = gmod(h - u.d.x + 540.0, 360.0) - 180.0;
+    let amount = u.c.w;
+    let nh = gmod(u.d.x + d * (1.0 - amount) + 360.0, 360.0);
+    let ns = max(hsv.y, amount * amount * 0.5 * min(hsv.z, 1.0));
+    return vec4f(hsv2rgb(vec3f(nh / 360.0, ns, hsv.z)) * a, c.a);
+}
+
+// Tune (mirrors fx::video_tune): snap hues to the key colors.
+// hues[] degrees, d.w count, c.w amount.
+@fragment
+fn fs_tune(i: VOut) -> @location(0) vec4f {
+    let c = tex0(i.uv);
+    let a = max(c.a, 1e-5);
+    let hsv = rgb2hsv(c.rgb / a);
+    let h = hsv.x * 360.0;
+    var best = 0.0;
+    var best_abs = 1e9;
+    let nh_count = i32(u.d.w + 0.5);
+    for (var k = 0; k < 12; k++) {
+        if (k >= nh_count) { break; }
+        let d = gmod(u.hues[k / 4][k % 4] - h + 540.0, 360.0) - 180.0;
+        if (abs(d) < best_abs) { best_abs = abs(d); best = d; }
+    }
+    let nh = gmod(h + best * u.c.w + 360.0, 360.0);
+    return vec4f(hsv2rgb(vec3f(nh / 360.0, hsv.y, hsv.z)) * a, c.a);
+}
+
+// Crush: d.x block size (px), d.y color levels.
+@fragment
+fn fs_crush(i: VOut) -> @location(0) vec4f {
+    let px = i.uv * u.res.xy;
+    let buv = (floor(px / u.d.x) * u.d.x + 0.5) / u.res.xy;
+    var c = tex0(buv);
+    let l = max(u.d.y - 1.0, 1.0);
+    c = vec4f(floor(c.rgb * l + 0.5) / l, c.a);
+    return c;
+}
+
+// Tile (mirrors fx::tile_source_uv + fx::video_tile): d.x count,
+// d.y mirror, d.z turn. Nearest texel so it matches the CPU export.
+fn tile1(t: f32) -> f32 {
+    let q = t * u.d.x;
+    let i = floor(q);
+    var f = q - i;
+    if (u.d.y >= 0.5 && gmod(i, 2.0) >= 0.5) { f = 1.0 - f; }
+    return f;
+}
+
+@fragment
+fn fs_tile(i: VOut) -> @location(0) vec4f {
+    var uv = i.uv;
+    if (abs(u.d.z) > 1e-6) {
+        let aspect = u.res.x / u.res.y;
+        let ang = u.d.z * 6.283185307;
+        let s = sin(ang);
+        let c = cos(ang);
+        let d = vec2f((uv.x - 0.5) * aspect, uv.y - 0.5);
+        uv = vec2f((d.x * c - d.y * s) / aspect + 0.5, d.x * s + d.y * c + 0.5);
+    }
+    let suv = vec2f(tile1(uv.x), tile1(uv.y));
+    let px = min(vec2i(suv * u.res.xy), vec2i(u.res.xy) - 1);
+    return textureLoad(t0, px, 0);
+}
+
+// Delay: t1 ghost, res.zw shift, c.z mix.
+@fragment
+fn fs_delay(i: VOut) -> @location(0) vec4f {
+    let cur = tex0(i.uv);
+    let guv = i.uv - u.res.zw;
+    var g = tex1(guv) * u.c.z;
+    if (guv.x < 0.0 || guv.x > 1.0 || guv.y < 0.0 || guv.y > 1.0) { g = vec4f(0.0); }
+    // under where transparent + screen where covered (premultiplied)
+    return cur + g * (1.0 - cur.a) + vec4f(g.rgb * cur.a * (1.0 - cur.rgb), 0.0);
+}
+
+// Reverb accumulate: t0 accum, t1 current, d.x decay.
+@fragment
+fn fs_racc(i: VOut) -> @location(0) vec4f {
+    return tex0(i.uv) * u.d.x + tex1(i.uv) * (1.0 - u.d.x);
+}
+
+// Reverb mix: t0 current, t1 accum, d.x blur radius, c.z mix.
+@fragment
+fn fs_rmix(i: VOut) -> @location(0) vec4f {
+    let cur = tex0(i.uv);
+    var sm = vec4f(0.0);
+    var wsum = 0.0;
+    for (var x = -2; x <= 2; x++) {
+        for (var y = -2; y <= 2; y++) {
+            let w = 1.0 / (1.0 + f32(x * x + y * y));
+            sm += tex1(i.uv + vec2f(f32(x), f32(y)) * u.d.x / u.res.xy) * w;
+            wsum += w;
+        }
+    }
+    sm = sm / wsum * u.c.z;
+    return cur + sm * (1.0 - cur.a) + vec4f(sm.rgb * cur.a * (1.0 - cur.rgb), 0.0);
+}
+
+// 8x8 DCT basis: b(u,x) = a(u) * cos((2x+1)u*pi/16)
+fn dctb(uu: i32, x: i32) -> f32 {
+    let a = select(0.5, 0.35355339, uu == 0);
+    return a * cos((2.0 * f32(x) + 1.0) * f32(uu) * 3.14159265 / 16.0);
+}
+
+@fragment
+fn fs_dct_row(i: VOut) -> @location(0) vec4f {
+    let px = floor(i.uv * u.res.xy);
+    let uu = i32(gmod(px.x, 8.0));
+    let bx = px.x - f32(uu);
+    var s = vec4f(0.0);
+    for (var k = 0; k < 8; k++) {
+        let uv = (vec2f(bx + f32(k), px.y) + 0.5) / u.res.xy;
+        s += (tex0(uv) - 0.5) * dctb(uu, k);
+    }
+    return s;
+}
+
+@fragment
+fn fs_dct_col(i: VOut) -> @location(0) vec4f {
+    let px = floor(i.uv * u.res.xy);
+    let v = i32(gmod(px.y, 8.0));
+    let by = px.y - f32(v);
+    var s = vec4f(0.0);
+    for (var k = 0; k < 8; k++) {
+        let uv = (vec2f(px.x, by + f32(k)) + 0.5) / u.res.xy;
+        s += tex0(uv) * dctb(v, k);
+    }
+    return s;
+}
+
+// Quantize: d.x crunch = (1-quality)^2, d.y DC-relative zeroing threshold.
+@fragment
+fn fs_quant(i: VOut) -> @location(0) vec4f {
+    let px = floor(i.uv * u.res.xy);
+    let uu = gmod(px.x, 8.0);
+    let v = gmod(px.y, 8.0);
+    var c = tex0(i.uv);
+    let dc = tex0((px - vec2f(uu, v) + 0.5) / u.res.xy);
+    let q = (1.0 + u.d.x * (8.0 + 16.0 * (uu + v))) / 255.0;
+    c = floor(c / q + 0.5) * q;
+    if (uu + v > 0.5) {
+        let keep = step(vec4f(u.d.y) * (abs(dc) + vec4f(0.02)), abs(c));
+        c *= keep;
+    }
+    return c;
+}
+
+@fragment
+fn fs_idct_col(i: VOut) -> @location(0) vec4f {
+    let px = floor(i.uv * u.res.xy);
+    let y = i32(gmod(px.y, 8.0));
+    let by = px.y - f32(y);
+    var s = vec4f(0.0);
+    for (var k = 0; k < 8; k++) {
+        let uv = (vec2f(px.x, by + f32(k)) + 0.5) / u.res.xy;
+        s += tex0(uv) * dctb(k, y);
+    }
+    return s;
+}
+
+@fragment
+fn fs_idct_row(i: VOut) -> @location(0) vec4f {
+    let px = floor(i.uv * u.res.xy);
+    let x = i32(gmod(px.x, 8.0));
+    let bx = px.x - f32(x);
+    var s = vec4f(0.0);
+    for (var k = 0; k < 8; k++) {
+        let uv = (vec2f(bx + f32(k), px.y) + 0.5) / u.res.xy;
+        s += tex0(uv) * dctb(k, x);
+    }
+    return clamp(s + 0.5, vec4f(0.0), vec4f(1.0));
+}
+"#;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Pipe {
+    Grain,
+    BlitBlend,
+    Blit,
+    Crush,
+    Tint,
+    Tune,
+    Tile,
+    Delay,
+    Racc,
+    Rmix,
+    DctRow,
+    DctCol,
+    Quant,
+    IdctCol,
+    IdctRow,
+}
+
+impl Pipe {
+    const ALL: [Pipe; 15] = [
+        Pipe::Grain,
+        Pipe::BlitBlend,
+        Pipe::Blit,
+        Pipe::Crush,
+        Pipe::Tint,
+        Pipe::Tune,
+        Pipe::Tile,
+        Pipe::Delay,
+        Pipe::Racc,
+        Pipe::Rmix,
+        Pipe::DctRow,
+        Pipe::DctCol,
+        Pipe::Quant,
+        Pipe::IdctCol,
+        Pipe::IdctRow,
+    ];
+
+    fn entry(self) -> &'static str {
+        match self {
+            Pipe::Grain => "fs_grain",
+            Pipe::BlitBlend | Pipe::Blit => "fs_blit",
+            Pipe::Crush => "fs_crush",
+            Pipe::Tint => "fs_tint",
+            Pipe::Tune => "fs_tune",
+            Pipe::Tile => "fs_tile",
+            Pipe::Delay => "fs_delay",
+            Pipe::Racc => "fs_racc",
+            Pipe::Rmix => "fs_rmix",
+            Pipe::DctRow => "fs_dct_row",
+            Pipe::DctCol => "fs_dct_col",
+            Pipe::Quant => "fs_quant",
+            Pipe::IdctCol => "fs_idct_col",
+            Pipe::IdctRow => "fs_idct_row",
+        }
+    }
+
+    /// Premultiplied "over" blending (GL: ONE, ONE_MINUS_SRC_ALPHA).
+    fn blends(self) -> bool {
+        matches!(self, Pipe::Grain | Pipe::BlitBlend)
+    }
+
+    /// The DCT intermediates write float targets.
+    fn format(self) -> wgpu::TextureFormat {
+        match self {
+            Pipe::DctRow | Pipe::DctCol | Pipe::Quant | Pipe::IdctCol => RGBA16F,
+            _ => RGBA8,
+        }
+    }
+}
 
 struct Target {
-    fbo: glow::Framebuffer,
-    tex: glow::Texture,
+    /// Owns the texture behind `view` (read back directly in tests).
+    #[cfg_attr(not(test), allow(dead_code))]
+    tex: wgpu::Texture,
+    view: wgpu::TextureView,
 }
 
 struct GpuSource {
-    tex: glow::Texture,
+    view: wgpu::TextureView,
     layers: i32,
     duration: f64,
     /// Identity of the uploaded clip (Arc pointer) to detect replacement.
@@ -49,520 +495,260 @@ struct GpuSource {
 
 #[derive(Default)]
 struct FxInst {
-    history: Vec<glow::Texture>,
+    /// Slab indices of the ghost-history ring.
+    history: Vec<usize>,
     head: usize,
     filled: usize,
-    accum: Option<[Target; 2]>,
+    accum: Option<[usize; 2]>,
     accum_idx: usize,
 }
 
+struct DrawOp {
+    pipe: Pipe,
+    t0: Option<usize>,
+    t1: Option<usize>,
+    /// Source id whose frame array is bound.
+    arr: Option<usize>,
+    u: Uni,
+}
+
+struct PassOp {
+    target: usize,
+    clear: Option<wgpu::Color>,
+    draws: Vec<DrawOp>,
+}
+
+/// Texture bind-group cache key: (t0, t1, arr), `u32::MAX` = dummy.
+type TexKey = (u32, u32, u32);
+
+fn key_part(x: Option<usize>) -> u32 {
+    x.map(|v| v as u32).unwrap_or(u32::MAX)
+}
+
 pub struct GpuPreview {
-    programs: HashMap<&'static str, glow::Program>,
-    vao: glow::VertexArray,
-    _vbo: glow::Buffer,
-    size: (i32, i32),
-    master: Option<Target>,
-    track_t: Option<Target>,
-    clip_t: Option<Target>,
-    ping: Option<Target>,
-    pong: Option<Target>,
-    fping: Option<Target>,
-    fpong: Option<Target>,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    tex_layout: wgpu::BindGroupLayout,
+    uni_layout: wgpu::BindGroupLayout,
+    pipelines: HashMap<Pipe, wgpu::RenderPipeline>,
+    present_pipe: wgpu::RenderPipeline,
+    sampler: wgpu::Sampler,
+    dummy_2d: wgpu::TextureView,
+    dummy_arr: wgpu::TextureView,
+    uni_buf: wgpu::Buffer,
+    uni_slots: u64,
+    uni_bg: wgpu::BindGroup,
+    uni_staging: Vec<u8>,
+    present_buf: wgpu::Buffer,
+    present_bg: wgpu::BindGroup,
+    present_next: usize,
+    tex_bgs: HashMap<TexKey, wgpu::BindGroup>,
+    size: (u32, u32),
+    targets: Vec<Target>,
     sources: HashMap<usize, GpuSource>,
     fx: HashMap<u64, FxInst>,
+    passes: Vec<PassOp>,
+    /// Slab index of the last rendered canvas (what `present` samples).
+    final_tex: Option<usize>,
+    last_frame: Option<u64>,
 }
 
-// Vertical convention: every offscreen target stores rows y-down with
-// v = 0 at the top (same as uploaded source frames), so full-screen passes
-// sample `v_uv` directly and never flip. Only drawing to the real screen
-// (`u_screen = 1`, the present pass) maps y-down to GL's y-up.
-const GRAIN_VS: &str = r#"#version 330 core
-layout(location=0) in vec2 a_pos;
-uniform vec4 u_rect;   // x,y,w,h in 0..1, y-down
-uniform float u_rot;   // radians, about the rect center
-uniform float u_aspect;
-uniform float u_screen;
-out vec2 v_uv;
-void main() {
-    v_uv = a_pos;
-    vec2 c = u_rect.xy + 0.5 * u_rect.zw;
-    vec2 off = (a_pos - 0.5) * u_rect.zw;
-    off.x *= u_aspect;
-    float cs = cos(u_rot), sn = sin(u_rot);
-    off = vec2(off.x * cs - off.y * sn, off.x * sn + off.y * cs);
-    off.x /= u_aspect;
-    vec2 p = c + off;
-    float y = u_screen > 0.5 ? 1.0 - p.y * 2.0 : p.y * 2.0 - 1.0;
-    gl_Position = vec4(p.x * 2.0 - 1.0, y, 0.0, 1.0);
-}"#;
-
-const QUAD_VS: &str = r#"#version 330 core
-layout(location=0) in vec2 a_pos;
-uniform vec4 u_rect; // x,y,w,h in 0..1, y-down "screen" space
-uniform float u_screen;
-out vec2 v_uv;
-void main() {
-    v_uv = a_pos;
-    vec2 p = u_rect.xy + a_pos * u_rect.zw;   // 0..1 y-down
-    float y = u_screen > 0.5 ? 1.0 - p.y * 2.0 : p.y * 2.0 - 1.0;
-    gl_Position = vec4(p.x * 2.0 - 1.0, y, 0.0, 1.0);
-}"#;
-
-const HSV_HELPERS: &str = r#"
-vec3 rgb2hsv(vec3 c) {
-    vec4 K = vec4(0.0, -1.0/3.0, 2.0/3.0, -1.0);
-    vec4 p = mix(vec4(c.bg, K.wz), vec4(c.gb, K.xy), step(c.b, c.g));
-    vec4 q = mix(vec4(p.xyw, c.r), vec4(c.r, p.yzx), step(p.x, c.r));
-    float d = q.x - min(q.w, q.y);
-    float e = 1.0e-10;
-    return vec3(abs(q.z + (q.w - q.y) / (6.0*d + e)), d / (q.x + e), q.x);
-}
-vec3 hsv2rgb(vec3 c) {
-    vec4 K = vec4(1.0, 2.0/3.0, 1.0/3.0, 3.0);
-    vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
-    return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
-}"#;
-
-fn grain_fs() -> String {
-    format!(
-        r#"#version 330 core
-in vec2 v_uv; out vec4 frag;
-uniform sampler2DArray u_src;
-uniform float u_layer;
-uniform vec4 u_patch;
-uniform float u_alpha;
-uniform float u_hue;      // degrees
-uniform int u_cf_mode;    // 0 off, 1 keep, 2 remove
-uniform vec4 u_cf;        // center_deg, half_width_deg, softness, sat_min
-uniform float u_cf_valmin;
-uniform float u_additive;
-{HSV_HELPERS}
-void main() {{
-    vec2 suv = u_patch.xy + v_uv * u_patch.zw;
-    vec4 texel = texture(u_src, vec3(suv, u_layer));
-    vec3 rgb = texel.rgb;
-    // Source alpha participates: segmented sources are transparent
-    // outside the tracked object, matching the CPU compositor.
-    float a = u_alpha * texel.a;
-    vec3 hsv = rgb2hsv(rgb);
-    if (u_cf_mode != 0) {{
-        float h = hsv.x * 360.0;
-        float d = abs(mod(h - u_cf.x + 540.0, 360.0) - 180.0);
-        float halfw = max(u_cf.y, 0.001);
-        float soft = max(halfw * u_cf.z, 0.001);
-        float inband = clamp(1.0 - (d - (halfw - soft)) / (2.0 * soft), 0.0, 1.0);
-        float colored = (hsv.y >= u_cf.w && hsv.z >= u_cf_valmin) ? 1.0 : 0.0;
-        float band = inband * colored;
-        a *= (u_cf_mode == 1) ? band : (1.0 - band);
-    }}
-    if (abs(u_hue) > 0.5) {{
-        hsv.x = fract(hsv.x + u_hue / 360.0 + 10.0);
-        rgb = hsv2rgb(hsv);
-    }}
-    frag = vec4(rgb * a, a * (1.0 - u_additive));
-}}"#
-    )
-}
-
-const BLIT_FS: &str = r#"#version 330 core
-in vec2 v_uv; out vec4 frag;
-uniform sampler2D u_tex;
-uniform float u_opacity;
-uniform float u_additive;
-uniform float u_alpha_mul; // extra alpha scale (delay feedback history)
-void main() {
-    vec4 c = texture(u_tex, v_uv);
-    frag = vec4(c.rgb * u_opacity, c.a * u_opacity * u_alpha_mul * (1.0 - u_additive));
-}"#;
-
-const PRESENT_FS: &str = r#"#version 330 core
-in vec2 v_uv; out vec4 frag;
-uniform sampler2D u_tex;
-void main() {
-    vec4 c = texture(u_tex, v_uv);
-    frag = vec4(c.rgb, 1.0);
-}"#;
-
-fn tint_fs() -> String {
-    format!(
-        r#"#version 330 core
-in vec2 v_uv; out vec4 frag;
-uniform sampler2D u_tex;
-uniform float u_hue;     // target, degrees
-uniform float u_amount;
-{HSV_HELPERS}
-void main() {{
-    vec4 c = texture(u_tex, v_uv);
-    float a = max(c.a, 1e-5);
-    vec3 rgb = c.rgb / a;          // unpremultiply
-    vec3 hsv = rgb2hsv(rgb);
-    float h = hsv.x * 360.0;
-    float d = mod(h - u_hue + 540.0, 360.0) - 180.0;
-    float nh = mod(u_hue + d * (1.0 - u_amount) + 360.0, 360.0);
-    float ns = max(hsv.y, u_amount * u_amount * 0.5 * min(hsv.z, 1.0));
-    rgb = hsv2rgb(vec3(nh / 360.0, ns, hsv.z));
-    frag = vec4(rgb * a, c.a);
-}}"#
-    )
-}
-
-/// Mirrors `fx::video_tune`: snap each hue to the nearest key color.
-fn tune_fs() -> String {
-    format!(
-        r#"#version 330 core
-in vec2 v_uv; out vec4 frag;
-uniform sampler2D u_tex;
-uniform float u_hues[12];  // degrees
-uniform int u_nh;
-uniform float u_amount;
-{HSV_HELPERS}
-void main() {{
-    vec4 c = texture(u_tex, v_uv);
-    float a = max(c.a, 1e-5);
-    vec3 hsv = rgb2hsv(c.rgb / a);
-    float h = hsv.x * 360.0;
-    float best = 0.0;
-    float best_abs = 1e9;
-    for (int i = 0; i < 12; i++) {{
-        if (i >= u_nh) break;
-        float d = mod(u_hues[i] - h + 540.0, 360.0) - 180.0;
-        if (abs(d) < best_abs) {{ best_abs = abs(d); best = d; }}
-    }}
-    float nh = mod(h + best * u_amount + 360.0, 360.0);
-    frag = vec4(hsv2rgb(vec3(nh / 360.0, hsv.y, hsv.z)) * a, c.a);
-}}"#
-    )
-}
-
-const CRUSH_FS: &str = r#"#version 330 core
-in vec2 v_uv; out vec4 frag;
-uniform sampler2D u_tex;
-uniform vec2 u_res;
-uniform float u_block;
-uniform float u_levels;
-void main() {
-    vec2 px = v_uv * u_res;
-    vec2 buv = (floor(px / u_block) * u_block + 0.5) / u_res;
-    vec4 c = texture(u_tex, buv);
-    float l = max(u_levels - 1.0, 1.0);
-    c.rgb = floor(c.rgb * l + 0.5) / l;
-    frag = c;
-}"#;
-
-/// Mirrors `fx::tile_source_uv` + `fx::video_tile`: repeat the picture as
-/// a count×count grid, optional mirror flips, rotation in turns. Nearest
-/// texel fetch so it matches the CPU export pixel-for-pixel; the whole
-/// (premultiplied) texel is copied, so alpha cut-outs tile too.
-const TILE_FS: &str = r#"#version 330 core
-in vec2 v_uv; out vec4 frag;
-uniform sampler2D u_tex;
-uniform vec2 u_res;
-uniform float u_count;
-uniform float u_mirror;
-uniform float u_turn;   // turns
-float tile1(float t) {
-    float q = t * u_count;
-    float i = floor(q);
-    float f = q - i;
-    if (u_mirror >= 0.5 && mod(i, 2.0) >= 0.5) f = 1.0 - f;
-    return f;
-}
-void main() {
-    vec2 uv = v_uv;
-    if (abs(u_turn) > 1e-6) {
-        float aspect = u_res.x / u_res.y;
-        float a = u_turn * 6.283185307;
-        float s = sin(a), c = cos(a);
-        vec2 d = vec2((uv.x - 0.5) * aspect, uv.y - 0.5);
-        uv = vec2((d.x * c - d.y * s) / aspect + 0.5, d.x * s + d.y * c + 0.5);
+fn make_tex(device: &wgpu::Device, w: u32, h: u32, layers: u32, format: wgpu::TextureFormat, target: bool) -> wgpu::Texture {
+    let mut usage = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST;
+    if target {
+        // COPY_SRC: read-back (tests today; Syphon / frame grabs later).
+        usage |= wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC;
     }
-    vec2 suv = vec2(tile1(uv.x), tile1(uv.y));
-    ivec2 px = min(ivec2(suv * u_res), ivec2(u_res) - 1);
-    frag = texelFetch(u_tex, px, 0);
-}"#;
-
-const DELAY_FS: &str = r#"#version 330 core
-in vec2 v_uv; out vec4 frag;
-uniform sampler2D u_tex;
-uniform sampler2D u_ghost;
-uniform vec2 u_shift;
-uniform float u_mix;
-void main() {
-    vec4 cur = texture(u_tex, v_uv);
-    vec2 guv = v_uv - u_shift;
-    vec4 g = vec4(0.0);
-    if (guv.x >= 0.0 && guv.x <= 1.0 && guv.y >= 0.0 && guv.y <= 1.0)
-        g = texture(u_ghost, guv) * u_mix;
-    // under where transparent + screen where covered (premultiplied)
-    frag = cur + g * (1.0 - cur.a) + vec4(g.rgb * cur.a * (1.0 - cur.rgb), 0.0);
-}"#;
-
-const REVERB_ACCUM_FS: &str = r#"#version 330 core
-in vec2 v_uv; out vec4 frag;
-uniform sampler2D u_acc;
-uniform sampler2D u_cur;
-uniform float u_decay;
-void main() {
-    frag = texture(u_acc, v_uv) * u_decay + texture(u_cur, v_uv) * (1.0 - u_decay);
-}"#;
-
-const REVERB_MIX_FS: &str = r#"#version 330 core
-in vec2 v_uv; out vec4 frag;
-uniform sampler2D u_tex;
-uniform sampler2D u_acc;
-uniform vec2 u_res;
-uniform float u_radius;
-uniform float u_mix;
-void main() {
-    vec4 cur = texture(u_tex, v_uv);
-    vec4 sm = vec4(0.0);
-    float wsum = 0.0;
-    for (int i = -2; i <= 2; i++) {
-        for (int j = -2; j <= 2; j++) {
-            float w = 1.0 / (1.0 + float(i*i + j*j));
-            sm += texture(u_acc, v_uv + vec2(float(i), float(j)) * u_radius / u_res) * w;
-            wsum += w;
-        }
-    }
-    sm = sm / wsum * u_mix;
-    frag = cur + sm * (1.0 - cur.a) + vec4(sm.rgb * cur.a * (1.0 - cur.rgb), 0.0);
-}"#;
-
-// 8x8 DCT basis in-shader: b(u,x) = a(u) * cos((2x+1)u*pi/16)
-const DCT_COMMON: &str = r#"
-float dctb(int u, int x) {
-    float a = (u == 0) ? 0.35355339 : 0.5;
-    return a * cos((2.0 * float(x) + 1.0) * float(u) * 3.14159265 / 16.0);
-}"#;
-
-fn dct_row_fs() -> String {
-    format!(
-        r#"#version 330 core
-in vec2 v_uv; out vec4 frag;
-uniform sampler2D u_tex;
-uniform vec2 u_res;
-{DCT_COMMON}
-void main() {{
-    vec2 px = floor(v_uv * u_res);
-    int u = int(mod(px.x, 8.0));
-    float bx = px.x - float(u);
-    vec4 s = vec4(0.0);
-    for (int k = 0; k < 8; k++) {{
-        vec2 uv = (vec2(bx + float(k), px.y) + 0.5) / u_res;
-        s += (texture(u_tex, uv) - 0.5) * dctb(u, k);
-    }}
-    frag = s;
-}}"#
-    )
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("chromagrain"),
+        size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: layers.max(1) },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage,
+        view_formats: &[],
+    })
 }
 
-fn dct_col_fs() -> String {
-    format!(
-        r#"#version 330 core
-in vec2 v_uv; out vec4 frag;
-uniform sampler2D u_tex;
-uniform vec2 u_res;
-{DCT_COMMON}
-void main() {{
-    vec2 px = floor(v_uv * u_res);
-    int v = int(mod(px.y, 8.0));
-    float by = px.y - float(v);
-    vec4 s = vec4(0.0);
-    for (int k = 0; k < 8; k++) {{
-        vec2 uv = (vec2(px.x, by + float(k)) + 0.5) / u_res;
-        s += texture(u_tex, uv) * dctb(v, k);
-    }}
-    frag = s;
-}}"#
-    )
-}
-
-const QUANT_FS: &str = r#"#version 330 core
-in vec2 v_uv; out vec4 frag;
-uniform sampler2D u_tex;
-uniform vec2 u_res;
-uniform float u_crunch;   // (1-quality)^2
-uniform float u_thresh;   // relative-to-DC zeroing threshold
-void main() {
-    vec2 px = floor(v_uv * u_res);
-    float u = mod(px.x, 8.0);
-    float v = mod(px.y, 8.0);
-    vec4 c = texture(u_tex, v_uv);
-    vec2 dcuv = (px - vec2(u, v) + 0.5) / u_res;
-    vec4 dc = texture(u_tex, dcuv);
-    float q = (1.0 + u_crunch * (8.0 + 16.0 * (u + v))) / 255.0;
-    c = floor(c / q + 0.5) * q;
-    if (u + v > 0.5) {
-        vec4 keep = step(vec4(u_thresh) * (abs(dc) + 0.02), abs(c));
-        c *= keep;
-    }
-    frag = c;
-}"#;
-
-fn idct_col_fs() -> String {
-    format!(
-        r#"#version 330 core
-in vec2 v_uv; out vec4 frag;
-uniform sampler2D u_tex;
-uniform vec2 u_res;
-{DCT_COMMON}
-void main() {{
-    vec2 px = floor(v_uv * u_res);
-    int y = int(mod(px.y, 8.0));
-    float by = px.y - float(y);
-    vec4 s = vec4(0.0);
-    for (int k = 0; k < 8; k++) {{
-        vec2 uv = (vec2(px.x, by + float(k)) + 0.5) / u_res;
-        s += texture(u_tex, uv) * dctb(k, y);
-    }}
-    frag = s;
-}}"#
-    )
-}
-
-fn idct_row_fs() -> String {
-    format!(
-        r#"#version 330 core
-in vec2 v_uv; out vec4 frag;
-uniform sampler2D u_tex;
-uniform vec2 u_res;
-{DCT_COMMON}
-void main() {{
-    vec2 px = floor(v_uv * u_res);
-    int x = int(mod(px.x, 8.0));
-    float bx = px.x - float(x);
-    vec4 s = vec4(0.0);
-    for (int k = 0; k < 8; k++) {{
-        vec2 uv = (vec2(bx + float(k), px.y) + 0.5) / u_res;
-        s += texture(u_tex, uv) * dctb(k, x);
-    }}
-    frag = clamp(s + 0.5, 0.0, 1.0);
-}}"#
-    )
-}
-
-unsafe fn compile(gl: &glow::Context, vs: &str, fs: &str) -> Result<glow::Program, String> {
-    unsafe {
-        let program = gl.create_program()?;
-        let mut shaders = Vec::new();
-        for (kind, src) in [(glow::VERTEX_SHADER, vs), (glow::FRAGMENT_SHADER, fs)] {
-            let sh = gl.create_shader(kind)?;
-            gl.shader_source(sh, src);
-            gl.compile_shader(sh);
-            if !gl.get_shader_compile_status(sh) {
-                return Err(format!("shader: {}", gl.get_shader_info_log(sh)));
-            }
-            gl.attach_shader(program, sh);
-            shaders.push(sh);
-        }
-        gl.link_program(program);
-        if !gl.get_program_link_status(program) {
-            return Err(format!("link: {}", gl.get_program_info_log(program)));
-        }
-        for sh in shaders {
-            gl.detach_shader(program, sh);
-            gl.delete_shader(sh);
-        }
-        Ok(program)
-    }
-}
-
-unsafe fn make_target(gl: &glow::Context, w: i32, h: i32, float: bool) -> Result<Target, String> {
-    unsafe {
-        let tex = gl.create_texture()?;
-        gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-        let (ifmt, ty) = if float {
-            (glow::RGBA16F as i32, glow::FLOAT)
-        } else {
-            (glow::RGBA8 as i32, glow::UNSIGNED_BYTE)
-        };
-        gl.tex_image_2d(glow::TEXTURE_2D, 0, ifmt, w, h, 0, glow::RGBA, ty, glow::PixelUnpackData::Slice(None));
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
-        let fbo = gl.create_framebuffer()?;
-        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
-        gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(tex), 0);
-        if gl.check_framebuffer_status(glow::FRAMEBUFFER) != glow::FRAMEBUFFER_COMPLETE {
-            return Err("framebuffer incomplete".into());
-        }
-        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-        Ok(Target { fbo, tex })
-    }
+fn array_view(tex: &wgpu::Texture) -> wgpu::TextureView {
+    tex.create_view(&wgpu::TextureViewDescriptor {
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        ..Default::default()
+    })
 }
 
 impl GpuPreview {
-    pub fn new(gl: &glow::Context) -> Result<GpuPreview, String> {
-        unsafe {
-            let mut programs = HashMap::new();
-            programs.insert("grain", compile(gl, GRAIN_VS, &grain_fs())?);
-            programs.insert("blit", compile(gl, QUAD_VS, BLIT_FS)?);
-            programs.insert("present", compile(gl, QUAD_VS, PRESENT_FS)?);
-            programs.insert("crush", compile(gl, QUAD_VS, CRUSH_FS)?);
-            programs.insert("tint", compile(gl, QUAD_VS, &tint_fs())?);
-            programs.insert("tune", compile(gl, QUAD_VS, &tune_fs())?);
-            programs.insert("tile", compile(gl, QUAD_VS, TILE_FS)?);
-            programs.insert("delay", compile(gl, QUAD_VS, DELAY_FS)?);
-            programs.insert("racc", compile(gl, QUAD_VS, REVERB_ACCUM_FS)?);
-            programs.insert("rmix", compile(gl, QUAD_VS, REVERB_MIX_FS)?);
-            programs.insert("dct_row", compile(gl, QUAD_VS, &dct_row_fs())?);
-            programs.insert("dct_col", compile(gl, QUAD_VS, &dct_col_fs())?);
-            programs.insert("quant", compile(gl, QUAD_VS, QUANT_FS)?);
-            programs.insert("idct_col", compile(gl, QUAD_VS, &idct_col_fs())?);
-            programs.insert("idct_row", compile(gl, QUAD_VS, &idct_row_fs())?);
-
-            let vao = gl.create_vertex_array()?;
-            let vbo = gl.create_buffer()?;
-            gl.bind_vertex_array(Some(vao));
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
-            let verts: [f32; 12] = [0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0];
-            gl.buffer_data_u8_slice(
-                glow::ARRAY_BUFFER,
-                bytemuck_cast(&verts),
-                glow::STATIC_DRAW,
-            );
-            gl.enable_vertex_attrib_array(0);
-            gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 8, 0);
-            gl.bind_vertex_array(None);
-
-            Ok(GpuPreview {
-                programs,
-                vao,
-                _vbo: vbo,
-                size: (0, 0),
-                master: None,
-                track_t: None,
-                clip_t: None,
-                ping: None,
-                pong: None,
-                fping: None,
-                fpong: None,
-                sources: HashMap::new(),
-                fx: HashMap::new(),
+    /// Build the pipeline for the egui render state (`target_format` is
+    /// what the window surfaces use).
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, target_format: wgpu::TextureFormat) -> GpuPreview {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("chromagrain preview"),
+            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+        });
+        let uni_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("chromagrain uniforms"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: true,
+                    min_binding_size: wgpu::BufferSize::new(UNI_SIZE),
+                },
+                count: None,
+            }],
+        });
+        let tex_entry = |binding: u32, dim: wgpu::TextureViewDimension| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: dim,
+                multisampled: false,
+            },
+            count: None,
+        };
+        let tex_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("chromagrain textures"),
+            entries: &[
+                tex_entry(0, wgpu::TextureViewDimension::D2),
+                tex_entry(1, wgpu::TextureViewDimension::D2),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                tex_entry(3, wgpu::TextureViewDimension::D2Array),
+            ],
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("chromagrain"),
+            bind_group_layouts: &[&uni_layout, &tex_layout],
+            push_constant_ranges: &[],
+        });
+        let premul = wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+            operation: wgpu::BlendOperation::Add,
+        };
+        let make_pipe = |entry: &str, format: wgpu::TextureFormat, blend: bool| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(entry),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some(entry),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: blend.then_some(wgpu::BlendState { color: premul, alpha: premul }),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
             })
+        };
+        let pipelines = Pipe::ALL.iter().map(|&p| (p, make_pipe(p.entry(), p.format(), p.blends()))).collect();
+        let present_pipe = make_pipe("fs_present", target_format, false);
+
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("chromagrain linear clamp"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let dummy_2d = make_tex(device, 1, 1, 1, RGBA8, false).create_view(&Default::default());
+        let dummy_arr = array_view(&make_tex(device, 1, 1, 1, RGBA8, false));
+
+        let (uni_buf, uni_bg) = Self::make_uni(device, &uni_layout, 64);
+        let (present_buf, present_bg) = Self::make_uni(device, &uni_layout, PRESENT_SLOTS as u64);
+        GpuPreview {
+            device: device.clone(),
+            queue: queue.clone(),
+            tex_layout,
+            uni_layout,
+            pipelines,
+            present_pipe,
+            sampler,
+            dummy_2d,
+            dummy_arr,
+            uni_buf,
+            uni_slots: 64,
+            uni_bg,
+            uni_staging: Vec::new(),
+            present_buf,
+            present_bg,
+            present_next: 0,
+            tex_bgs: HashMap::new(),
+            size: (0, 0),
+            targets: Vec::new(),
+            sources: HashMap::new(),
+            fx: HashMap::new(),
+            passes: Vec::new(),
+            final_tex: None,
+            last_frame: None,
         }
     }
 
-    fn ensure_targets(&mut self, gl: &glow::Context, w: i32, h: i32) -> Result<(), String> {
-        if self.size == (w, h) && self.master.is_some() {
-            return Ok(());
-        }
-        unsafe {
-            self.size = (w, h);
-            self.master = Some(make_target(gl, w, h, false)?);
-            self.track_t = Some(make_target(gl, w, h, false)?);
-            self.clip_t = Some(make_target(gl, w, h, false)?);
-            self.ping = Some(make_target(gl, w, h, false)?);
-            self.pong = Some(make_target(gl, w, h, false)?);
-            self.fping = Some(make_target(gl, w, h, true).ok()).flatten();
-            self.fpong = Some(make_target(gl, w, h, true).ok()).flatten();
-            self.fx.clear(); // sizes changed; rebuild temporal state
-        }
-        Ok(())
+    fn make_uni(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, slots: u64) -> (wgpu::Buffer, wgpu::BindGroup) {
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("chromagrain uniforms"),
+            size: slots * UNI_STRIDE,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("chromagrain uniforms"),
+            layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &buf,
+                    offset: 0,
+                    size: wgpu::BufferSize::new(UNI_SIZE),
+                }),
+            }],
+        });
+        (buf, bg)
     }
 
-    fn ensure_source(&mut self, gl: &glow::Context, project: &Project, sid: usize) -> Option<()> {
+    fn new_target(&mut self, float: bool) -> usize {
+        let tex = make_tex(&self.device, self.size.0, self.size.1, 1, if float { RGBA16F } else { RGBA8 }, true);
+        let view = tex.create_view(&Default::default());
+        self.targets.push(Target { tex, view });
+        self.targets.len() - 1
+    }
+
+    fn ensure_targets(&mut self, w: u32, h: u32) {
+        if self.size == (w, h) && !self.targets.is_empty() {
+            return;
+        }
+        self.size = (w, h);
+        self.targets.clear();
+        self.tex_bgs.clear();
+        self.fx.clear(); // sizes changed; rebuild temporal state
+        for i in 0..FIXED_TARGETS {
+            self.new_target(i == FPING || i == FPONG);
+        }
+        self.final_tex = None;
+    }
+
+    fn ensure_source(&mut self, project: &Project, sid: usize) -> Option<()> {
         let video = project.sources.get(sid)?.video.as_ref()?;
         let ident = Arc::as_ptr(video) as usize;
         if self.sources.get(&sid).is_some_and(|s| s.ident == ident) {
@@ -583,8 +769,7 @@ impl GpuPreview {
             let f = &video.frames[fi];
             let base = (tw * th * 4) as usize * l;
             for y in 0..th {
-                let sy = (y as f32 / scale) as u32;
-                let sy = sy.min(f.height - 1);
+                let sy = ((y as f32 / scale) as u32).min(f.height - 1);
                 for x in 0..tw {
                     let sx = ((x as f32 / scale) as u32).min(f.width - 1);
                     let si = ((sy * f.width + sx) * 4) as usize;
@@ -593,350 +778,171 @@ impl GpuPreview {
                 }
             }
         }
-        unsafe {
-            if let Some(old) = self.sources.remove(&sid) {
-                gl.delete_texture(old.tex);
-            }
-            let tex = gl.create_texture().ok()?;
-            gl.bind_texture(glow::TEXTURE_2D_ARRAY, Some(tex));
-            gl.tex_image_3d(
-                glow::TEXTURE_2D_ARRAY,
-                0,
-                glow::RGBA8 as i32,
-                tw as i32,
-                th as i32,
-                take as i32,
-                0,
-                glow::RGBA,
-                glow::UNSIGNED_BYTE,
-                glow::PixelUnpackData::Slice(Some(&data)),
-            );
-            for (p, v) in [
-                (glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32),
-                (glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32),
-                (glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32),
-                (glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32),
-            ] {
-                gl.tex_parameter_i32(glow::TEXTURE_2D_ARRAY, p, v);
-            }
-            self.sources.insert(
-                sid,
-                GpuSource { tex, layers: take as i32, duration: video.duration(), ident },
-            );
-        }
+        let tex = make_tex(&self.device, tw, th, take as u32, RGBA8, false);
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &data,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(tw * 4), rows_per_image: Some(th) },
+            wgpu::Extent3d { width: tw, height: th, depth_or_array_layers: take as u32 },
+        );
+        let view = array_view(&tex);
+        self.sources.insert(sid, GpuSource { view, layers: take as i32, duration: video.duration(), ident });
+        // Bind groups holding the old view are stale.
+        self.tex_bgs.retain(|k, _| k.2 != sid as u32);
         Some(())
     }
 
-    unsafe fn use_program(&self, gl: &glow::Context, name: &str) -> glow::Program {
-        let p = self.programs[name];
-        unsafe {
-            gl.use_program(Some(p));
-        }
-        p
+    // ------------------------------------------------------------ recording
+
+    fn pass(&mut self, target: usize, clear: Option<[f64; 4]>) {
+        let clear = clear.map(|c| wgpu::Color { r: c[0], g: c[1], b: c[2], a: c[3] });
+        self.passes.push(PassOp { target, clear, draws: Vec::new() });
     }
 
-    unsafe fn set_f(&self, gl: &glow::Context, p: glow::Program, name: &str, v: f32) {
-        unsafe {
-            let loc = gl.get_uniform_location(p, name);
-            gl.uniform_1_f32(loc.as_ref(), v);
-        }
-    }
-    unsafe fn set_i(&self, gl: &glow::Context, p: glow::Program, name: &str, v: i32) {
-        unsafe {
-            let loc = gl.get_uniform_location(p, name);
-            gl.uniform_1_i32(loc.as_ref(), v);
-        }
-    }
-    unsafe fn set_2f(&self, gl: &glow::Context, p: glow::Program, name: &str, a: f32, b: f32) {
-        unsafe {
-            let loc = gl.get_uniform_location(p, name);
-            gl.uniform_2_f32(loc.as_ref(), a, b);
-        }
-    }
-    unsafe fn set_4f(&self, gl: &glow::Context, p: glow::Program, name: &str, v: [f32; 4]) {
-        unsafe {
-            let loc = gl.get_uniform_location(p, name);
-            gl.uniform_4_f32(loc.as_ref(), v[0], v[1], v[2], v[3]);
+    fn draw(&mut self, pipe: Pipe, t0: Option<usize>, t1: Option<usize>, arr: Option<usize>, u: Uni) {
+        if let Some(p) = self.passes.last_mut() {
+            p.draws.push(DrawOp { pipe, t0, t1, arr, u });
         }
     }
 
-    unsafe fn draw_quad(&self, gl: &glow::Context) {
-        unsafe {
-            gl.bind_vertex_array(Some(self.vao));
-            gl.draw_arrays(glow::TRIANGLES, 0, 6);
+    /// A full-target pass that overwrites every pixel (no blending).
+    fn full(&mut self, target: usize, pipe: Pipe, t0: usize, t1: Option<usize>, u: Uni) {
+        self.pass(target, Some([0.0; 4]));
+        self.draw(pipe, Some(t0), t1, None, u);
+    }
+
+    fn res_uni(&self) -> Uni {
+        Uni { res: [self.size.0 as f32, self.size.1 as f32, 0.0, 0.0], ..Default::default() }
+    }
+
+    fn other(cur: usize) -> usize {
+        if cur == PING {
+            PONG
+        } else {
+            PING
         }
     }
 
-    unsafe fn bind_target(&self, gl: &glow::Context, t: &Target, clear: Option<[f32; 4]>) {
-        unsafe {
-            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(t.fbo));
-            gl.viewport(0, 0, self.size.0, self.size.1);
-            if let Some(c) = clear {
-                gl.clear_color(c[0], c[1], c[2], c[3]);
-                gl.clear(glow::COLOR_BUFFER_BIT);
-            }
-        }
-    }
-
-    /// Process an effect chain over `cur` (a texture), returning the final
-    /// texture. Uses ping/pong; temporal effects keep per-instance state.
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn apply_chain(
-        &mut self,
-        gl: &glow::Context,
-        chain: &[AvEffect],
-        scope: u64,
-        mut cur: glow::Texture,
-        fps: f32,
-    ) -> glow::Texture {
-        unsafe {
-            gl.disable(glow::BLEND);
-            for (fi, fx) in chain.iter().enumerate() {
-                if fx.video <= 0.001 {
-                    // Delay history must still record for later enabling.
-                    if let EffectKind::Delay { time, .. } = fx.kind {
-                        let key = scope ^ ((fi as u64 + 1) << 40);
-                        let frames = ((time * fps).round() as usize).clamp(1, MAX_HISTORY);
-                        self.push_history(gl, key, frames, cur, 1.0);
-                    }
-                    continue;
+    /// Record an effect chain over `cur` (slab index), returning the slab
+    /// index holding the result. Temporal effects keep per-instance state.
+    fn apply_chain(&mut self, chain: &[AvEffect], scope: u64, mut cur: usize, fps: f32) -> usize {
+        for (fi, fx) in chain.iter().enumerate() {
+            let key = scope ^ ((fi as u64 + 1) << 40);
+            if fx.video <= 0.001 {
+                // Delay history must still record for later enabling.
+                if let EffectKind::Delay { time, .. } = fx.kind {
+                    let frames = ((time * fps).round() as usize).clamp(1, MAX_HISTORY);
+                    self.push_history(key, frames, cur, 1.0);
                 }
-                let (w, h) = (self.size.0 as f32, self.size.1 as f32);
-                match fx.kind {
-                    EffectKind::Tint { hue, amount } => {
-                        let out = if cur == self.ping.as_ref().unwrap().tex {
-                            self.pong.as_ref().unwrap()
-                        } else {
-                            self.ping.as_ref().unwrap()
-                        };
-                        self.bind_target(gl, out, None);
-                        let p = self.use_program(gl, "tint");
-                        gl.active_texture(glow::TEXTURE0);
-                        gl.bind_texture(glow::TEXTURE_2D, Some(cur));
-                        self.set_i(gl, p, "u_tex", 0);
-                        self.set_f(gl, p, "u_hue", hue);
-                        self.set_f(gl, p, "u_amount", (amount * fx.video).clamp(0.0, 1.0));
-                        self.set_4f(gl, p, "u_rect", [0.0, 0.0, 1.0, 1.0]);
-                        self.draw_quad(gl);
-                        cur = out.tex;
-                    }
-                    EffectKind::Tune { root, scale, amount, .. } => {
-                        let out = if cur == self.ping.as_ref().unwrap().tex {
-                            self.pong.as_ref().unwrap()
-                        } else {
-                            self.ping.as_ref().unwrap()
-                        };
-                        self.bind_target(gl, out, None);
-                        let p = self.use_program(gl, "tune");
-                        gl.active_texture(glow::TEXTURE0);
-                        gl.bind_texture(glow::TEXTURE_2D, Some(cur));
-                        self.set_i(gl, p, "u_tex", 0);
-                        let hues = chromagrain_core::fx::key_hues(root, scale);
-                        let mut arr = [0.0f32; 12];
-                        for (a, h) in arr.iter_mut().zip(&hues) {
-                            *a = *h;
-                        }
-                        let loc = gl.get_uniform_location(p, "u_hues");
-                        gl.uniform_1_f32_slice(loc.as_ref(), &arr);
-                        self.set_i(gl, p, "u_nh", hues.len().min(12) as i32);
-                        self.set_f(gl, p, "u_amount", (amount * fx.video).clamp(0.0, 1.0));
-                        self.set_4f(gl, p, "u_rect", [0.0, 0.0, 1.0, 1.0]);
-                        self.draw_quad(gl);
-                        cur = out.tex;
-                    }
-                    EffectKind::Tile { count, mirror, spin } => {
-                        let (n, turn) = chromagrain_core::fx::tile_video_params(count, spin, fx.video);
-                        if (n - 1.0).abs() < 1e-4 && turn.abs() < 1e-6 {
-                            continue;
-                        }
-                        let out = if cur == self.ping.as_ref().unwrap().tex {
-                            self.pong.as_ref().unwrap()
-                        } else {
-                            self.ping.as_ref().unwrap()
-                        };
-                        self.bind_target(gl, out, None);
-                        let p = self.use_program(gl, "tile");
-                        gl.active_texture(glow::TEXTURE0);
-                        gl.bind_texture(glow::TEXTURE_2D, Some(cur));
-                        self.set_i(gl, p, "u_tex", 0);
-                        self.set_2f(gl, p, "u_res", w, h);
-                        self.set_f(gl, p, "u_count", n);
-                        self.set_f(gl, p, "u_mirror", mirror);
-                        self.set_f(gl, p, "u_turn", turn);
-                        self.set_4f(gl, p, "u_rect", [0.0, 0.0, 1.0, 1.0]);
-                        self.draw_quad(gl);
-                        cur = out.tex;
-                    }
-                    EffectKind::Crush { downsample, bits } => {
-                        let out = if cur == self.ping.as_ref().unwrap().tex {
-                            self.pong.as_ref().unwrap()
-                        } else {
-                            self.ping.as_ref().unwrap()
-                        };
-                        self.bind_target(gl, out, None);
-                        let p = self.use_program(gl, "crush");
-                        gl.active_texture(glow::TEXTURE0);
-                        gl.bind_texture(glow::TEXTURE_2D, Some(cur));
-                        self.set_i(gl, p, "u_tex", 0);
-                        self.set_2f(gl, p, "u_res", w, h);
-                        let block = 1.0 + (downsample - 1.0) * fx.video;
-                        let levels = 2.0f32.powf(8.0 + (bits.clamp(1.0, 8.0) - 8.0) * fx.video);
-                        self.set_f(gl, p, "u_block", block.max(1.0));
-                        self.set_f(gl, p, "u_levels", levels);
-                        self.set_4f(gl, p, "u_rect", [0.0, 0.0, 1.0, 1.0]);
-                        self.draw_quad(gl);
-                        cur = out.tex;
-                    }
-                    EffectKind::Delay { time, feedback, mix, shift_x, shift_y } => {
-                        let key = scope ^ ((fi as u64 + 1) << 40);
-                        let frames = ((time * fps).round() as usize).clamp(1, MAX_HISTORY);
-                        let ghost = self.history_tail(key, frames);
-                        let out = if cur == self.ping.as_ref().unwrap().tex {
-                            self.pong.as_ref().unwrap()
-                        } else {
-                            self.ping.as_ref().unwrap()
-                        };
-                        self.bind_target(gl, out, None);
-                        let p = self.use_program(gl, "delay");
-                        gl.active_texture(glow::TEXTURE0);
-                        gl.bind_texture(glow::TEXTURE_2D, Some(cur));
-                        gl.active_texture(glow::TEXTURE1);
-                        gl.bind_texture(glow::TEXTURE_2D, Some(ghost.unwrap_or(cur)));
-                        self.set_i(gl, p, "u_tex", 0);
-                        self.set_i(gl, p, "u_ghost", 1);
-                        self.set_2f(gl, p, "u_shift", shift_x, shift_y);
-                        self.set_f(gl, p, "u_mix", if ghost.is_some() { mix * fx.video } else { 0.0 });
-                        self.set_4f(gl, p, "u_rect", [0.0, 0.0, 1.0, 1.0]);
-                        self.draw_quad(gl);
-                        cur = out.tex;
-                        self.push_history(gl, key, frames, cur, feedback);
-                    }
-                    EffectKind::Reverb { size, damp, mix } => {
-                        let key = scope ^ ((fi as u64 + 1) << 40);
-                        self.ensure_accum(gl, key);
-                        let inst = self.fx.get(&key).unwrap();
-                        let (a_read, a_write) = (inst.accum_idx, 1 - inst.accum_idx);
-                        let read_tex = inst.accum.as_ref().unwrap()[a_read].tex;
-                        // accum' = acc*decay + cur*(1-decay)
-                        let write = &self.fx[&key].accum.as_ref().unwrap()[a_write];
-                        let wf = write.fbo;
-                        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(wf));
-                        gl.viewport(0, 0, self.size.0, self.size.1);
-                        let p = self.use_program(gl, "racc");
-                        gl.active_texture(glow::TEXTURE0);
-                        gl.bind_texture(glow::TEXTURE_2D, Some(read_tex));
-                        gl.active_texture(glow::TEXTURE1);
-                        gl.bind_texture(glow::TEXTURE_2D, Some(cur));
-                        self.set_i(gl, p, "u_acc", 0);
-                        self.set_i(gl, p, "u_cur", 1);
-                        self.set_f(gl, p, "u_decay", 0.75 + 0.24 * size.clamp(0.0, 1.0));
-                        self.set_4f(gl, p, "u_rect", [0.0, 0.0, 1.0, 1.0]);
-                        self.draw_quad(gl);
-                        let acc_tex = self.fx[&key].accum.as_ref().unwrap()[a_write].tex;
-                        self.fx.get_mut(&key).unwrap().accum_idx = a_write;
-                        // out = cur + smear
-                        let out = if cur == self.ping.as_ref().unwrap().tex {
-                            self.pong.as_ref().unwrap()
-                        } else {
-                            self.ping.as_ref().unwrap()
-                        };
-                        self.bind_target(gl, out, None);
-                        let p = self.use_program(gl, "rmix");
-                        gl.active_texture(glow::TEXTURE0);
-                        gl.bind_texture(glow::TEXTURE_2D, Some(cur));
-                        gl.active_texture(glow::TEXTURE1);
-                        gl.bind_texture(glow::TEXTURE_2D, Some(acc_tex));
-                        self.set_i(gl, p, "u_tex", 0);
-                        self.set_i(gl, p, "u_acc", 1);
-                        self.set_2f(gl, p, "u_res", w, h);
-                        self.set_f(gl, p, "u_radius", 1.0 + damp * 5.0);
-                        self.set_f(gl, p, "u_mix", mix * fx.video);
-                        self.set_4f(gl, p, "u_rect", [0.0, 0.0, 1.0, 1.0]);
-                        self.draw_quad(gl);
-                        cur = out.tex;
-                    }
-                    EffectKind::Compress { quality } => {
-                        let (Some(fp), Some(fq)) = (&self.fping, &self.fpong) else { continue };
-                        let q = 1.0 + (quality - 1.0) * fx.video;
-                        if q >= 0.999 {
-                            continue;
-                        }
-                        let crunch = (1.0 - q) * (1.0 - q);
-                        // row DCT: cur -> fping
-                        for (name, src, dst) in [
-                            ("dct_row", cur, fp),
-                            ("dct_col", fp.tex, fq),
-                        ] {
-                            self.bind_target(gl, dst, None);
-                            let p = self.use_program(gl, name);
-                            gl.active_texture(glow::TEXTURE0);
-                            gl.bind_texture(glow::TEXTURE_2D, Some(src));
-                            self.set_i(gl, p, "u_tex", 0);
-                            self.set_2f(gl, p, "u_res", w, h);
-                            self.set_4f(gl, p, "u_rect", [0.0, 0.0, 1.0, 1.0]);
-                            self.draw_quad(gl);
-                        }
-                        // quantize: fpong -> fping
-                        self.bind_target(gl, fp, None);
-                        let p = self.use_program(gl, "quant");
-                        gl.active_texture(glow::TEXTURE0);
-                        gl.bind_texture(glow::TEXTURE_2D, Some(fq.tex));
-                        self.set_i(gl, p, "u_tex", 0);
-                        self.set_2f(gl, p, "u_res", w, h);
-                        self.set_f(gl, p, "u_crunch", crunch);
-                        self.set_f(gl, p, "u_thresh", crunch * 0.35);
-                        self.set_4f(gl, p, "u_rect", [0.0, 0.0, 1.0, 1.0]);
-                        self.draw_quad(gl);
-                        // inverse: fping -> fpong -> (rgba8 out)
-                        self.bind_target(gl, fq, None);
-                        let p = self.use_program(gl, "idct_col");
-                        gl.active_texture(glow::TEXTURE0);
-                        gl.bind_texture(glow::TEXTURE_2D, Some(fp.tex));
-                        self.set_i(gl, p, "u_tex", 0);
-                        self.set_2f(gl, p, "u_res", w, h);
-                        self.set_4f(gl, p, "u_rect", [0.0, 0.0, 1.0, 1.0]);
-                        self.draw_quad(gl);
-                        let out = if cur == self.ping.as_ref().unwrap().tex {
-                            self.pong.as_ref().unwrap()
-                        } else {
-                            self.ping.as_ref().unwrap()
-                        };
-                        self.bind_target(gl, out, None);
-                        let p = self.use_program(gl, "idct_row");
-                        gl.active_texture(glow::TEXTURE0);
-                        gl.bind_texture(glow::TEXTURE_2D, Some(fq.tex));
-                        self.set_i(gl, p, "u_tex", 0);
-                        self.set_2f(gl, p, "u_res", w, h);
-                        self.set_4f(gl, p, "u_rect", [0.0, 0.0, 1.0, 1.0]);
-                        self.draw_quad(gl);
-                        cur = out.tex;
-                    }
-                }
+                continue;
             }
-            cur
-        }
-    }
-
-    unsafe fn ensure_accum(&mut self, gl: &glow::Context, key: u64) {
-        let inst = self.fx.entry(key).or_default();
-        if inst.accum.is_none() {
-            unsafe {
-                let a = make_target(gl, self.size.0, self.size.1, false).ok();
-                let b = make_target(gl, self.size.0, self.size.1, false).ok();
-                if let (Some(a), Some(b)) = (a, b) {
-                    for t in [&a, &b] {
-                        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(t.fbo));
-                        gl.clear_color(0.0, 0.0, 0.0, 0.0);
-                        gl.clear(glow::COLOR_BUFFER_BIT);
+            let out = Self::other(cur);
+            match fx.kind {
+                EffectKind::Tint { hue, amount } => {
+                    let mut u = self.res_uni();
+                    u.d[0] = hue;
+                    u.c[3] = (amount * fx.video).clamp(0.0, 1.0);
+                    self.full(out, Pipe::Tint, cur, None, u);
+                    cur = out;
+                }
+                EffectKind::Tune { root, scale, amount, .. } => {
+                    let mut u = self.res_uni();
+                    let hues = chromagrain_core::fx::key_hues(root, scale);
+                    for (a, h) in u.hues.iter_mut().zip(&hues) {
+                        *a = *h;
                     }
-                    inst.accum = Some([a, b]);
+                    u.d[3] = hues.len().min(12) as f32;
+                    u.c[3] = (amount * fx.video).clamp(0.0, 1.0);
+                    self.full(out, Pipe::Tune, cur, None, u);
+                    cur = out;
+                }
+                EffectKind::Tile { count, mirror, spin } => {
+                    let (n, turn) = chromagrain_core::fx::tile_video_params(count, spin, fx.video);
+                    if (n - 1.0).abs() < 1e-4 && turn.abs() < 1e-6 {
+                        continue;
+                    }
+                    let mut u = self.res_uni();
+                    u.d = [n, mirror, turn, 0.0];
+                    self.full(out, Pipe::Tile, cur, None, u);
+                    cur = out;
+                }
+                EffectKind::Crush { downsample, bits } => {
+                    let mut u = self.res_uni();
+                    let block = 1.0 + (downsample - 1.0) * fx.video;
+                    let levels = 2.0f32.powf(8.0 + (bits.clamp(1.0, 8.0) - 8.0) * fx.video);
+                    u.d = [block.max(1.0), levels, 0.0, 0.0];
+                    self.full(out, Pipe::Crush, cur, None, u);
+                    cur = out;
+                }
+                EffectKind::Delay { time, feedback, mix, shift_x, shift_y } => {
+                    let frames = ((time * fps).round() as usize).clamp(1, MAX_HISTORY);
+                    let ghost = self.history_tail(key, frames);
+                    let mut u = self.res_uni();
+                    u.res[2] = shift_x;
+                    u.res[3] = shift_y;
+                    u.c[2] = if ghost.is_some() { mix * fx.video } else { 0.0 };
+                    self.full(out, Pipe::Delay, cur, Some(ghost.unwrap_or(cur)), u);
+                    cur = out;
+                    self.push_history(key, frames, cur, feedback);
+                }
+                EffectKind::Reverb { size, damp, mix } => {
+                    self.ensure_accum(key);
+                    let inst = &self.fx[&key];
+                    let Some(acc) = inst.accum else { continue };
+                    let (read, write) = (acc[inst.accum_idx], acc[1 - inst.accum_idx]);
+                    // accum' = acc*decay + cur*(1-decay)
+                    let mut u = Uni::default();
+                    u.d[0] = 0.75 + 0.24 * size.clamp(0.0, 1.0);
+                    self.full(write, Pipe::Racc, read, Some(cur), u);
+                    let inst = self.fx.get_mut(&key).unwrap();
+                    inst.accum_idx = 1 - inst.accum_idx;
+                    // out = cur + smear
+                    let mut u = self.res_uni();
+                    u.d[0] = 1.0 + damp * 5.0;
+                    u.c[2] = mix * fx.video;
+                    self.full(out, Pipe::Rmix, cur, Some(write), u);
+                    cur = out;
+                }
+                EffectKind::Compress { quality } => {
+                    let q = 1.0 + (quality - 1.0) * fx.video;
+                    if q >= 0.999 {
+                        continue;
+                    }
+                    let crunch = (1.0 - q) * (1.0 - q);
+                    let u = self.res_uni();
+                    self.full(FPING, Pipe::DctRow, cur, None, u);
+                    self.full(FPONG, Pipe::DctCol, FPING, None, u);
+                    let mut uq = u;
+                    uq.d = [crunch, crunch * 0.35, 0.0, 0.0];
+                    self.full(FPING, Pipe::Quant, FPONG, None, uq);
+                    self.full(FPONG, Pipe::IdctCol, FPING, None, u);
+                    self.full(out, Pipe::IdctRow, FPONG, None, u);
+                    cur = out;
                 }
             }
         }
+        cur
+    }
+
+    fn ensure_accum(&mut self, key: u64) {
+        if self.fx.get(&key).is_some_and(|i| i.accum.is_some()) {
+            return;
+        }
+        let a = self.new_target(false);
+        let b = self.new_target(false);
+        // New targets start undefined: clear them.
+        self.pass(a, Some([0.0; 4]));
+        self.pass(b, Some([0.0; 4]));
+        self.fx.entry(key).or_default().accum = Some([a, b]);
     }
 
     /// The frame from `frames` steps ago, if the ring has filled.
-    fn history_tail(&mut self, key: u64, frames: usize) -> Option<glow::Texture> {
+    fn history_tail(&self, key: u64, frames: usize) -> Option<usize> {
         let inst = self.fx.get(&key)?;
         if inst.filled < frames || inst.history.len() < frames {
             return None;
@@ -946,350 +952,504 @@ impl GpuPreview {
     }
 
     /// Record `cur` (scaled by feedback) into the ring for `key`.
-    unsafe fn push_history(
+    fn push_history(&mut self, key: u64, frames: usize, cur: usize, feedback: f32) {
+        let need = frames.min(MAX_HISTORY);
+        while self.fx.entry(key).or_default().history.len() < need {
+            let t = self.new_target(false);
+            self.fx.get_mut(&key).unwrap().history.push(t);
+        }
+        let slot = {
+            let inst = &self.fx[&key];
+            inst.history[inst.head % need]
+        };
+        let u = Uni { c: [feedback, 1.0, 0.0, 0.0], ..Default::default() };
+        self.full(slot, Pipe::Blit, cur, None, u);
+        let inst = self.fx.get_mut(&key).unwrap();
+        inst.head = (inst.head % need + 1) % need;
+        inst.filled = (inst.filled + 1).min(need + 1);
+    }
+
+    /// Record the grain draws of one event list into the current pass.
+    #[allow(clippy::too_many_arguments)]
+    fn record_grains(
         &mut self,
-        gl: &glow::Context,
-        key: u64,
-        frames: usize,
-        cur: glow::Texture,
-        feedback: f32,
+        sid: usize,
+        draws: Vec<chromagrain_core::video::GrainDraw>,
+        color_filter: Option<&chromagrain_core::video::ColorFilter>,
+        additive: f32,
     ) {
-        unsafe {
-            let (w, h) = self.size;
-            let need = frames.min(MAX_HISTORY);
-            // Ensure ring textures exist.
-            {
-                let inst = self.fx.entry(key).or_default();
-                while inst.history.len() < need {
-                    let t = match make_target(gl, w, h, false) {
-                        Ok(t) => t,
-                        Err(_) => return,
-                    };
-                    // Keep only the texture; render into it via shared fbo.
-                    inst.history.push(t.tex);
-                    gl.delete_framebuffer(t.fbo);
-                }
-            }
-            let (head, tex) = {
-                let inst = self.fx.get(&key).unwrap();
-                (inst.head % need, inst.history[inst.head % need])
+        let Some(gsrc) = self.sources.get(&sid) else { return };
+        let (layers, dur) = (gsrc.layers, gsrc.duration.max(1e-6));
+        let aspect = self.size.0 as f32 / self.size.1.max(1) as f32;
+        let (mode, cf, valmin) = match color_filter {
+            None => (0.0, [0.0f32; 4], 0.0),
+            Some(c) => (
+                if c.mode == ColorFilterMode::Keep { 1.0 } else { 2.0 },
+                [c.hue_center, c.hue_width / 2.0, c.softness, c.sat_min],
+                c.val_min,
+            ),
+        };
+        for d in draws {
+            let layer = ((d.src_time / dur).rem_euclid(1.0) * layers as f64).min(layers as f64 - 1.0) as f32;
+            let u = Uni {
+                rect: d.dest,
+                patch: d.patch,
+                cf,
+                a: [d.rotation, aspect, layer.floor(), d.alpha],
+                b: [d.hue_shift, mode, valmin, additive],
+                ..Default::default()
             };
-            // Render cur * feedback into the history slot.
-            let fbo = gl.create_framebuffer().ok();
-            let Some(fbo) = fbo else { return };
-            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
-            gl.framebuffer_texture_2d(
-                glow::FRAMEBUFFER,
-                glow::COLOR_ATTACHMENT0,
-                glow::TEXTURE_2D,
-                Some(tex),
-                0,
-            );
-            gl.viewport(0, 0, w, h);
-            gl.disable(glow::BLEND);
-            let p = self.use_program(gl, "blit");
-            gl.active_texture(glow::TEXTURE0);
-            gl.bind_texture(glow::TEXTURE_2D, Some(cur));
-            self.set_i(gl, p, "u_tex", 0);
-            self.set_f(gl, p, "u_opacity", feedback);
-            self.set_f(gl, p, "u_additive", 0.0);
-            self.set_f(gl, p, "u_alpha_mul", 1.0);
-            self.set_4f(gl, p, "u_rect", [0.0, 0.0, 1.0, 1.0]);
-            self.draw_quad(gl);
-            gl.delete_framebuffer(fbo);
-            let inst = self.fx.get_mut(&key).unwrap();
-            inst.head = (head + 1) % need;
-            inst.filled = (inst.filled + 1).min(need + 1);
+            self.draw(Pipe::Grain, None, None, Some(sid), u);
         }
     }
 
-    /// Render the whole scene and present it into the egui viewport.
-    pub fn paint(
-        &mut self,
-        gl: &glow::Context,
-        info: &eframe::egui::PaintCallbackInfo,
-        scene: &Scene,
-    ) {
-        let (w, h) = (scene.project.width as i32, scene.project.height as i32);
-        if self.ensure_targets(gl, w.max(2), h.max(2)).is_err() {
+    /// Composite `tex` (premultiplied) over `target`.
+    fn blend_onto(&mut self, target: usize, tex: usize, opacity: f32, additive: f32) {
+        self.pass(target, None);
+        let u = Uni { c: [opacity, 1.0, 0.0, 0.0], b: [0.0, 0.0, 0.0, additive], ..Default::default() };
+        self.draw(Pipe::BlitBlend, Some(tex), None, None, u);
+    }
+
+    /// Render the whole scene offscreen; returns the commands to submit.
+    pub fn render(&mut self, scene: &Scene) -> wgpu::CommandBuffer {
+        let (w, h) = (scene.project.width.max(2), scene.project.height.max(2));
+        self.ensure_targets(w, h);
+        self.passes.clear();
+
+        // Upload any sources we need.
+        let needed: Vec<usize> =
+            scene.plan.iter().flat_map(|cp| cp.parts.iter().map(|(sid, _)| *sid)).collect();
+        for sid in needed {
+            self.ensure_source(&scene.project, sid);
+        }
+
+        // Master starts opaque black.
+        self.pass(MASTER, Some([0.0, 0.0, 0.0, 1.0]));
+
+        let t = scene.t;
+        let fps = scene.project.fps;
+        let aspect = w as f32 / h as f32;
+        for (ti, track) in scene.project.tracks.iter().enumerate() {
+            if track.muted {
+                continue;
+            }
+            let plans: Vec<&ClipPlan> = scene.plan.iter().filter(|p| p.track == ti).collect();
+            if plans.is_empty() {
+                continue;
+            }
+            // Track layer.
+            self.pass(TRACK, Some([0.0; 4]));
+            let mut track_any = !track.effects.is_empty();
+            for cp in &plans {
+                let Some(clip) = track.clips.get(cp.clip_index) else { continue };
+                let any_active =
+                    cp.parts.iter().any(|(_, evs)| evs.iter().any(|e| t >= e.onset && t < e.end()));
+                if !any_active && clip.effects.is_empty() {
+                    continue;
+                }
+                // Clip layer.
+                self.pass(CLIP, Some([0.0; 4]));
+                if any_active {
+                    for (sid, evs) in &cp.parts {
+                        let Some(gsrc) = self.sources.get(sid) else { continue };
+                        let dur = gsrc.duration.max(1e-6);
+                        let style: VisualGrainStyle = cp.style;
+                        let draws = grain_draws_opts(
+                            evs,
+                            &style,
+                            &clip.link,
+                            &clip.transform,
+                            dur,
+                            t,
+                            aspect,
+                            scene.parked,
+                        );
+                        self.record_grains(*sid, draws, clip.color_filter.as_ref(), style.additive);
+                    }
+                }
+                let final_tex = self.apply_chain(
+                    &clip.effects,
+                    ((ti as u64) << 20) | (cp.clip_index as u64 + 1),
+                    CLIP,
+                    fps,
+                );
+                // Blend clip layer into track layer.
+                self.blend_onto(TRACK, final_tex, 1.0, cp.style.additive * 0.5);
+                track_any = true;
+            }
+            if !track_any {
+                continue;
+            }
+            let final_tex = self.apply_chain(&track.effects, (ti as u64 + 1) << 32, TRACK, fps);
+            // Composite track onto master.
+            let beat = t * scene.project.bpm / 60.0;
+            self.blend_onto(MASTER, final_tex, track.opacity_at(beat), 0.0);
+        }
+
+        // Live pad hits on top, full correspondence, default style.
+        if !scene.live.is_empty() {
+            self.pass(CLIP, Some([0.0; 4]));
+            let style = VisualGrainStyle::default();
+            let link = chromagrain_core::video::AvLink::default();
+            let mut drew = false;
+            for (sid, ev) in &scene.live {
+                self.ensure_source(&scene.project, *sid);
+                let Some(gsrc) = self.sources.get(sid) else { continue };
+                let dur = gsrc.duration.max(1e-6);
+                let draws = grain_draws(
+                    std::slice::from_ref(ev),
+                    &style,
+                    &link,
+                    &chromagrain_core::timeline::ClipTransform::default(),
+                    dur,
+                    scene.live_t,
+                    aspect,
+                );
+                if draws.is_empty() {
+                    continue;
+                }
+                // The pass may have been interrupted by an upload-free
+                // ensure; keep drawing into the clip layer.
+                self.record_grains(*sid, draws, None, 0.4);
+                drew = true;
+            }
+            if drew {
+                self.blend_onto(MASTER, CLIP, 1.0, 0.3);
+            }
+        }
+
+        // Master chain.
+        let final_tex = self.apply_chain(&scene.project.master_effects, 0xFFFF_0000_0000, MASTER, fps);
+        self.final_tex = Some(final_tex);
+        self.execute()
+    }
+
+    fn tex_bind_group(&mut self, key: TexKey) {
+        if self.tex_bgs.contains_key(&key) {
             return;
         }
-        unsafe {
-            let prev_fbo = gl.get_parameter_i32(glow::FRAMEBUFFER_BINDING);
-            let scissor_was_on = gl.is_enabled(glow::SCISSOR_TEST);
-            gl.disable(glow::SCISSOR_TEST);
-
-            // Upload any sources we need.
-            let needed: Vec<usize> = scene
-                .plan
-                .iter()
-                .flat_map(|cp| cp.parts.iter().map(|(sid, _)| *sid))
-                .collect();
-            for sid in needed {
-                self.ensure_source(gl, &scene.project, sid);
+        let view2d = |k: u32| -> &wgpu::TextureView {
+            if k == u32::MAX {
+                &self.dummy_2d
+            } else {
+                &self.targets[k as usize].view
             }
+        };
+        let arr = if key.2 == u32::MAX {
+            &self.dummy_arr
+        } else {
+            self.sources.get(&(key.2 as usize)).map(|s| &s.view).unwrap_or(&self.dummy_arr)
+        };
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("chromagrain textures"),
+            layout: &self.tex_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(view2d(key.0)) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(view2d(key.1)) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(arr) },
+            ],
+        });
+        self.tex_bgs.insert(key, bg);
+    }
 
-            // Master starts opaque black.
-            let master_fbo = self.master.as_ref().unwrap().fbo;
-            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(master_fbo));
-            gl.viewport(0, 0, self.size.0, self.size.1);
-            gl.clear_color(0.0, 0.0, 0.0, 1.0);
-            gl.clear(glow::COLOR_BUFFER_BIT);
-
-            let t = scene.t;
-            let fps = scene.project.fps;
-            for (ti, track) in scene.project.tracks.iter().enumerate() {
-                if track.muted {
-                    continue;
-                }
-                let plans: Vec<&ClipPlan> =
-                    scene.plan.iter().filter(|p| p.track == ti).collect();
-                if plans.is_empty() {
-                    continue;
-                }
-                // Track layer.
-                let track_fbo = self.track_t.as_ref().unwrap().fbo;
-                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(track_fbo));
-                gl.viewport(0, 0, self.size.0, self.size.1);
-                gl.clear_color(0.0, 0.0, 0.0, 0.0);
-                gl.clear(glow::COLOR_BUFFER_BIT);
-                let mut track_any = !track.effects.is_empty();
-
-                for cp in &plans {
-                    let Some(clip) = track.clips.get(cp.clip_index) else { continue };
-                    let any_active = cp
-                        .parts
-                        .iter()
-                        .any(|(_, evs)| evs.iter().any(|e| t >= e.onset && t < e.end()));
-                    if !any_active && clip.effects.is_empty() {
-                        continue;
-                    }
-                    // Clip layer.
-                    let clip_target = self.clip_t.as_ref().unwrap();
-                    self.bind_target(gl, clip_target, Some([0.0, 0.0, 0.0, 0.0]));
-                    if any_active {
-                        gl.enable(glow::BLEND);
-                        gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
-                        for (sid, evs) in &cp.parts {
-                            let Some(gsrc) = self.sources.get(sid) else { continue };
-                            let (gtex, layers, dur) =
-                                (gsrc.tex, gsrc.layers, gsrc.duration.max(1e-6));
-                            let style: VisualGrainStyle = cp.style;
-                            let aspect = self.size.0 as f32 / self.size.1.max(1) as f32;
-                            let draws = grain_draws_opts(
-                                evs,
-                                &style,
-                                &clip.link,
-                                &clip.transform,
-                                dur,
-                                t,
-                                aspect,
-                                scene.parked,
-                            );
-                            let p = self.use_program(gl, "grain");
-                            gl.active_texture(glow::TEXTURE0);
-                            gl.bind_texture(glow::TEXTURE_2D_ARRAY, Some(gtex));
-                            self.set_i(gl, p, "u_src", 0);
-                            let (mode, cf, valmin) = match &clip.color_filter {
-                                None => (0, [0.0f32; 4], 0.0),
-                                Some(c) => (
-                                    if c.mode == ColorFilterMode::Keep { 1 } else { 2 },
-                                    [c.hue_center, c.hue_width / 2.0, c.softness, c.sat_min],
-                                    c.val_min,
-                                ),
-                            };
-                            self.set_i(gl, p, "u_cf_mode", mode);
-                            self.set_4f(gl, p, "u_cf", cf);
-                            self.set_f(gl, p, "u_cf_valmin", valmin);
-                            self.set_f(gl, p, "u_additive", style.additive);
-                            self.set_f(gl, p, "u_aspect", aspect);
-                            for d in draws {
-                                let layer = ((d.src_time / dur).rem_euclid(1.0)
-                                    * layers as f64)
-                                    .min(layers as f64 - 1.0)
-                                    as f32;
-                                self.set_f(gl, p, "u_layer", layer.floor());
-                                self.set_4f(gl, p, "u_patch", d.patch);
-                                self.set_f(gl, p, "u_alpha", d.alpha);
-                                self.set_f(gl, p, "u_hue", d.hue_shift);
-                                self.set_f(gl, p, "u_rot", d.rotation);
-                                self.set_4f(gl, p, "u_rect", d.dest);
-                                self.draw_quad(gl);
-                            }
-                        }
-                        gl.disable(glow::BLEND);
-                    }
-                    let clip_tex = self.clip_t.as_ref().unwrap().tex;
-                    let final_tex = self.apply_chain(
-                        gl,
-                        &clip.effects,
-                        ((ti as u64) << 20) | (cp.clip_index as u64 + 1),
-                        clip_tex,
-                        fps,
-                    );
-                    // Blend clip layer into track layer.
-                    gl.bind_framebuffer(glow::FRAMEBUFFER, Some(track_fbo));
-                    gl.viewport(0, 0, self.size.0, self.size.1);
-                    gl.enable(glow::BLEND);
-                    gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
-                    let p = self.use_program(gl, "blit");
-                    gl.active_texture(glow::TEXTURE0);
-                    gl.bind_texture(glow::TEXTURE_2D, Some(final_tex));
-                    self.set_i(gl, p, "u_tex", 0);
-                    self.set_f(gl, p, "u_opacity", 1.0);
-                    self.set_f(gl, p, "u_additive", cp.style.additive * 0.5);
-                    self.set_f(gl, p, "u_alpha_mul", 1.0);
-                    self.set_4f(gl, p, "u_rect", [0.0, 0.0, 1.0, 1.0]);
-                    self.draw_quad(gl);
-                    gl.disable(glow::BLEND);
-                    track_any = true;
-                }
-                if !track_any {
-                    continue;
-                }
-                let track_tex = self.track_t.as_ref().unwrap().tex;
-                let final_tex =
-                    self.apply_chain(gl, &track.effects, (ti as u64 + 1) << 32, track_tex, fps);
-                // Composite track onto master.
-                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(master_fbo));
-                gl.viewport(0, 0, self.size.0, self.size.1);
-                gl.enable(glow::BLEND);
-                gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
-                let p = self.use_program(gl, "blit");
-                gl.active_texture(glow::TEXTURE0);
-                gl.bind_texture(glow::TEXTURE_2D, Some(final_tex));
-                self.set_i(gl, p, "u_tex", 0);
-                let beat = t * scene.project.bpm / 60.0;
-                self.set_f(gl, p, "u_opacity", track.opacity_at(beat));
-                self.set_f(gl, p, "u_additive", 0.0);
-                self.set_f(gl, p, "u_alpha_mul", 1.0);
-                self.set_4f(gl, p, "u_rect", [0.0, 0.0, 1.0, 1.0]);
-                self.draw_quad(gl);
-                gl.disable(glow::BLEND);
+    /// Upload this frame's uniforms and encode every recorded pass.
+    fn execute(&mut self) -> wgpu::CommandBuffer {
+        let passes = std::mem::take(&mut self.passes);
+        let n: u64 = passes.iter().map(|p| p.draws.len() as u64).sum::<u64>().max(1);
+        if n > self.uni_slots {
+            let slots = n.next_power_of_two();
+            let (buf, bg) = Self::make_uni(&self.device, &self.uni_layout, slots);
+            self.uni_buf = buf;
+            self.uni_bg = bg;
+            self.uni_slots = slots;
+        }
+        self.uni_staging.clear();
+        self.uni_staging.resize((n * UNI_STRIDE) as usize, 0);
+        let mut slot = 0usize;
+        for p in &passes {
+            for d in &p.draws {
+                let at = slot * UNI_STRIDE as usize;
+                self.uni_staging[at..at + UNI_SIZE as usize].copy_from_slice(uni_bytes(&d.u));
+                slot += 1;
             }
-
-            // Live pad hits on top, full correspondence, default style.
-            if !scene.live.is_empty() {
-                let clip_target = self.clip_t.as_ref().unwrap();
-                self.bind_target(gl, clip_target, Some([0.0, 0.0, 0.0, 0.0]));
-                gl.enable(glow::BLEND);
-                gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
-                let style = VisualGrainStyle::default();
-                let link = chromagrain_core::video::AvLink::default();
-                let mut drew = false;
-                for (sid, ev) in &scene.live {
-                    self.ensure_source(gl, &scene.project, *sid);
-                    let Some(gsrc) = self.sources.get(sid) else { continue };
-                    let (gtex, layers, dur) = (gsrc.tex, gsrc.layers, gsrc.duration.max(1e-6));
-                    let aspect = self.size.0 as f32 / self.size.1.max(1) as f32;
-                    let draws = grain_draws(
-                        std::slice::from_ref(ev),
-                        &style,
-                        &link,
-                        &chromagrain_core::timeline::ClipTransform::default(),
-                        dur,
-                        scene.live_t,
-                        aspect,
-                    );
-                    if draws.is_empty() {
-                        continue;
-                    }
-                    let p = self.use_program(gl, "grain");
-                    gl.active_texture(glow::TEXTURE0);
-                    gl.bind_texture(glow::TEXTURE_2D_ARRAY, Some(gtex));
-                    self.set_i(gl, p, "u_src", 0);
-                    self.set_i(gl, p, "u_cf_mode", 0);
-                    self.set_f(gl, p, "u_cf_valmin", 0.0);
-                    self.set_f(gl, p, "u_additive", 0.4);
-                    self.set_f(
-                        gl,
-                        p,
-                        "u_aspect",
-                        self.size.0 as f32 / self.size.1.max(1) as f32,
-                    );
-                    for d in draws {
-                        let layer = ((d.src_time / dur).rem_euclid(1.0) * layers as f64)
-                            .min(layers as f64 - 1.0) as f32;
-                        self.set_f(gl, p, "u_layer", layer.floor());
-                        self.set_4f(gl, p, "u_patch", d.patch);
-                        self.set_f(gl, p, "u_alpha", d.alpha);
-                        self.set_f(gl, p, "u_hue", d.hue_shift);
-                        self.set_f(gl, p, "u_rot", d.rotation);
-                        self.set_4f(gl, p, "u_rect", d.dest);
-                        self.draw_quad(gl);
-                        drew = true;
-                    }
-                }
-                gl.disable(glow::BLEND);
-                if drew {
-                    let live_tex = self.clip_t.as_ref().unwrap().tex;
-                    gl.bind_framebuffer(glow::FRAMEBUFFER, Some(master_fbo));
-                    gl.viewport(0, 0, self.size.0, self.size.1);
-                    gl.enable(glow::BLEND);
-                    gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
-                    let p = self.use_program(gl, "blit");
-                    gl.active_texture(glow::TEXTURE0);
-                    gl.bind_texture(glow::TEXTURE_2D, Some(live_tex));
-                    self.set_i(gl, p, "u_tex", 0);
-                    self.set_f(gl, p, "u_opacity", 1.0);
-                    self.set_f(gl, p, "u_additive", 0.3);
-                    self.set_f(gl, p, "u_alpha_mul", 1.0);
-                    self.set_4f(gl, p, "u_rect", [0.0, 0.0, 1.0, 1.0]);
-                    self.draw_quad(gl);
-                    gl.disable(glow::BLEND);
-                }
+        }
+        self.queue.write_buffer(&self.uni_buf, 0, &self.uni_staging);
+        for p in &passes {
+            for d in &p.draws {
+                self.tex_bind_group((key_part(d.t0), key_part(d.t1), key_part(d.arr)));
             }
+        }
 
-            // Master chain.
-            let master_tex = self.master.as_ref().unwrap().tex;
-            let final_tex = self.apply_chain(
-                gl,
-                &scene.project.master_effects,
-                0xFFFF_0000_0000,
-                master_tex,
-                fps,
-            );
-
-            // Present into the egui viewport.
-            gl.bind_framebuffer(
-                glow::FRAMEBUFFER,
-                if prev_fbo != 0 {
-                    Some(glow::NativeFramebuffer(
-                        std::num::NonZeroU32::new(prev_fbo as u32).unwrap(),
-                    ))
-                } else {
-                    None
-                },
-            );
-            let vp = info.viewport_in_pixels();
-            gl.viewport(vp.left_px, vp.from_bottom_px, vp.width_px, vp.height_px);
-            let clip = info.clip_rect_in_pixels();
-            gl.enable(glow::SCISSOR_TEST);
-            gl.scissor(clip.left_px, clip.from_bottom_px, clip.width_px, clip.height_px);
-            gl.disable(glow::BLEND);
-            let p = self.use_program(gl, "present");
-            gl.active_texture(glow::TEXTURE0);
-            gl.bind_texture(glow::TEXTURE_2D, Some(final_tex));
-            self.set_i(gl, p, "u_tex", 0);
-            self.set_f(gl, p, "u_screen", 1.0);
-            self.set_4f(gl, p, "u_rect", [0.0, 0.0, 1.0, 1.0]);
-            self.draw_quad(gl);
-
-            // Restore state egui expects.
-            if !scissor_was_on {
-                gl.disable(glow::SCISSOR_TEST);
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("chromagrain preview"),
+        });
+        let mut slot = 0u64;
+        for p in &passes {
+            let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.targets[p.target].view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: match p.clear {
+                            Some(c) => wgpu::LoadOp::Clear(c),
+                            None => wgpu::LoadOp::Load,
+                        },
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            for d in &p.draws {
+                rp.set_pipeline(&self.pipelines[&d.pipe]);
+                rp.set_bind_group(0, &self.uni_bg, &[(slot * UNI_STRIDE) as u32]);
+                rp.set_bind_group(1, &self.tex_bgs[&(key_part(d.t0), key_part(d.t1), key_part(d.arr))], &[]);
+                rp.draw(0..6, 0..1);
+                slot += 1;
             }
-            gl.enable(glow::BLEND);
-            gl.blend_func_separate(
-                glow::ONE,
-                glow::ONE_MINUS_SRC_ALPHA,
-                glow::ONE_MINUS_DST_ALPHA,
-                glow::ONE,
-            );
+        }
+        enc.finish()
+    }
+
+    /// Prepare a present of the canvas: `crop` is the visible uv window
+    /// (x, y, w, h) of the canvas. Returns the present slot to paint with.
+    fn prepare_present(&mut self, crop: [f32; 4]) -> Option<usize> {
+        let tex = self.final_tex?;
+        self.tex_bind_group((tex as u32, u32::MAX, u32::MAX));
+        let slot = self.present_next;
+        self.present_next = (self.present_next + 1) % PRESENT_SLOTS;
+        let u = Uni { patch: crop, ..Default::default() };
+        self.queue.write_buffer(&self.present_buf, slot as u64 * UNI_STRIDE, uni_bytes(&u));
+        Some(slot)
+    }
+
+    fn present(&self, rp: &mut wgpu::RenderPass<'static>, slot: usize) {
+        let Some(tex) = self.final_tex else { return };
+        let Some(bg) = self.tex_bgs.get(&(tex as u32, u32::MAX, u32::MAX)) else { return };
+        rp.set_pipeline(&self.present_pipe);
+        rp.set_bind_group(0, &self.present_bg, &[(slot as u64 * UNI_STRIDE) as u32]);
+        rp.set_bind_group(1, bg, &[]);
+        rp.draw(0..6, 0..1);
+    }
+}
+
+/// Install the pipeline into egui-wgpu's shared callback resources (once,
+/// at startup). Returns false when there is no wgpu render state.
+pub fn install(cc: &eframe::CreationContext<'_>) -> bool {
+    let Some(rs) = cc.wgpu_render_state.as_ref() else { return false };
+    let g = GpuPreview::new(&rs.device, &rs.queue, rs.target_format);
+    rs.renderer.write().callback_resources.insert(g);
+    true
+}
+
+/// Paint callback: shows the current scene in `rect` (any viewport).
+/// Parts of `rect` outside the window are cropped, not squeezed, so a
+/// "cover" fullscreen keeps its aspect.
+pub struct PreviewCallback {
+    pub scene: Arc<Mutex<Option<Scene>>>,
+    pub rect: egui::Rect,
+    slot: AtomicUsize,
+}
+
+impl PreviewCallback {
+    pub fn shape(scene: Arc<Mutex<Option<Scene>>>, rect: egui::Rect) -> egui::Shape {
+        egui::Shape::Callback(egui_wgpu::Callback::new_paint_callback(
+            rect,
+            PreviewCallback { scene, rect, slot: AtomicUsize::new(usize::MAX) },
+        ))
+    }
+}
+
+impl egui_wgpu::CallbackTrait for PreviewCallback {
+    fn prepare(
+        &self,
+        _device: &wgpu::Device,
+        _queue: &wgpu::Queue,
+        screen: &egui_wgpu::ScreenDescriptor,
+        _egui_encoder: &mut wgpu::CommandEncoder,
+        resources: &mut egui_wgpu::CallbackResources,
+    ) -> Vec<wgpu::CommandBuffer> {
+        let Some(g) = resources.get_mut::<GpuPreview>() else { return Vec::new() };
+        let mut out = Vec::new();
+        if let Some(scene) = self.scene.lock().unwrap().as_ref() {
+            if g.last_frame != Some(scene.frame) || g.final_tex.is_none() {
+                out.push(g.render(scene));
+                g.last_frame = Some(scene.frame);
+            }
+        }
+        // Visible part of the rect, as a uv window into the canvas.
+        let ppp = screen.pixels_per_point.max(1e-3);
+        let screen_rect = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(screen.size_in_pixels[0] as f32 / ppp, screen.size_in_pixels[1] as f32 / ppp),
+        );
+        let r = self.rect;
+        let vis = r.intersect(screen_rect);
+        let (rw, rh) = (r.width().max(1e-3), r.height().max(1e-3));
+        let crop = [
+            (vis.min.x - r.min.x) / rw,
+            (vis.min.y - r.min.y) / rh,
+            vis.width().max(0.0) / rw,
+            vis.height().max(0.0) / rh,
+        ];
+        let slot = g.prepare_present(crop).unwrap_or(usize::MAX);
+        self.slot.store(slot, Ordering::Relaxed);
+        out
+    }
+
+    fn paint(
+        &self,
+        _info: egui::PaintCallbackInfo,
+        render_pass: &mut wgpu::RenderPass<'static>,
+        resources: &egui_wgpu::CallbackResources,
+    ) {
+        let slot = self.slot.load(Ordering::Relaxed);
+        if slot == usize::MAX {
+            return;
+        }
+        if let Some(g) = resources.get::<GpuPreview>() {
+            g.present(render_pass, slot);
         }
     }
 }
 
-fn bytemuck_cast(v: &[f32; 12]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+#[cfg(test)]
+mod tests {
+    //! GPU ↔ CPU parity: render one frame on a headless wgpu device and
+    //! compare it with the reference CPU renderer. Skips (passes) when no
+    //! adapter is available (e.g. a GPU-less CI box).
+    use super::*;
+    use chromagrain_core::render::{plan_project, render_project};
+    use chromagrain_core::timeline::{Clip, Source};
+    use chromagrain_core::video::{Frame, VideoClip};
+
+    fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
+    }
+
+    fn project(master: Option<AvEffect>) -> Project {
+        let mut p = Project { bpm: 120.0, width: 160, height: 96, fps: 24.0, ..Default::default() };
+        let sid = p.add_source(Source {
+            name: "pattern".into(),
+            audio: None,
+            video: Some(Arc::new(VideoClip::test_pattern(160, 96, 12.0, 2.0))),
+            base_hz: 0.0,
+        });
+        // Additive glow is off: under glow the GPU's premultiplied blend
+        // is a documented approximation of the CPU's straight-alpha mix
+        // (same as the GL pipeline it replaces); everything else must
+        // match closely.
+        let t = p.add_track("bed");
+        let mut bed = Clip::new_snippet(sid, 0.0, 4.0);
+        bed.grains.gain = 1.0;
+        bed.visual.additive = 0.0;
+        p.tracks[t].clips.push(bed);
+        let t = p.add_track("cloud");
+        let mut c = Clip::new(sid, 0.0, 4.0);
+        c.grains.density = 30.0;
+        c.grains.duration = 0.3;
+        c.grains.pitch_jitter = 5.0;
+        c.visual.additive = 0.0;
+        p.tracks[t].clips.push(c);
+        p.master_effects.extend(master);
+        p
+    }
+
+    /// GPU frame at `t` seconds, read back as RGBA8.
+    fn gpu_frame(g: &mut GpuPreview, p: &Project, t: f64, frame: u64) -> Frame {
+        let scene = Scene {
+            project: p.clone(),
+            plan: Arc::new(plan_project(p)),
+            t,
+            live: Vec::new(),
+            live_t: 0.0,
+            parked: false,
+            frame,
+        };
+        let cb = g.render(&scene);
+        let (w, h) = (p.width, p.height);
+        let row = (w * 4).div_ceil(256) * 256;
+        let buf = g.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (row * h) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = g.device.create_command_encoder(&Default::default());
+        enc.copy_texture_to_buffer(
+            g.targets[g.final_tex.unwrap()].tex.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(h) },
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        g.queue.submit([cb, enc.finish()]);
+        buf.slice(..).map_async(wgpu::MapMode::Read, |r| r.unwrap());
+        g.device.poll(wgpu::PollType::Wait).unwrap();
+        let data = buf.slice(..).get_mapped_range();
+        let mut out = Frame::black(w, h);
+        for y in 0..h as usize {
+            let src = &data[y * row as usize..y * row as usize + w as usize * 4];
+            out.data[y * w as usize * 4..(y + 1) * w as usize * 4].copy_from_slice(src);
+        }
+        out
+    }
+
+    fn mean_abs_diff(a: &Frame, b: &Frame) -> f32 {
+        let mut sum = 0u64;
+        let mut n = 0u64;
+        for (pa, pb) in a.data.chunks_exact(4).zip(b.data.chunks_exact(4)) {
+            for c in 0..3 {
+                sum += (pa[c] as i32 - pb[c] as i32).unsigned_abs() as u64;
+                n += 1;
+            }
+        }
+        sum as f32 / n as f32
+    }
+
+    #[test]
+    fn gpu_matches_the_cpu_reference_for_every_effect() {
+        let Some((device, queue)) = device() else {
+            eprintln!("no wgpu adapter: skipping GPU parity test");
+            return;
+        };
+        let mut g = GpuPreview::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
+        let t = 1.25;
+        let beat = t * 2.0; // 120 bpm
+        let mut frame = 0;
+        let mut report = Vec::new();
+        for name in ["none", "crush", "tint", "tune", "tile", "kaleido", "compress", "delay", "reverb"] {
+            let fx = EffectKind::parse(name).map(AvEffect::new);
+            let p = project(fx);
+            frame += 1;
+            let gpu = gpu_frame(&mut g, &p, t, frame);
+            let cpu = render_project(&p, beat, beat + 0.01).frames.remove(0);
+            let d = mean_abs_diff(&gpu, &cpu);
+            if let Ok(dir) = std::env::var("CHROMAGRAIN_PARITY_DIR") {
+                let dir = std::path::Path::new(&dir);
+                let _ = chromagrain_core::media::save_frame_png(&dir.join(format!("parity_{name}_gpu.png")), &gpu);
+                let _ = chromagrain_core::media::save_frame_png(&dir.join(format!("parity_{name}_cpu.png")), &cpu);
+            }
+            report.push(format!("{name}: {d:.2}"));
+            assert!(gpu.mean_luma() > 10.0, "{name}: GPU frame is not black ({})", gpu.mean_luma());
+            // Temporal effects (delay ghosts, reverb persistence) start
+            // from history on the CPU; one GPU frame has none yet.
+            let tol = match name {
+                "delay" | "reverb" => 6.0,
+                "compress" => 6.0, // GPU uses a DC-relative threshold
+                _ => 2.0,
+            };
+            if std::env::var("CHROMAGRAIN_PARITY_DIR").is_ok() {
+                continue; // dumping images: report every effect
+            }
+            assert!(d < tol, "{name}: mean |gpu - cpu| = {d:.2} (tolerance {tol}) — {report:?}");
+        }
+        eprintln!("gpu vs cpu mean abs diff (0..255): {report:?}");
+    }
 }
