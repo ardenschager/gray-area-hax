@@ -9,17 +9,26 @@ use crate::grain::{GrainEvent, GrainSettings};
 use crate::music::Key;
 use crate::timeline::{Source, SourceId};
 
-/// One step of a row: on/off, semitone offset, gain multiplier.
+/// One step of a row: on/off, semitone offset, gain multiplier, plus the
+/// chop-sequencing extras: which slice of the source it plays, how long,
+/// and how likely it is to fire.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Step {
     pub on: bool,
     pub pitch: f32,
     pub gain: f32,
+    /// Read position 0..1 in the source for this hit (the slice it
+    /// triggers); negative = the row's own position.
+    pub slice: f32,
+    /// Hit length as a multiple of the row's grain duration (1 = as set).
+    pub length: f32,
+    /// Probability the step fires, 0..1.
+    pub chance: f32,
 }
 
 impl Default for Step {
     fn default() -> Self {
-        Step { on: false, pitch: 0.0, gain: 1.0 }
+        Step { on: false, pitch: 0.0, gain: 1.0, slice: -1.0, length: 1.0, chance: 1.0 }
     }
 }
 
@@ -48,6 +57,8 @@ pub struct SeqRow {
     /// Loop-mode segment, normalized 0..1 of the source.
     pub loop_start: f32,
     pub loop_end: f32,
+    /// Silenced (the lane header's tap-to-mute).
+    pub muted: bool,
 }
 
 impl SeqRow {
@@ -66,6 +77,7 @@ impl SeqRow {
             mode: RowMode::Steps,
             loop_start: 0.0,
             loop_end: 1.0,
+            muted: false,
         }
     }
 
@@ -145,6 +157,9 @@ pub fn pattern_events(
 
     for (row_idx, row) in pattern.rows.iter().enumerate() {
         let Some(source) = sources.get(row.source) else { continue };
+        if row.muted {
+            continue;
+        }
         let source_len = source.duration();
         if source_len <= 0.0 || row.steps.is_empty() {
             continue;
@@ -152,6 +167,8 @@ pub fn pattern_events(
         let base_hz = source.effective_base_hz();
         let key = key_override.or(row.key.as_ref());
         let mut rng = Rng::new(row.grains.seed ^ ((row_idx as u64 + 1) * 0x9E37));
+        // Chance rolls use their own stream so they never shift the jitter.
+        let mut chance_rng = Rng::new(row.grains.seed ^ ((row_idx as u64 + 1) * 0xC4A5_CE00));
         let mut events = Vec::new();
         let mut id: u64 = (row_idx as u64) << 32;
 
@@ -180,8 +197,9 @@ pub fn pattern_events(
                     let pitch_j = rng.bipolar();
                     let pan_j = rng.bipolar();
                     let rev_j = rng.next_f32();
+                    let roll = chance_rng.next_f32();
                     slot += 1;
-                    if !step.on {
+                    if !step.on || roll >= step.chance {
                         continue;
                     }
                     let g = eff_at(t);
@@ -194,14 +212,14 @@ pub fn pattern_events(
                         g.quantize_amount,
                         g.detune_cents,
                     );
-                    let mut pos =
-                        g.position as f64 * source_len + g.spray as f64 * spray_j as f64;
+                    let at = if step.slice >= 0.0 { step.slice.min(1.0) } else { g.position };
+                    let mut pos = at as f64 * source_len + g.spray as f64 * spray_j as f64;
                     pos = pos.rem_euclid(source_len.max(1e-6));
 
                     events.push(GrainEvent {
                         onset: clip_start_secs + t,
                         source_pos: pos,
-                        duration: g.duration.clamp(0.01, 5.0),
+                        duration: (g.duration * step.length.max(0.05)).clamp(0.01, 5.0),
                         pitch_ratio: ratio,
                         gain: g.gain * step.gain,
                         pan: (g.pan + g.pan_spread * pan_j).clamp(-1.0, 1.0),
@@ -279,6 +297,26 @@ mod tests {
             p.rows[r].steps[i].on = true;
         }
         p
+    }
+
+    #[test]
+    fn steps_play_their_slice_length_and_chance() {
+        let mut p = four_on_the_floor();
+        p.rows[0].steps[4].slice = 0.5;
+        p.rows[0].steps[4].length = 2.0;
+        p.rows[0].steps[8].chance = 0.0;
+        let sources = source_440();
+        let parts = pattern_events(&p, &sources, 0.0, 2.0, 0.5, None, &[]);
+        let evs = &parts[0].1;
+        assert_eq!(evs.len(), 3, "the chance-0 step never fires");
+        let d = p.rows[0].grains.duration;
+        assert!((evs[1].source_pos - 1.0).abs() < 1e-6, "slice 0.5 of a 2 s source");
+        assert!((evs[1].duration - 2.0 * d).abs() < 1e-6);
+        assert!((evs[0].duration - d).abs() < 1e-6);
+        // Chance doesn't reshuffle the other steps' jitter.
+        let base = pattern_events(&four_on_the_floor(), &sources, 0.0, 2.0, 0.5, None, &[]);
+        assert_eq!(base[0].1[0].pan, evs[0].pan);
+        assert_eq!(base[0].1[3].pan, evs[2].pan);
     }
 
     #[test]

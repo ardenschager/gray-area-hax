@@ -9,13 +9,20 @@ description = "Audiovisual granular sampling compositor / sequencer"
 chromagrain-core = { path = "../core" }
 eframe = { version = "0.32", default-features = false, features = [
     "default_fonts",
-    "glow",
+    "wgpu",
     "wayland",
     "x11",
 ] }
+# wgpu backends (eframe pulls wgpu with none): Metal on macOS/iOS,
+# D3D12/Vulkan on Windows/Linux, GLES as a fallback.
+wgpu = { version = "25", default-features = false, features = ["metal", "dx12", "vulkan", "gles", "wgsl"] }
 cpal = "0.15"
 rtrb = "0.3"
 midir = "0.10"
 rfd = "0.15"
 ureq = { version = "2", features = ["json"] }
 serde_json = "1"
+
+[dev-dependencies]
+pollster = "0.4"
+egui_kittest = { version = "0.32", features = ["wgpu", "snapshot", "eframe"] }

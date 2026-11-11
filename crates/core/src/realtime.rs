@@ -25,8 +25,11 @@ pub struct RealtimeAudio {
     /// When false, the arrangement is paused: the playhead freezes and
     /// plan events are silent, but live (MIDI) events keep sounding.
     pub transport: bool,
-    /// One-shot live events (MIDI pads), on the monotonic live clock.
-    live: Vec<(usize, GrainEvent)>,
+    /// One-shot live events (MIDI pads, emitters) on the monotonic live
+    /// clock: (bus, source, event). Bus 0 is dry; bus b > 0 runs through
+    /// `live_buses[b - 1]` (e.g. one per emitter: its smear + look).
+    live: Vec<(u8, usize, GrainEvent)>,
+    live_buses: Vec<(Vec<crate::fx::AvEffect>, Vec<AudioFxState>)>,
     /// Monotonic sample clock that never pauses (times live events).
     live_pos: u64,
     scratch_clip: StereoBuffer,
@@ -83,6 +86,7 @@ impl RealtimeAudio {
             loop_region,
             transport: true,
             live: Vec::new(),
+            live_buses: Vec::new(),
             live_pos: 0,
             scratch_clip: StereoBuffer { left: Vec::new(), right: Vec::new(), sample_rate: sr },
             scratch_track: StereoBuffer { left: Vec::new(), right: Vec::new(), sample_rate: sr },
@@ -115,7 +119,41 @@ impl RealtimeAudio {
     /// Fire a one-shot live grain (a MIDI pad hit). The event's `onset`
     /// is on the live clock; pass `live_now_secs()` for "immediately".
     pub fn trigger_live(&mut self, source: usize, event: GrainEvent) {
-        self.live.push((source, event));
+        self.live.push((0, source, event));
+    }
+
+    /// [`RealtimeAudio::trigger_live`] on effect bus `bus` (0 = dry).
+    pub fn trigger_live_bus(&mut self, bus: u8, source: usize, event: GrainEvent) {
+        self.live.push((bus, source, event));
+    }
+
+    /// Set the effect chain of live bus `bus` (1-based). State is kept
+    /// while the chain's shape (effect kinds) stays the same, so wet
+    /// amounts can be swept without clicks; a new shape rebuilds it.
+    pub fn set_live_bus(&mut self, bus: u8, chain: Vec<crate::fx::AvEffect>) {
+        if bus == 0 {
+            return;
+        }
+        let i = bus as usize - 1;
+        while self.live_buses.len() <= i {
+            self.live_buses.push((Vec::new(), Vec::new()));
+        }
+        let same = self.live_buses[i].0.len() == chain.len()
+            && self.live_buses[i].0.iter().zip(&chain).all(|(a, b)| {
+                std::mem::discriminant(&a.kind) == std::mem::discriminant(&b.kind)
+                    && match (a.kind, b.kind) {
+                        // Time-structuring params live in the state.
+                        (crate::fx::EffectKind::Delay { time: x, .. }, crate::fx::EffectKind::Delay { time: y, .. }) => x == y,
+                        (crate::fx::EffectKind::Reverb { size: x, damp: dx, .. }, crate::fx::EffectKind::Reverb { size: y, damp: dy, .. }) => x == y && dx == dy,
+                        (crate::fx::EffectKind::Tune { root: x, scale: sx, focus: fx, .. }, crate::fx::EffectKind::Tune { root: y, scale: sy, focus: fy, .. }) => x == y && sx == sy && fx == fy,
+                        (crate::fx::EffectKind::Tint { hue: x, amount: ax }, crate::fx::EffectKind::Tint { hue: y, amount: ay }) => x == y && ax == ay,
+                        _ => true,
+                    }
+            });
+        if !same {
+            self.live_buses[i].1 = fx::audio_chain_states(&chain, self.project.sample_rate);
+        }
+        self.live_buses[i].0 = chain;
     }
 
     /// Fill one stereo block, advancing (and looping) the playhead.
@@ -246,28 +284,39 @@ impl RealtimeAudio {
     /// chain and soft clip. Called for every block, transport or not.
     fn render_live_and_master(&mut self, at: usize, n: usize, left: &mut [f32], right: &mut [f32]) {
         let sr = self.project.sample_rate as f64;
-        if !self.live.is_empty() {
-            let t_live = self.live_pos as f64 / sr;
+        let t_live = self.live_pos as f64 / sr;
+        let n_buses = self.live_buses.len() as u8;
+        for bus in 0..=n_buses {
+            let has_fx = bus > 0 && !self.live_buses[bus as usize - 1].0.is_empty();
+            let any = self.live.iter().any(|(b, _, _)| *b == bus);
+            if !any && !has_fx {
+                continue; // fx buses keep running so their tails ring out
+            }
             self.scratch_clip.left.resize(n, 0.0);
             self.scratch_clip.right.resize(n, 0.0);
             self.scratch_clip.left.fill(0.0);
             self.scratch_clip.right.fill(0.0);
-            for (sid, ev) in &self.live {
-                let Some(audio) =
-                    self.project.sources.get(*sid).and_then(|s| s.audio.as_deref())
-                else {
+            for (b, sid, ev) in &self.live {
+                if *b != bus {
+                    continue;
+                }
+                let Some(audio) = self.project.sources.get(*sid).and_then(|s| s.audio.as_deref()) else {
                     continue;
                 };
                 render_grains_audio(audio, std::slice::from_ref(ev), &mut self.scratch_clip, t_live);
+            }
+            if has_fx {
+                let (chain, states) = &mut self.live_buses[bus as usize - 1];
+                fx::process_audio_chain(&mut self.scratch_clip.left, &mut self.scratch_clip.right, chain, states);
             }
             for i in 0..n {
                 left[at + i] += self.scratch_clip.left[i];
                 right[at + i] += self.scratch_clip.right[i];
             }
-            // Prune finished pads.
-            let done_before = t_live + n as f64 / sr;
-            self.live.retain(|(_, ev)| ev.end() > done_before);
         }
+        // Prune finished hits.
+        let done_before = t_live + n as f64 / sr;
+        self.live.retain(|(_, _, ev)| ev.end() > done_before);
         self.live_pos += n as u64;
 
         fx::process_audio_chain(
@@ -435,6 +484,33 @@ mod tests {
         // Playhead advanced only while transport ran.
         assert!(rt.playhead_secs() > 0.0);
         assert!((rt.playhead_secs() - 0.25).abs() < 1e-6, "paused blocks froze it");
+    }
+
+    #[test]
+    fn live_buses_run_their_own_effects() {
+        let p = perf_project();
+        let sr = p.sample_rate as usize;
+        let settings = crate::grain::GrainSettings { gain: 1.0, duration: 0.2, ..Default::default() };
+        let tail = |bus: u8| {
+            let mut rt = RealtimeAudio::new(p.clone(), 0.0, None);
+            rt.transport = false;
+            rt.set_live_bus(1, vec![AvEffect::new(EffectKind::Delay {
+                time: 0.25,
+                feedback: 0.5,
+                mix: 0.8,
+                shift_x: 0.0,
+                shift_y: 0.0,
+            })]);
+            let ev = crate::grain::grain_from_note(&settings, 60, 120, 3.0, rt.live_now_secs(), 1);
+            rt.trigger_live_bus(bus, 0, ev);
+            let mut l = vec![0.0f32; sr];
+            let mut r = vec![0.0f32; sr];
+            rt.next_block(&mut l, &mut r);
+            // Energy well after the 0.2 s grain ended: only an echo.
+            (l[sr * 2 / 5..sr * 3 / 5].iter().map(|s| s * s).sum::<f32>()).sqrt()
+        };
+        assert!(tail(0) < 1e-3, "dry bus: no echo ({})", tail(0));
+        assert!(tail(1) > 0.05, "bus 1 echoes ({})", tail(1));
     }
 
     #[test]

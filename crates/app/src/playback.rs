@@ -28,8 +28,13 @@ struct Shared {
     new_project: Mutex<Option<Project>>,
     loop_region: Mutex<Option<(f64, f64)>>,
     transport_cmd: Mutex<Option<TransportCmd>>,
-    /// Live pad hits waiting for the engine (onset filled engine-side).
-    live_queue: Mutex<Vec<(usize, GrainEvent)>>,
+    /// Live hits waiting for the engine (onset filled engine-side):
+    /// (bus, source, event).
+    live_queue: Mutex<Vec<(u8, usize, GrainEvent)>>,
+    /// Effect chains of the live buses (1-based), re-applied whenever the
+    /// engine is rebuilt.
+    live_buses: Mutex<Vec<Vec<chromagrain_core::fx::AvEffect>>>,
+    buses_dirty: AtomicBool,
     /// One-shot preview sounds (instrument note auditions), mixed in after
     /// the engine at the project rate: (samples, read position).
     auditions: Mutex<Vec<(Arc<Vec<f32>>, usize)>>,
@@ -61,6 +66,16 @@ pub struct Playback {
 
 impl Playback {
     pub fn new() -> Playback {
+        Playback::build(true)
+    }
+
+    /// No audio device at all (tests, headless renders): the engine still
+    /// runs and the transport clock follows wall time.
+    pub fn new_headless() -> Playback {
+        Playback::build(false)
+    }
+
+    fn build(open_device: bool) -> Playback {
         let shared = Arc::new(Shared {
             shutdown: AtomicBool::new(false),
             transport: AtomicBool::new(false),
@@ -70,6 +85,8 @@ impl Playback {
             loop_region: Mutex::new(None),
             transport_cmd: Mutex::new(None),
             live_queue: Mutex::new(Vec::new()),
+            live_buses: Mutex::new(Vec::new()),
+            buses_dirty: AtomicBool::new(false),
             auditions: Mutex::new(Vec::new()),
         });
         let (producer, consumer) = rtrb::RingBuffer::<f32>::new(RING_CAPACITY);
@@ -82,8 +99,10 @@ impl Playback {
             wall_start: None,
             last_error: None,
         };
-        if let Err(e) = pb.init_stream(consumer) {
-            pb.last_error = Some(e);
+        if open_device {
+            if let Err(e) = pb.init_stream(consumer) {
+                pb.last_error = Some(e);
+            }
         }
         // The engine runs regardless of the device so pads/visuals work
         // headless too (audio simply has nowhere to go without a stream).
@@ -175,7 +194,27 @@ impl Playback {
     /// Fire a live pad hit (MIDI note / on-screen pad). The engine stamps
     /// the onset when it picks the event up.
     pub fn trigger(&self, source: usize, event: GrainEvent) {
-        self.shared.live_queue.lock().unwrap().push((source, event));
+        self.shared.live_queue.lock().unwrap().push((0, source, event));
+    }
+
+    /// [`Playback::trigger`] through live effect bus `bus` (0 = dry).
+    pub fn trigger_bus(&self, bus: u8, source: usize, event: GrainEvent) {
+        self.shared.live_queue.lock().unwrap().push((bus, source, event));
+    }
+
+    /// Set the effect chain of live bus `bus` (1-based).
+    pub fn set_bus(&self, bus: u8, chain: Vec<chromagrain_core::fx::AvEffect>) {
+        if bus == 0 {
+            return;
+        }
+        let mut b = self.shared.live_buses.lock().unwrap();
+        while b.len() < bus as usize {
+            b.push(Vec::new());
+        }
+        if b[bus as usize - 1] != chain {
+            b[bus as usize - 1] = chain;
+            self.shared.buses_dirty.store(true, Ordering::Relaxed);
+        }
     }
 
     /// Handle for playing one-shot preview sounds (see [`Auditioner`]).
@@ -231,6 +270,7 @@ fn producer_loop(device_rate: u32, mut producer: rtrb::Producer<f32>, shared: Ar
                 let transport = engine.transport;
                 engine = RealtimeAudio::new(p, beat, loop_now);
                 engine.transport = transport;
+                shared.buses_dirty.store(true, Ordering::Relaxed);
                 ratio = engine.sample_rate() as f64 / device_rate as f64;
             } else {
                 engine.loop_region = loop_now;
@@ -246,11 +286,16 @@ fn producer_loop(device_rate: u32, mut producer: rtrb::Producer<f32>, shared: Ar
                 TransportCmd::Stop => engine.transport = false,
             }
         }
+        if shared.buses_dirty.swap(false, Ordering::Relaxed) {
+            for (i, chain) in shared.live_buses.lock().unwrap().iter().enumerate() {
+                engine.set_live_bus(i as u8 + 1, chain.clone());
+            }
+        }
         {
             let mut queue = shared.live_queue.lock().unwrap();
-            for (source, mut ev) in queue.drain(..) {
+            for (bus, source, mut ev) in queue.drain(..) {
                 ev.onset = engine.live_now_secs();
-                engine.trigger_live(source, ev);
+                engine.trigger_live_bus(bus, source, ev);
             }
         }
 

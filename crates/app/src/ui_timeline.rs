@@ -8,7 +8,6 @@ use chromagrain_core::seq::{RowMode, StepPattern};
 use chromagrain_core::timeline::{Clip, ClipKind, Project};
 use eframe::egui::{self, Color32, Pos2, Rect, Stroke};
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 
 const HEADER_W: f32 = 158.0;
 const RULER_H: f32 = 22.0;
@@ -172,39 +171,8 @@ impl App {
             return;
         }
 
-        // Publish a consistent (project, plan) pair for the paint callback.
-        {
-            let t = self.plan_project.beats_to_secs(self.playhead_beats);
-            *self.scene.lock().unwrap() = Some(crate::gpu::Scene {
-                project: self.plan_project.clone(),
-                plan: self.plan.clone(),
-                t,
-                live: self.live_events.clone(),
-                live_t: self.app_clock.elapsed().as_secs_f64(),
-                parked: !self.playback.is_playing(),
-            });
-        }
-        let gpu_slot = self.gpu.clone();
-        let scene = self.scene.clone();
-        let failed = self.gpu_failed.clone();
-        let cb = eframe::egui_glow::CallbackFn::new(move |info, painter| {
-            let mut slot = gpu_slot.lock().unwrap();
-            if slot.is_none() && !failed.load(Ordering::Relaxed) {
-                match crate::gpu::GpuPreview::new(painter.gl()) {
-                    Ok(g) => *slot = Some(g),
-                    Err(e) => {
-                        eprintln!("gpu preview init failed: {e}");
-                        failed.store(true, Ordering::Relaxed);
-                    }
-                }
-            }
-            if let Some(g) = slot.as_mut() {
-                if let Some(scene) = scene.lock().unwrap().as_ref() {
-                    g.paint(painter.gl(), &info, scene);
-                }
-            }
-        });
-        ui.painter().add(egui::PaintCallback { rect, callback: Arc::new(cb) });
+        // The scene was published for this frame in `update`.
+        ui.painter().add(crate::gpu::PreviewCallback::shape(self.scene.clone(), rect));
 
         if self.fullscreen {
             // Nothing drawn over the picture; esc / F / double-click exit.

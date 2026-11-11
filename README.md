@@ -85,11 +85,12 @@ versa). It will be crunchy.
   follows the same shape); onsets can **beat-sync** to a 1/32–1/4 grid for
   rhythmic clouds; and each grain can stack up to 4 **harmony voices** at
   a chosen interval (octaves, fifths…), key-quantized, detuned and spread.
-- **SuperCollider instruments, inside the app** — warm pad, electric
-  piano, pluck, bass, acid, bell, supersaw lead, choir, drone and a drum
-  kit, written as real SuperCollider SynthDefs (`assets/synthdefs/build.scd`)
-  and run in-process by [plyphon](https://github.com/nannou-org/plyphon), a
-  pure-Rust scsynth. No server to launch, nothing routed: each part renders
+- **SuperCollider instruments, inside the app** — grain cloud, cassette
+  keys, prepared string, fold bass, acid fuzz, gamelan metal, formant sync
+  lead, speak & spell choir, tape drone and a drum kit, written as
+  SuperCollider SynthDefs in Rust (`crates/core/src/sc_defs.rs`) and run
+  in-process by [plyphon](https://github.com/nannou-org/plyphon), a
+  pure-Rust scsynth. No SuperCollider install, not even to build. No server to launch, nothing routed: each part renders
   into a library source (with an oscilloscope trace as its picture), so it
   gets everything samples get — grains, snippets, patterns, pads, key
   quantize, the AV effect chain and export. See *Instruments* below.
@@ -215,7 +216,30 @@ cargo run --release            # builds (first time takes a few minutes) and ope
 The binary lands at `target/release/chromagrain` if you want to launch it
 directly later. `cargo test` runs the full engine test suite.
 
-### 3. First session, in 60 seconds
+### 3. The studio (default UI)
+
+`chromagrain` opens the play-first **studio** (design: `design/v001/`):
+three views, one drawer, a tiny top bar. Neutral graphite chrome — the
+only colour is your footage. Touch-first: every target ≥ 44 px, nothing
+needs hover or right-click (tap toggles, hold opens detail, vertical drag
+changes a value).
+
+| view | what you do |
+|------|-------------|
+| **Play** (1) | an 8×8 grid: each column is a clip as 8 frame tiles. Touch the grid and the selected **emitter** (1–4) jumps there and sprays grains while held; grab a ring to play that emitter. Each emitter has 4 macro knobs — **Grain** (sample ↔ cloud), **Pitch** (snapped to the global key), **Smear** (time freeze + echo + reverb), **Look** (clean, tune, crush, jpeg, tint, tile, kaleido) — the same macro definition the plugin engine uses (`core::instrument`). **Rec** bounces what you play into a take (new library clip, placed on a *takes* track). |
+| **Sequence** (2) | nanoloop-style lanes, one per clip, 16 steps. An active step is a thumbnail of the slice it plays. Tap = toggle, drag up/down = pitch in key degrees, hold = step sheet (slice, pitch, length, chance). Lanes can be shorter (polymeter, `↺`). Scenes 1–8 (tap = queue at the next bar; an empty scene copies the current one) and a song chain that becomes the arrangement. |
+| **Perform** (3) | 4×4 clip pads (one global bank), launch quantize Now / Beat / Bar, output to this screen or Display 2, Stop all, Fullscreen (F) with a minimal auto-hiding HUD. |
+
+**Deep** (top bar, an emitter's `⋯` / long-press, a lane header long-press)
+holds everything that isn't playing: per-emitter grain settings and
+sound↔picture links, lane length/clip/sound, the master effects, the full
+arrangement with automation, the script console, and the library
+(files, YouTube, ♪ instruments). Keys: space, 1/2/3 or Tab, F, R, O, Esc.
+
+`chromagrain --classic` opens the previous editor (below) until the studio
+reaches parity.
+
+### 4. Classic editor, first session in 60 seconds
 
 The window has three places, and every thing lives in exactly one of them:
 
@@ -278,6 +302,15 @@ The window has three places, and every thing lives in exactly one of them:
    shift+scroll = rotate. The inspector's *picture* section has the same
    plus one-click 50% / 100% / fill / ±90° / center / reset. **F** (or
    double-click the preview) goes fullscreen; esc comes back.
+   **O** (or *⧉ output* in the top bar) opens the **performance output**:
+   a second window with only the picture — black, letterboxed, no
+   cursor. With a projector / second screen attached it goes fullscreen
+   there and the controls stay on the laptop. With one screen, the main
+   window itself goes fullscreen (picture only, esc comes back) — a second
+   window fullscreened over the controls could freeze them in another
+   macOS Space. In the output window F or double-click toggles fullscreen
+   (only on a non-main display), O closes. Space, enter and the pad keys
+   still play while it has focus.
 8. **Put it in a key**: the inspector's *key* section picks a root + scale
    once and uses it two ways — *snap notes* re-pitches every grain/hit to
    the key; *tune the sound* runs a resonator bank on every note of the key
@@ -364,9 +397,14 @@ empty pad in perform mode) and opens its editor under the timeline:
   follows, in time with the project tempo. The editor is the one place the
   part is edited — the clip inspector still does the clip things (mode,
   picture, key, effects).
-- The sound: 12 SynthDefs in `assets/synthdefs/build.scd`; rebuild the
-  `.scsyndef` files with
-  `/Applications/SuperCollider.app/Contents/MacOS/sclang assets/synthdefs/build.scd`.
+- The sound: 12 SynthDefs in `crates/core/src/sc_defs.rs`, written with a
+  small SuperCollider-style builder (`sc_graph.rs`: UGens take the same
+  inputs as their SC classes, `+ - * /` and `.tanh()`/`.midiratio()`/…
+  build op units, constants fold) and handed to plyphon directly. No
+  sclang and no `.scsyndef` files, so nothing outside `cargo` is needed.
+  Listen with `SC_WAV_DIR=… cargo test --release -p chromagrain-core
+  sc::tests::dump_phrases -- --ignored`; measure with
+  `tools/audio_check.py`.
   plyphon is vendored with two fixes (`vendor/plyphon-unit/PATCHES.md`):
   audio-rate `MulAdd` operands and control-rate operands of binary ops
   are now interpolated across the block like scsynth, which removes a
@@ -384,6 +422,7 @@ balance control. Mono files stay mono at no extra cost.
 chromagrain --script examples/sequencer.rhai   # build + render a composition from a script
 chromagrain --script examples/crunchy.rhai
 chromagrain --demo                             # open the app on the demo project
+chromagrain --demo --output --play             # installation: output window + autoplay
 chromagrain --render-demo out.mp4              # render the built-in demo project
 ```
 
@@ -484,21 +523,32 @@ crates/core        chromagrain-core (headless, fully tested)
   timeline.rs      Source / Clip (granular|snippet|pattern) / Track / Project
   render.rs        offline renderer: clip -> track -> master, z-ordered
   realtime.rs      streaming performance engine (loop region, live edits)
+  take.rs          bounce played grains into a new source (Rec takes)
+  instrument.rs    Instrument: the plugin-shaped facade (decoded media in,
+                   note on/off, GRAIN/PITCH/SMEAR/LOOK macros, host
+                   transport, process() + FrameState snapshots)
   media.rs         wav/png IO, ffmpeg decode/encode, yt-dlp fetch,
                    segmentation sidecars (Apple Vision / SAM 3)
   sc.rs            SuperCollider instruments via plyphon: catalog, parts,
                    seamless-loop + single-note offline renders
+  sc_defs.rs       the 12 instrument SynthDefs, in Rust
+  sc_graph.rs      SuperCollider-style SynthDef builder for plyphon
   script.rs        rhai bindings over all of the above
 crates/app         chromagrain (desktop app)
   main.rs          eframe GUI: preview, timeline, sequencer, inspector
-  gpu.rs           glow/OpenGL realtime pipeline: grain quads + effect
-                   shader passes + track compositing + live pad layer
+  gpu.rs           wgpu realtime pipeline (Metal/D3D12/Vulkan): grain
+                   quads + WGSL effect passes + track compositing + live
+                   pad layer; renders once per frame, any window presents
+  studio/          the play-first studio UI: play / sequence / perform
+                   views, deep drawer, theme (Geist, graphite), widgets,
+                   frame atlases, headless kittest snapshot + touch tests
+  ui_output.rs     performance output window (second viewport)
+  displays.rs      which displays are attached (CoreGraphics on macOS)
   playback.rs      always-on engine: lock-free ring into cpal, transport
                    start/stop, live pad triggers any time
   midi.rs          midir input, note pads, CC mappings with learn
   ui_synth.rs      instrument editor (knobs + piano roll), debounced
                    background re-renders, note auditions
-assets/synthdefs   the SynthDefs (build.scd) + compiled .scsyndef files
 tools/             segment_vision.swift (Vision) and segment.py (SAM 3)
 vendor/            plyphon-unit with block-interpolation fixes
 ```

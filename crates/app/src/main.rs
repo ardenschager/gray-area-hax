@@ -19,16 +19,21 @@
 //!   looping pads. Each pad is a track whose first clip loops forever;
 //!   pads start/stop on the next beat or bar. Sources, patterns and the
 //!   master bus are shared with the arrangement.
+//! * **Output** (`O` / top-bar button) — a second window with only the
+//!   picture, fullscreen on the second display (see `ui_output`).
 
 mod browser;
+mod displays;
 mod gpu;
 mod history;
 mod midi;
 mod playback;
+mod studio;
 mod theme;
 mod ui_browse;
 mod ui_inspector;
 mod ui_library;
+mod ui_output;
 mod ui_perform;
 mod ui_synth;
 mod ui_timeline;
@@ -99,26 +104,49 @@ fn main() -> eframe::Result<()> {
             .with_inner_size([1440.0, 900.0])
             .with_min_inner_size([1000.0, 640.0])
             .with_drag_and_drop(true),
+        renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
     // `chromagrain clip.mp4 other.mov` — open with those files placed on
     // their own tracks at the start. `--perform` opens on the pads (the
     // files land on pads instead). Starts blank; `--demo` loads the demo.
+    // `--output` opens the performance output window, `--play` starts the
+    // transport (together: an unattended installation).
     let perform = args.iter().any(|a| a == "--perform");
     let demo = args.iter().any(|a| a == "--demo");
+    let output = args.iter().any(|a| a == "--output");
+    // The play-first studio UI is the default; `--classic` opens the
+    // previous timeline editor (kept until the studio reaches parity).
+    let classic = args.iter().any(|a| a == "--classic");
+    let autoplay = args.iter().any(|a| a == "--play");
     let open: Vec<PathBuf> =
         args.iter().skip(1).map(PathBuf::from).filter(|p| p.is_file()).collect();
     eframe::run_native(
         "chromagrain",
         options,
         Box::new(move |cc| {
-            theme::apply(&cc.egui_ctx);
-            let mut app = App::new(demo);
+            if classic {
+                theme::apply(&cc.egui_ctx);
+            }
+            let mut app = App::new(AppOpts { demo, classic, headless: false });
+            if !classic {
+                app.studio_install_theme(&cc.egui_ctx);
+            }
+            if !gpu::install(cc) {
+                eprintln!("gpu preview unavailable (no wgpu render state)");
+                app.gpu_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             if perform {
                 app.set_mode(AppMode::Perform);
             }
             for p in open {
                 app.import_path(p, Some(Place { track: 0, new_track: true, beat: 0.0 }));
+            }
+            if output {
+                app.toggle_output();
+            }
+            if autoplay {
+                app.start_play();
             }
             Ok(Box::new(app))
         }),
@@ -238,12 +266,14 @@ enum Job {
     Youtube(String),
 }
 
-enum WorkerMsg {
+pub(crate) enum WorkerMsg {
     Source(Result<Source, String>),
     /// A file finished loading: remember its path, maybe place it.
     Loaded(PathBuf, Option<Place>, Result<Source, String>),
     Script(Result<String, String>),
     Export(Result<String, String>),
+    /// A bounced Rec take and the beat it was recorded at.
+    Take(chromagrain_core::timeline::Source, f64),
 }
 
 
@@ -285,9 +315,20 @@ pub struct App {
     loop_end: f64,
     playhead_beats: f64,
 
-    gpu: Arc<Mutex<Option<gpu::GpuPreview>>>,
     gpu_failed: Arc<AtomicBool>,
+    /// The scene every canvas presents this frame (published once per
+    /// update; the GPU renders it once however many windows show it).
     scene: Arc<Mutex<Option<gpu::Scene>>>,
+    /// App frame counter (`Scene::frame`).
+    frame_no: u64,
+    /// The performance output window (`O`).
+    output: ui_output::OutputWin,
+    /// Single-display output: go fullscreen in this window next frame.
+    pending_fullscreen: bool,
+    /// The previous timeline editor instead of the studio (`--classic`).
+    classic: bool,
+    /// The play-first studio UI state.
+    studio: studio::Studio,
 
     busy: Option<String>,
     jobs: VecDeque<Job>,
@@ -299,7 +340,7 @@ pub struct App {
     midi_port: usize,
     cc_mappings: Vec<midi::CcMapping>,
     /// Live pad hits for the GPU preview, on the app clock.
-    live_events: Vec<(usize, chromagrain_core::grain::GrainEvent)>,
+    live_events: Vec<(usize, u8, chromagrain_core::grain::GrainEvent)>,
     live_id: u64,
     app_clock: std::time::Instant,
     last_sync: std::time::Instant,
@@ -365,14 +406,28 @@ pub struct App {
     drops: Vec<(PathBuf, Place, f64)>,
 }
 
+/// How to start the app.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AppOpts {
+    /// Open the built-in demo project instead of a blank canvas.
+    pub demo: bool,
+    /// The classic timeline editor instead of the studio.
+    pub classic: bool,
+    /// No audio device, no disk scan, no MIDI (tests / headless renders).
+    pub headless: bool,
+}
+
 impl App {
     /// A blank canvas (`demo` = the built-in demo project instead).
-    fn new(demo: bool) -> App {
+    fn new(opts: AppOpts) -> App {
+        let demo = opts.demo;
         let (tx, rx) = mpsc::channel();
         let project = if demo { Project::demo() } else { Project::default() };
         let plan = Arc::new(plan_project(&project));
         let mut browser = browser::Browser::new();
-        browser.ensure_started();
+        if !opts.headless {
+            browser.ensure_started();
+        }
         App {
             plan_project: project.clone(),
             project: Arc::new(Mutex::new(project)),
@@ -382,14 +437,18 @@ impl App {
             sel: if demo { Sel::Clip(0, 0) } else { Sel::None },
             focus_track: 0,
             last_source: 0,
-            playback: playback::Playback::new(),
+            playback: if opts.headless { playback::Playback::new_headless() } else { playback::Playback::new() },
             loop_on: false,
             loop_start: 0.0,
             loop_end: 8.0,
             playhead_beats: 0.0,
-            gpu: Arc::new(Mutex::new(None)),
             gpu_failed: Arc::new(AtomicBool::new(false)),
             scene: Arc::new(Mutex::new(None)),
+            frame_no: 0,
+            output: ui_output::OutputWin::default(),
+            pending_fullscreen: false,
+            classic: opts.classic,
+            studio: studio::Studio::default(),
             busy: None,
             jobs: VecDeque::new(),
             rx,
@@ -399,7 +458,7 @@ impl App {
             } else {
                 "blank canvas — drop video or audio anywhere, or drag from Browse".into()
             },
-            midi: midi::Midi::new(),
+            midi: if opts.headless { midi::Midi::none() } else { midi::Midi::new() },
             midi_port: 0,
             cc_mappings: Vec::new(),
             live_events: Vec::new(),
@@ -480,7 +539,7 @@ impl App {
         self.playback.set_project(p);
     }
 
-    fn start_play(&mut self) {
+    pub(crate) fn start_play(&mut self) {
         let p = self.project.lock().unwrap().clone();
         self.playback.play(&p, self.playhead_beats, self.loop_region());
         self.playback.set_project(p);
@@ -893,7 +952,7 @@ impl App {
         self.playback.trigger(source, ev.clone());
         let mut vis = ev;
         vis.onset = self.app_clock.elapsed().as_secs_f64();
-        self.live_events.push((source, vis));
+        self.live_events.push((source, 0, vis));
     }
 
     fn handle_midi(&mut self) {
@@ -1266,11 +1325,29 @@ impl App {
                     self.script_log = format!("ERROR: {e}");
                     self.status = "script error".into();
                 }
+                WorkerMsg::Take(src, beat) => self.studio_place_take(src, beat),
                 WorkerMsg::Export(Ok(path)) => self.status = format!("rendered {path}"),
                 WorkerMsg::Export(Err(e)) => self.status = format!("render failed: {e}"),
             }
         }
         self.pump_jobs();
+    }
+
+    /// Hand the GPU a consistent (project, plan) pair for this frame.
+    fn publish_scene(&mut self) {
+        self.frame_no += 1;
+        let t = self.plan_project.beats_to_secs(self.playhead_beats);
+        *self.scene.lock().unwrap() = Some(gpu::Scene {
+            project: self.plan_project.clone(),
+            plan: self.plan.clone(),
+            t,
+            live: self.live_events.clone(),
+            live_t: self.app_clock.elapsed().as_secs_f64(),
+            buses: if self.classic { Vec::new() } else { self.studio_buses() },
+            backdrop: self.studio_backdrop(),
+            parked: !self.playback.is_playing(),
+            frame: self.frame_no,
+        });
     }
 
     pub(crate) fn toggle_fullscreen(&mut self, ctx: &egui::Context) {
@@ -1320,6 +1397,9 @@ impl App {
         }
         if redo {
             self.redo();
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::O) && !i.modifiers.any()) {
+            self.toggle_output();
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Tab) && !i.modifiers.any()) {
             let m = if self.mode == AppMode::Perform { AppMode::Arrange } else { AppMode::Perform };
@@ -1384,7 +1464,7 @@ impl App {
 }
 
 /// A fresh clip of `src` in the given play mode.
-fn build_clip(p: &mut Project, src: usize, beat: f64, mode: PlayMode) -> Clip {
+pub(crate) fn build_clip(p: &mut Project, src: usize, beat: f64, mode: PlayMode) -> Clip {
     let media_beats = p.secs_to_beats(p.sources[src].duration());
     let q = p.quantize.max(0.0625);
     match mode {
@@ -1422,7 +1502,11 @@ impl eframe::App for App {
         self.synth_update(ctx);
         bg += self.project_rev - r;
         self.browser.poll(ctx);
-        self.handle_shortcuts(ctx);
+        if self.classic {
+            self.handle_shortcuts(ctx);
+        } else {
+            self.studio_update(ctx);
+        }
 
         if self.playback.is_playing() {
             let p = self.project.lock().unwrap();
@@ -1447,12 +1531,21 @@ impl eframe::App for App {
         }
 
         let now = self.app_clock.elapsed().as_secs_f64();
-        self.live_events.retain(|(_, e)| e.end() + 0.5 > now);
+        self.live_events.retain(|(_, _, e)| e.end() + 0.5 > now);
         if !self.live_events.is_empty() {
             ctx.request_repaint();
         }
         if self.project_rev != self.plan_rev {
             ctx.request_repaint_after(std::time::Duration::from_millis(90));
+        }
+        self.publish_scene();
+        if std::mem::take(&mut self.pending_fullscreen) && !self.fullscreen {
+            self.toggle_fullscreen(ctx);
+        }
+        self.output_ui(ctx);
+        if !self.classic {
+            self.studio_ui(ctx);
+            return;
         }
 
         if self.fullscreen {
