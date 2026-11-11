@@ -12,3 +12,5 @@ seq-out.*
 outputs/**/*.mp4
 outputs/**/*.wav
 outputs/**/*.png
+outputs/**/work/
+
