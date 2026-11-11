@@ -181,6 +181,86 @@ const MAX_VOICES: usize = 16;
 const MAX_GRAINS: usize = 4096;
 const ECHO_TIME: f32 = 0.33;
 
+/// The cloud end of the GRAIN morph, overridable per emitter / voice
+/// ("deep" settings). Defaults are the instrument's own.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Cloud {
+    /// Grain length at GRAIN = 1, seconds.
+    pub duration: f32,
+    /// Grains per second at GRAIN = 1.
+    pub density: f32,
+    /// Read-position scatter at GRAIN = 1, seconds.
+    pub spray: f32,
+    pub pan_spread: f32,
+    /// Pitch scatter at GRAIN = 1 (scale steps when a key is set).
+    pub pitch_jitter: f32,
+    /// Probability of reversed grains (cloud half of the morph).
+    pub reverse: f32,
+}
+
+impl Default for Cloud {
+    fn default() -> Self {
+        Cloud {
+            duration: CLOUD_DURATION,
+            density: CLOUD_DENSITY,
+            spray: CLOUD_SPRAY,
+            pan_spread: CLOUD_PAN_SPREAD,
+            pitch_jitter: CLOUD_PITCH_JITTER,
+            reverse: CLOUD_REVERSE,
+        }
+    }
+}
+
+/// One grain of a held note — THE grain definition shared by the
+/// instrument, the app's emitters and the plugin. `head` is the read head
+/// (source seconds); returns the event (onset 0: the caller places it) and
+/// the hop to the next grain. The caller advances its head by
+/// `hop * map.speed`.
+#[allow(clippy::too_many_arguments)]
+pub fn grain_step(
+    map: &MacroMap,
+    cloud: &Cloud,
+    key: Option<&Key>,
+    rng: &mut Rng,
+    head: f64,
+    src_len: f64,
+    note: u8,
+    velocity: f32,
+    id: u64,
+) -> (GrainEvent, f64) {
+    let tex = map.texture;
+    let dur = ((SAMPLE_DURATION.ln() + (cloud.duration.max(0.005).ln() - SAMPLE_DURATION.ln()) * tex).exp()
+        * (1.0 + tex * CLOUD_DUR_JITTER * rng.bipolar()))
+    .max(0.005) as f64;
+    let cloud_hop = 1.0 / cloud.density.max(0.5) as f64;
+    let hop = (dur / 2.0 + (cloud_hop - dur / 2.0) * tex as f64).max(0.002);
+    let jitter = tex as f64 * hop * 0.5 * rng.bipolar() as f64;
+    let pos = head + tex as f64 * cloud.spray as f64 * rng.bipolar() as f64;
+    let base = note as f32 + map.pitch_st;
+    let scatter = tex * cloud.pitch_jitter * rng.bipolar();
+    let midi = match key {
+        Some(k) if scatter.abs() > 1e-4 => base + k.quantize_midi(base + scatter) - k.quantize_midi(base),
+        _ => base,
+    };
+    let pan = (tex * cloud.pan_spread * rng.bipolar()).clamp(-1.0, 1.0);
+    let reverse = tex >= 0.5 && rng.next_f32() < cloud.reverse;
+    let overlap = (dur / hop).max(0.25) as f32;
+    let norm = (overlap * 0.5).powf(-(1.0 - 0.5 * tex));
+    let ev = GrainEvent {
+        onset: jitter, // relative: the caller adds the scheduled time
+        source_pos: pos.rem_euclid(src_len.max(1e-6)),
+        duration: dur as f32,
+        pitch_ratio: semitones_to_ratio(midi - 60.0),
+        gain: BASE_GAIN * velocity * norm,
+        pan,
+        envelope: 1.0,
+        env_skew: 0.0,
+        reverse,
+        id,
+    };
+    (ev, hop)
+}
+
 struct Voice {
     note: u8,
     velocity: f32,
@@ -608,7 +688,6 @@ impl Instrument {
     /// grains shrink, thin to the cloud density and scatter in onset,
     /// position, pan and (in key) pitch. Loudness stays level.
     fn schedule(&mut self, until: f64, map: &MacroMap) {
-        let tex = map.texture;
         let sync = (self.sync_div > 0.0).then_some(self.sync_div as f64);
         for vi in 0..self.voices.len() {
             let src_len = self.sources.get(self.voices[vi].source).map(|s| s.duration()).unwrap_or(0.0);
@@ -620,38 +699,12 @@ impl Instrument {
                     return;
                 }
                 let key = self.key;
+                let cloud = Cloud::default();
                 let v = &mut self.voices[vi];
-                let rng = &mut v.rng;
-                let dur = ((SAMPLE_DURATION.ln() + (CLOUD_DURATION.ln() - SAMPLE_DURATION.ln()) * tex).exp()
-                    * (1.0 + tex * CLOUD_DUR_JITTER * rng.bipolar()))
-                .max(0.005) as f64;
-                let cloud_hop = 1.0 / CLOUD_DENSITY as f64;
-                let hop = (dur / 2.0 + (cloud_hop - dur / 2.0) * tex as f64).max(0.002);
-                let jitter = tex as f64 * hop * 0.5 * rng.bipolar() as f64;
-                let onset = (v.next_t + jitter).max(v.start_t);
-                let pos = v.head + tex as f64 * CLOUD_SPRAY as f64 * rng.bipolar() as f64;
-                let base = v.note as f32 + map.pitch_st;
-                let scatter = tex * CLOUD_PITCH_JITTER * rng.bipolar();
-                let midi = match key {
-                    Some(k) if scatter.abs() > 1e-4 => base + k.quantize_midi(base + scatter) - k.quantize_midi(base),
-                    _ => base,
-                };
-                let pan = (tex * CLOUD_PAN_SPREAD * rng.bipolar()).clamp(-1.0, 1.0);
-                let reverse = tex >= 0.5 && rng.next_f32() < CLOUD_REVERSE;
-                let overlap = (dur / hop).max(0.25) as f32;
-                let norm = (overlap * 0.5).powf(-(1.0 - 0.5 * tex));
-                let ev = GrainEvent {
-                    onset,
-                    source_pos: pos.rem_euclid(src_len.max(1e-6)),
-                    duration: dur as f32,
-                    pitch_ratio: semitones_to_ratio(midi - 60.0),
-                    gain: BASE_GAIN * v.velocity * norm,
-                    pan,
-                    envelope: 1.0,
-                    env_skew: 0.0,
-                    reverse,
-                    id: v.serial.wrapping_mul(1 << 20).wrapping_add(v.k),
-                };
+                let id = v.serial.wrapping_mul(1 << 20).wrapping_add(v.k);
+                let (mut ev, hop) =
+                    grain_step(map, &cloud, key.as_ref(), &mut v.rng, v.head, src_len, v.note, v.velocity, id);
+                ev.onset = (v.next_t + ev.onset).max(v.start_t);
                 let (source, serial) = (v.source, v.serial);
                 v.head += hop * map.speed as f64;
                 v.k += 1;
