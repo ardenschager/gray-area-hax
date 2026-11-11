@@ -1,0 +1,3 @@
+# Metadata for nih-plug's `cargo xtask bundle` (see xtask/).
+[chromagrain-plugin]
+name = "chromagrain"
