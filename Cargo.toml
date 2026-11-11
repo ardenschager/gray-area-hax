@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/ui", "crates/app", "crates/plugin", "xtask"]
+members = ["crates/core", "crates/ui", "crates/app", "crates/plugin", "crates/ffi", "xtask"]
 
 [workspace.package]
 version = "0.1.0"
@@ -20,3 +20,7 @@ opt-level = 2
 # plyphon-unit with a MulAdd fix (see vendor/plyphon-unit/PATCHES.md).
 [patch."https://github.com/nannou-org/plyphon"]
 plyphon-unit = { path = "vendor/plyphon-unit" }
+
+# nih-plug with a state-load fix (see vendor/nih-plug/PATCHES.md).
+[patch."https://github.com/robbert-vdh/nih-plug.git"]
+nih_plug = { path = "vendor/nih-plug" }
