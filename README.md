@@ -85,11 +85,12 @@ versa). It will be crunchy.
   follows the same shape); onsets can **beat-sync** to a 1/32–1/4 grid for
   rhythmic clouds; and each grain can stack up to 4 **harmony voices** at
   a chosen interval (octaves, fifths…), key-quantized, detuned and spread.
-- **SuperCollider instruments, inside the app** — warm pad, electric
-  piano, pluck, bass, acid, bell, supersaw lead, choir, drone and a drum
-  kit, written as real SuperCollider SynthDefs (`assets/synthdefs/build.scd`)
-  and run in-process by [plyphon](https://github.com/nannou-org/plyphon), a
-  pure-Rust scsynth. No server to launch, nothing routed: each part renders
+- **SuperCollider instruments, inside the app** — grain cloud, cassette
+  keys, prepared string, fold bass, acid fuzz, gamelan metal, formant sync
+  lead, speak & spell choir, tape drone and a drum kit, written as
+  SuperCollider SynthDefs in Rust (`crates/core/src/sc_defs.rs`) and run
+  in-process by [plyphon](https://github.com/nannou-org/plyphon), a
+  pure-Rust scsynth. No SuperCollider install, not even to build. No server to launch, nothing routed: each part renders
   into a library source (with an oscilloscope trace as its picture), so it
   gets everything samples get — grains, snippets, patterns, pads, key
   quantize, the AV effect chain and export. See *Instruments* below.
@@ -371,9 +372,14 @@ empty pad in perform mode) and opens its editor under the timeline:
   follows, in time with the project tempo. The editor is the one place the
   part is edited — the clip inspector still does the clip things (mode,
   picture, key, effects).
-- The sound: 12 SynthDefs in `assets/synthdefs/build.scd`; rebuild the
-  `.scsyndef` files with
-  `/Applications/SuperCollider.app/Contents/MacOS/sclang assets/synthdefs/build.scd`.
+- The sound: 12 SynthDefs in `crates/core/src/sc_defs.rs`, written with a
+  small SuperCollider-style builder (`sc_graph.rs`: UGens take the same
+  inputs as their SC classes, `+ - * /` and `.tanh()`/`.midiratio()`/…
+  build op units, constants fold) and handed to plyphon directly. No
+  sclang and no `.scsyndef` files, so nothing outside `cargo` is needed.
+  Listen with `SC_WAV_DIR=… cargo test --release -p chromagrain-core
+  sc::tests::dump_phrases -- --ignored`; measure with
+  `tools/audio_check.py`.
   plyphon is vendored with two fixes (`vendor/plyphon-unit/PATCHES.md`):
   audio-rate `MulAdd` operands and control-rate operands of binary ops
   are now interpolated across the block like scsynth, which removes a
@@ -499,6 +505,8 @@ crates/core        chromagrain-core (headless, fully tested)
                    segmentation sidecars (Apple Vision / SAM 3)
   sc.rs            SuperCollider instruments via plyphon: catalog, parts,
                    seamless-loop + single-note offline renders
+  sc_defs.rs       the 12 instrument SynthDefs, in Rust
+  sc_graph.rs      SuperCollider-style SynthDef builder for plyphon
   script.rs        rhai bindings over all of the above
 crates/app         chromagrain (desktop app)
   main.rs          eframe GUI: preview, timeline, sequencer, inspector
@@ -512,7 +520,6 @@ crates/app         chromagrain (desktop app)
   midi.rs          midir input, note pads, CC mappings with learn
   ui_synth.rs      instrument editor (knobs + piano roll), debounced
                    background re-renders, note auditions
-assets/synthdefs   the SynthDefs (build.scd) + compiled .scsyndef files
 tools/             segment_vision.swift (Vision) and segment.py (SAM 3)
 vendor/            plyphon-unit with block-interpolation fixes
 ```

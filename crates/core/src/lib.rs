@@ -35,6 +35,8 @@ pub mod music;
 pub mod realtime;
 pub mod render;
 pub mod sc;
+pub mod sc_defs;
+pub mod sc_graph;
 pub mod script;
 pub mod seq;
 pub mod stretch;
