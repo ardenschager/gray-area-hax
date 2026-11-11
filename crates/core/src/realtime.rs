@@ -3,11 +3,13 @@
 //! cpal callback drains is (sample-exactly) the offline render, streamed.
 //! Supports a beat-quantized loop region for live use.
 
-use crate::audio::{render_grains_audio, render_grains_audio_spatial, StereoBuffer};
+use crate::audio::{
+    render_grains_audio, render_grains_audio_spatial, MasterConditioner, StereoBuffer, TapeState,
+};
 use crate::fx::{self, AudioFxState};
 use crate::grain::GrainEvent;
 use crate::render::{plan_project, ClipPlan};
-use crate::timeline::Project;
+use crate::timeline::{DuckState, Project};
 
 pub struct RealtimeAudio {
     project: Project,
@@ -17,7 +19,13 @@ pub struct RealtimeAudio {
     clip_states: Vec<Vec<AudioFxState>>,
     tilt_states: Vec<crate::dsp::TiltState>,
     track_states: Vec<Vec<AudioFxState>>,
+    track_tape_states: Vec<TapeState>,
+    duck_states: Vec<DuckState>,
+    track_buses: Vec<StereoBuffer>,
+    track_active: Vec<bool>,
     master_states: Vec<AudioFxState>,
+    master_tape_state: TapeState,
+    master_cond: MasterConditioner,
     /// Absolute playhead in samples from beat 0.
     sample_pos: u64,
     /// Loop region in beats (start, end), if looping.
@@ -33,7 +41,6 @@ pub struct RealtimeAudio {
     /// Monotonic sample clock that never pauses (times live events).
     live_pos: u64,
     scratch_clip: StereoBuffer,
-    scratch_track: StereoBuffer,
 }
 
 impl RealtimeAudio {
@@ -71,7 +78,18 @@ impl RealtimeAudio {
             .iter()
             .map(|t| fx::audio_chain_states(&t.effects, sr))
             .collect();
+        let n_tracks = project.tracks.len();
+        let track_tape_states = (0..n_tracks)
+            .map(|ti| TapeState::new(0x5452_4B00 ^ ti as u64))
+            .collect();
+        let duck_states = vec![DuckState::default(); n_tracks];
+        let track_buses = (0..n_tracks)
+            .map(|_| StereoBuffer { left: Vec::new(), right: Vec::new(), sample_rate: sr })
+            .collect();
+        let track_active = vec![false; n_tracks];
         let master_states = fx::audio_chain_states(&project.master_effects, sr);
+        let master_tape_state = TapeState::new(0x4D41_5354);
+        let master_cond = MasterConditioner::default();
         let tilt_states = plan.iter().map(|_| crate::dsp::TiltState::default()).collect();
         let sample_pos = (project.beats_to_secs(start_beat) * sr as f64).round() as u64;
         RealtimeAudio {
@@ -81,7 +99,13 @@ impl RealtimeAudio {
             clip_states,
             tilt_states,
             track_states,
+            track_tape_states,
+            duck_states,
+            track_buses,
+            track_active,
             master_states,
+            master_tape_state,
+            master_cond,
             sample_pos,
             loop_region,
             transport: true,
@@ -89,7 +113,6 @@ impl RealtimeAudio {
             live_buses: Vec::new(),
             live_pos: 0,
             scratch_clip: StereoBuffer { left: Vec::new(), right: Vec::new(), sample_rate: sr },
-            scratch_track: StereoBuffer { left: Vec::new(), right: Vec::new(), sample_rate: sr },
         }
     }
 
@@ -195,18 +218,21 @@ impl RealtimeAudio {
         left[at..at + n].fill(0.0);
         right[at..at + n].fill(0.0);
 
-        self.scratch_track.left.resize(n, 0.0);
-        self.scratch_track.right.resize(n, 0.0);
         self.scratch_clip.left.resize(n, 0.0);
         self.scratch_clip.right.resize(n, 0.0);
+        let n_tracks = self.project.tracks.len();
+        self.track_active.fill(false);
 
         for (ti, track) in self.project.tracks.iter().enumerate() {
             if track.muted {
                 continue;
             }
-            self.scratch_track.left.fill(0.0);
-            self.scratch_track.right.fill(0.0);
-            let mut track_touched = !track.effects.is_empty();
+            let tbus = &mut self.track_buses[ti];
+            tbus.left.resize(n, 0.0);
+            tbus.right.resize(n, 0.0);
+            tbus.left.fill(0.0);
+            tbus.right.fill(0.0);
+            let mut track_touched = !track.effects.is_empty() || track.tape.is_active();
 
             for (pi, cp) in self.plan.iter().enumerate() {
                 if cp.track != ti {
@@ -220,7 +246,7 @@ impl RealtimeAudio {
                     self.scratch_clip.right.fill(0.0);
                     &mut self.scratch_clip
                 } else {
-                    &mut self.scratch_track
+                    &mut *tbus
                 };
                 let mut any = has_fx; // fx chains must run every block
                 for (part_i, (sid, evs)) in cp.parts.iter().enumerate() {
@@ -250,8 +276,8 @@ impl RealtimeAudio {
                         self.project.sample_rate,
                     );
                     for i in 0..n {
-                        self.scratch_track.left[i] += self.scratch_clip.left[i];
-                        self.scratch_track.right[i] += self.scratch_clip.right[i];
+                        tbus.left[i] += self.scratch_clip.left[i];
+                        tbus.right[i] += self.scratch_clip.right[i];
                     }
                 }
                 track_touched |= any;
@@ -261,19 +287,59 @@ impl RealtimeAudio {
                 continue;
             }
             fx::process_audio_chain(
-                &mut self.scratch_track.left,
-                &mut self.scratch_track.right,
+                &mut tbus.left,
+                &mut tbus.right,
                 &track.effects,
                 &mut self.track_states[ti],
             );
+            if track.tape.is_active() {
+                self.track_tape_states[ti].process_block(
+                    &mut tbus.left,
+                    &mut tbus.right,
+                    &track.tape,
+                    self.project.sample_rate,
+                );
+            }
             // Same per-sample level-automation expression as the offline
             // renderer, so streamed output stays sample-exact.
             let beats_per_sec = self.project.bpm / 60.0;
             for i in 0..n {
                 let beat = (t0 + i as f64 / sr) * beats_per_sec;
                 let level = track.level_at(beat);
-                left[at + i] += self.scratch_track.left[i] * level;
-                right[at + i] += self.scratch_track.right[i] * level;
+                tbus.left[i] *= level;
+                tbus.right[i] *= level;
+            }
+            self.track_active[ti] = true;
+        }
+
+        // Second pass: z-independent sidechain ducking + master sum.
+        let sr_u32 = self.project.sample_rate;
+        for (ti, track) in self.project.tracks.iter().enumerate() {
+            if !self.track_active[ti] {
+                continue;
+            }
+            if let Some(spec) = &track.duck {
+                if spec.source_track < n_tracks && spec.source_track != ti {
+                    let sc_active = self.track_active[spec.source_track];
+                    for i in 0..n {
+                        let (sl, sr_c) = if sc_active {
+                            (
+                                self.track_buses[spec.source_track].left[i],
+                                self.track_buses[spec.source_track].right[i],
+                            )
+                        } else {
+                            (0.0, 0.0)
+                        };
+                        let g = self.duck_states[ti].step(sl, sr_c, spec, sr_u32);
+                        left[at + i] += self.track_buses[ti].left[i] * g;
+                        right[at + i] += self.track_buses[ti].right[i] * g;
+                    }
+                    continue;
+                }
+            }
+            for i in 0..n {
+                left[at + i] += self.track_buses[ti].left[i];
+                right[at + i] += self.track_buses[ti].right[i];
             }
         }
 
@@ -281,7 +347,7 @@ impl RealtimeAudio {
     }
 
     /// Mix live (MIDI) events on the monotonic clock, then run the master
-    /// chain and soft clip. Called for every block, transport or not.
+    /// chain, master tape, and master conditioner (sample-exact with offline).
     fn render_live_and_master(&mut self, at: usize, n: usize, left: &mut [f32], right: &mut [f32]) {
         let sr = self.project.sample_rate as f64;
         let t_live = self.live_pos as f64 / sr;
@@ -325,14 +391,19 @@ impl RealtimeAudio {
             &self.project.master_effects,
             &mut self.master_states,
         );
-        // Same soft clip as the offline master.
-        for s in left[at..at + n].iter_mut().chain(right[at..at + n].iter_mut()) {
-            if s.abs() > 1.0 {
-                *s = s.tanh();
-            } else {
-                *s = s.tanh() * 0.2 + *s * 0.8;
-            }
+        if self.project.master_tape.is_active() {
+            self.master_tape_state.process_block(
+                &mut left[at..at + n],
+                &mut right[at..at + n],
+                &self.project.master_tape,
+                self.project.sample_rate,
+            );
         }
+        self.master_cond.process_block(
+            &mut left[at..at + n],
+            &mut right[at..at + n],
+            self.project.sample_rate,
+        );
     }
 }
 
@@ -399,6 +470,26 @@ mod tests {
             downsample: 3.0,
             bits: 8.0,
         }));
+        // Sidechain ducking (bed ducks from seq, testing reverse z-order) +
+        // analog tape/vinyl stages on track and master.
+        p.tracks[t1].duck = Some(crate::timeline::DuckSpec {
+            source_track: t2,
+            amount: 0.6,
+            attack: 0.008,
+            release: 0.16,
+        });
+        p.tracks[t1].tape = crate::audio::TapeSettings {
+            wow: 0.3,
+            warmth: 0.35,
+            age: 0.25,
+            dust: 0.2,
+        };
+        p.master_tape = crate::audio::TapeSettings {
+            wow: 0.15,
+            warmth: 0.2,
+            age: 0.1,
+            dust: 0.1,
+        };
         p
     }
 
@@ -459,7 +550,8 @@ mod tests {
         let mut rt = RealtimeAudio::new(p, 0.0, None);
         rt.transport = false;
 
-        // Silence before any pad.
+        // Silence before any pad (disable master vinyl dust so silence is exact).
+        rt.project.master_tape.dust = 0.0;
         let mut l = vec![0.0f32; sr / 4];
         let mut r = vec![0.0f32; sr / 4];
         rt.next_block(&mut l, &mut r);
@@ -492,7 +584,9 @@ mod tests {
         let sr = p.sample_rate as usize;
         let settings = crate::grain::GrainSettings { gain: 1.0, duration: 0.2, ..Default::default() };
         let tail = |bus: u8| {
-            let mut rt = RealtimeAudio::new(p.clone(), 0.0, None);
+            let mut p_clean = p.clone();
+            p_clean.master_tape = crate::audio::TapeSettings::default();
+            let mut rt = RealtimeAudio::new(p_clean, 0.0, None);
             rt.transport = false;
             rt.set_live_bus(1, vec![AvEffect::new(EffectKind::Delay {
                 time: 0.25,

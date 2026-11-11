@@ -560,32 +560,41 @@ impl AllPass {
     }
 }
 
-/// Freeverb-style reverb tank for one channel (4 combs + 2 allpasses).
+/// Freeverb-style reverb tank for one channel (8 combs + 4 allpasses) with a
+/// 160 Hz wet-input high-pass and natural HF damping floor so reverb tails
+/// stay dense and velvety without low-end boom or narrow 4-comb ringing.
 pub struct ReverbChannel {
     combs: Vec<Comb>,
     aps: Vec<AllPass>,
+    hp_lp: f32,
+    hp_a: f32,
 }
 
 impl ReverbChannel {
     fn new(sample_rate: u32, size: f32, damp: f32, offset: f32) -> ReverbChannel {
-        let sr_scale = sample_rate as f32 / 44100.0;
-        let feedback = 0.7 + 0.28 * size.clamp(0.0, 1.0);
-        let damp = damp.clamp(0.0, 1.0) * 0.8;
+        let sr = sample_rate.max(1) as f32;
+        let sr_scale = sr / 44100.0;
+        let feedback = 0.68 + 0.24 * size.clamp(0.0, 1.0);
+        let damp = 0.16 + damp.clamp(0.0, 1.0) * 0.68;
+        let hp_a = 1.0 - (-2.0 * std::f32::consts::PI * 160.0 / sr).exp();
         ReverbChannel {
-            combs: [1116.0f32, 1188.0, 1277.0, 1356.0]
+            combs: [1116.0f32, 1188.0, 1277.0, 1356.0, 1422.0, 1491.0, 1557.0, 1617.0]
                 .iter()
                 .map(|t| Comb::new(((t + offset) * sr_scale) as usize, feedback, damp))
                 .collect(),
-            aps: [556.0f32, 441.0]
+            aps: [556.0f32, 441.0, 341.0, 225.0]
                 .iter()
                 .map(|t| AllPass::new(((t + offset) * sr_scale) as usize))
                 .collect(),
+            hp_lp: 0.0,
+            hp_a,
         }
     }
 
     fn process(&mut self, samples: &mut [f32], mix: f32) {
         for s in samples.iter_mut() {
-            let input = *s * 0.25;
+            self.hp_lp += self.hp_a * (*s - self.hp_lp);
+            let input = (*s - self.hp_lp) * 0.13;
             let mut wet: f32 = self.combs.iter_mut().map(|c| c.process(input)).sum();
             for ap in self.aps.iter_mut() {
                 wet = ap.process(wet);

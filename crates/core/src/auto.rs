@@ -85,6 +85,8 @@ pub fn param_range(name: &str) -> Option<(f32, f32)> {
         "voices" => (1.0, 4.0),
         "voice_interval" => (-12.0, 12.0),
         "voice_detune" => (0.0, 1.0),
+        "texture" => (0.0, 1.0),
+        "swing" => (0.25, 0.75),
         _ => return None,
     })
 }

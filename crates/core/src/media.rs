@@ -324,6 +324,8 @@ pub fn encode_video(
             "veryfast",
             "-c:a",
             "aac",
+            "-b:a",
+            "256k",
             "-shortest",
         ])
         .arg(path)
@@ -647,6 +649,32 @@ pub fn apply_masks(video: &VideoClip, masks: &[MaskFrame]) -> VideoClip {
     VideoClip { frames, fps: video.fps }
 }
 
+/// Fast 64-bit FNV-1a fingerprint over a `VideoClip` + prompt + sidecar cmd
+/// so repeat script renders reuse cached segmentation masks instantly.
+pub fn video_fingerprint(video: &VideoClip, extra: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    let mix = |h: &mut u64, bytes: &[u8]| {
+        for &b in bytes {
+            *h ^= b as u64;
+            *h = h.wrapping_mul(0x100000001b3);
+        }
+    };
+    mix(&mut h, extra.as_bytes());
+    mix(&mut h, &video.fps.to_bits().to_le_bytes());
+    mix(&mut h, &(video.frames.len() as u64).to_le_bytes());
+    let n = video.frames.len();
+    for fi in [0, n / 4, n / 2, (n * 3) / 4, n.saturating_sub(1)] {
+        if let Some(f) = video.frames.get(fi) {
+            mix(&mut h, &f.width.to_le_bytes());
+            mix(&mut h, &f.height.to_le_bytes());
+            for b in f.data.iter().step_by(61) {
+                mix(&mut h, &[*b]);
+            }
+        }
+    }
+    h
+}
+
 /// Run the segmenter sidecar on `video` with a text `prompt` and return
 /// the same video with the tracked object's mask baked into alpha.
 pub fn segment_video(
@@ -659,36 +687,64 @@ pub fn segment_video(
         return Err("source has no video".into());
     }
     std::fs::create_dir_all(work_dir).map_err(|e| e.to_string())?;
-    let vid_path = work_dir.join("segment-input.mp4");
     let mask_dir = work_dir.join("masks");
-    let _ = std::fs::remove_dir_all(&mask_dir);
-    std::fs::create_dir_all(&mask_dir).map_err(|e| e.to_string())?;
+    let key_path = work_dir.join("cache_key.txt");
+    let cache_key = format!(
+        "{:016x}:{}:{}",
+        video_fingerprint(video, prompt),
+        cmd.join(" "),
+        prompt
+    );
 
-    // Silent temp encode so the sidecar sees exactly our frames.
-    let silence = StereoBuffer::new(video.duration().max(0.1), 44100);
-    encode_video(&vid_path, &video.frames, video.fps, &silence)?;
+    let cached_paths = || -> Option<Vec<PathBuf>> {
+        let saved = std::fs::read_to_string(&key_path).ok()?;
+        if saved.trim() != cache_key {
+            return None;
+        }
+        let mut p: Vec<PathBuf> = std::fs::read_dir(&mask_dir)
+            .ok()?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().map(|x| x == "pgm").unwrap_or(false))
+            .collect();
+        p.sort();
+        (p.len().abs_diff(video.frames.len()) <= 2 && !p.is_empty()).then_some(p)
+    };
 
-    let out = Command::new(&cmd[0])
-        .args(&cmd[1..])
-        .arg(&vid_path)
-        .arg(prompt)
-        .arg(&mask_dir)
-        .output()
-        .map_err(|e| format!("segmenter failed to launch: {e}"))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        return Err(format!("segmenter failed: {}", err.trim()));
-    }
+    let paths = if let Some(p) = cached_paths() {
+        p
+    } else {
+        let vid_path = work_dir.join("segment-input.mp4");
+        let _ = std::fs::remove_dir_all(&mask_dir);
+        std::fs::create_dir_all(&mask_dir).map_err(|e| e.to_string())?;
 
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(&mask_dir)
-        .map_err(|e| e.to_string())?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().map(|x| x == "pgm").unwrap_or(false))
-        .collect();
-    paths.sort();
-    if paths.is_empty() {
-        return Err("segmenter produced no masks".into());
-    }
+        // Silent temp encode so the sidecar sees exactly our frames.
+        let silence = StereoBuffer::new(video.duration().max(0.1), 44100);
+        encode_video(&vid_path, &video.frames, video.fps, &silence)?;
+
+        let out = Command::new(&cmd[0])
+            .args(&cmd[1..])
+            .arg(&vid_path)
+            .arg(prompt)
+            .arg(&mask_dir)
+            .output()
+            .map_err(|e| format!("segmenter failed to launch: {e}"))?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            return Err(format!("segmenter failed: {}", err.trim()));
+        }
+
+        let mut p: Vec<PathBuf> = std::fs::read_dir(&mask_dir)
+            .map_err(|e| e.to_string())?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().map(|x| x == "pgm").unwrap_or(false))
+            .collect();
+        p.sort();
+        if p.is_empty() {
+            return Err("segmenter produced no masks".into());
+        }
+        let _ = std::fs::write(&key_path, &cache_key);
+        p
+    };
     let radius = ((video.frames[0].width.min(video.frames[0].height) as f32
         * MASK_FEATHER_FRAC) as u32)
         .max(1);

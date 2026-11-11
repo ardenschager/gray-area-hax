@@ -68,6 +68,19 @@ pub struct GrainSettings {
     /// overlap, spray, pitch/pan scatter and patch size all follow it).
     #[serde(default)]
     pub texture: f32,
+    /// Shuffle / swing for beat-synced clouds (`sync_div > 0`): 0.5 = straight,
+    /// 0.60 = classic 60% shuffle delaying odd grid slots.
+    #[serde(default = "default_swing")]
+    pub swing: f32,
+    /// Turntable / sampler coupling for snippets: when true, `speed`
+    /// automatically tracks the pitch ratio (varispeed + formant shift,
+    /// single pristine grain with zero OLA time-stretch warble).
+    #[serde(default)]
+    pub varispeed: bool,
+}
+
+fn default_swing() -> f32 {
+    0.5
 }
 
 impl GrainSettings {
@@ -99,6 +112,8 @@ impl GrainSettings {
             "voice_detune" => self.voice_detune = x.clamp(0.0, 2.0),
             "seed" => self.seed = value as u64,
             "texture" | "grain" | "grainy" => self.texture = x.clamp(0.0, 1.0),
+            "swing" | "shuffle" => self.swing = x.clamp(0.25, 0.75),
+            "varispeed" | "tape_pitch" => self.varispeed = x >= 0.5,
             _ => return Err(()),
         }
         Ok(())
@@ -131,6 +146,8 @@ impl Default for GrainSettings {
             voice_detune: 0.0,
             seed: 0xC0FFEE,
             texture: 0.0,
+            swing: 0.5,
+            varispeed: false,
         }
     }
 }
@@ -234,8 +251,17 @@ pub fn schedule_grains_auto(
         let reverse = rng.next_f32() < s.reverse_prob;
 
         let n_voices = s.voices.clamp(1, 4);
-        // Keep the cloud's loudness roughly level as voices stack.
-        let vgain = s.gain / (n_voices as f32).sqrt();
+        // Keep the cloud's loudness roughly level as voices AND grain overlap
+        // (`density * duration`) stack, so dense pads don't slam +10 dB into
+        // master limiting. Below overlap 2.5 we leave single-grain / sparse
+        // gain untouched so existing voice-compensation behavior holds.
+        let overlap = s.density.max(0.1) * s.duration.max(0.005);
+        let overlap_norm = if overlap > 2.5 {
+            (2.5 / overlap).powf(0.38)
+        } else {
+            1.0
+        };
+        let vgain = s.gain * overlap_norm / (n_voices as f32).sqrt();
         for v in 0..n_voices {
             let detune = if v == 0 { 0.0 } else { s.voice_detune * rng.bipolar() };
             let st = s.pitch + v as f32 * s.voice_interval + pitch_j + detune;
@@ -246,6 +272,10 @@ pub fn schedule_grains_auto(
                 s.quantize_amount,
                 s.detune_cents,
             );
+            // Equal-loudness warmth compensation: upward-pitched grains land
+            // in the ear's 2-5 kHz sensitivity peak, so gently attenuate
+            // `ratio > 1` (`ratio == 1` stays exact unity).
+            let pitch_warmth = if ratio > 1.0 { ratio.powf(-0.35) } else { 1.0 };
             let pan = (s.pan + s.pan_spread.clamp(0.0, 1.0) * rng.bipolar())
                 .clamp(-1.0, 1.0);
             events.push(GrainEvent {
@@ -253,7 +283,7 @@ pub fn schedule_grains_auto(
                 source_pos: pos,
                 duration: dur,
                 pitch_ratio: ratio,
-                gain: vgain,
+                gain: vgain * pitch_warmth,
                 pan,
                 envelope: s.envelope,
                 env_skew: s.env_skew,
@@ -274,17 +304,24 @@ pub fn schedule_grains_auto(
 
     let mut id: u64 = 0;
     if settings.sync_div > 0.0 {
-        // Beat-synced: onsets live on the sync grid; density is the mean
-        // trigger rate, realized as a per-slot probability.
+        // Beat-synced: onsets live on the sync grid (with optional swing on
+        // odd slots); density is the mean trigger rate, realized as a
+        // per-slot probability.
         let slot_secs = (settings.sync_div as f64 * secs_per_beat).max(1e-3);
         let mut k = 0u64;
         loop {
-            let t = k as f64 * slot_secs;
-            if t >= clip_len {
+            let base_t = k as f64 * slot_secs;
+            if base_t >= clip_len {
                 break;
             }
             let roll = rng.next_f32();
-            let s = eff_at(t);
+            let s = eff_at(base_t);
+            let swing_off = if k % 2 == 1 {
+                (s.swing.clamp(0.25, 0.75) as f64 - 0.5) * 2.0 * slot_secs
+            } else {
+                0.0
+            };
+            let t = (base_t + swing_off).clamp(0.0, (clip_len - 1e-6).max(0.0));
             let p = (s.density as f64 * slot_secs).min(1.0) as f32;
             if roll < p {
                 emit(t, clip_start, source_len, base_hz, key, &s, &mut rng, &mut events, &mut id);

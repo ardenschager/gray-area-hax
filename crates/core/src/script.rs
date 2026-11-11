@@ -227,9 +227,109 @@ pub fn build_engine(session: Session, log: Arc<Mutex<String>>) -> Engine {
                 .get(src as usize)
                 .ok_or_else(|| rt_err(format!("no source {src}")))?
                 .clone();
-            let work = s.cache_dir.join("segment");
+            let fp = source
+                .video
+                .as_deref()
+                .map(|v| media::video_fingerprint(v, prompt))
+                .unwrap_or(0);
+            let work = s.cache_dir.join("segment").join(format!("{fp:016x}"));
             let seg = media::segment_source(&source, prompt, &work).map_err(rt_err)?;
             Ok(s.project.lock().unwrap().add_source(seg) as i64)
+        },
+    );
+
+    engine.register_fn(
+        "slice",
+        |s: &mut Session, src: i64, start_secs: f64, len_secs: f64| -> ScriptResult<i64> {
+            let mut p = s.project.lock().unwrap();
+            let source = p
+                .sources
+                .get(src as usize)
+                .ok_or_else(|| rt_err(format!("no source {src}")))?
+                .clone();
+            let sliced = source.slice(start_secs.max(0.0), len_secs.max(0.01));
+            Ok(p.add_source(sliced) as i64)
+        },
+    );
+
+    engine.register_fn(
+        "pair",
+        |s: &mut Session, audio_src: i64, video_src: i64| -> ScriptResult<i64> {
+            let mut p = s.project.lock().unwrap();
+            let a = p
+                .sources
+                .get(audio_src as usize)
+                .ok_or_else(|| rt_err(format!("no source {audio_src}")))?
+                .clone();
+            let v = p
+                .sources
+                .get(video_src as usize)
+                .ok_or_else(|| rt_err(format!("no source {video_src}")))?
+                .clone();
+            Ok(p.add_source(a.pair(&v)) as i64)
+        },
+    );
+
+    engine.register_fn(
+        "slices",
+        |s: &mut Session, src: i64, max_slices: i64| -> ScriptResult<rhai::Array> {
+            let p = s.project.lock().unwrap();
+            let source = p
+                .sources
+                .get(src as usize)
+                .ok_or_else(|| rt_err(format!("no source {src}")))?;
+            let pts = source
+                .audio
+                .as_deref()
+                .map(|a| a.detect_slices(max_slices.clamp(1, 128) as usize))
+                .unwrap_or_default();
+            Ok(pts
+                .into_iter()
+                .map(|(pos, _dur)| rhai::Dynamic::from_float(pos as f64))
+                .collect())
+        },
+    );
+
+    // Built-in pure-Rust synthdef drum/pad render (from `sc` / `sc_defs`, zero
+    // external processes required): e.g. `s.synth_source("kit", 36, 0.8)` or
+    // `s.synth_source("cg_drone", 41, 4.0)` -> SourceId.
+    engine.register_fn(
+        "synth_source",
+        |s: &mut Session, def_name: &str, midi_note: i64, secs: f64| -> ScriptResult<i64> {
+            let sr = s.project.lock().unwrap().sample_rate;
+            let (inst_id, default_note) = match def_name {
+                "kick" => ("kit", 36u8),
+                "snare" => ("kit", 38u8),
+                "hat" => ("kit", 42u8),
+                "open_hat" => ("kit", 46u8),
+                other => (other, midi_note.clamp(12, 108) as u8),
+            };
+            let pitch = if midi_note > 0 {
+                midi_note.clamp(12, 108) as u8
+            } else {
+                default_note
+            };
+            let mut part = crate::sc::SynthPart::new(inst_id, 0);
+            if crate::sc::instrument(inst_id).is_none() {
+                return Err(rt_err(format!("unknown builtin synth '{def_name}'")));
+            }
+            let len_s = secs.clamp(0.1, 16.0);
+            part.length_beats = len_s;
+            part.notes = vec![crate::sc::Note {
+                start: 0.0,
+                len: (len_s * 0.7).max(0.1),
+                pitch,
+                vel: 0.9,
+            }];
+            let clip = crate::sc::render_part(&part, 60.0, sr).map_err(rt_err)?;
+            let base_hz = part.base_hz();
+            let src = Source {
+                name: format!("synth:{def_name}"),
+                audio: Some(std::sync::Arc::new(clip)),
+                video: None,
+                base_hz,
+            };
+            Ok(s.project.lock().unwrap().add_source(src) as i64)
         },
     );
 
@@ -331,6 +431,8 @@ pub fn build_engine(session: Session, log: Arc<Mutex<String>>) -> Engine {
                     "max_size" => v.max_size = x.clamp(0.01, 1.0),
                     "additive" => v.additive = x.clamp(0.0, 1.0),
                     "scatter_y" => v.scatter_y = x.clamp(0.0, 1.0),
+                    "feather" => v.feather = x.clamp(0.0, 1.0),
+                    "flicker" => v.flicker = x.clamp(0.0, 1.0),
                     // Correspondence dials (gain_to_opacity, pitch_to_hue,
                     // pitch_to_rate, pan_to_x, envelope_to_opacity,
                     // reverse_video, hue_per_semitone alias).
@@ -427,6 +529,85 @@ pub fn build_engine(session: Session, log: Arc<Mutex<String>>) -> Engine {
         }
     });
     engine.register_fn(
+        "track_blend",
+        |s: &mut Session, track: i64, additive: f64| -> ScriptResult<()> {
+            let mut p = s.project.lock().unwrap();
+            let t = p
+                .tracks
+                .get_mut(track as usize)
+                .ok_or_else(|| rt_err(format!("no track {track}")))?;
+            t.additive = Some((additive as f32).clamp(0.0, 1.0));
+            Ok(())
+        },
+    );
+    engine.register_fn(
+        "track_duck",
+        |s: &mut Session,
+         track: i64,
+         src_track: i64,
+         amount: f64,
+         attack: f64,
+         release: f64|
+         -> ScriptResult<()> {
+            let mut p = s.project.lock().unwrap();
+            let n = p.tracks.len();
+            if src_track < 0 || src_track as usize >= n {
+                return Err(rt_err(format!("no source track {src_track}")));
+            }
+            let t = p
+                .tracks
+                .get_mut(track as usize)
+                .ok_or_else(|| rt_err(format!("no track {track}")))?;
+            t.duck = Some(crate::timeline::DuckSpec {
+                source_track: src_track as usize,
+                amount: (amount as f32).clamp(0.0, 1.0),
+                attack: (attack as f32).clamp(0.0005, 1.0),
+                release: (release as f32).clamp(0.005, 4.0),
+            });
+            Ok(())
+        },
+    );
+    engine.register_fn(
+        "track_duck_opacity",
+        |s: &mut Session, track: i64, amount: f64| -> ScriptResult<()> {
+            let mut p = s.project.lock().unwrap();
+            let t = p
+                .tracks
+                .get_mut(track as usize)
+                .ok_or_else(|| rt_err(format!("no track {track}")))?;
+            t.duck_to_opacity = (amount as f32).clamp(0.0, 1.0);
+            Ok(())
+        },
+    );
+    engine.register_fn(
+        "track_tape",
+        |s: &mut Session, track: i64, wow: f64, warmth: f64, age: f64, dust: f64| -> ScriptResult<()> {
+            let mut p = s.project.lock().unwrap();
+            let t = p
+                .tracks
+                .get_mut(track as usize)
+                .ok_or_else(|| rt_err(format!("no track {track}")))?;
+            t.tape = crate::audio::TapeSettings {
+                wow: (wow as f32).clamp(0.0, 1.0),
+                warmth: (warmth as f32).clamp(0.0, 1.0),
+                age: (age as f32).clamp(0.0, 1.0),
+                dust: (dust as f32).clamp(0.0, 1.0),
+            };
+            Ok(())
+        },
+    );
+    engine.register_fn(
+        "master_tape",
+        |s: &mut Session, wow: f64, warmth: f64, age: f64, dust: f64| {
+            s.project.lock().unwrap().master_tape = crate::audio::TapeSettings {
+                wow: (wow as f32).clamp(0.0, 1.0),
+                warmth: (warmth as f32).clamp(0.0, 1.0),
+                age: (age as f32).clamp(0.0, 1.0),
+                dust: (dust as f32).clamp(0.0, 1.0),
+            };
+        },
+    );
+    engine.register_fn(
         "track_effect",
         |s: &mut Session, track: i64, kind: &str| -> ScriptResult<i64> {
             let kind = EffectKind::parse(kind)
@@ -472,6 +653,18 @@ pub fn build_engine(session: Session, log: Arc<Mutex<String>>) -> Engine {
                 .get_mut(pid as usize)
                 .ok_or_else(|| rt_err(format!("no pattern {pid}")))?;
             pat.set_grid(length_beats, steps_per_beat as u32);
+            Ok(())
+        },
+    );
+    engine.register_fn(
+        "pattern_swing",
+        |s: &mut Session, pid: i64, swing: f64| -> ScriptResult<()> {
+            let mut p = s.project.lock().unwrap();
+            let pat = p
+                .patterns
+                .get_mut(pid as usize)
+                .ok_or_else(|| rt_err(format!("no pattern {pid}")))?;
+            pat.swing = (swing as f32).clamp(0.25, 0.75);
             Ok(())
         },
     );
@@ -560,6 +753,88 @@ pub fn build_engine(session: Session, log: Arc<Mutex<String>>) -> Engine {
                 Ok(())
             })?
             .map_err(rt_err)
+        },
+    );
+    engine.register_fn(
+        "step_offset",
+        |s: &mut Session, pid: i64, row: i64, idx: i64, offset: f64| -> ScriptResult<()> {
+            with_row(s, pid, row, |r| -> Result<(), String> {
+                let st = r
+                    .steps
+                    .get_mut(idx as usize)
+                    .ok_or_else(|| format!("no step {idx}"))?;
+                st.offset = (offset as f32).clamp(-0.5, 0.5);
+                Ok(())
+            })?
+            .map_err(rt_err)
+        },
+    );
+    engine.register_fn(
+        "step_slice",
+        |s: &mut Session, pid: i64, row: i64, idx: i64, slice: f64| -> ScriptResult<()> {
+            with_row(s, pid, row, |r| -> Result<(), String> {
+                let st = r
+                    .steps
+                    .get_mut(idx as usize)
+                    .ok_or_else(|| format!("no step {idx}"))?;
+                st.slice = if slice < 0.0 { -1.0 } else { (slice as f32).clamp(0.0, 1.0) };
+                Ok(())
+            })?
+            .map_err(rt_err)
+        },
+    );
+    engine.register_fn(
+        "step_length",
+        |s: &mut Session, pid: i64, row: i64, idx: i64, length: f64| -> ScriptResult<()> {
+            with_row(s, pid, row, |r| -> Result<(), String> {
+                let st = r
+                    .steps
+                    .get_mut(idx as usize)
+                    .ok_or_else(|| format!("no step {idx}"))?;
+                st.length = (length as f32).clamp(0.05, 16.0);
+                Ok(())
+            })?
+            .map_err(rt_err)
+        },
+    );
+    engine.register_fn(
+        "step_chance",
+        |s: &mut Session, pid: i64, row: i64, idx: i64, chance: f64| -> ScriptResult<()> {
+            with_row(s, pid, row, |r| -> Result<(), String> {
+                let st = r
+                    .steps
+                    .get_mut(idx as usize)
+                    .ok_or_else(|| format!("no step {idx}"))?;
+                st.chance = (chance as f32).clamp(0.0, 1.0);
+                Ok(())
+            })?
+            .map_err(rt_err)
+        },
+    );
+    engine.register_fn(
+        "row_swing",
+        |s: &mut Session, pid: i64, row: i64, swing: f64| -> ScriptResult<()> {
+            with_row(s, pid, row, |r| {
+                r.swing = if swing <= 0.0 {
+                    None
+                } else {
+                    Some((swing as f32).clamp(0.25, 0.75))
+                };
+            })
+        },
+    );
+    engine.register_fn(
+        "row_humanize",
+        |s: &mut Session, pid: i64, row: i64, secs: f64| -> ScriptResult<()> {
+            with_row(s, pid, row, |r| {
+                r.humanize = (secs as f32).clamp(0.0, 0.1);
+            })
+        },
+    );
+    engine.register_fn(
+        "row_mute",
+        |s: &mut Session, pid: i64, row: i64, muted: bool| -> ScriptResult<()> {
+            with_row(s, pid, row, |r| r.muted = muted)
         },
     );
     engine.register_fn(
@@ -1074,5 +1349,57 @@ mod tests {
         assert!(wav.exists());
         let clip = media::load_wav(&wav).unwrap();
         assert!(clip.duration() > 0.9);
+    }
+
+    #[test]
+    fn script_swing_duck_tape_slices_and_synth_sources() {
+        let project = fresh();
+        let script = r#"
+            let s = session(132.0);
+            let demo = s.demo_source();
+            let sub = s.slice(demo, 0.2, 1.5);
+            let kick = s.synth_source("kick", 36, 0.5);
+            let kick_av = s.pair(kick, sub);
+            let sl = s.slices(demo, 8);
+            print("nslices=" + sl.len());
+
+            let t_pad = s.track("pad");
+            let t_drm = s.track("drums");
+            s.track_blend(t_drm, 0.85);
+            s.track_duck(t_pad, t_drm, 0.65, 0.008, 0.18);
+            s.track_duck_opacity(t_pad, 0.5);
+            s.track_tape(t_pad, 0.25, 0.3, 0.2, 0.15);
+            s.master_tape(0.1, 0.2, 0.1, 0.05);
+
+            let c_pad = s.snippet(t_pad, sub, 0.0, 4.0);
+            s.set(c_pad, "pitch", -5.0);
+            s.set(c_pad, "varispeed", 1.0);
+            s.set(c_pad, "feather", 0.35);
+            s.set(c_pad, "flicker", 0.2);
+
+            let p = s.pattern("ukg");
+            s.pattern_swing(p, 0.60);
+            let r = s.row(p, kick_av);
+            s.row_swing(p, r, 0.62);
+            s.row_humanize(p, r, 0.004);
+            s.step(p, r, 0, true);
+            s.step(p, r, 1, true);
+            s.step_offset(p, r, 1, 0.08);
+            s.step_slice(p, r, 1, 0.25);
+            s.step_length(p, r, 1, 0.75);
+            s.step_chance(p, r, 1, 0.9);
+            s.pattern_clip(t_drm, p, 0.0, 4.0);
+        "#;
+        let out = run_script(project.clone(), Path::new("/tmp"), script).unwrap();
+        assert!(out.contains("nslices="), "log: {out}");
+        let p = project.lock().unwrap();
+        assert!(p.tracks[0].duck.is_some());
+        assert_eq!(p.tracks[1].additive, Some(0.85));
+        assert!(p.tracks[0].tape.is_active());
+        assert!(p.master_tape.is_active());
+        assert!(p.tracks[0].clips[0].grains.varispeed);
+        assert!((p.tracks[0].clips[0].visual.feather - 0.35).abs() < 1e-6);
+        assert!((p.patterns[0].swing - 0.60).abs() < 1e-6);
+        assert_eq!(p.patterns[0].rows[0].steps[1].slice, 0.25);
     }
 }

@@ -70,6 +70,17 @@ impl Source {
         });
         Source { name: self.name.clone(), audio, video, base_hz: self.base_hz }
     }
+
+    /// Combine `self`'s audio (and `base_hz`) with `video_src`'s video frames,
+    /// producing a unified AV source whose grains trigger both together.
+    pub fn pair(&self, video_src: &Source) -> Source {
+        Source {
+            name: format!("{} + {}", self.name, video_src.name),
+            audio: self.audio.clone(),
+            video: video_src.video.clone(),
+            base_hz: self.base_hz,
+        }
+    }
 }
 
 /// What a clip does with its source.
@@ -179,9 +190,11 @@ impl Clip {
     pub fn new_snippet(source: SourceId, start_beat: f64, length_beats: f64) -> Clip {
         let mut c = Clip::new(source, start_beat, length_beats);
         c.kind = ClipKind::Snippet;
-        // Snippets default to short edge fades rather than a grain window.
+        // Snippets default to short edge fades and opaque alpha-over rather
+        // than a glowing grain cloud.
         c.grains.envelope = 0.05;
         c.grains.pan_spread = 0.0;
+        c.visual.additive = 0.0;
         c
     }
 
@@ -274,6 +287,46 @@ impl Clip {
 /// follows it on its track.
 pub const FOREVER_TAIL_BEATS: f64 = 64.0;
 
+/// Sidechain envelope ducking from another track (`source_track` may sit
+/// anywhere in the track list, independent of video z-order).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DuckSpec {
+    pub source_track: usize,
+    /// Maximum gain reduction `0..1` (`0.6` ducks down toward `40%` on peaks).
+    pub amount: f32,
+    /// Attack time in seconds (e.g. `0.008`).
+    pub attack: f32,
+    /// Release time in seconds (e.g. `0.18`).
+    pub release: f32,
+}
+
+/// Streaming envelope follower state for [`DuckSpec`], shared by offline and
+/// realtime rendering.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DuckState {
+    pub env: f32,
+}
+
+impl DuckState {
+    #[inline]
+    pub fn step(&mut self, sc_l: f32, sc_r: f32, spec: &DuckSpec, sample_rate: u32) -> f32 {
+        let sr = sample_rate.max(1) as f32;
+        let x = sc_l.abs().max(sc_r.abs());
+        let att_c = (-1.0 / (spec.attack.max(0.0005) * sr)).exp();
+        let rel_c = (-1.0 / (spec.release.max(0.005) * sr)).exp();
+        if x > self.env {
+            self.env = att_c * self.env + (1.0 - att_c) * x;
+        } else {
+            self.env = rel_c * self.env + (1.0 - rel_c) * x;
+        }
+        // Soft-knee detector Curve: 0.30 amplitude (~ -10 dBFS) reaches ~80% of
+        // the requested duck amount without pumping violently on tiny hiss.
+        let drive = (self.env * 3.2).min(4.0);
+        let shaped = drive / (1.0 + drive);
+        (1.0 - spec.amount.clamp(0.0, 1.0) * shaped).clamp(0.0, 1.0)
+    }
+}
+
 /// A track: clips, a level fader, and its own AV effect chain. Track order
 /// is also the video compositing order — later tracks render ON TOP.
 #[derive(Debug, Clone)]
@@ -290,6 +343,15 @@ pub struct Track {
     /// Level automation over absolute timeline beats (empty = static
     /// `level`). Drives audio gain per sample and video opacity per frame.
     pub level_points: Vec<crate::auto::AutoPoint>,
+    /// Optional sidechain ducking from another track.
+    pub duck: Option<DuckSpec>,
+    /// How strongly sidechain audio ducking also dims this track's visuals (`0..1`).
+    pub duck_to_opacity: f32,
+    /// Explicit track-onto-master blend mode (`0` = alpha-over, `1` = additive
+    /// glow; `None` = inherit max active clip `additive`).
+    pub additive: Option<f32>,
+    /// Per-track analog tape / vinyl stage.
+    pub tape: crate::audio::TapeSettings,
 }
 
 impl Default for Track {
@@ -302,6 +364,10 @@ impl Default for Track {
             level: 1.0,
             level_to_opacity: 1.0,
             level_points: Vec::new(),
+            duck: None,
+            duck_to_opacity: 0.35,
+            additive: None,
+            tape: crate::audio::TapeSettings::default(),
         }
     }
 }
@@ -366,6 +432,8 @@ pub struct Project {
     /// SuperCollider instrument parts; each renders into one library
     /// source (`part.source`), which clips and pads use like any media.
     pub synth_parts: Vec<crate::sc::SynthPart>,
+    /// Master analog tape / vinyl stage applied before master limiting.
+    pub master_tape: crate::audio::TapeSettings,
 }
 
 impl Default for Project {
@@ -382,6 +450,7 @@ impl Default for Project {
             master_effects: Vec::new(),
             quantize: 0.25,
             synth_parts: Vec::new(),
+            master_tape: crate::audio::TapeSettings::default(),
         }
     }
 }

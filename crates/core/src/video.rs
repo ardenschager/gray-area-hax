@@ -63,6 +63,40 @@ impl Frame {
         }
         (sum / (self.width as f64 * self.height as f64)) as f32
     }
+
+    /// Normalized `(cx, cy)` alpha centroid when this frame is a sparse
+    /// segmented cutout (`0.5%..80%` opaque). Returns `None` for normal
+    /// full-frame footage (`alpha == 255` everywhere) so full-frame sources
+    /// keep their exact patch coordinates.
+    pub fn alpha_focus(&self) -> Option<(f32, f32)> {
+        if self.width == 0 || self.height == 0 {
+            return None;
+        }
+        let step_x = (self.width / 48).max(1);
+        let step_y = (self.height / 36).max(1);
+        let mut w_sum = 0.0f64;
+        let mut x_sum = 0.0f64;
+        let mut y_sum = 0.0f64;
+        let mut samples = 0u64;
+        let mut y = 0u32;
+        while y < self.height {
+            let mut x = 0u32;
+            while x < self.width {
+                let a = self.data[((y * self.width + x) * 4 + 3) as usize] as f64 / 255.0;
+                w_sum += a;
+                x_sum += a * (x as f64 + 0.5) / self.width as f64;
+                y_sum += a * (y as f64 + 0.5) / self.height as f64;
+                samples += 1;
+                x += step_x;
+            }
+            y += step_y;
+        }
+        let frac = w_sum / samples.max(1) as f64;
+        if !(0.005..0.80).contains(&frac) {
+            return None;
+        }
+        Some(((x_sum / w_sum) as f32, (y_sum / w_sum) as f32))
+    }
 }
 
 /// A decoded (or procedural) video clip held in memory.
@@ -88,6 +122,44 @@ impl VideoClip {
         let mut idx = (t * self.fps as f64).floor() as i64;
         idx = idx.rem_euclid(self.frames.len() as i64);
         self.frames.get(idx as usize)
+    }
+
+    /// Temporally blended frame at `t` seconds: linearly crossfades adjacent
+    /// source frames so slow-motion snippets (`speed < 1`) glide smoothly
+    /// instead of stepping at reduced frame rates.
+    pub fn frame_blended_at(&self, t: f64) -> Option<std::borrow::Cow<'_, Frame>> {
+        if self.frames.is_empty() || self.fps <= 0.0 {
+            return None;
+        }
+        let pos = t * self.fps as f64;
+        let fl = pos.floor();
+        let frac = (pos - fl) as f32;
+        let n = self.frames.len() as i64;
+        let i0 = (fl as i64).rem_euclid(n) as usize;
+        if frac <= 0.01 || n <= 1 {
+            return Some(std::borrow::Cow::Borrowed(&self.frames[i0]));
+        }
+        let i1 = ((fl as i64 + 1).rem_euclid(n)) as usize;
+        if frac >= 0.99 || i0 == i1 {
+            return Some(std::borrow::Cow::Borrowed(&self.frames[i1]));
+        }
+        let f0 = &self.frames[i0];
+        let f1 = &self.frames[i1];
+        if f0.width != f1.width || f0.height != f1.height {
+            return Some(std::borrow::Cow::Borrowed(f0));
+        }
+        let inv = 1.0 - frac;
+        let data: Vec<u8> = f0
+            .data
+            .iter()
+            .zip(&f1.data)
+            .map(|(&a, &b)| (a as f32 * inv + b as f32 * frac + 0.5) as u8)
+            .collect();
+        Some(std::borrow::Cow::Owned(Frame {
+            width: f0.width,
+            height: f0.height,
+            data,
+        }))
     }
 
     /// Procedural test clip: hue sweeps over time, a bright moving bar gives
@@ -257,6 +329,19 @@ pub struct VisualGrainStyle {
     pub additive: f32,
     /// Vertical scatter amount (0 = all grains centered vertically).
     pub scatter_y: f32,
+    /// Optional soft cosine border taper on visual grain patches (`0..1`).
+    /// Defaults to `0.0` so crisp lo-fi grain blocks stay intact unless requested.
+    #[serde(default)]
+    pub feather: f32,
+    /// Visual transient sharpness (`0..1`): `1.0` = raw audio envelope (hard
+    /// percussive flashes), `0.0` = calm multi-frame bloom & afterglow.
+    /// Defaults to `0.30` so 16th-note percussion glows instead of strobing.
+    #[serde(default = "default_flicker")]
+    pub flicker: f32,
+}
+
+fn default_flicker() -> f32 {
+    0.30
 }
 
 impl Default for VisualGrainStyle {
@@ -267,11 +352,25 @@ impl Default for VisualGrainStyle {
             max_size: 0.65,
             additive: 0.35,
             scatter_y: 0.7,
+            feather: 0.0,
+            flicker: 0.30,
         }
     }
 }
 
 impl VisualGrainStyle {
+    /// Visual lifetime of a grain in seconds (extends very short percussive
+    /// grains into a smooth multi-frame decay when `flicker < 1.0`).
+    #[inline]
+    pub fn visual_duration(&self, audio_duration: f32) -> f64 {
+        let fl = self.flicker.clamp(0.0, 1.0);
+        if fl >= 0.999 {
+            return audio_duration.max(0.001) as f64;
+        }
+        let min_d = 0.22 * (1.0 - fl) + audio_duration * fl;
+        audio_duration.max(min_d).max(0.001) as f64
+    }
+
     /// Blend from full-frame (`t` = 0) to `cloud` (`t` = 1) — the picture
     /// side of the sample <-> grains morph.
     pub fn morph(additive: f32, cloud: &VisualGrainStyle, t: f32) -> VisualGrainStyle {
@@ -285,6 +384,8 @@ impl VisualGrainStyle {
             max_size: lin(full.max_size, cloud.max_size),
             additive: lin(additive, cloud.additive),
             scatter_y: lin(0.0, cloud.scatter_y),
+            feather: lin(0.0, cloud.feather),
+            flicker: lin(1.0, cloud.flicker),
         }
     }
 
@@ -296,6 +397,8 @@ impl VisualGrainStyle {
             max_size: 1.0,
             additive,
             scatter_y: 0.0,
+            feather: 0.0,
+            flicker: 1.0,
         }
     }
 }
@@ -333,7 +436,7 @@ impl Default for AvLink {
         AvLink {
             gain_to_opacity: 1.0,
             envelope_to_opacity: 1.0,
-            pitch_to_hue: 12.0,
+            pitch_to_hue: 2.0,
             pitch_to_rate: 1.0,
             pan_to_x: 1.0,
             reverse_video: true,
@@ -425,12 +528,30 @@ pub fn grain_draws_opts(
     let (sin_r, cos_r) = rot.sin_cos();
     let tscale = transform.scale.max(0.01);
     let aspect = aspect.max(0.01);
+    let fl = style.flicker.clamp(0.0, 1.0);
     for ev in events {
-        if t < ev.onset || t >= ev.end() {
+        let vis_dur = if parked {
+            ev.duration.max(0.001) as f64
+        } else {
+            style.visual_duration(ev.duration)
+        };
+        if t < ev.onset || t >= ev.onset + vis_dur {
             continue;
         }
-        let phase = ((t - ev.onset) / ev.duration as f64) as f32;
-        let mut env = grain_env_skewed(phase, ev.envelope, ev.env_skew);
+        let phase = ((t - ev.onset) / vis_dur) as f32;
+        let (vis_env_taper, vis_skew, flash_damp) = if fl < 0.999 && !parked {
+            let taper = ev.envelope.max((1.0 - fl) * 0.85);
+            let skew = ev.env_skew * fl;
+            let damp = if vis_dur > ev.duration as f64 {
+                ((ev.duration.max(0.005) as f64 / vis_dur).powf(0.35 * (1.0 - fl as f64))) as f32
+            } else {
+                1.0
+            };
+            (taper, skew, damp)
+        } else {
+            (ev.envelope, ev.env_skew, 1.0)
+        };
+        let mut env = grain_env_skewed(phase, vis_env_taper, vis_skew) * flash_damp;
         if parked && ev.duration >= 0.25 {
             env = env.max(grain_env_skewed(0.5, ev.envelope, ev.env_skew));
         }
@@ -485,6 +606,20 @@ pub fn grain_draws_opts(
     out
 }
 
+#[inline]
+fn border_feather(qx: f32, qy: f32, feather: f32) -> f32 {
+    let f = (feather.clamp(0.0, 1.0) * 0.45).max(0.0);
+    if f <= 1e-4 {
+        return 1.0;
+    }
+    let edge = |q: f32| -> f32 {
+        let dist = q.min(1.0 - q).clamp(0.0, f);
+        let u = dist / f;
+        0.5 - 0.5 * (std::f32::consts::PI * u).cos()
+    };
+    edge(qx) * edge(qy)
+}
+
 /// Composite every grain active at output time `t` (timeline seconds) onto
 /// `out` — a transparent layer with straight-alpha accumulation. Geometry
 /// comes from [`grain_draws`] (shared with the GPU preview); this function
@@ -500,16 +635,55 @@ pub fn composite_grains_frame(
     out: &mut Frame,
     t: f64,
 ) {
+    composite_grains_frame_opts(clip, events, style, link, transform, color_filter, out, t, false, None);
+}
+
+/// [`composite_grains_frame`] with optional neighbor-frame temporal crossfade
+/// (`blend_frames`, used for slow-motion snippets) and optional `hue_override`
+/// (preserving pitch-decoupled hue on stretched snippets).
+#[allow(clippy::too_many_arguments)]
+pub fn composite_grains_frame_opts(
+    clip: &VideoClip,
+    events: &[GrainEvent],
+    style: &VisualGrainStyle,
+    link: &AvLink,
+    transform: &crate::timeline::ClipTransform,
+    color_filter: Option<&ColorFilter>,
+    out: &mut Frame,
+    t: f64,
+    blend_frames: bool,
+    hue_override: Option<f32>,
+) {
     let ow = out.width as f32;
     let oh = out.height as f32;
     let aspect = ow / oh.max(1.0);
     let add = style.additive.clamp(0.0, 1.0);
+    let feath = style.feather.clamp(0.0, 1.0);
     let draws = grain_draws(events, style, link, transform, clip.duration(), t, aspect);
 
     for d in draws {
-        let Some(src) = clip.frame_at(d.src_time) else { continue };
+        let src_cow = if blend_frames {
+            clip.frame_blended_at(d.src_time)
+        } else {
+            clip.frame_at(d.src_time).map(std::borrow::Cow::Borrowed)
+        };
+        let Some(src) = src_cow else { continue };
         let alpha = d.alpha;
-        let hue_shift = d.hue_shift;
+        let hue_shift = hue_override.unwrap_or(d.hue_shift);
+
+        // If the source frame is a segmented cutout (`alpha_focus` is Some)
+        // and the grain patch is smaller than the whole frame, bias the patch
+        // gently toward the cutout's centroid so cropped grains actually
+        // capture the subject rather than transparent void.
+        let mut patch = d.patch;
+        if patch[2] < 0.98 {
+            if let Some((fx, fy)) = src.alpha_focus() {
+                let target_x = (fx - patch[2] * 0.5).clamp(0.0, (1.0 - patch[2]).max(0.0));
+                let target_y = (fy - patch[3] * 0.5).clamp(0.0, (1.0 - patch[3]).max(0.0));
+                patch[0] = patch[0] * 0.25 + target_x * 0.75;
+                patch[1] = patch[1] * 0.25 + target_y * 0.75;
+            }
+        }
 
         // Dest rect in pixels.
         let rw = (d.dest[2] * ow / 2.0).max(1.0); // half extents
@@ -543,14 +717,14 @@ pub fn composite_grains_frame(
                 if !(0.0..1.0).contains(&qx) || !(0.0..1.0).contains(&qy) {
                     continue;
                 }
-                let sx = ((d.patch[0] + qx * d.patch[2]) * (sw - 1.0)) as u32;
-                let sy = ((d.patch[1] + qy * d.patch[3]) * (sh - 1.0)) as u32;
+                let sx = ((patch[0] + qx * patch[2]) * (sw - 1.0)) as u32;
+                let sy = ((patch[1] + qy * patch[3]) * (sh - 1.0)) as u32;
                 let [mut r, mut g, mut b, ta] =
                     src.get(sx.min(src.width - 1), sy.min(src.height - 1));
 
                 // The source frame's own alpha participates: segmented
                 // (masked) sources composite only where the object is.
-                let mut a = alpha * ta as f32 / 255.0;
+                let mut a = alpha * (ta as f32 / 255.0) * border_feather(qx, qy, feath);
                 if a <= 0.003 {
                     continue;
                 }
@@ -567,7 +741,7 @@ pub fn composite_grains_frame(
                 }
 
                 // Straight-alpha accumulation into the layer, with an
-                // additive component for glow.
+                // unpremultiplied additive component for true glow.
                 let dst = out.get(x as u32, y as u32);
                 let da = dst[3] as f32 / 255.0;
                 let out_a = (a + da * (1.0 - a)).max(1e-6);
@@ -575,7 +749,7 @@ pub fn composite_grains_frame(
                     let s = src_c as f32;
                     let dd = dst_c as f32;
                     let over = (s * a + dd * da * (1.0 - a)) / out_a;
-                    let additive = (dd * da + s * a).min(255.0);
+                    let additive = ((dd * da + s * a) / out_a).min(255.0);
                     (over * (1.0 - add) + additive * add) as u8
                 };
                 out.put(
@@ -633,7 +807,7 @@ pub fn blend_layer_over(dst: &mut Frame, src: &Frame, additive: f32) {
         let out_a = (sa + da * (1.0 - sa)).max(1e-6);
         for c in 0..3 {
             let over = (s[c] as f32 * sa + d[c] as f32 * da * (1.0 - sa)) / out_a;
-            let additive_v = (d[c] as f32 * da + s[c] as f32 * sa).min(255.0);
+            let additive_v = ((d[c] as f32 * da + s[c] as f32 * sa) / out_a).min(255.0);
             d[c] = (over * (1.0 - add) + additive_v * add) as u8;
         }
         d[3] = (out_a * 255.0) as u8;
@@ -889,5 +1063,85 @@ mod tests {
         assert!(clip.frame_at(0.05).is_some());
         // Wraps.
         assert!(clip.frame_at(100.0).is_some());
+    }
+
+    #[test]
+    fn additive_glow_never_darkens_background() {
+        let mut bg = Frame::black(16, 16);
+        for px in bg.data.chunks_exact_mut(4) {
+            px[0] = 120;
+            px[1] = 120;
+            px[2] = 120;
+        }
+        let mut src_f = Frame::black(16, 16);
+        for px in src_f.data.chunks_exact_mut(4) {
+            px[0] = 80;
+            px[1] = 80;
+            px[2] = 80;
+        }
+        let clip = VideoClip { frames: vec![src_f; 4], fps: 10.0 };
+        let ev = crate::grain::GrainEvent {
+            onset: 0.0,
+            source_pos: 0.0,
+            duration: 1.0,
+            pitch_ratio: 1.0,
+            gain: 0.35,
+            pan: 0.0,
+            envelope: 0.1,
+            env_skew: 0.0,
+            reverse: false,
+            id: 0,
+        };
+        let style = VisualGrainStyle { additive: 1.0, min_size: 1.0, max_size: 1.0, flicker: 1.0, ..Default::default() };
+        let mut clip_layer = Frame::transparent(16, 16);
+        composite_grains_frame(&clip, &[ev], &style, &AvLink::default(), &crate::timeline::ClipTransform::default(), None, &mut clip_layer, 0.5);
+        let mut track_layer = Frame::transparent(16, 16);
+        blend_layer_over(&mut track_layer, &clip_layer, 1.0);
+        blend_layer(&mut bg, &track_layer, 1.0, 1.0);
+        assert!(bg.mean_luma() > 135.0, "additive glow must brighten bg (120 -> {})", bg.mean_luma());
+    }
+
+    #[test]
+    fn flicker_dial_smooths_percussive_strobe() {
+        let ev = crate::grain::GrainEvent {
+            onset: 0.0,
+            source_pos: 0.0,
+            duration: 0.05,
+            pitch_ratio: 1.0,
+            gain: 1.0,
+            pan: 0.0,
+            envelope: 0.1,
+            env_skew: -0.95, // hard percussive audio transient
+            reverse: false,
+            id: 0,
+        };
+        let tform = crate::timeline::ClipTransform::default();
+        let link = AvLink::default();
+        let raw_style = VisualGrainStyle { flicker: 1.0, ..Default::default() };
+        let calm_style = VisualGrainStyle { flicker: 0.2, ..Default::default() };
+
+        // At t = 2 ms, raw percussive envelope slams near 1.0 while calm
+        // bloom ramps in gently; at t = 100 ms (after the 50 ms audio grain),
+        // raw is gone while calm still glows softly.
+        let raw_t0 = grain_draws(&[ev.clone()], &raw_style, &link, &tform, 1.0, 0.002, 1.0);
+        let calm_t0 = grain_draws(&[ev.clone()], &calm_style, &link, &tform, 1.0, 0.002, 1.0);
+        assert!(raw_t0[0].alpha > 0.7);
+        assert!(calm_t0.is_empty() || calm_t0[0].alpha < 0.25);
+
+        let raw_tail = grain_draws(&[ev.clone()], &raw_style, &link, &tform, 1.0, 0.10, 1.0);
+        let calm_tail = grain_draws(&[ev], &calm_style, &link, &tform, 1.0, 0.10, 1.0);
+        assert!(raw_tail.is_empty());
+        assert!(!calm_tail.is_empty() && calm_tail[0].alpha > 0.05);
+    }
+
+    #[test]
+    fn frame_blended_at_interpolates_frames() {
+        let mut f0 = Frame::black(4, 4);
+        let mut f1 = Frame::black(4, 4);
+        for px in f0.data.chunks_exact_mut(4) { px[0] = 0; }
+        for px in f1.data.chunks_exact_mut(4) { px[0] = 200; }
+        let vc = VideoClip { frames: vec![f0, f1], fps: 10.0 };
+        let mid = vc.frame_blended_at(0.05).unwrap();
+        assert!((mid.get(0, 0)[0] as i32 - 100).abs() <= 2);
     }
 }

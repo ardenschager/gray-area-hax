@@ -24,11 +24,22 @@ pub struct Step {
     pub length: f32,
     /// Probability the step fires, 0..1.
     pub chance: f32,
+    /// Micro-timing nudge in fractions of a step (-0.5..0.5; positive = late,
+    /// negative = early) for unquantized / drunken pocket.
+    pub offset: f32,
 }
 
 impl Default for Step {
     fn default() -> Self {
-        Step { on: false, pitch: 0.0, gain: 1.0, slice: -1.0, length: 1.0, chance: 1.0 }
+        Step {
+            on: false,
+            pitch: 0.0,
+            gain: 1.0,
+            slice: -1.0,
+            length: 1.0,
+            chance: 1.0,
+            offset: 0.0,
+        }
     }
 }
 
@@ -59,6 +70,10 @@ pub struct SeqRow {
     pub loop_end: f32,
     /// Silenced (the lane header's tap-to-mute).
     pub muted: bool,
+    /// Optional per-row swing override (0.25..0.75; None = use pattern.swing).
+    pub swing: Option<f32>,
+    /// Deterministic timing humanize jitter in seconds (0 = tight).
+    pub humanize: f32,
 }
 
 impl SeqRow {
@@ -78,6 +93,8 @@ impl SeqRow {
             loop_start: 0.0,
             loop_end: 1.0,
             muted: false,
+            swing: None,
+            humanize: 0.0,
         }
     }
 
@@ -93,6 +110,9 @@ pub struct StepPattern {
     pub name: String,
     pub steps_per_beat: u32,
     pub length_beats: f64,
+    /// Shuffle / swing ratio: 0.5 = straight, 0.58..0.64 = classic MPC/UKG
+    /// shuffle delaying odd steps by `(swing - 0.5) * 2 * step_secs`.
+    pub swing: f32,
     pub rows: Vec<SeqRow>,
 }
 
@@ -102,6 +122,7 @@ impl StepPattern {
             name: name.to_string(),
             steps_per_beat: 4,
             length_beats: 4.0,
+            swing: 0.5,
             rows: Vec::new(),
         }
     }
@@ -167,8 +188,11 @@ pub fn pattern_events(
         let base_hz = source.effective_base_hz();
         let key = key_override.or(row.key.as_ref());
         let mut rng = Rng::new(row.grains.seed ^ ((row_idx as u64 + 1) * 0x9E37));
-        // Chance rolls use their own stream so they never shift the jitter.
+        // Chance and humanize rolls use dedicated streams so they never shift
+        // the musical spray/pitch/pan jitter of existing steps.
         let mut chance_rng = Rng::new(row.grains.seed ^ ((row_idx as u64 + 1) * 0xC4A5_CE00));
+        let mut hum_rng = Rng::new(row.grains.seed ^ ((row_idx as u64 + 1) * 0x4041_5E00));
+        let eff_swing = row.swing.unwrap_or(pattern.swing).clamp(0.25, 0.75) as f64;
         let mut events = Vec::new();
         let mut id: u64 = (row_idx as u64) << 32;
 
@@ -186,8 +210,8 @@ pub fn pattern_events(
                 // longer than the pattern grid phase against it (polymeter).
                 let mut slot = 0usize;
                 loop {
-                    let t = slot as f64 * step_secs;
-                    if t >= clip_len_secs {
+                    let grid_t = slot as f64 * step_secs;
+                    if grid_t >= clip_len_secs {
                         break;
                     }
                     let step = row.steps[slot % row.steps.len()];
@@ -198,10 +222,17 @@ pub fn pattern_events(
                     let pan_j = rng.bipolar();
                     let rev_j = rng.next_f32();
                     let roll = chance_rng.next_f32();
+                    let hum_j = hum_rng.bipolar();
+                    let is_odd = slot % 2 == 1;
                     slot += 1;
                     if !step.on || roll >= step.chance {
                         continue;
                     }
+                    let swing_shift = if is_odd { (eff_swing - 0.5) * 2.0 * step_secs } else { 0.0 };
+                    let nudge = step.offset.clamp(-0.5, 0.5) as f64 * step_secs;
+                    let hum = row.humanize.clamp(0.0, 0.1) as f64 * hum_j as f64;
+                    let t = (grid_t + swing_shift + nudge + hum)
+                        .clamp(0.0, (clip_len_secs - 1e-6).max(0.0));
                     let g = eff_at(t);
 
                     let st = g.pitch + step.pitch + g.pitch_jitter * pitch_j;

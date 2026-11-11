@@ -94,10 +94,47 @@ fn paulstretch_channel(input: &[f32], factor: f32, sr: u32) -> Vec<f32> {
 
         // Keep magnitudes, randomize phases (conjugate-symmetric so the
         // inverse transform stays real). Fresh phases per segment is what
-        // makes paulstretch shimmer instead of loop.
+        // makes paulstretch shimmer instead of loop. Zero DC and infrasound
+        // (<20 Hz) so rectifying bin 0 never injects DC offset or low thumps,
+        // and gently blur + warm narrow upper partials (>750 Hz) so bell/tine
+        // harmonics become breathy pads instead of continuous sine whistles.
+        let sr_f = sr.max(1) as f32;
+        let hz_per_bin = sr_f / w as f32;
+        let min_k = (20.0 / hz_per_bin).ceil() as usize;
+        let blur_k = (750.0 / hz_per_bin).ceil() as usize;
+        let raw_mags: Vec<f32> = (0..=half)
+            .map(|k| (re[k] * re[k] + im[k] * im[k]).sqrt())
+            .collect();
+
         let mut rng = Rng::new(0x9A75_57E7 ^ seg as u64);
+        re[0] = 0.0;
+        im[0] = 0.0;
+        re[half] = 0.0;
+        im[half] = 0.0;
         for k in 1..half {
-            let mag = (re[k] * re[k] + im[k] * im[k]).sqrt();
+            if k < min_k {
+                re[k] = 0.0;
+                im[k] = 0.0;
+                re[w - k] = 0.0;
+                im[w - k] = 0.0;
+                continue;
+            }
+            let mut mag = if k >= blur_k && k + 2 < half {
+                // 5-bin triangular spectral smoothing turns piercing upper
+                // tine/soprano spikes into soft, breathy spectral clouds.
+                0.10 * raw_mags[k - 2]
+                    + 0.22 * raw_mags[k - 1]
+                    + 0.36 * raw_mags[k]
+                    + 0.22 * raw_mags[k + 1]
+                    + 0.10 * raw_mags[k + 2]
+            } else {
+                raw_mags[k]
+            };
+            let freq = k as f32 * hz_per_bin;
+            if freq > 900.0 {
+                // Gentle natural warmth rolloff on stretched upper partials.
+                mag *= (1.0 + ((freq - 900.0) / 1600.0).powi(2)).powf(-0.35);
+            }
             let ph = rng.next_f32() * 2.0 * std::f32::consts::PI;
             let (s, c) = ph.sin_cos();
             re[k] = mag * c;
@@ -105,10 +142,6 @@ fn paulstretch_channel(input: &[f32], factor: f32, sr: u32) -> Vec<f32> {
             re[w - k] = re[k];
             im[w - k] = -im[k];
         }
-        re[0] = (re[0] * re[0] + im[0] * im[0]).sqrt();
-        im[0] = 0.0;
-        re[half] = (re[half] * re[half] + im[half] * im[half]).sqrt();
-        im[half] = 0.0;
 
         fft(&mut re, &mut im, true);
         let base = seg * half;

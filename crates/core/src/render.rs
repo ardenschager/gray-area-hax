@@ -9,13 +9,14 @@
 //!
 //! Track order is the video z-order: later tracks composite on top.
 
-use crate::audio::{render_grains_audio_spatial, StereoBuffer};
+use crate::audio::{render_grains_audio_spatial, StereoBuffer, TapeState};
 use crate::fx;
 use crate::grain::{schedule_grains_auto, GrainEvent};
 use crate::seq::pattern_events;
-use crate::timeline::{Clip, ClipKind, Project, Source};
+use crate::timeline::{Clip, ClipKind, DuckState, Project, Source};
 use crate::video::{
-    blend_layer, blend_layer_over, composite_grains_frame, Frame, VisualGrainStyle,
+    blend_layer, blend_layer_over, composite_grains_frame, composite_grains_frame_opts, Frame,
+    VisualGrainStyle,
 };
 
 pub struct RenderOutput {
@@ -32,15 +33,60 @@ pub struct ClipPlan {
     pub track: usize,
     pub clip_index: usize,
     pub parts: Vec<(usize, Vec<GrainEvent>)>,
+    /// Optional dedicated continuous video events for untextured stretched
+    /// snippets, preventing 50%-overlap audio OLA grains from strobing
+    /// straight-alpha video opacity at the grain hop rate.
+    pub video_parts: Option<Vec<(usize, Vec<GrainEvent>)>>,
     pub style: VisualGrainStyle,
 }
 
+/// Find a small source-position offset (within `±8 ms`) around `nominal_pos`
+/// whose waveform best correlates with `ref_pos` (where the previous OLA grain
+/// currently sits), eliminating comb-filtering / phase warble on stretched
+/// basslines, pads, and vocals (WSOLA).
+fn wsola_align(audio: &crate::audio::AudioClip, ref_pos: f64, nominal_pos: f64) -> f64 {
+    let sr = audio.sample_rate as usize;
+    let n = audio.samples.len();
+    if sr == 0 || n < 1024 {
+        return nominal_pos;
+    }
+    let win = (sr / 180).clamp(64, 320); // ~5.5 ms correlation window
+    let max_off = (sr / 125).clamp(32, 480) as isize; // ±8 ms search range
+    let ref_i = ((ref_pos * sr as f64).round() as isize).rem_euclid(n as isize) as usize;
+    let nom_i = ((nominal_pos * sr as f64).round() as isize).rem_euclid(n as isize);
+
+    let mut best_off = 0isize;
+    let mut best_score = f32::NEG_INFINITY;
+    let mut d = -max_off;
+    while d <= max_off {
+        let cand_i = (nom_i + d).rem_euclid(n as isize) as usize;
+        let mut dot = 0.0f32;
+        let mut e_cand = 1e-6f32;
+        let mut j = 0usize;
+        while j < win {
+            let a = audio.samples[(ref_i + j) % n];
+            let b = audio.samples[(cand_i + j) % n];
+            dot += a * b;
+            e_cand += b * b;
+            j += 2;
+        }
+        // Slight preference for smaller offsets when correlation ties.
+        let penalty = 1.0 - 0.05 * (d.abs() as f32 / max_off as f32);
+        let score = (dot / e_cand.sqrt()) * penalty;
+        if score > best_score {
+            best_score = score;
+            best_off = d;
+        }
+        d += 2;
+    }
+    (nominal_pos + best_off as f64 / sr as f64).rem_euclid(n as f64 / sr as f64)
+}
+
 /// Events for a snippet clip. When `speed` matches the pitch ratio
-/// (including the default speed=1 / pitch=0), the source plays as ONE
-/// pristine grain. Otherwise the snippet becomes a granular time-stretch:
-/// overlapping hann grains whose read head advances at `speed` while each
-/// grain resamples at the pitch ratio — tempo changes WITHOUT pitch
-/// changes (and vice versa). Automation is honored per grain.
+/// (including the default speed=1 / pitch=0, or `varispeed = true`), the
+/// source plays as ONE pristine grain. Otherwise the snippet becomes a
+/// WSOLA-aligned granular time-stretch: overlapping 200 ms Hann grains whose
+/// read head advances at `speed` while each grain resamples at the pitch ratio.
 fn snippet_events(
     clip: &Clip,
     source: &Source,
@@ -62,10 +108,11 @@ fn snippet_events(
     };
 
     let base_ratio = quantized(g.pitch, g);
+    let eff_speed0 = if g.varispeed { base_ratio } else { g.speed };
     if g.texture > 1e-3 {
         return textured_events(clip, source_len, clip_t0, clip_len, secs_per_beat, &quantized);
     }
-    if clip.automation.is_empty() && (g.speed - base_ratio).abs() < 1e-3 {
+    if clip.automation.is_empty() && (eff_speed0 - base_ratio).abs() < 1e-3 {
         // Record-player coupling: a single unbroken grain.
         return vec![GrainEvent {
             onset: clip_t0,
@@ -81,12 +128,15 @@ fn snippet_events(
         }];
     }
 
-    // Granular time-stretch train: 150 ms hann grains at 50% overlap sum
-    // to constant amplitude; the read head integrates `speed` over time.
-    const GRAIN: f64 = 0.15;
+    // WSOLA-aligned granular time-stretch train: 200 ms Hann grains at 50%
+    // overlap sum to constant amplitude; correlation alignment prevents comb
+    // warble while the read head integrates `speed` over time.
+    const GRAIN: f64 = 0.20;
     const HOP: f64 = GRAIN / 2.0;
     let mut events = Vec::new();
     let mut head = g.position as f64 * source_len;
+    let mut prev_pos = head;
+    let mut prev_ratio = base_ratio as f64;
     let mut k = 0u64;
     loop {
         let t = k as f64 * HOP;
@@ -99,22 +149,77 @@ fn snippet_events(
             crate::auto::settings_at(g, &clip.automation, t / secs_per_beat.max(1e-9))
         };
         let ratio = quantized(eff.pitch, &eff);
+        let speed = if eff.varispeed { ratio } else { eff.speed };
+        let nom_pos = head.rem_euclid(source_len.max(1e-6));
+        let rev = eff.reverse_prob >= 0.5;
+        let aligned_pos = if k > 0 && !rev {
+            if let Some(audio) = source.audio.as_deref() {
+                let ref_pos = (prev_pos + HOP * prev_ratio).rem_euclid(source_len.max(1e-6));
+                wsola_align(audio, ref_pos, nom_pos)
+            } else {
+                nom_pos
+            }
+        } else {
+            nom_pos
+        };
+        prev_pos = aligned_pos;
+        prev_ratio = ratio as f64;
         events.push(GrainEvent {
             onset: clip_t0 + t,
-            source_pos: head.rem_euclid(source_len.max(1e-6)),
+            source_pos: aligned_pos,
             duration: GRAIN.min(clip_len - t + HOP) as f32,
             pitch_ratio: ratio,
             gain: eff.gain,
             pan: eff.pan.clamp(-1.0, 1.0),
             envelope: 1.0, // full hann: overlapped windows sum to unity
             env_skew: 0.0,
-            reverse: eff.reverse_prob >= 0.5,
+            reverse: rev,
             id: g.seed.wrapping_add(k),
         });
-        head += HOP * eff.speed.max(0.05) as f64;
+        head += HOP * speed.max(0.05) as f64;
         k += 1;
     }
     events
+}
+
+/// Continuous visual event(s) for an untextured stretched snippet (`texture == 0`
+/// and `speed != base_ratio`): advances video smoothly at `speed` as ONE
+/// unbroken pass instead of alpha-stacking 50%-overlap Hann audio grains (which
+/// would ripple straight-alpha opacity between `1.0` and `0.75` at the hop rate).
+fn snippet_video_events(
+    clip: &Clip,
+    source: &Source,
+    clip_t0: f64,
+    clip_len: f64,
+) -> Option<Vec<GrainEvent>> {
+    let g = &clip.grains;
+    if g.texture > 1e-3 {
+        return None;
+    }
+    let source_len = source.duration();
+    let base_ratio = crate::music::effective_ratio(
+        g.pitch,
+        clip.key.as_ref(),
+        source.effective_base_hz(),
+        g.quantize_amount,
+        g.detune_cents,
+    );
+    let eff_speed = if g.varispeed { base_ratio } else { g.speed };
+    if clip.automation.is_empty() && (eff_speed - base_ratio).abs() < 1e-3 {
+        return None; // `parts` is already a single unbroken grain
+    }
+    Some(vec![GrainEvent {
+        onset: clip_t0,
+        source_pos: (g.position as f64 * source_len).min(source_len),
+        duration: clip_len as f32,
+        pitch_ratio: eff_speed.max(0.05),
+        gain: g.gain,
+        pan: g.pan.clamp(-1.0, 1.0),
+        envelope: g.envelope,
+        env_skew: g.env_skew,
+        reverse: g.reverse_prob >= 0.5,
+        id: g.seed,
+    }])
 }
 
 /// The sample <-> grains morph (`texture` > 0): a grain train whose read
@@ -246,7 +351,7 @@ pub fn plan_project(project: &Project) -> Vec<ClipPlan> {
             let full_len = project.beats_to_secs(clip.length_beats);
             // Repeating clips plan one pass, then tile it (below).
             let clip_len = project.beats_to_secs(clip.pass_beats());
-            let (parts, style) = match clip.kind {
+            let (parts, video_parts, style) = match clip.kind {
                 ClipKind::Granular => {
                     let Some(source) = project.sources.get(clip.source) else { continue };
                     if source.duration() <= 0.0 {
@@ -262,7 +367,7 @@ pub fn plan_project(project: &Project) -> Vec<ClipPlan> {
                         source.effective_base_hz(),
                         clip.key.as_ref(),
                     );
-                    (vec![(clip.source, events)], clip.visual)
+                    (vec![(clip.source, events)], None, clip.visual)
                 }
                 ClipKind::Snippet => {
                     let Some(source) = project.sources.get(clip.source) else { continue };
@@ -270,8 +375,11 @@ pub fn plan_project(project: &Project) -> Vec<ClipPlan> {
                         continue;
                     }
                     let evs = snippet_events(clip, source, clip_t0, clip_len, secs_per_beat);
+                    let vevs = snippet_video_events(clip, source, clip_t0, clip_len)
+                        .map(|v| vec![(clip.source, v)]);
                     (
                         vec![(clip.source, evs)],
+                        vevs,
                         VisualGrainStyle::morph(
                             clip.visual.additive,
                             &clip.visual,
@@ -290,18 +398,34 @@ pub fn plan_project(project: &Project) -> Vec<ClipPlan> {
                         clip.key.as_ref(),
                         &clip.automation,
                     );
-                    (parts, clip.visual)
+                    (parts, None, clip.visual)
                 }
             };
-            let parts = if clip.loop_beats.is_some() {
+            let tile_part_list = |plist: Vec<(usize, Vec<GrainEvent>)>| -> Vec<(usize, Vec<GrainEvent>)> {
                 let period = project.beats_to_secs(clip.period_beats());
-                // Media per pass: snippets read at `speed`, clouds scan.
                 let rate = match clip.kind {
-                    ClipKind::Snippet => clip.grains.speed as f64,
+                    ClipKind::Snippet => {
+                        if clip.grains.varispeed {
+                            let bh = project
+                                .sources
+                                .get(clip.source)
+                                .map(|s| s.effective_base_hz())
+                                .unwrap_or(440.0);
+                            crate::music::effective_ratio(
+                                clip.grains.pitch,
+                                clip.key.as_ref(),
+                                bh,
+                                clip.grains.quantize_amount,
+                                clip.grains.detune_cents,
+                            ) as f64
+                        } else {
+                            clip.grains.speed as f64
+                        }
+                    }
                     ClipKind::Granular => clip.grains.scan_speed as f64,
                     ClipKind::Pattern(_) => 0.0,
                 };
-                parts
+                plist
                     .into_iter()
                     .map(|(sid, evs)| {
                         let lay = PassLayout {
@@ -317,10 +441,14 @@ pub fn plan_project(project: &Project) -> Vec<ClipPlan> {
                         (sid, tile_events(&evs, clip, clip_t0, &lay, full_len))
                     })
                     .collect()
-            } else {
-                parts
             };
-            plans.push(ClipPlan { track: ti, clip_index: ci, parts, style });
+            let parts = if clip.loop_beats.is_some() { tile_part_list(parts) } else { parts };
+            let video_parts = if clip.loop_beats.is_some() {
+                video_parts.map(tile_part_list)
+            } else {
+                video_parts
+            };
+            plans.push(ClipPlan { track: ti, clip_index: ci, parts, video_parts, style });
         }
     }
     plans
@@ -369,16 +497,19 @@ pub fn render_project(project: &Project, from_beat: f64, to_beat: f64) -> Render
     let mut frames: Vec<Frame> =
         (0..n_frames).map(|_| Frame::black(project.width, project.height)).collect();
 
+    let n_tracks = project.tracks.len();
+    let mut track_buses: Vec<Option<StereoBuffer>> = vec![None; n_tracks];
+
+    // ---- Pass 1 (audio): clips -> clip fx -> track bus -> track fx -> tape -> level ----
     for (ti, track) in project.tracks.iter().enumerate() {
         if track.muted {
             continue;
         }
         let clip_plans: Vec<&ClipPlan> = plan.iter().filter(|p| p.track == ti).collect();
-        if clip_plans.is_empty() {
+        if clip_plans.is_empty() && track.effects.is_empty() && !track.tape.is_active() {
             continue;
         }
 
-        // ---- audio: clips -> clip fx -> track bus -> track fx -> level ----
         let mut track_bus = StereoBuffer::new(len, project.sample_rate);
         for cp in &clip_plans {
             let clip = &track.clips[cp.clip_index];
@@ -409,18 +540,73 @@ pub fn render_project(project: &Project, from_beat: f64, to_beat: f64) -> Render
             }
         }
         fx::apply_audio_chain(&mut track_bus, &track.effects);
+        if track.tape.is_active() {
+            let mut tape_state = TapeState::new(0x5452_4B00 ^ ti as u64);
+            let start_samples = (t0 * project.sample_rate as f64).round() as u64;
+            let _ = start_samples; // matched at t0 = 0 with RealtimeAudio
+            tape_state.process_block(
+                &mut track_bus.left,
+                &mut track_bus.right,
+                &track.tape,
+                project.sample_rate,
+            );
+        }
         let sr = project.sample_rate as f64;
         let beats_per_sec = project.bpm / 60.0;
-        for i in 0..master_audio.len().min(track_bus.len()) {
+        for i in 0..track_bus.len() {
             let beat = (t0 + i as f64 / sr) * beats_per_sec;
             let level = track.level_at(beat);
-            master_audio.left[i] += track_bus.left[i] * level;
-            master_audio.right[i] += track_bus.right[i] * level;
+            track_bus.left[i] *= level;
+            track_bus.right[i] *= level;
         }
+        track_buses[ti] = Some(track_bus);
+    }
 
-        // ---- video: clips -> clip fx -> track layer -> track fx -> z ----
+    // ---- Pass 2 (audio sum + z-independent sidechain ducking) ----
+    let mut track_duck_frames: Vec<Vec<f32>> = vec![Vec::new(); n_tracks];
+    for (ti, track) in project.tracks.iter().enumerate() {
+        let Some(bus) = &track_buses[ti] else { continue };
+        let n_samp = master_audio.len().min(bus.len());
+        if let Some(spec) = &track.duck {
+            if spec.source_track < n_tracks && spec.source_track != ti {
+                let mut dstate = DuckState::default();
+                let mut frame_gains = vec![1.0f32; n_frames];
+                let sr = project.sample_rate;
+                let sc_opt = track_buses[spec.source_track].as_ref();
+                for i in 0..n_samp {
+                    let (sl, sr_c) = sc_opt
+                        .map(|sc| (sc.left[i], sc.right[i]))
+                        .unwrap_or((0.0, 0.0));
+                    let g = dstate.step(sl, sr_c, spec, sr);
+                    master_audio.left[i] += bus.left[i] * g;
+                    master_audio.right[i] += bus.right[i] * g;
+                    let fi = ((i as f64 / sr as f64) * project.fps as f64) as usize;
+                    if fi < n_frames {
+                        frame_gains[fi] = g;
+                    }
+                }
+                track_duck_frames[ti] = frame_gains;
+                continue;
+            }
+        }
+        for i in 0..n_samp {
+            master_audio.left[i] += bus.left[i];
+            master_audio.right[i] += bus.right[i];
+        }
+    }
+
+    // ---- Pass 3 (video): clips -> clip fx -> track layer -> track fx -> z ----
+    for (ti, track) in project.tracks.iter().enumerate() {
+        if track.muted {
+            continue;
+        }
+        let clip_plans: Vec<&ClipPlan> = plan.iter().filter(|p| p.track == ti).collect();
+        if clip_plans.is_empty() {
+            continue;
+        }
         let track_has_video = clip_plans.iter().any(|cp| {
-            cp.parts.iter().any(|(sid, evs)| {
+            let vparts = cp.video_parts.as_deref().unwrap_or(&cp.parts);
+            vparts.iter().any(|(sid, evs)| {
                 !evs.is_empty()
                     && project.sources.get(*sid).is_some_and(|s| s.video.is_some())
             })
@@ -434,36 +620,77 @@ pub fn render_project(project: &Project, from_beat: f64, to_beat: f64) -> Render
             .map(|cp| fx::video_chain_states(&track.clips[cp.clip_index].effects, project.fps))
             .collect();
         let mut track_vstates = fx::video_chain_states(&track.effects, project.fps);
+        let fallback_add = clip_plans
+            .iter()
+            .map(|cp| cp.style.additive)
+            .fold(0.0f32, f32::max);
 
         for (fi, frame) in frames.iter_mut().enumerate() {
             let ft = t0 + fi as f64 / project.fps as f64;
             let mut track_layer: Option<Frame> = None;
+            let mut active_add: Option<f32> = None;
 
             for (cpi, cp) in clip_plans.iter().enumerate() {
                 let clip = &track.clips[cp.clip_index];
-                let any_active = cp
-                    .parts
-                    .iter()
-                    .any(|(_, evs)| evs.iter().any(|e| ft >= e.onset && ft < e.end()));
+                let vparts = cp.video_parts.as_deref().unwrap_or(&cp.parts);
+                let is_stretched_snippet = cp.video_parts.is_some();
+                let any_active = vparts.iter().any(|(_, evs)| {
+                    evs.iter().any(|e| {
+                        ft >= e.onset && ft < e.onset + cp.style.visual_duration(e.duration)
+                    })
+                });
                 if !any_active && clip.effects.is_empty() {
                     continue;
                 }
                 let mut clip_layer = Frame::transparent(project.width, project.height);
                 if any_active {
-                    for (sid, evs) in &cp.parts {
+                    active_add = Some(active_add.unwrap_or(0.0).max(cp.style.additive));
+                    let hue_override = if is_stretched_snippet {
+                        let bh = project
+                            .sources
+                            .get(clip.source)
+                            .map(|s| s.effective_base_hz())
+                            .unwrap_or(440.0);
+                        let br = crate::music::effective_ratio(
+                            clip.grains.pitch,
+                            clip.key.as_ref(),
+                            bh,
+                            clip.grains.quantize_amount,
+                            clip.grains.detune_cents,
+                        );
+                        Some(crate::music::ratio_to_semitones(br) * clip.link.pitch_to_hue)
+                    } else {
+                        None
+                    };
+                    for (sid, evs) in vparts {
                         if let Some(video) =
                             project.sources.get(*sid).and_then(|s| s.video.as_ref())
                         {
-                            composite_grains_frame(
-                                video,
-                                evs,
-                                &cp.style,
-                                &clip.link,
-                                &clip.transform,
-                                clip.color_filter.as_ref(),
-                                &mut clip_layer,
-                                ft,
-                            );
+                            if is_stretched_snippet {
+                                composite_grains_frame_opts(
+                                    video,
+                                    evs,
+                                    &cp.style,
+                                    &clip.link,
+                                    &clip.transform,
+                                    clip.color_filter.as_ref(),
+                                    &mut clip_layer,
+                                    ft,
+                                    true,
+                                    hue_override,
+                                );
+                            } else {
+                                composite_grains_frame(
+                                    video,
+                                    evs,
+                                    &cp.style,
+                                    &clip.link,
+                                    &clip.transform,
+                                    clip.color_filter.as_ref(),
+                                    &mut clip_layer,
+                                    ft,
+                                );
+                            }
                         }
                     }
                 }
@@ -479,14 +706,29 @@ pub fn render_project(project: &Project, from_beat: f64, to_beat: f64) -> Render
             let mut tl = track_layer
                 .unwrap_or_else(|| Frame::transparent(project.width, project.height));
             fx::apply_video_chain(&mut tl, &track.effects, &mut track_vstates);
-            let opacity = track.opacity_at((t0 + fi as f64 / project.fps as f64)
-                * project.bpm / 60.0);
-            blend_layer(frame, &tl, 0.0, opacity);
+            let mut opacity =
+                track.opacity_at((t0 + fi as f64 / project.fps as f64) * project.bpm / 60.0);
+            if let Some(&dg) = track_duck_frames[ti].get(fi) {
+                opacity *= 1.0 - (1.0 - dg) * track.duck_to_opacity.clamp(0.0, 1.0);
+            }
+            let track_add = track
+                .additive
+                .unwrap_or_else(|| active_add.unwrap_or(fallback_add));
+            blend_layer(frame, &tl, track_add, opacity);
         }
     }
 
     // ---- master chain ----
     fx::apply_audio_chain(&mut master_audio, &project.master_effects);
+    if project.master_tape.is_active() {
+        let mut master_tape = TapeState::new(0x4D41_5354);
+        master_tape.process_block(
+            &mut master_audio.left,
+            &mut master_audio.right,
+            &project.master_tape,
+            project.sample_rate,
+        );
+    }
     let mut master_states = fx::video_chain_states(&project.master_effects, project.fps);
     for frame in &mut frames {
         fx::apply_video_chain(frame, &project.master_effects, &mut master_states);
@@ -1194,5 +1436,88 @@ mod tests {
         let f_on = out.frames[7].mean_luma();
         let f_off = out.frames[4].mean_luma();
         assert!(f_on > f_off + 1.0, "visual hit {f_on} vs gap {f_off}");
+    }
+
+    #[test]
+    fn stretched_snippet_video_has_zero_hop_strobe() {
+        // Regression test for Strobe A: a uniform-brightness video snippet
+        // played at speed = 0.65 (time-stretched) must maintain flat luma
+        // across frames instead of rippling 1.0 <-> 0.75 at the OLA hop rate.
+        let mut p = bright_project();
+        p.fps = 24.0;
+        p.tracks[0].clips[0].grains.speed = 0.65;
+        p.tracks[0].clips[0].grains.envelope = 0.02;
+        let out = render_project(&p, 0.0, 4.0);
+        // Audio uses the multi-grain stretch train...
+        assert!(out.events[0].len() > 8);
+        // ...while interior video frames stay rock-steady (zero frame-to-frame
+        // luma ripple).
+        let interior = &out.frames[6..out.frames.len() - 6];
+        for w in interior.windows(2) {
+            let dl = (w[1].mean_luma() - w[0].mean_luma()).abs();
+            assert!(dl < 0.5, "stretched snippet strobed by {dl} luma");
+        }
+    }
+
+    #[test]
+    fn varispeed_snippet_couples_speed_to_pitch_as_single_grain() {
+        let mut p = snippet_project();
+        p.tracks[0].clips[0].grains.pitch = -5.0;
+        p.tracks[0].clips[0].grains.varispeed = true;
+        let out = render_project(&p, 0.0, 4.0);
+        assert_eq!(out.events[0].len(), 1, "varispeed plays as one unbroken grain");
+    }
+
+    #[test]
+    fn sidechain_ducking_works_across_any_track_order() {
+        // Track 0 (background pad) ducks from Track 1 (foreground kick),
+        // verifying that sidechain order is independent of video z-order.
+        let mut p = Project { bpm: 120.0, width: 32, height: 24, fps: 24.0, ..Default::default() };
+        let pad_src = p.add_source(crate::timeline::Source {
+            name: "pad".into(),
+            audio: Some(std::sync::Arc::new(crate::audio::AudioClip::sine(220.0, 2.0, p.sample_rate))),
+            video: Some(std::sync::Arc::new(solid_video(200, 200, 200))),
+            base_hz: 220.0,
+        });
+        let kick_src = p.add_source(crate::timeline::Source {
+            name: "kick".into(),
+            audio: Some(std::sync::Arc::new(crate::audio::AudioClip::sine(60.0, 0.5, p.sample_rate))),
+            video: None,
+            base_hz: 60.0,
+        });
+        let t_pad = p.add_track("pad");
+        let mut c_pad = Clip::new_snippet(pad_src, 0.0, 4.0);
+        c_pad.grains.envelope = 0.01;
+        c_pad.grains.gain = 0.5;
+        p.tracks[t_pad].clips.push(c_pad);
+
+        let t_kick = p.add_track("kick");
+        let mut c_kick = Clip::new_snippet(kick_src, 1.0, 0.5); // kick hits at beat 1 (t = 0.5s)
+        c_kick.grains.gain = 1.0;
+        p.tracks[t_kick].clips.push(c_kick);
+        p.tracks[t_kick].level = 0.0; // mute kick in master? No, level=0 mutes sc too; mute kick output? Keep audible on R, pan pad L!
+        p.tracks[t_kick].level = 1.0;
+        p.tracks[t_pad].clips[0].grains.pan = -1.0;
+        p.tracks[t_kick].clips[0].grains.pan = 1.0;
+
+        let unducked = render_project(&p, 0.0, 4.0);
+        p.tracks[t_pad].duck = Some(crate::timeline::DuckSpec {
+            source_track: t_kick,
+            amount: 0.85,
+            attack: 0.005,
+            release: 0.15,
+        });
+        p.tracks[t_pad].duck_to_opacity = 0.8;
+        let ducked = render_project(&p, 0.0, 4.0);
+
+        // Pad is hard-left, kick is hard-right: left channel at t=0.55..0.70s is pure pad.
+        let sr = p.sample_rate as usize;
+        let rms = |v: &[f32]| (v.iter().map(|s| s * s).sum::<f32>() / v.len() as f32).sqrt();
+        let u_on = rms(&unducked.audio.left[sr / 2 + 1000..sr * 3 / 4]);
+        let d_on = rms(&ducked.audio.left[sr / 2 + 1000..sr * 3 / 4]);
+        assert!(d_on < u_on * 0.55, "pad ducked on kick hit: {d_on} vs {u_on}");
+
+        // Video luma also dips during the kick at t ~ 0.6s (frame 14).
+        assert!(ducked.frames[14].mean_luma() < unducked.frames[14].mean_luma() * 0.75);
     }
 }
