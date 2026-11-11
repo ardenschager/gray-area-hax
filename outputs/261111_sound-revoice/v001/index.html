@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>chromagrain sound re-voice v001</title>
+<style>
+  body { background:#8a8a8a; color:#111; font:15px/1.45 -apple-system, Helvetica, sans-serif; margin:0; padding:24px 32px; }
+  h1 { font-weight:600; margin:0 0 4px; }
+  .lede { max-width:70em; margin:0 0 24px; }
+  section { background:#9a9a9a; border-radius:6px; padding:14px 18px; margin:0 0 18px; }
+  h2 { margin:0; font-size:18px; } h2 code { font-size:12px; color:#333; margin-left:6px; }
+  h3 { margin:6px 0; font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:#333; }
+  .desc { margin:4px 0 10px; max-width:70em; }
+  .pair { display:grid; grid-template-columns:1fr 1fr; gap:18px; }
+  audio { width:100%; } img { width:100%; display:block; margin-top:6px; border-radius:3px; }
+  .stat { font-size:11px; color:#222; margin:4px 0 0; }
+</style></head><body>
+<h1>chromagrain: instrument re-voice (v001)</h1>
+<p class="lede">Every built-in instrument playing its starter phrase at 120 bpm (repeated to at least 6 s), rendered by plyphon
+exactly like the app does (loop-folded, loudness-normalised to about -16 dBFS RMS), so before and after play at matching loudness.
+Drums are also soloed. Spectrograms are log-frequency. Stats come from <code>tools/audio_check.py</code>.
+"clicks" on acid are saw-wave edges and on the drone are the intentional tape-dust specks; hat "near-clip" is the soft-knee
+limiter catching a sparse solo hat (no hard clipping; the kit render peaks at -1.5 dBFS). See NOTES.md for what changed and why.</p>
+
+<section>
+  <h2>drum kit <code>kit</code></h2>
+  <p class="desc">all three drums together in the starter groove</p>
+  <div class="pair">
+    <div><h3>before</h3><audio controls preload="none" src="before/kit.wav"></audio>
+      <img src="before/kit.png" alt="before spectrogram" loading="lazy"><p class="stat">peak -0.14 dBFS · rms -16.38 dBFS · crest 16.2 dB · centroid 3492 Hz · L/R corr 0.999 · clean</p></div>
+    <div><h3>after</h3><audio controls preload="none" src="after/kit.wav"></audio>
+      <img src="after/kit.png" alt="after spectrogram" loading="lazy"><p class="stat">peak -1.55 dBFS · rms -15.94 dBFS · crest 14.4 dB · centroid 2790 Hz · L/R corr 0.999 · clean</p></div>
+  </div>
+</section>
+<section>
+  <h2>kick <code>cg_kick</code></h2>
+  <p class="desc">sine that dives from two octaves up and sags under the note, beater tick and mid knock, overdriven with punch</p>
+  <div class="pair">
+    <div><h3>before</h3><audio controls preload="none" src="before/cg_kick.wav"></audio>
+      <img src="before/cg_kick.png" alt="before spectrogram" loading="lazy"><p class="stat">peak -5.1 dBFS · rms -16.44 dBFS · crest 11.3 dB · centroid 192 Hz · L/R corr 1.0 · clean</p></div>
+    <div><h3>after</h3><audio controls preload="none" src="after/cg_kick.wav"></audio>
+      <img src="after/cg_kick.png" alt="after spectrogram" loading="lazy"><p class="stat">peak -7.8 dBFS · rms -15.94 dBFS · crest 8.1 dB · centroid 114 Hz · L/R corr 1.0 · clean</p></div>
+  </div>
+</section>
+<section>
+  <h2>snare <code>cg_snare</code></h2>
+  <p class="desc">five struck drum-head modes with a pitch drop, stick crack, and wires that rattle with the head (noise ring-modded by the membrane + a comb tuned to the shell)</p>
+  <div class="pair">
+    <div><h3>before</h3><audio controls preload="none" src="before/cg_snare.wav"></audio>
+      <img src="before/cg_snare.png" alt="before spectrogram" loading="lazy"><p class="stat">peak -0.25 dBFS · rms -21.72 dBFS · crest 21.5 dB · centroid 11526 Hz · L/R corr 1.0 · mostly silent</p></div>
+    <div><h3>after</h3><audio controls preload="none" src="after/cg_snare.wav"></audio>
+      <img src="after/cg_snare.png" alt="after spectrogram" loading="lazy"><p class="stat">peak -0.17 dBFS · rms -21.28 dBFS · crest 21.1 dB · centroid 10483 Hz · L/R corr 1.0 · mostly silent</p></div>
+  </div>
+</section>
+<section>
+  <h2>hats <code>cg_hat</code></h2>
+  <p class="desc">six squares at the TR-808 cymbal ratios, ring-modulated in pairs for a clangier metal, band-passed for closed/open</p>
+  <div class="pair">
+    <div><h3>before</h3><audio controls preload="none" src="before/cg_hat.wav"></audio>
+      <img src="before/cg_hat.png" alt="before spectrogram" loading="lazy"><p class="stat">peak -0.01 dBFS · rms -26.46 dBFS · crest 26.4 dB · centroid 12447 Hz · L/R corr 0.924 · near-clip, 2 clipped, mostly silent</p></div>
+    <div><h3>after</h3><audio controls preload="none" src="after/cg_hat.wav"></audio>
+      <img src="after/cg_hat.png" alt="after spectrogram" loading="lazy"><p class="stat">peak -0.01 dBFS · rms -24.76 dBFS · crest 24.8 dB · centroid 9730 Hz · L/R corr 0.948 · near-clip, 2 clipped, mostly silent</p></div>
+  </div>
+</section>
+<section>
+  <h2>fold bass <code>cg_bass</code></h2>
+  <p class="desc">west-coast wavefolded sine through a Moog ladder; velocity and an envelope drive the folder so accents bark and ghost notes stay round; analog drift</p>
+  <div class="pair">
+    <div><h3>before</h3><audio controls preload="none" src="before/cg_bass.wav"></audio>
+      <img src="before/cg_bass.png" alt="before spectrogram" loading="lazy"><p class="stat">peak -1.63 dBFS · rms -16.45 dBFS · crest 14.8 dB · centroid 625 Hz · L/R corr 1.0 · clean</p></div>
+    <div><h3>after</h3><audio controls preload="none" src="after/cg_bass.wav"></audio>
+      <img src="after/cg_bass.png" alt="after spectrogram" loading="lazy"><p class="stat">peak -5.86 dBFS · rms -16.7 dBFS · crest 10.8 dB · centroid 396 Hz · L/R corr 1.0 · clean</p></div>
+  </div>
+</section>
+<section>
+  <h2>acid fuzz <code>cg_acid</code></h2>
+  <p class="desc">303 squelch with real accents (loud notes open the filter further and tighten the resonance), steeper filter, then a fuzz pedal</p>
+  <div class="pair">
+    <div><h3>before</h3><audio controls preload="none" src="before/cg_acid.wav"></audio>
+      <img src="before/cg_acid.png" alt="before spectrogram" loading="lazy"><p class="stat">peak -3.68 dBFS · rms -17.31 dBFS · crest 13.6 dB · centroid 2792 Hz · L/R corr 1.0 · 96 click(s)</p></div>
+    <div><h3>after</h3><audio controls preload="none" src="after/cg_acid.wav"></audio>
+      <img src="after/cg_acid.png" alt="after spectrogram" loading="lazy"><p class="stat">peak -3.46 dBFS · rms -17.35 dBFS · crest 13.9 dB · centroid 1939 Hz · L/R corr 1.0 · 42 click(s)</p></div>
+  </div>
+</section>
+<section>
+  <h2>tape drone <code>cg_drone</code></h2>
+  <p class="desc">partials drifting in level and tune on their own clocks, a resonant filter and an overtone-singer band wandering through them, on a worn tape loop with hiss and dust; stays below ~1 kHz so it sits under dialogue</p>
+  <div class="pair">
+    <div><h3>before</h3><audio controls preload="none" src="before/cg_drone.wav"></audio>
+      <img src="before/cg_drone.png" alt="before spectrogram" loading="lazy"><p class="stat">peak -5.57 dBFS · rms -15.93 dBFS · crest 10.4 dB · centroid 154 Hz · L/R corr -0.173 · clean</p></div>
+    <div><h3>after</h3><audio controls preload="none" src="after/cg_drone.wav"></audio>
+      <img src="after/cg_drone.png" alt="after spectrogram" loading="lazy"><p class="stat">peak -3.87 dBFS · rms -15.92 dBFS · crest 12.1 dB · centroid 516 Hz · L/R corr 0.002 · 3 click(s)</p></div>
+  </div>
+</section>
+<section>
+  <h2>grain cloud <code>cg_pad</code></h2>
+  <p class="desc">each note is a swarm of tiny FM grains scattered across octaves and the stereo field, over a dark drifting bed, smeared by allpass diffusion and a little tape wobble</p>
+  <div class="pair">
+    <div><h3>before</h3><audio controls preload="none" src="before/cg_pad.wav"></audio>
+      <img src="before/cg_pad.png" alt="before spectrogram" loading="lazy"><p class="stat">peak -3.18 dBFS · rms -15.92 dBFS · crest 12.7 dB · centroid 614 Hz · L/R corr 0.69 · clean</p></div>
+    <div><h3>after</h3><audio controls preload="none" src="after/cg_pad.wav"></audio>
+      <img src="after/cg_pad.png" alt="after spectrogram" loading="lazy"><p class="stat">peak -1.96 dBFS · rms -15.92 dBFS · crest 14.0 dB · centroid 821 Hz · L/R corr -0.021 · clean</p></div>
+  </div>
+</section>
+<section>
+  <h2>cassette keys <code>cg_keys</code></h2>
+  <p class="desc">the FM tine piano bounced to a worn cassette: wow and flutter (the wobble knob), tube-ish bark on hard hits, rolled-off top, hiss; also fixes the old DC offset</p>
+  <div class="pair">
+    <div><h3>before</h3><audio controls preload="none" src="before/cg_keys.wav"></audio>
+      <img src="before/cg_keys.png" alt="before spectrogram" loading="lazy"><p class="stat">peak -2.74 dBFS · rms -15.92 dBFS · crest 13.2 dB · centroid 393 Hz · L/R corr 0.994 · DC</p></div>
+    <div><h3>after</h3><audio controls preload="none" src="after/cg_keys.wav"></audio>
+      <img src="after/cg_keys.png" alt="after spectrogram" loading="lazy"><p class="stat">peak -3.5 dBFS · rms -15.92 dBFS · crest 12.4 dB · centroid 628 Hz · L/R corr -0.004 · clean</p></div>
+  </div>
+</section>
+<section>
+  <h2>prepared string <code>cg_pluck</code></h2>
+  <p class="desc">Karplus-Strong string with a bolt wedged in it: inharmonic free-bar modes ring with each pluck and a sitar-like jawari buzz rides the peaks</p>
+  <div class="pair">
+    <div><h3>before</h3><audio controls preload="none" src="before/cg_pluck.wav"></audio>
+      <img src="before/cg_pluck.png" alt="before spectrogram" loading="lazy"><p class="stat">peak -0.96 dBFS · rms -15.92 dBFS · crest 15.0 dB · centroid 2033 Hz · L/R corr 1.0 · clean</p></div>
+    <div><h3>after</h3><audio controls preload="none" src="after/cg_pluck.wav"></audio>
+      <img src="after/cg_pluck.png" alt="after spectrogram" loading="lazy"><p class="stat">peak -0.1 dBFS · rms -15.93 dBFS · crest 15.8 dB · centroid 4032 Hz · L/R corr -0.008 · clean</p></div>
+  </div>
+</section>
+<section>
+  <h2>gamelan metal <code>cg_bell</code></h2>
+  <p class="desc">struck modal bar (free-bar ratios, warped by the metal knob), every partial doubled a few Hz apart between L and R so it beats like a gamelan pair, gong hum underneath</p>
+  <div class="pair">
+    <div><h3>before</h3><audio controls preload="none" src="before/cg_bell.wav"></audio>
+      <img src="before/cg_bell.png" alt="before spectrogram" loading="lazy"><p class="stat">peak -4.22 dBFS · rms -15.92 dBFS · crest 11.7 dB · centroid 998 Hz · L/R corr 0.02 · clean</p></div>
+    <div><h3>after</h3><audio controls preload="none" src="after/cg_bell.wav"></audio>
+      <img src="after/cg_bell.png" alt="after spectrogram" loading="lazy"><p class="stat">peak -0.42 dBFS · rms -15.94 dBFS · crest 15.5 dB · centroid 1015 Hz · L/R corr 0.038 · clean</p></div>
+  </div>
+</section>
+<section>
+  <h2>formant sync lead <code>cg_lead</code></h2>
+  <p class="desc">band-limited formant oscillators whose formant tears down on every note (the sync-lead &#x27;yow&#x27; without aliasing), over a feedback-FM sine an octave down</p>
+  <div class="pair">
+    <div><h3>before</h3><audio controls preload="none" src="before/cg_lead.wav"></audio>
+      <img src="before/cg_lead.png" alt="before spectrogram" loading="lazy"><p class="stat">peak -0.03 dBFS · rms -18.22 dBFS · crest 18.2 dB · centroid 1969 Hz · L/R corr 0.809 · near-clip</p></div>
+    <div><h3>after</h3><audio controls preload="none" src="after/cg_lead.wav"></audio>
+      <img src="after/cg_lead.png" alt="after spectrogram" loading="lazy"><p class="stat">peak -4.72 dBFS · rms -16.84 dBFS · crest 12.1 dB · centroid 1585 Hz · L/R corr 0.109 · clean</p></div>
+  </div>
+</section>
+<section>
+  <h2>speak &amp; spell choir <code>cg_choir</code></h2>
+  <p class="desc">three jittery glottal buzzes per note through drifting vowel formants, so the chord talks; part of it crushed to an 8 kHz / 7-bit toy speech chip (new grit knob)</p>
+  <div class="pair">
+    <div><h3>before</h3><audio controls preload="none" src="before/cg_choir.wav"></audio>
+      <img src="before/cg_choir.png" alt="before spectrogram" loading="lazy"><p class="stat">peak -2.62 dBFS · rms -15.92 dBFS · crest 13.3 dB · centroid 1660 Hz · L/R corr 0.044 · clean</p></div>
+    <div><h3>after</h3><audio controls preload="none" src="after/cg_choir.wav"></audio>
+      <img src="after/cg_choir.png" alt="after spectrogram" loading="lazy"><p class="stat">peak -3.87 dBFS · rms -15.98 dBFS · crest 12.1 dB · centroid 1531 Hz · L/R corr 0.691 · clean</p></div>
+  </div>
+</section>
+</body></html>
