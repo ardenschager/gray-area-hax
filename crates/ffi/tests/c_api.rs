@@ -39,7 +39,7 @@ fn c_program_links_and_passes() {
         .arg(&bin);
     // `cargo rustc -p chromagrain-ffi --lib -- --print native-static-libs`
     if cfg!(target_os = "macos") {
-        cc.args(["-liconv", "-lSystem", "-lc", "-lm"]);
+        cc.args(["-liconv", "-lSystem", "-lc", "-lm", "-lpthread"]);
     } else {
         cc.args(["-lpthread", "-ldl", "-lc", "-lm"]);
     }

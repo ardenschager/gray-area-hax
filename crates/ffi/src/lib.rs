@@ -5,18 +5,122 @@
 //! Conventions: every function tolerates a NULL instrument (no-op /
 //! zero result). Source ids are `int32_t`, -1 meaning "none". Keys are a
 //! root pitch class 0..11 (or -1 for chromatic) plus a [`CgScale`].
-//! Realtime safety is as documented on [`Instrument`]: process, notes,
-//! macros, transport and grain snapshots don't allocate; construction,
-//! sources and keys do.
+//!
+//! Threads. Plain functions (`cg_instrument_set_*`, `note_*`, `process`,
+//! `add_source_pcm_rgba`, ...) touch the instrument directly: call them
+//! from one thread at a time (in a plugin, the render thread). The
+//! `cg_instrument_post_*` family is for every other thread (UI, host
+//! parameter observers, decoders): they only touch atomics or a lock-free
+//! queue that the next `process` call drains, and they do the allocating
+//! work (building sources, key state) on the calling thread. Replaced
+//! media and key state come back the same way and are freed by the next
+//! `post_*` / [`cg_instrument_collect_garbage`] call, never on the render
+//! thread.
 
 #![allow(clippy::missing_safety_doc)]
 
-use chromagrain_core::instrument::{Instrument, Macro, Transport};
+use chromagrain_core::instrument::{source_from_pcm_rgba, Instrument, KeyFx, Macro, Transport, MAX_SOURCES};
 use chromagrain_core::music::{Key, ScaleKind};
+use chromagrain_core::timeline::Source;
 use std::ffi::{c_char, CStr};
+use std::ptr::{addr_of, addr_of_mut};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::Mutex;
+
+const QUEUE: usize = 32;
+const DIRTY_SYNC: u32 = 1 << 4;
+const DIRTY_FOLLOW: u32 = 1 << 5;
+
+enum Msg {
+    Source(Source),
+    Key(KeyFx),
+}
 
 /// Opaque instrument handle.
-pub struct CgInstrument(Instrument);
+pub struct CgInstrument {
+    /// Owned by whoever calls `process` (the render thread).
+    rt: Rt,
+    /// Shared with every other thread: atomics + the queue ends they use.
+    mail: Mail,
+}
+
+struct Rt {
+    inst: Instrument,
+    inbox: rtrb::Consumer<Msg>,
+    trash: rtrb::Producer<Msg>,
+    gain: f32,
+}
+
+struct Mail {
+    inbox: Mutex<rtrb::Producer<Msg>>,
+    trash: Mutex<rtrb::Consumer<Msg>>,
+    sample_rate: AtomicU32,
+    macros: [AtomicU32; 4],
+    sync: AtomicU32,
+    follow: AtomicU32,
+    /// Bits 0..3 = macros, DIRTY_SYNC, DIRTY_FOLLOW.
+    dirty: AtomicU32,
+    gain: AtomicU32,
+    sources: AtomicUsize,
+}
+
+impl Rt {
+    /// Apply everything posted since the last block (allocation-free).
+    fn drain(&mut self, mail: &Mail) {
+        let dirty = mail.dirty.swap(0, Ordering::AcqRel);
+        for (k, m) in Macro::ALL.iter().enumerate() {
+            if dirty & (1 << k) != 0 {
+                self.inst.set_macro(*m, f32::from_bits(mail.macros[k].load(Ordering::Acquire)));
+            }
+        }
+        if dirty & DIRTY_SYNC != 0 {
+            self.inst.set_sync(f32::from_bits(mail.sync.load(Ordering::Acquire)));
+        }
+        if dirty & DIRTY_FOLLOW != 0 {
+            self.inst.set_follow_transport(mail.follow.load(Ordering::Acquire) != 0);
+        }
+        while let Ok(msg) = self.inbox.pop() {
+            let old = match msg {
+                Msg::Source(src) => {
+                    let n = self.inst.sources().len();
+                    if n < MAX_SOURCES {
+                        let id = self.inst.add_source(src);
+                        self.inst.select_source(id);
+                        None
+                    } else {
+                        self.inst.select_source(n - 1);
+                        Some(Msg::Source(self.inst.swap_source(n - 1, src).unwrap_or_else(|s| s)))
+                    }
+                }
+                Msg::Key(fx) => Some(Msg::Key(self.inst.swap_key(fx))),
+            };
+            if let Some(t) = old {
+                let _ = self.trash.push(t); // full only if nobody collects; then it frees here
+            }
+        }
+        mail.sources.store(self.inst.sources().len(), Ordering::Release);
+    }
+}
+
+impl Mail {
+    fn post(&self, msg: Msg) -> bool {
+        self.collect();
+        match self.inbox.lock() {
+            Ok(mut q) => q.push(msg).is_ok(),
+            Err(_) => false,
+        }
+    }
+
+    fn collect(&self) -> usize {
+        let Ok(mut t) = self.trash.lock() else { return 0 };
+        let mut n = 0;
+        while let Ok(m) = t.pop() {
+            drop(m);
+            n += 1;
+        }
+        n
+    }
+}
 
 /// The four performance macros (values 0..1).
 #[repr(u32)]
@@ -92,12 +196,23 @@ pub struct CgGrain {
     pub reverse: bool,
 }
 
+// The render side and the shared side are borrowed as disjoint fields, so a
+// `post_*` call on another thread never aliases the `&mut` that `process`
+// holds.
+unsafe fn rt<'a>(p: *mut CgInstrument) -> Option<&'a mut Rt> {
+    (!p.is_null()).then(|| &mut *addr_of_mut!((*p).rt))
+}
+
+unsafe fn mail<'a>(p: *const CgInstrument) -> Option<&'a Mail> {
+    (!p.is_null()).then(|| &*addr_of!((*p).mail))
+}
+
 unsafe fn get<'a>(p: *const CgInstrument) -> Option<&'a Instrument> {
-    p.as_ref().map(|c| &c.0)
+    (!p.is_null()).then(|| &(*addr_of!((*p).rt)).inst)
 }
 
 unsafe fn get_mut<'a>(p: *mut CgInstrument) -> Option<&'a mut Instrument> {
-    p.as_mut().map(|c| &mut c.0)
+    rt(p).map(|r| &mut r.inst)
 }
 
 unsafe fn slice<'a, T>(p: *const T, len: usize) -> &'a [T] {
@@ -111,7 +226,24 @@ unsafe fn slice<'a, T>(p: *const T, len: usize) -> &'a [T] {
 /// A new instrument at `sample_rate`. Free with [`cg_instrument_free`].
 #[no_mangle]
 pub extern "C" fn cg_instrument_new(sample_rate: u32) -> *mut CgInstrument {
-    Box::into_raw(Box::new(CgInstrument(Instrument::new(sample_rate))))
+    let (inbox_tx, inbox) = rtrb::RingBuffer::new(QUEUE);
+    let (trash, trash_rx) = rtrb::RingBuffer::new(QUEUE);
+    let inst = Instrument::new(sample_rate);
+    let macros = Macro::ALL.map(|m| AtomicU32::new(inst.macro_value(m).to_bits()));
+    Box::into_raw(Box::new(CgInstrument {
+        mail: Mail {
+            inbox: Mutex::new(inbox_tx),
+            trash: Mutex::new(trash_rx),
+            sample_rate: AtomicU32::new(inst.sample_rate()),
+            macros,
+            sync: AtomicU32::new(0f32.to_bits()),
+            follow: AtomicU32::new(0),
+            dirty: AtomicU32::new(0),
+            gain: AtomicU32::new(1f32.to_bits()),
+            sources: AtomicUsize::new(0),
+        },
+        rt: Rt { inst, inbox, trash, gain: 1.0 },
+    }))
 }
 
 #[no_mangle]
@@ -124,8 +256,9 @@ pub unsafe extern "C" fn cg_instrument_free(inst: *mut CgInstrument) {
 /// Change the output rate (re-activation). Silences everything.
 #[no_mangle]
 pub unsafe extern "C" fn cg_instrument_reset(inst: *mut CgInstrument, sample_rate: u32) {
-    if let Some(i) = get_mut(inst) {
-        i.reset(sample_rate);
+    if let (Some(r), Some(m)) = (rt(inst), mail(inst)) {
+        r.inst.reset(sample_rate);
+        m.sample_rate.store(r.inst.sample_rate(), Ordering::Release);
     }
 }
 
@@ -156,9 +289,16 @@ pub unsafe extern "C" fn cg_instrument_add_source_pcm_rgba(
     base_hz: f32,
 ) -> i32 {
     let Some(i) = get_mut(inst) else { return -1 };
-    let name = if name.is_null() { String::from("source") } else { CStr::from_ptr(name).to_string_lossy().into_owned() };
-    let id = i.add_source_pcm_rgba(&name, slice(pcm, pcm_len), channels, pcm_rate, slice(rgba, rgba_len), width, height, fps, base_hz);
+    let id = i.add_source_pcm_rgba(&c_name(name), slice(pcm, pcm_len), channels, pcm_rate, slice(rgba, rgba_len), width, height, fps, base_hz);
     i32::try_from(id).unwrap_or(-1)
+}
+
+unsafe fn c_name(name: *const c_char) -> String {
+    if name.is_null() {
+        String::from("source")
+    } else {
+        CStr::from_ptr(name).to_string_lossy().into_owned()
+    }
 }
 
 #[no_mangle]
@@ -311,13 +451,110 @@ pub unsafe extern "C" fn cg_instrument_process(inst: *mut CgInstrument, left: *m
         return;
     }
     let (l, r) = (std::slice::from_raw_parts_mut(left, frames), std::slice::from_raw_parts_mut(right, frames));
-    match get_mut(inst) {
-        Some(i) => i.process(l, r),
-        None => {
-            l.fill(0.0);
-            r.fill(0.0);
+    let (Some(rt), Some(mail)) = (rt(inst), mail(inst)) else {
+        l.fill(0.0);
+        r.fill(0.0);
+        return;
+    };
+    rt.drain(mail);
+    rt.inst.process(l, r);
+    // Gain, ramped across the block so automation never zippers.
+    let target = f32::from_bits(mail.gain.load(Ordering::Acquire));
+    let (g0, step) = (rt.gain, (target - rt.gain) / frames as f32);
+    if g0 != 1.0 || target != 1.0 {
+        for k in 0..frames {
+            let g = g0 + step * (k + 1) as f32;
+            l[k] *= g;
+            r[k] *= g;
         }
     }
+    rt.gain = target;
+}
+
+// ------------------------------------------------------- any-thread API
+
+/// Thread-safe: queue decoded media (same arguments as
+/// [`cg_instrument_add_source_pcm_rgba`]); the next `process` adds and
+/// selects it. The source is built (copied) on the calling thread. Returns
+/// false if the queue is full.
+#[no_mangle]
+pub unsafe extern "C" fn cg_instrument_post_source_pcm_rgba(
+    inst: *const CgInstrument,
+    name: *const c_char,
+    pcm: *const f32,
+    pcm_len: usize,
+    channels: u32,
+    pcm_rate: u32,
+    rgba: *const u8,
+    rgba_len: usize,
+    width: u32,
+    height: u32,
+    fps: f32,
+    base_hz: f32,
+) -> bool {
+    let Some(m) = mail(inst) else { return false };
+    let src = source_from_pcm_rgba(&c_name(name), slice(pcm, pcm_len), channels, pcm_rate, slice(rgba, rgba_len), width, height, fps, base_hz);
+    m.post(Msg::Source(src))
+}
+
+/// Thread-safe: change the key (see [`cg_instrument_set_key`]); the look
+/// state is built on the calling thread and swapped in by the next
+/// `process`. Returns false if the queue is full.
+#[no_mangle]
+pub unsafe extern "C" fn cg_instrument_post_key(inst: *const CgInstrument, root: i32, scale: u32) -> bool {
+    let Some(m) = mail(inst) else { return false };
+    let key = (root >= 0).then(|| Key::new(root, SCALES.get(scale as usize).copied().unwrap_or(ScaleKind::Chromatic)));
+    m.post(Msg::Key(KeyFx::prepare(key, m.sample_rate.load(Ordering::Acquire))))
+}
+
+/// Thread-safe: set a macro from the next block on.
+#[no_mangle]
+pub unsafe extern "C" fn cg_instrument_post_macro(inst: *const CgInstrument, m: u32, value: f32) {
+    if let (Some(mail), true) = (mail(inst), (m as usize) < 4) {
+        mail.macros[m as usize].store(value.to_bits(), Ordering::Release);
+        mail.dirty.fetch_or(1 << m, Ordering::AcqRel);
+    }
+}
+
+/// Thread-safe: beat grid for grain onsets (see [`cg_instrument_set_sync`]).
+#[no_mangle]
+pub unsafe extern "C" fn cg_instrument_post_sync(inst: *const CgInstrument, div_beats: f32) {
+    if let Some(m) = mail(inst) {
+        m.sync.store(div_beats.to_bits(), Ordering::Release);
+        m.dirty.fetch_or(DIRTY_SYNC, Ordering::AcqRel);
+    }
+}
+
+/// Thread-safe: follow the host transport (see [`cg_instrument_set_follow_transport`]).
+#[no_mangle]
+pub unsafe extern "C" fn cg_instrument_post_follow_transport(inst: *const CgInstrument, on: bool) {
+    if let Some(m) = mail(inst) {
+        m.follow.store(on as u32, Ordering::Release);
+        m.dirty.fetch_or(DIRTY_FOLLOW, Ordering::AcqRel);
+    }
+}
+
+/// Thread-safe: output gain (linear, 1 = unity), ramped over the next block.
+#[no_mangle]
+pub unsafe extern "C" fn cg_instrument_post_gain(inst: *const CgInstrument, gain: f32) {
+    if let Some(m) = mail(inst) {
+        let g = if gain.is_finite() { gain.clamp(0.0, 16.0) } else { 1.0 };
+        m.gain.store(g.to_bits(), Ordering::Release);
+    }
+}
+
+/// Thread-safe: how many sources the instrument held after the last block.
+#[no_mangle]
+pub unsafe extern "C" fn cg_instrument_loaded_source_count(inst: *const CgInstrument) -> usize {
+    mail(inst).map(|m| m.sources.load(Ordering::Acquire)).unwrap_or(0)
+}
+
+/// Thread-safe (not the render thread): free media / key state that
+/// `process` replaced. `post_*` calls do this too. Returns how many items
+/// were freed.
+#[no_mangle]
+pub unsafe extern "C" fn cg_instrument_collect_garbage(inst: *const CgInstrument) -> usize {
+    mail(inst).map(|m| m.collect()).unwrap_or(0)
 }
 
 /// The grains on screen at instrument time `t` (pass
@@ -366,6 +603,24 @@ mod tests {
             assert!(l.iter().any(|s| s.abs() > 0.01));
             let mut g = [CgGrain::default(); 4];
             assert!(cg_instrument_visible_grains(i, cg_instrument_now_secs(i), g.as_mut_ptr(), g.len()) > 0);
+            // Posted from another thread, applied by the next process.
+            let pcm2 = pcm.clone();
+            let ip = i as usize;
+            std::thread::spawn(move || {
+                let i = ip as *const CgInstrument;
+                assert!(cg_instrument_post_source_pcm_rgba(i, std::ptr::null(), pcm2.as_ptr(), pcm2.len(), 1, 48_000, std::ptr::null(), 0, 0, 0, 0.0, 0.0));
+                assert!(cg_instrument_post_key(i, 2, CgScale::Dorian as u32));
+                cg_instrument_post_macro(i, CgMacro::Smear as u32, 0.25);
+                cg_instrument_post_gain(i, 0.5);
+            })
+            .join()
+            .unwrap();
+            assert_eq!(cg_instrument_source_count(i), 1, "nothing applied before process");
+            cg_instrument_process(i, l.as_mut_ptr(), r.as_mut_ptr(), l.len());
+            assert_eq!((cg_instrument_source_count(i), cg_instrument_loaded_source_count(i), cg_instrument_active_source(i)), (2, 2, 1));
+            assert_eq!((cg_instrument_key_root(i), cg_instrument_key_scale(i)), (2, CgScale::Dorian as u32));
+            assert_eq!(cg_instrument_macro_value(i, CgMacro::Smear as u32), 0.25);
+            assert_eq!(cg_instrument_collect_garbage(i), 1, "the old key state came back to be freed");
             cg_instrument_free(i);
             // NULL is tolerated everywhere.
             cg_instrument_note_on(std::ptr::null_mut(), 60, 1.0);

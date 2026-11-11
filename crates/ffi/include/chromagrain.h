@@ -247,6 +247,64 @@ size_t cg_instrument_latency_samples(const CgInstrument *inst);
 void cg_instrument_process(CgInstrument *inst, float *left, float *right, size_t frames);
 
 /**
+ * Thread-safe: queue decoded media (same arguments as
+ * [`cg_instrument_add_source_pcm_rgba`]); the next `process` adds and
+ * selects it. The source is built (copied) on the calling thread. Returns
+ * false if the queue is full.
+ */
+bool cg_instrument_post_source_pcm_rgba(const CgInstrument *inst,
+                                        const char *name,
+                                        const float *pcm,
+                                        size_t pcm_len,
+                                        uint32_t channels,
+                                        uint32_t pcm_rate,
+                                        const uint8_t *rgba,
+                                        size_t rgba_len,
+                                        uint32_t width,
+                                        uint32_t height,
+                                        float fps,
+                                        float base_hz);
+
+/**
+ * Thread-safe: change the key (see [`cg_instrument_set_key`]); the look
+ * state is built on the calling thread and swapped in by the next
+ * `process`. Returns false if the queue is full.
+ */
+bool cg_instrument_post_key(const CgInstrument *inst, int32_t root, uint32_t scale);
+
+/**
+ * Thread-safe: set a macro from the next block on.
+ */
+void cg_instrument_post_macro(const CgInstrument *inst, uint32_t m, float value);
+
+/**
+ * Thread-safe: beat grid for grain onsets (see [`cg_instrument_set_sync`]).
+ */
+void cg_instrument_post_sync(const CgInstrument *inst, float div_beats);
+
+/**
+ * Thread-safe: follow the host transport (see [`cg_instrument_set_follow_transport`]).
+ */
+void cg_instrument_post_follow_transport(const CgInstrument *inst, bool on);
+
+/**
+ * Thread-safe: output gain (linear, 1 = unity), ramped over the next block.
+ */
+void cg_instrument_post_gain(const CgInstrument *inst, float gain);
+
+/**
+ * Thread-safe: how many sources the instrument held after the last block.
+ */
+size_t cg_instrument_loaded_source_count(const CgInstrument *inst);
+
+/**
+ * Thread-safe (not the render thread): free media / key state that
+ * `process` replaced. `post_*` calls do this too. Returns how many items
+ * were freed.
+ */
+size_t cg_instrument_collect_garbage(const CgInstrument *inst);
+
+/**
  * The grains on screen at instrument time `t` (pass
  * [`cg_instrument_now_secs`] for "now"): writes up to `cap` into `out` and
  * returns how many there are in total. Realtime-safe.

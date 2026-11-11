@@ -13,6 +13,7 @@ crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 chromagrain-core = { path = "../core" }
+rtrb = "0.3"
 
 [build-dependencies]
 cbindgen = { version = "0.27", default-features = false }

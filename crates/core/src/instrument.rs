@@ -445,9 +445,7 @@ impl Instrument {
         id
     }
 
-    /// Raw-data entry point (what a C ABI wraps): `pcm` is mono
-    /// (`channels` = 1) or interleaved stereo; `rgba` is `n_frames`
-    /// tightly packed `width × height` RGBA8 frames. Either may be empty.
+    /// Raw-data entry point (what a C ABI wraps): see [`source_from_pcm_rgba`].
     #[allow(clippy::too_many_arguments)]
     pub fn add_source_pcm_rgba(
         &mut self,
@@ -461,26 +459,7 @@ impl Instrument {
         fps: f32,
         base_hz: f32,
     ) -> SourceId {
-        let audio = (!pcm.is_empty() && pcm_rate > 0).then(|| {
-            Arc::new(if channels >= 2 {
-                let n = pcm.len() / channels as usize;
-                let ch = channels as usize;
-                let l: Vec<f32> = (0..n).map(|i| pcm[i * ch]).collect();
-                let r: Vec<f32> = (0..n).map(|i| pcm[i * ch + 1]).collect();
-                AudioClip::stereo(&l, &r, pcm_rate)
-            } else {
-                AudioClip::new(pcm.to_vec(), pcm_rate)
-            })
-        });
-        let frame_bytes = (width as usize) * (height as usize) * 4;
-        let video = (frame_bytes > 0 && rgba.len() >= frame_bytes && fps > 0.0).then(|| {
-            let frames = rgba
-                .chunks_exact(frame_bytes)
-                .map(|d| Frame { width, height, data: d.to_vec() })
-                .collect();
-            Arc::new(VideoClip { frames, fps })
-        });
-        self.add_source(Source { name: name.into(), audio, video, base_hz })
+        self.add_source(source_from_pcm_rgba(name, pcm, channels, pcm_rate, rgba, width, height, fps, base_hz))
     }
 
     /// Swap the media behind an id (sounding grains keep their old audio
@@ -815,6 +794,44 @@ impl Instrument {
     pub fn video_frame_events(&self, t: f64) -> impl Iterator<Item = (SourceId, &GrainEvent)> + '_ {
         self.grains.iter().filter(move |g| t >= g.ev.onset && t < g.ev.end()).map(|g| (g.source, &g.ev))
     }
+}
+
+/// Build a [`Source`] from raw data (what hosts with their own decoders,
+/// e.g. AVFoundation, hand over): `pcm` is mono (`channels` = 1) or
+/// interleaved stereo; `rgba` is tightly packed `width × height` RGBA8
+/// frames at `fps`. Either may be empty. Allocates.
+#[allow(clippy::too_many_arguments)]
+pub fn source_from_pcm_rgba(
+    name: &str,
+    pcm: &[f32],
+    channels: u32,
+    pcm_rate: u32,
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    fps: f32,
+    base_hz: f32,
+) -> Source {
+    let audio = (!pcm.is_empty() && pcm_rate > 0).then(|| {
+        Arc::new(if channels >= 2 {
+            let n = pcm.len() / channels as usize;
+            let ch = channels as usize;
+            let l: Vec<f32> = (0..n).map(|i| pcm[i * ch]).collect();
+            let r: Vec<f32> = (0..n).map(|i| pcm[i * ch + 1]).collect();
+            AudioClip::stereo(&l, &r, pcm_rate)
+        } else {
+            AudioClip::new(pcm.to_vec(), pcm_rate)
+        })
+    });
+    let frame_bytes = (width as usize) * (height as usize) * 4;
+    let video = (frame_bytes > 0 && rgba.len() >= frame_bytes && fps > 0.0).then(|| {
+        let frames = rgba
+            .chunks_exact(frame_bytes)
+            .map(|d| Frame { width, height, data: d.to_vec() })
+            .collect();
+        Arc::new(VideoClip { frames, fps })
+    });
+    Source { name: name.into(), audio, video, base_hz }
 }
 
 /// CPU rasterizer for [`FrameState`]s — the reference picture (thumbnails,

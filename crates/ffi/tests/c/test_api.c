@@ -5,6 +5,7 @@
 #include "chromagrain.h"
 
 #include <math.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,6 +36,21 @@ static void run(CgInstrument *inst, float *l, float *r, size_t frames) {
         size_t n = frames - pos < BLOCK ? frames - pos : BLOCK;
         cg_instrument_process(inst, l + pos, r + pos, n);
     }
+}
+
+/* A "decoder / UI" thread: posts media, a key, macros and gain while the
+ * main thread keeps rendering. */
+static void *poster(void *arg) {
+    CgInstrument *inst = arg;
+    size_t n = SR / 2;
+    float *pcm = malloc(sizeof(float) * n);
+    for (size_t i = 0; i < n; i++) pcm[i] = 0.4f * sinf(2.0f * (float)M_PI * 330.0f * (float)i / SR);
+    bool ok = cg_instrument_post_source_pcm_rgba(inst, "posted", pcm, n, 1, SR, NULL, 0, 0, 0, 0.0f, 330.0f);
+    free(pcm);
+    ok = ok && cg_instrument_post_key(inst, 2, CG_SCALE_DORIAN);
+    cg_instrument_post_macro(inst, CG_MACRO_GRAIN, 1.0f);
+    cg_instrument_post_gain(inst, 0.5f);
+    return ok ? inst : NULL;
 }
 
 int main(void) {
@@ -117,6 +133,20 @@ int main(void) {
     cg_instrument_reset(inst, 44100);
     CHECK(cg_instrument_sample_rate(inst) == 44100 && cg_instrument_now_secs(inst) == 0.0, "reset");
     CHECK(cg_instrument_source_count(inst) == 1, "media survives reset");
+
+    /* Cross-thread posting while rendering. */
+    pthread_t th;
+    void *ret = NULL;
+    pthread_create(&th, NULL, poster, inst);
+    for (int k = 0; k < 50; k++) run(inst, l, r, BLOCK); /* render concurrently */
+    pthread_join(th, &ret);
+    CHECK(ret != NULL, "posting succeeded");
+    run(inst, l, r, BLOCK);
+    CHECK(cg_instrument_loaded_source_count(inst) == 2, "posted source arrived (%zu)", cg_instrument_loaded_source_count(inst));
+    CHECK(cg_instrument_active_source(inst) == 1, "posted source is active");
+    CHECK(cg_instrument_key_root(inst) == 2 && cg_instrument_key_scale(inst) == CG_SCALE_DORIAN, "posted key applied");
+    CHECK(cg_instrument_macro_value(inst, CG_MACRO_GRAIN) == 1.0f, "posted macro applied");
+    CHECK(cg_instrument_collect_garbage(inst) == 1, "replaced key state collected off the render thread");
 
     /* NULL handles are tolerated. */
     cg_instrument_note_on(NULL, 60, 1.0f);

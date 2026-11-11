@@ -869,6 +869,7 @@ version = "0.1.0"
 dependencies = [
  "cbindgen",
  "chromagrain-core",
+ "rtrb",
 ]
 
 [[package]]
