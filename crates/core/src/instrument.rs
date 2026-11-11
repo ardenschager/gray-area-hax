@@ -179,6 +179,9 @@ const BASE_GAIN: f32 = 0.8;
 const LOOKAHEAD: f64 = 0.1;
 const MAX_VOICES: usize = 16;
 const MAX_GRAINS: usize = 4096;
+/// Sources the instrument holds without reallocating: [`Instrument::add_source`]
+/// is allocation-free (safe on the audio thread) below this count.
+pub const MAX_SOURCES: usize = 16;
 const ECHO_TIME: f32 = 0.33;
 
 struct Voice {
@@ -220,6 +223,41 @@ pub struct FrameState {
     pub effects: Vec<AvEffect>,
     /// Index into [`LOOKS`].
     pub look: usize,
+}
+
+/// Key-dependent look state (the tune look's resonators), built off the
+/// audio thread and installed with [`Instrument::swap_key`].
+pub struct KeyFx {
+    key: Option<Key>,
+    sample_rate: u32,
+    looks: Vec<Option<AvEffect>>,
+    look_states: Vec<Vec<AudioFxState>>,
+}
+
+impl KeyFx {
+    /// Build the look chain for `key` at `sample_rate`. Allocates.
+    pub fn prepare(key: Option<Key>, sample_rate: u32) -> KeyFx {
+        let sample_rate = sample_rate.max(1);
+        let mut looks: Vec<Option<AvEffect>> =
+            LOOKS.iter().map(|n| n.and_then(EffectKind::parse).map(AvEffect::new)).collect();
+        if let Some(k) = key {
+            for fx in looks.iter_mut().flatten() {
+                if let EffectKind::Tune { root, scale, .. } = &mut fx.kind {
+                    *root = k.root as f32;
+                    *scale = k.scale;
+                }
+            }
+        }
+        let look_states = looks
+            .iter()
+            .map(|l| l.as_ref().map(|fx| fx::audio_chain_states(std::slice::from_ref(fx), sample_rate)).unwrap_or_default())
+            .collect();
+        KeyFx { key, sample_rate, looks, look_states }
+    }
+
+    pub fn key(&self) -> Option<Key> {
+        self.key
+    }
 }
 
 /// The playable instrument. See the module docs.
@@ -265,11 +303,10 @@ impl Instrument {
             }),
             AvEffect::new(EffectKind::Reverb { size: 0.85, damp: 0.4, mix: 0.0 }),
         ];
-        let looks: Vec<Option<AvEffect>> =
-            LOOKS.iter().map(|n| n.and_then(EffectKind::parse).map(AvEffect::new)).collect();
+        let looks = Vec::new();
         let mut inst = Instrument {
             sample_rate,
-            sources: Vec::new(),
+            sources: Vec::with_capacity(MAX_SOURCES),
             active: None,
             macros: Macro::ALL.map(Macro::default_value),
             key: None,
@@ -306,19 +343,9 @@ impl Instrument {
     fn rebuild_fx(&mut self) {
         let sr = self.sample_rate;
         self.smear_states = fx::audio_chain_states(&self.smear_chain, sr);
-        if let Some(k) = self.key {
-            for fx in self.looks.iter_mut().flatten() {
-                if let EffectKind::Tune { root, scale, .. } = &mut fx.kind {
-                    *root = k.root as f32;
-                    *scale = k.scale;
-                }
-            }
-        }
-        self.look_states = self
-            .looks
-            .iter()
-            .map(|l| l.as_ref().map(|fx| fx::audio_chain_states(std::slice::from_ref(fx), sr)).unwrap_or_default())
-            .collect();
+        let KeyFx { looks, look_states, .. } = KeyFx::prepare(self.key, sr);
+        self.looks = looks;
+        self.look_states = look_states;
         // Room for the largest block a host is likely to send.
         self.scratch.left.reserve(8192);
         self.scratch.right.reserve(8192);
@@ -388,6 +415,16 @@ impl Instrument {
         }
     }
 
+    /// [`Instrument::replace_source`] that hands back the old media instead
+    /// of dropping it, so an audio thread can pass it elsewhere to be freed.
+    /// Returns `Err(source)` for an unknown id.
+    pub fn swap_source(&mut self, id: SourceId, source: Source) -> Result<Source, Source> {
+        match self.sources.get_mut(id) {
+            Some(s) => Ok(std::mem::replace(s, source)),
+            None => Err(source),
+        }
+    }
+
     pub fn sources(&self) -> &[Source] {
         &self.sources
     }
@@ -421,10 +458,28 @@ impl Instrument {
     }
 
     /// The one global key (None = chromatic). Allocates (rebuilds the
-    /// tune look's resonators).
+    /// tune look's resonators); on an audio thread use
+    /// [`KeyFx::prepare`] elsewhere + [`Instrument::swap_key`].
     pub fn set_key(&mut self, key: Option<Key>) {
         self.key = key;
         self.rebuild_fx();
+    }
+
+    /// Change the key without allocating: install look state built off the
+    /// audio thread by [`KeyFx::prepare`]. Returns the replaced state (to
+    /// be dropped elsewhere), or `fx` itself if it was prepared for a
+    /// different sample rate (nothing changes then).
+    pub fn swap_key(&mut self, mut fx: KeyFx) -> KeyFx {
+        if fx.sample_rate != self.sample_rate {
+            return fx;
+        }
+        std::mem::swap(&mut self.looks, &mut fx.looks);
+        std::mem::swap(&mut self.look_states, &mut fx.look_states);
+        let old = self.key;
+        self.key = fx.key;
+        fx.key = old;
+        fx.sample_rate = self.sample_rate;
+        fx
     }
 
     pub fn key(&self) -> Option<Key> {
@@ -1065,6 +1120,34 @@ mod tests {
         let cap = snap.grains.capacity();
         i.fill_frame(&mut snap);
         assert_eq!(snap.grains.capacity(), cap);
+    }
+
+    #[test]
+    fn swap_key_matches_set_key_and_swap_source_returns_the_old_media() {
+        let k = Key::new(2, ScaleKind::Dorian);
+        let render = |mut i: Instrument| {
+            i.set_macro(Macro::Look, 1.5 / LOOKS.len() as f32); // tune
+            i.note_on(62, 1.0);
+            run(&mut i, 0.4, 512).0
+        };
+        let mut a = inst_with_sine();
+        a.set_key(Some(k));
+        let mut b = inst_with_sine();
+        let old = b.swap_key(KeyFx::prepare(Some(k), SR));
+        assert_eq!(old.key(), None);
+        assert_eq!(b.key(), Some(k));
+        assert_eq!(render(a), render(b));
+        // Wrong rate: refused, nothing changes.
+        let mut c = inst_with_sine();
+        let back = c.swap_key(KeyFx::prepare(Some(k), 44100));
+        assert_eq!((back.key(), c.key()), (Some(k), None));
+
+        let mut i = inst_with_sine();
+        let old = i.swap_source(0, sine_source(440.0, 1.0)).ok().unwrap();
+        assert_eq!(old.base_hz, 220.0);
+        assert_eq!(i.sources()[0].base_hz, 440.0);
+        assert!(i.swap_source(5, sine_source(1.0, 1.0)).is_err());
+        assert!(i.sources().len() < MAX_SOURCES && i.sources.capacity() >= MAX_SOURCES);
     }
 
     #[test]
