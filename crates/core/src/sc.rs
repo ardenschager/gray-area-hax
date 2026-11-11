@@ -199,15 +199,15 @@ fn starter_kit() -> (f64, Vec<Note>) {
 pub static INSTRUMENTS: &[Instrument] = &[
     Instrument {
         id: "cg_pad",
-        label: "warm pad",
-        blurb: "seven detuned saws, slow filter bloom, chorus",
+        label: "grain cloud",
+        blurb: "swarms of tiny FM grains scattered over octaves and stereo, on a drifting bed",
         knobs: &[
             k("cutoff", "brightness", 200.0, 12000.0, 1800.0, true, "filter cutoff"),
-            k("detune", "detune", 0.0, 0.6, 0.18, false, "how far apart the saws drift (semitones)"),
+            k("detune", "scatter", 0.0, 0.6, 0.18, false, "random pitch spread per grain (semitones)"),
             k("attack", "attack", 0.01, 4.0, 0.9, true, "fade-in per note (s)"),
             k("release", "release", 0.05, 6.0, 2.5, true, "fade-out per note (s)"),
-            k("width", "width", 0.0, 1.0, 0.8, false, "stereo spread"),
-            k("air", "air", 0.0, 1.0, 0.3, false, "breathy noise on top"),
+            k("width", "width", 0.0, 1.0, 0.8, false, "how far grains scatter left/right"),
+            k("air", "density", 0.0, 1.0, 0.3, false, "more grains per second, plus tape hiss"),
         ],
         trim: 1.0,
         starter: starter_pad,
@@ -215,13 +215,13 @@ pub static INSTRUMENTS: &[Instrument] = &[
     },
     Instrument {
         id: "cg_keys",
-        label: "electric piano",
-        blurb: "FM tine piano with tremolo",
+        label: "cassette keys",
+        blurb: "FM tine piano bounced to a worn cassette: wow, flutter, tape bark",
         knobs: &[
             k("tone", "tone", 0.0, 1.0, 0.5, false, "how hard the tines are struck"),
             k("bell", "bell", 0.0, 1.0, 0.5, false, "metallic ping on the attack"),
             k("decay", "decay", 0.2, 6.0, 2.5, true, "how long notes ring (s)"),
-            k("tremolo", "tremolo", 0.0, 1.0, 0.25, false, "wobble + auto-pan"),
+            k("tremolo", "wobble", 0.0, 1.0, 0.25, false, "tape wow and flutter (also widens)"),
         ],
         trim: 1.0,
         starter: starter_keys,
@@ -229,12 +229,12 @@ pub static INSTRUMENTS: &[Instrument] = &[
     },
     Instrument {
         id: "cg_pluck",
-        label: "pluck",
-        blurb: "plucked string (Karplus-Strong) arpeggio",
+        label: "prepared string",
+        blurb: "plucked string with a bolt in it: metal modes and sitar-like bridge buzz",
         knobs: &[
             k("decay", "ring", 0.3, 8.0, 3.0, true, "how long the string rings (s)"),
-            k("color", "color", 0.0, 1.0, 0.5, false, "dark nylon to bright steel"),
-            k("body", "body", 0.0, 1.0, 0.4, false, "wooden body resonance"),
+            k("color", "pick", 0.0, 1.0, 0.5, false, "soft thumb to hard metal pick"),
+            k("body", "prepared", 0.0, 1.0, 0.55, false, "bolt resonance and bridge buzz"),
         ],
         trim: 1.0,
         starter: starter_pluck,
@@ -242,13 +242,13 @@ pub static INSTRUMENTS: &[Instrument] = &[
     },
     Instrument {
         id: "cg_bass",
-        label: "bass",
-        blurb: "sub + saw through a Moog ladder",
+        label: "fold bass",
+        blurb: "wavefolded sine through a Moog ladder; accents bark, ghost notes stay round",
         knobs: &[
             k("cutoff", "cutoff", 80.0, 5000.0, 700.0, true, "filter cutoff"),
             k("res", "resonance", 0.0, 3.5, 1.6, false, "filter emphasis"),
-            k("drive", "drive", 0.0, 1.0, 0.4, false, "saturation"),
-            k("sub", "sub", 0.0, 1.0, 0.6, false, "sine an octave down"),
+            k("drive", "fold", 0.0, 1.0, 0.5, false, "wavefolder depth (velocity pushes it further)"),
+            k("sub", "sub", 0.0, 1.0, 0.6, false, "clean sine weight under the fold"),
             k("glide", "glide", 0.0, 0.3, 0.0, false, "slide between notes (s)"),
         ],
         trim: 1.0,
@@ -257,14 +257,14 @@ pub static INSTRUMENTS: &[Instrument] = &[
     },
     Instrument {
         id: "cg_acid",
-        label: "acid",
-        blurb: "303-style squelch line",
+        label: "acid fuzz",
+        blurb: "303-style squelch with real accents, through a fuzz pedal",
         knobs: &[
             k("cutoff", "cutoff", 80.0, 4000.0, 500.0, true, "base filter cutoff"),
             k("res", "resonance", 0.04, 0.8, 0.15, true, "lower = squelchier"),
             k("envmod", "env mod", 0.0, 1.0, 0.7, false, "how far each note opens the filter"),
             k("decay", "decay", 0.05, 1.5, 0.3, true, "filter envelope decay (s)"),
-            k("wave", "saw / square", 0.0, 1.0, 0.0, false, ""),
+            k("wave", "saw / square", 0.0, 1.0, 0.0, false, "square side gets pulse-width sweep"),
         ],
         trim: 0.9,
         starter: starter_acid,
@@ -272,13 +272,13 @@ pub static INSTRUMENTS: &[Instrument] = &[
     },
     Instrument {
         id: "cg_bell",
-        label: "bell",
-        blurb: "inharmonic FM bell, shimmering tail",
+        label: "gamelan metal",
+        blurb: "struck modal bar, each partial doubled a few Hz apart so it beats",
         knobs: &[
-            k("ratio", "ratio", 0.5, 8.0, 3.5, false, "modulator ratio — changes the metal"),
-            k("index", "strike", 0.0, 10.0, 3.0, false, "FM depth"),
+            k("ratio", "metal", 0.5, 8.0, 3.5, false, "squeezes or stretches the partials: gong to glass"),
+            k("index", "strike", 0.0, 10.0, 3.0, false, "mallet hardness: felt to steel"),
             k("decay", "decay", 0.3, 12.0, 5.0, true, "ring time (s)"),
-            k("shimmer", "shimmer", 0.0, 1.0, 0.4, false, "stereo chorus on the tail"),
+            k("shimmer", "beating", 0.0, 1.0, 0.4, false, "how fast the paired partials beat (ombak)"),
         ],
         trim: 1.0,
         starter: starter_bell,
@@ -286,11 +286,11 @@ pub static INSTRUMENTS: &[Instrument] = &[
     },
     Instrument {
         id: "cg_lead",
-        label: "supersaw lead",
-        blurb: "bright detuned saw lead with vibrato",
+        label: "formant sync lead",
+        blurb: "sync-style formant sweep on every note over a feedback-FM sine",
         knobs: &[
             k("cutoff", "brightness", 300.0, 14000.0, 4000.0, true, "filter cutoff"),
-            k("detune", "detune", 0.0, 0.5, 0.12, false, "saw spread (semitones)"),
+            k("sync", "sync", 0.0, 1.0, 0.4, false, "how far the formant tears down on each note"),
             k("vibrato", "vibrato", 0.0, 1.0, 0.15, false, "delayed vibrato depth"),
             k("release", "release", 0.02, 3.0, 0.4, true, "fade-out per note (s)"),
         ],
@@ -300,13 +300,14 @@ pub static INSTRUMENTS: &[Instrument] = &[
     },
     Instrument {
         id: "cg_choir",
-        label: "choir",
-        blurb: "vowel formants: a e i o u",
+        label: "speak & spell choir",
+        blurb: "three jittery singers per note, drifting vowels, part-crushed to toy speech",
         knobs: &[
             k("vowel", "vowel", 0.0, 1.0, 0.2, false, "a → e → i → o → u"),
             k("breath", "breath", 0.0, 1.0, 0.3, false, "air in the voice"),
             k("attack", "attack", 0.01, 3.0, 0.6, true, "fade-in (s)"),
             k("release", "release", 0.05, 5.0, 1.5, true, "fade-out (s)"),
+            k("grit", "grit", 0.0, 1.0, 0.4, false, "8 kHz / 7-bit speech-chip crush"),
         ],
         trim: 1.0,
         starter: starter_choir,
@@ -314,11 +315,11 @@ pub static INSTRUMENTS: &[Instrument] = &[
     },
     Instrument {
         id: "cg_drone",
-        label: "drone",
-        blurb: "slowly moving resonant bed",
+        label: "tape drone",
+        blurb: "drifting partials and a wandering filter on a worn tape loop",
         knobs: &[
-            k("motion", "motion", 0.0, 1.0, 0.4, false, "how fast the harmonics wander"),
-            k("color", "color", 0.0, 1.0, 0.5, false, "dark to bright"),
+            k("motion", "motion", 0.0, 1.0, 0.4, false, "how fast partials wander; more tape wobble"),
+            k("color", "color", 0.0, 1.0, 0.5, false, "pure sines to buzzing saws, more dust"),
             k("attack", "attack", 0.1, 8.0, 3.0, true, "swell in (s)"),
             k("release", "release", 0.1, 8.0, 4.0, true, "fade out (s)"),
         ],
@@ -329,15 +330,16 @@ pub static INSTRUMENTS: &[Instrument] = &[
     Instrument {
         id: "kit",
         label: "drum kit",
-        blurb: "kick, snare, hats — synthesized",
+        blurb: "driven kick with beater tick, rattling snare, 808-metal hats",
         knobs: &[
-            k("cg_kick.punch", "kick punch", 0.0, 1.0, 0.6, false, "pitch drop on the hit"),
+            k("cg_kick.punch", "kick punch", 0.0, 1.0, 0.6, false, "pitch dive + drive"),
             k("cg_kick.decay", "kick length", 0.1, 1.5, 0.45, true, "(s)"),
-            k("cg_snare.tone", "snare body", 0.0, 1.0, 0.4, false, ""),
-            k("cg_snare.snap", "snare snap", 0.0, 1.0, 0.7, false, "noise wires"),
+            k("cg_kick.click", "kick click", 0.0, 1.0, 0.3, false, "beater tick and knock"),
+            k("cg_snare.tone", "snare body", 0.0, 1.0, 0.4, false, "drum head ring"),
+            k("cg_snare.snap", "snare snap", 0.0, 1.0, 0.7, false, "wires and stick crack"),
             k("cg_snare.decay", "snare length", 0.05, 0.8, 0.22, true, "(s)"),
             k("cg_hat.decay", "hat length", 0.02, 0.6, 0.07, true, "(s) — open hats ring 4× longer"),
-            k("cg_hat.tone", "hat tone", 0.0, 1.0, 0.6, false, ""),
+            k("cg_hat.tone", "hat tone", 0.0, 1.0, 0.6, false, "dark to glassy metal"),
         ],
         trim: 1.0,
         starter: starter_kit,
@@ -749,6 +751,41 @@ mod tests {
             assert!(peak <= 1.0, "{} clips: {peak}", inst.id);
             assert!(a.samples.iter().all(|v| v.is_finite()), "{} has NaN", inst.id);
             eprintln!("{:>16}: rms {r:.3} peak {peak:.2} in {:?}", inst.label, t.elapsed());
+        }
+    }
+
+    /// Every SynthDef the catalog can reach (each instrument, and each kit
+    /// drum on its own) parses, compiles in plyphon and renders finite,
+    /// audible, unclipped audio — at a low and a high pitch, soft and hard.
+    #[test]
+    fn every_synthdef_renders_alone() {
+        let mut cases: Vec<(String, SynthPart)> = Vec::new();
+        for inst in INSTRUMENTS.iter().filter(|i| !i.kit) {
+            for (pitch, vel) in [(36u8, 0.4f32), (60, 1.0), (84, 0.7)] {
+                let mut p = SynthPart::new(inst.id, 0);
+                p.notes = vec![Note { start: 0.0, len: 2.0, pitch, vel }];
+                p.length_beats = 8.0;
+                cases.push((format!("{} @{pitch}", inst.id), p));
+            }
+        }
+        for (pitch, def, _, label) in KIT {
+            for vel in [0.3f32, 1.0] {
+                let mut p = SynthPart::new("kit", 0);
+                p.notes = vec![Note { start: 0.0, len: 0.25, pitch: *pitch, vel }];
+                p.length_beats = 4.0;
+                cases.push((format!("{def} ({label}) v{vel}"), p));
+            }
+        }
+        for (name, p) in cases {
+            let inst = instrument(&p.instrument).unwrap();
+            let (l, r) = render_raw(&p, inst, 120.0, 48000, 48000 * 3).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(l.iter().chain(&r).all(|v| v.is_finite()), "{name}: non-finite samples");
+            let peak = l.iter().chain(&r).fold(0f32, |m, v| m.max(v.abs()));
+            let rms = rms(&l).max(rms(&r));
+            assert!(rms > 1e-3, "{name}: silent (rms {rms})");
+            assert!(peak < 1.5, "{name}: raw peak {peak} (renders should leave headroom)");
+            let dc = (l.iter().sum::<f32>() / l.len() as f32).abs();
+            assert!(dc < 0.02, "{name}: DC offset {dc}");
         }
     }
 
