@@ -7,7 +7,8 @@
 //! plugin state as file paths and is decoded again on a background thread
 //! (see [`engine`]) and handed to the audio thread lock-free. `process`
 //! never allocates or locks (enforced in debug builds by nih-plug's
-//! `assert_process_allocs`).
+//! `assert_process_allocs`). Latency (`Instrument::latency_samples`, the
+//! windowed LOOK) is reported at activation.
 
 pub mod editor;
 pub mod engine;
@@ -24,14 +25,13 @@ pub struct Chromagrain {
     params: Arc<CgParams>,
     audio: AudioSide,
     shared: Arc<Shared>,
-    reported_latency: u32,
 }
 
 impl Default for Chromagrain {
     fn default() -> Self {
         let params = Arc::new(CgParams::default());
         let (audio, shared) = engine::spawn(params.clone(), 48_000);
-        Self { params, audio, shared, reported_latency: 0 }
+        Self { params, audio, shared }
     }
 }
 
@@ -46,7 +46,7 @@ impl Chromagrain {
     /// instrument and queues decodes for persisted media not loaded yet
     /// (a restored session). Returns the latency to report.
     pub fn setup(&mut self, sample_rate: u32) -> u32 {
-        self.audio.reset(sample_rate, self.params.key());
+        self.audio.reset(sample_rate, &self.params);
         // Hosts' wrappers also do this; offline use (tests) relies on it.
         self.params.gain.smoothed.reset(self.params.gain.value());
         let persisted = self.params.sources.lock().map(|s| s.clone()).unwrap_or_default();
@@ -54,8 +54,7 @@ impl Chromagrain {
         for p in persisted.into_iter().filter(|p| !loaded.contains(p)) {
             self.shared.send(Job::Load(p.into()));
         }
-        self.reported_latency = self.audio.latency_samples();
-        self.reported_latency
+        self.audio.latency_samples()
     }
 
     /// One block, host-independent (what `process` does after reading the
@@ -118,11 +117,10 @@ impl Plugin for Chromagrain {
             }
         };
         self.audio.render(buffer.as_slice(), &self.params, transport, &mut next);
-        let latency = self.audio.latency_samples();
-        if latency != self.reported_latency {
-            self.reported_latency = latency;
-            context.set_latency_samples(latency);
-        }
+        // Latency is reported at activation only: CLAP allows it to change
+        // only inside `activate` (nih-plug's mid-process path trips
+        // clap-validator). Moving LOOK onto/off the windowed look takes
+        // effect for delay compensation at the next activation.
         ProcessStatus::Normal
     }
 }

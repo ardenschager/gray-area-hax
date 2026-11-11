@@ -147,12 +147,21 @@ impl Default for CgParams {
                 .with_value_to_string(Arc::new(|v| {
                     let st = MacroMap::resolve(&[0.0, v, 0.0, 0.0], None).pitch_st;
                     format!("{st:+} st")
+                }))
+                .with_string_to_value(Arc::new(|s| {
+                    let st: f32 = s.trim().trim_end_matches("st").trim().trim_start_matches('+').parse().ok()?;
+                    Some(((st + 12.0) / 24.0).clamp(0.0, 1.0))
                 })),
             smear: macro_param(Macro::Smear, "Smear"),
             look: FloatParam::new("Look", Macro::Look.default_value(), FloatRange::Linear { min: 0.0, max: 1.0 })
                 .with_value_to_string(Arc::new(|v| {
                     let i = MacroMap::resolve(&[0.0, 0.5, 0.0, v], None).look;
                     LOOKS[i].unwrap_or("none").to_string()
+                }))
+                .with_string_to_value(Arc::new(|s| {
+                    let s = s.trim();
+                    let i = LOOKS.iter().position(|l| l.unwrap_or("none").eq_ignore_ascii_case(s))?;
+                    Some((i as f32 + 0.5) / LOOKS.len() as f32)
                 })),
             root: EnumParam::new("Key", Root::Off),
             scale: EnumParam::new("Scale", Scale::Minor),

@@ -131,13 +131,25 @@ pub fn spawn(params: Arc<CgParams>, sample_rate: u32) -> (AudioSide, Arc<Shared>
 
 impl AudioSide {
     /// (Re)start at `sample_rate` (plugin activation; not the audio thread).
-    pub fn reset(&mut self, sample_rate: u32, key: Option<Key>) {
+    pub fn reset(&mut self, sample_rate: u32, params: &CgParams) {
         self.shared.sample_rate.store(sample_rate, Ordering::Relaxed);
         self.inst.reset(sample_rate);
-        self.inst.set_key(key);
+        self.inst.set_key(params.key());
+        self.apply_params(params);
     }
 
-    /// Latency the instrument reports right now.
+    /// Macros, sync and follow from the params (cheap; every block).
+    fn apply_params(&mut self, params: &CgParams) {
+        let inst = &mut self.inst;
+        inst.set_macro(Macro::Grain, params.grain.value());
+        inst.set_macro(Macro::Pitch, params.pitch.value());
+        inst.set_macro(Macro::Smear, params.smear.value());
+        inst.set_macro(Macro::Look, params.look.value());
+        inst.set_sync(params.sync.value().beats());
+        inst.set_follow_transport(params.follow.value());
+    }
+
+    /// Latency the instrument reports right now (the current LOOK).
     pub fn latency_samples(&self) -> u32 {
         self.inst.latency_samples() as u32
     }
@@ -147,13 +159,8 @@ impl AudioSide {
     /// order. Allocation- and lock-free.
     pub fn render(&mut self, out: &mut [&mut [f32]], params: &CgParams, transport: Option<Transport>, next_event: &mut dyn FnMut() -> Option<Ev>) {
         self.drain();
+        self.apply_params(params);
         let inst = &mut self.inst;
-        inst.set_macro(Macro::Grain, params.grain.value());
-        inst.set_macro(Macro::Pitch, params.pitch.value());
-        inst.set_macro(Macro::Smear, params.smear.value());
-        inst.set_macro(Macro::Look, params.look.value());
-        inst.set_sync(params.sync.value().beats());
-        inst.set_follow_transport(params.follow.value());
         if let Some(t) = transport {
             inst.set_transport(t);
         }
