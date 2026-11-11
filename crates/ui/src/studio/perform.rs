@@ -134,6 +134,7 @@ impl Studio {
         let cy = bar.center().y;
         let beat_i = (host.playhead_beats().max(0.0) % 4.0).floor() as usize;
         let playing = host.playing();
+        let routing = host.caps().output;
         let Some(perf) = host.perform() else { return };
         let mut x = bar.left();
         if !narrow {
@@ -151,18 +152,20 @@ impl Studio {
             p.circle_filled(egui::pos2(x + k as f32 * 10.0, cy), 2.6, if on { HI } else { G5 });
         }
         x += 52.0;
-        if !narrow {
-            let r = caps(&p, egui::pos2(x, cy), Align2::LEFT_CENTER, "Output", 10.5);
-            x = r.right() + 12.0;
-        }
-        let ow = if narrow { 180.0 } else { 184.0 };
-        let o = Rect::from_min_size(egui::pos2(x, cy - 22.0), egui::vec2(ow, 44.0));
-        let open = perf.output().is_some();
-        if let Some(i) = segmented(ui, o, ui.id().with("out"), &["This screen", "Display 2"], &[], open as usize, font(13.0), false) {
-            if i == 1 {
-                perf.open_output();
-            } else if open {
-                perf.close_output();
+        if routing {
+            if !narrow {
+                let r = caps(&p, egui::pos2(x, cy), Align2::LEFT_CENTER, "Output", 10.5);
+                x = r.right() + 12.0;
+            }
+            let ow = if narrow { 180.0 } else { 184.0 };
+            let o = Rect::from_min_size(egui::pos2(x, cy - 22.0), egui::vec2(ow, 44.0));
+            let open = perf.output().is_some();
+            if let Some(i) = segmented(ui, o, ui.id().with("out"), &["This screen", "Display 2"], &[], open as usize, font(13.0), false) {
+                if i == 1 {
+                    perf.open_output();
+                } else if open {
+                    perf.close_output();
+                }
             }
         }
         // Right: stop all, fullscreen.

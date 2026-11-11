@@ -3,7 +3,7 @@
 //! notes and render blocks — no host, no GUI.
 
 use chromagrain_core::audio::AudioClip;
-use chromagrain_core::instrument::Transport;
+use chromagrain_core::instrument::{PadSlot, Transport};
 use chromagrain_core::timeline::Source;
 use chromagrain_core::video::VideoClip;
 use chromagrain_core::grain::GrainEvent;
@@ -203,10 +203,21 @@ fn taps_do_not_allocate_on_the_audio_thread() {
     let mut p = ready_plugin();
     let (mut l, mut r) = (vec![0.0f32; 512], vec![0.0f32; 512]);
     p.render(&mut [&mut l[..], &mut r[..]], None, &mut || None);
-    for k in 0..50 {
+    let t = Some(Transport { bpm: 140.0, playing: true, beat: 0.0 });
+    for k in 0..50u64 {
         for _ in 0..8 {
             assert!(p.shared().live(Live::Fire(0, GrainEvent { id: k, ..tap() })));
         }
-        assert_no_alloc::assert_no_alloc(|| p.render(&mut [&mut l[..], &mut r[..]], None, &mut || None));
+        // Pads too: load, launch (editor and MIDI), stop; the audio thread
+        // echoes their grains to the editor.
+        let n = (k % 16) as usize;
+        p.shared().live(Live::Pad(n, Some(PadSlot::new(0, 1.0))));
+        p.shared().live(Live::TogglePad(n));
+        if k == 40 {
+            p.shared().live(Live::StopPads);
+        }
+        let mut note = (k % 3 == 0).then_some(Ev::On { timing: 7, note: 36 + n as u8, velocity: 0.8 });
+        assert_no_alloc::assert_no_alloc(|| p.render(&mut [&mut l[..], &mut r[..]], t, &mut || note.take()));
     }
+    assert!(p.shared().grains.lock().unwrap().slots() > 0, "pad grains reached the editor ring");
 }

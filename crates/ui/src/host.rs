@@ -29,6 +29,8 @@ pub struct Caps {
     pub deep_tabs: Vec<DeepTab>,
     /// Export button.
     pub export: bool,
+    /// Perform's output routing (a second window on another display).
+    pub output: bool,
 }
 
 impl Default for Caps {
@@ -41,6 +43,7 @@ impl Default for Caps {
             tempo: true,
             deep_tabs: vec![DeepTab::Links, DeepTab::Effects, DeepTab::Automation, DeepTab::Script, DeepTab::Library],
             export: true,
+            output: true,
         }
     }
 }

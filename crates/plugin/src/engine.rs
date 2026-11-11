@@ -18,7 +18,7 @@
 //! tests drive exactly the code the host does.
 
 use crate::params::CgParams;
-use chromagrain_core::instrument::{Instrument, KeyFx, Macro, Transport, MAX_SOURCES};
+use chromagrain_core::instrument::{GrainOrigin, Instrument, KeyFx, Macro, PadSlot, Transport, MAX_SOURCES, PADS};
 use chromagrain_core::music::Key;
 use chromagrain_core::grain::GrainEvent;
 use chromagrain_core::seq::StepPattern;
@@ -35,6 +35,8 @@ const RING: usize = 64;
 /// Editor messages per block, with lots of room (four emitters at a few
 /// hundred grains/s, pads).
 const LIVE_RING: usize = 1024;
+/// Grains per editor frame, with room (16 pad loops + notes).
+const GRAIN_RING: usize = 4096;
 
 /// Loader -> audio.
 pub enum ToAudio {
@@ -53,6 +55,11 @@ pub enum Live {
     /// A one-shot grain (an emitter on the Play grid), played at the
     /// start of the next block.
     Fire(usize, GrainEvent),
+    /// Load / clear perform pad n.
+    Pad(usize, Option<PadSlot>),
+    /// Start / stop pad n on the next launch-grid line.
+    TogglePad(usize),
+    StopPads,
 }
 
 /// Audio -> loader: replaced things, to be dropped off the audio thread.
@@ -98,6 +105,20 @@ pub struct Shared {
     pub playing: AtomicBool,
     pub beat_bits: AtomicU64,
     pub bpm_bits: AtomicU64,
+    /// Instrument clock (seconds) at the end of the last block.
+    pub clock_bits: AtomicU64,
+    /// Pads as the audio thread last saw them: bit n = on, 16+n = a launch
+    /// is queued, 32+n = the queued launch starts the pad.
+    pub pad_bits: AtomicU64,
+    /// Grid beat each pad's loop started on.
+    pub pad_beats: [AtomicU64; PADS],
+    /// The pads' contents as the editor set them (the audio thread has its
+    /// own copy; this one is for drawing).
+    pub pad_slots: Mutex<[Option<PadSlot>; PADS]>,
+    /// Grains the instrument made from notes and pads (audio -> editor,
+    /// for the canvas; one-shots and step lanes the editor draws itself):
+    /// (source, grain, from a pad?).
+    pub grains: Mutex<rtrb::Consumer<(usize, GrainEvent, bool)>>,
 }
 
 impl Shared {
@@ -123,6 +144,18 @@ impl Shared {
     }
     pub fn bpm(&self) -> f64 {
         f64::from_bits(self.bpm_bits.load(Ordering::Relaxed))
+    }
+    pub fn clock(&self) -> f64 {
+        f64::from_bits(self.clock_bits.load(Ordering::Relaxed))
+    }
+    /// (on, queued start/stop) for pad n.
+    pub fn pad_state(&self, n: usize) -> (bool, Option<bool>) {
+        let b = self.pad_bits.load(Ordering::Relaxed);
+        let bit = |k: usize| b >> k & 1 == 1;
+        (bit(n), bit(16 + n).then(|| bit(32 + n)))
+    }
+    pub fn pad_beat(&self, n: usize) -> f64 {
+        self.pad_beats.get(n).map_or(0.0, |b| f64::from_bits(b.load(Ordering::Relaxed)))
     }
 
     /// Keep the editor's copy in step with the instrument (which recycles
@@ -167,6 +200,7 @@ pub struct AudioSide {
     rx: rtrb::Consumer<ToAudio>,
     live: rtrb::Consumer<Live>,
     trash: rtrb::Producer<Trash>,
+    grains: rtrb::Producer<(usize, GrainEvent, bool)>,
     shared: Arc<Shared>,
 }
 
@@ -175,6 +209,7 @@ pub fn spawn(params: Arc<CgParams>, sample_rate: u32) -> (AudioSide, Arc<Shared>
     let (to_audio, rx) = rtrb::RingBuffer::new(RING);
     let (trash, trash_rx) = rtrb::RingBuffer::new(RING);
     let (live, live_rx) = rtrb::RingBuffer::new(LIVE_RING);
+    let (grains, grains_rx) = rtrb::RingBuffer::new(GRAIN_RING);
     let (jobs, job_rx) = mpsc::channel();
     let shared = Arc::new(Shared {
         jobs,
@@ -188,6 +223,11 @@ pub fn spawn(params: Arc<CgParams>, sample_rate: u32) -> (AudioSide, Arc<Shared>
         playing: AtomicBool::new(false),
         beat_bits: AtomicU64::new(0f64.to_bits()),
         bpm_bits: AtomicU64::new(120f64.to_bits()),
+        clock_bits: AtomicU64::new(0f64.to_bits()),
+        pad_bits: AtomicU64::new(0),
+        pad_beats: std::array::from_fn(|_| AtomicU64::new(0f64.to_bits())),
+        pad_slots: Mutex::new([None; PADS]),
+        grains: Mutex::new(grains_rx),
     });
     let loader = Loader { params, shared: shared.clone(), jobs: job_rx, to_audio, trash: trash_rx, key: None, key_rate: sample_rate, pending: Vec::new() };
     std::thread::Builder::new()
@@ -196,7 +236,7 @@ pub fn spawn(params: Arc<CgParams>, sample_rate: u32) -> (AudioSide, Arc<Shared>
         .expect("spawn loader thread");
     let mut inst = Instrument::new(sample_rate);
     inst.set_key(None);
-    (AudioSide { inst, rx, live: live_rx, trash, shared: shared.clone() }, shared)
+    (AudioSide { inst, rx, live: live_rx, trash, grains, shared: shared.clone() }, shared)
 }
 
 impl AudioSide {
@@ -206,6 +246,21 @@ impl AudioSide {
         self.inst.reset(sample_rate);
         self.inst.set_key(params.key());
         self.apply_params(params);
+        // Restore the pads (a session load: the sources reload in the
+        // same order, so the indices hold).
+        let saved = params.pads.lock().map(|p| p.clone()).unwrap_or_default();
+        let mut slots = [None; PADS];
+        for (pad, source, start, len) in saved {
+            if pad < PADS {
+                slots[pad] = Some(PadSlot { start, ..PadSlot::new(source, len) });
+            }
+        }
+        for (i, s) in slots.iter().enumerate() {
+            self.inst.set_pad(i, *s);
+        }
+        if let Ok(mut m) = self.shared.pad_slots.lock() {
+            *m = slots;
+        }
     }
 
     /// Macros, sync and follow from the params (cheap; every block).
@@ -217,6 +272,7 @@ impl AudioSide {
         inst.set_macro(Macro::Look, params.look.value());
         inst.set_sync(params.sync.value().beats());
         inst.set_follow_transport(params.follow.value());
+        inst.set_launch_quantize(params.launch.value().beats());
     }
 
     /// Latency the instrument reports right now (the current LOOK).
@@ -228,12 +284,14 @@ impl AudioSide {
     /// host's (None when it reports no tempo). Events must come in timing
     /// order. Allocation- and lock-free.
     pub fn render(&mut self, out: &mut [&mut [f32]], params: &CgParams, transport: Option<Transport>, next_event: &mut dyn FnMut() -> Option<Ev>) {
-        self.drain();
-        self.apply_params(params);
-        let inst = &mut self.inst;
+        // Transport and params first: queued pad launches aim at this
+        // block's beat grid.
         if let Some(t) = transport {
-            inst.set_transport(t);
+            self.inst.set_transport(t);
         }
+        self.apply_params(params);
+        self.drain();
+        let inst = &mut self.inst;
 
         let (l, r) = match out {
             [l, r, ..] => (l, r),
@@ -276,6 +334,20 @@ impl AudioSide {
         self.shared.playing.store(t.playing, Ordering::Relaxed);
         self.shared.beat_bits.store(t.beat.to_bits(), Ordering::Relaxed);
         self.shared.bpm_bits.store(t.bpm.to_bits(), Ordering::Relaxed);
+        self.shared.clock_bits.store(now.to_bits(), Ordering::Relaxed);
+        let mut bits = 0u64;
+        for (n, p) in inst.pads().iter().enumerate() {
+            bits |= (p.on as u64) << n | (p.queued.is_some() as u64) << (16 + n) | ((p.queued == Some(true)) as u64) << (32 + n);
+            self.shared.pad_beats[n].store(p.start_beat.to_bits(), Ordering::Relaxed);
+        }
+        self.shared.pad_bits.store(bits, Ordering::Relaxed);
+        let ring = &mut self.grains;
+        inst.drain_new_grains(|src, ev, origin| {
+            if matches!(origin, GrainOrigin::Note | GrainOrigin::Pad(_)) {
+                // Full = no editor reading: drop (the picture is optional).
+                let _ = ring.push((src, ev.clone(), matches!(origin, GrainOrigin::Pad(_))));
+            }
+        });
     }
 
     /// Take everything the loader has sent.
@@ -312,6 +384,9 @@ impl AudioSide {
         while let Ok(msg) = self.live.pop() {
             match msg {
                 Live::Fire(src, ev) => self.inst.trigger(src, ev),
+                Live::Pad(n, slot) => self.inst.set_pad(n, slot),
+                Live::TogglePad(n) => self.inst.toggle_pad(n),
+                Live::StopPads => self.inst.stop_pads(),
             }
         }
     }

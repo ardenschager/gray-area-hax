@@ -101,6 +101,28 @@ impl SyncDiv {
     }
 }
 
+/// Perform pads' launch grid.
+#[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Launch {
+    Now,
+    Beat,
+    Bar,
+}
+
+impl Launch {
+    pub fn beats(self) -> f64 {
+        match self {
+            Launch::Now => 0.0,
+            Launch::Beat => 1.0,
+            Launch::Bar => 4.0,
+        }
+    }
+}
+
+/// One loaded perform pad in the plugin state: (pad, source index in
+/// load order, start 0..1, length in beats).
+pub type PersistedPad = (usize, usize, f32, f32);
+
 #[derive(Params)]
 pub struct CgParams {
     /// Editor window size (logical points), remembered with the session.
@@ -109,6 +131,9 @@ pub struct CgParams {
     /// Loaded media, as file paths (decoded again when the state loads).
     #[persist = "sources"]
     pub sources: Mutex<Vec<String>>,
+    /// Loaded perform pads.
+    #[persist = "pads"]
+    pub pads: Mutex<Vec<PersistedPad>>,
 
     #[id = "grain"]
     pub grain: FloatParam,
@@ -128,6 +153,8 @@ pub struct CgParams {
     pub follow: BoolParam,
     #[id = "gain"]
     pub gain: FloatParam,
+    #[id = "launch"]
+    pub launch: EnumParam<Launch>,
 }
 
 fn macro_param(m: Macro, name: &str) -> FloatParam {
@@ -142,6 +169,7 @@ impl Default for CgParams {
         Self {
             editor_size: Arc::new(Mutex::new(crate::editor::DEFAULT_SIZE)),
             sources: Mutex::new(Vec::new()),
+            pads: Mutex::new(Vec::new()),
             grain: macro_param(Macro::Grain, "Grain"),
             pitch: FloatParam::new("Pitch", Macro::Pitch.default_value(), FloatRange::Linear { min: 0.0, max: 1.0 })
                 .with_value_to_string(Arc::new(|v| {
@@ -176,6 +204,7 @@ impl Default for CgParams {
             .with_unit(" dB")
             .with_value_to_string(formatters::v2s_f32_gain_to_db(1))
             .with_string_to_value(formatters::s2v_f32_gain_to_db()),
+            launch: EnumParam::new("Pad launch", Launch::Beat),
         }
     }
 }
