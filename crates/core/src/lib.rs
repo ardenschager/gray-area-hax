@@ -41,5 +41,6 @@ pub mod script;
 pub mod seq;
 pub mod stretch;
 pub mod synth;
+pub mod take;
 pub mod timeline;
 pub mod video;

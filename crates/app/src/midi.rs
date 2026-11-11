@@ -41,6 +41,11 @@ pub struct Midi {
 }
 
 impl Midi {
+    /// No MIDI at all (headless tests).
+    pub fn none() -> Midi {
+        Midi { rx: None, conn: None, ports: Vec::new(), connected: None, last_error: None }
+    }
+
     pub fn new() -> Midi {
         let mut m = Midi {
             rx: None,

@@ -36,14 +36,29 @@ pub struct Scene {
     pub project: Project,
     pub plan: Arc<Vec<ClipPlan>>,
     pub t: f64,
-    /// Live pad hits (MIDI / on-screen), timed on the app clock.
-    pub live: Vec<(usize, chromagrain_core::grain::GrainEvent)>,
+    /// Live hits (MIDI pads, emitters) timed on the app clock:
+    /// (source, bus, event). Bus 0 = the plain pad layer; bus b > 0 uses
+    /// `buses[b - 1]` (its own grain style + effect chain).
+    pub live: Vec<(usize, u8, chromagrain_core::grain::GrainEvent)>,
     pub live_t: f64,
+    pub buses: Vec<LiveBus>,
+    /// Full-frame picture under everything: (source, media seconds).
+    pub backdrop: Option<(usize, f64)>,
     /// Transport stopped: long events ignore fades so the still frame shows.
     pub parked: bool,
     /// App frame counter: the scene is rendered once per distinct value,
     /// however many viewports present it.
     pub frame: u64,
+}
+
+/// A live layer's look: how its grains are drawn and what effects run
+/// over it (e.g. one per emitter: GRAIN's style, SMEAR + LOOK).
+#[derive(Clone, Debug, Default)]
+pub struct LiveBus {
+    pub style: VisualGrainStyle,
+    pub effects: Vec<AvEffect>,
+    /// Sound↔picture dials for this layer.
+    pub link: chromagrain_core::video::AvLink,
 }
 
 const MAX_SRC_W: u32 = 256;
@@ -1028,8 +1043,18 @@ impl GpuPreview {
             self.ensure_source(&scene.project, sid);
         }
 
-        // Master starts opaque black.
+        // Master starts opaque black (plus the backdrop picture, if any).
         self.pass(MASTER, Some([0.0, 0.0, 0.0, 1.0]));
+        if let Some((sid, at)) = scene.backdrop {
+            self.ensure_source(&scene.project, sid);
+            if let Some(g) = self.sources.get(&sid) {
+                let layer = ((at / g.duration.max(1e-6)).rem_euclid(1.0) * g.layers as f64)
+                    .min(g.layers as f64 - 1.0)
+                    .floor() as f32;
+                let u = Uni { a: [0.0, 1.0, layer, 1.0], ..Default::default() };
+                self.draw(Pipe::Grain, None, None, Some(sid), u);
+            }
+        }
 
         let t = scene.t;
         let fps = scene.project.fps;
@@ -1091,13 +1116,21 @@ impl GpuPreview {
             self.blend_onto(MASTER, final_tex, track.opacity_at(beat), 0.0);
         }
 
-        // Live pad hits on top, full correspondence, default style.
-        if !scene.live.is_empty() {
+        // Live hits on top, one layer per bus, full correspondence.
+        let n_buses = scene.buses.len().min(250) as u8;
+        for bus in 0..=n_buses {
+            let (style, effects, link, add_in, add_out) = if bus == 0 {
+                (VisualGrainStyle::default(), &[][..], chromagrain_core::video::AvLink::default(), 0.4, 0.3)
+            } else {
+                let b = &scene.buses[bus as usize - 1];
+                (b.style, &b.effects[..], b.link, b.style.additive, b.style.additive * 0.5)
+            };
+            let any = scene.live.iter().any(|h| h.1 == bus);
+            if !any && effects.is_empty() {
+                continue; // fx buses keep running so trails fade out
+            }
             self.pass(CLIP, Some([0.0; 4]));
-            let style = VisualGrainStyle::default();
-            let link = chromagrain_core::video::AvLink::default();
-            let mut drew = false;
-            for (sid, ev) in &scene.live {
+            for (sid, _, ev) in scene.live.iter().filter(|h| h.1 == bus) {
                 self.ensure_source(&scene.project, *sid);
                 let Some(gsrc) = self.sources.get(sid) else { continue };
                 let dur = gsrc.duration.max(1e-6);
@@ -1110,17 +1143,12 @@ impl GpuPreview {
                     scene.live_t,
                     aspect,
                 );
-                if draws.is_empty() {
-                    continue;
+                if !draws.is_empty() {
+                    self.record_grains(*sid, draws, None, add_in);
                 }
-                // The pass may have been interrupted by an upload-free
-                // ensure; keep drawing into the clip layer.
-                self.record_grains(*sid, draws, None, 0.4);
-                drew = true;
             }
-            if drew {
-                self.blend_onto(MASTER, CLIP, 1.0, 0.3);
-            }
+            let out = self.apply_chain(effects, 0xB000_0000_0000_0000 | bus as u64, CLIP, fps);
+            self.blend_onto(MASTER, out, 1.0, add_out);
         }
 
         // Master chain.
@@ -1373,6 +1401,8 @@ mod tests {
             t,
             live: Vec::new(),
             live_t: 0.0,
+            buses: Vec::new(),
+            backdrop: None,
             parked: false,
             frame,
         };
@@ -1439,6 +1469,8 @@ mod tests {
             t: 1.25,
             live: Vec::new(),
             live_t: 0.0,
+            buses: Vec::new(),
+            backdrop: None,
             parked: false,
             frame: 7,
         })));
