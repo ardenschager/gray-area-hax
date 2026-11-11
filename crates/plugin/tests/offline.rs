@@ -6,7 +6,8 @@ use chromagrain_core::audio::AudioClip;
 use chromagrain_core::instrument::Transport;
 use chromagrain_core::timeline::Source;
 use chromagrain_core::video::VideoClip;
-use chromagrain_plugin::engine::{Ev, Job};
+use chromagrain_core::grain::GrainEvent;
+use chromagrain_plugin::engine::{Ev, Job, Live};
 use chromagrain_plugin::Chromagrain;
 use nih_plug::prelude::Params;
 use std::sync::atomic::Ordering;
@@ -169,4 +170,43 @@ fn reports_latency_for_the_current_look() {
     let mut p = ready_plugin();
     assert_eq!(p.audio().latency_samples(), 0, "no look, no latency");
     assert_eq!(p.setup(SR), 0);
+}
+
+fn tap() -> GrainEvent {
+    GrainEvent { onset: 0.0, source_pos: 0.5, duration: 0.08, pitch_ratio: 1.0, gain: 0.8, pan: 0.0, envelope: 0.5, env_skew: -1.0, reverse: false, id: 7 }
+}
+
+/// An emitter tap goes editor -> audio thread directly (no loader hop):
+/// it sounds in the very next block the host renders, from its first
+/// samples, whatever the loader thread is doing.
+#[test]
+fn a_tap_sounds_within_one_block() {
+    let mut p = ready_plugin();
+    let block = 256; // 5.3 ms at 48 kHz
+    let (mut l, mut r) = (vec![0.0f32; block], vec![0.0f32; block]);
+    p.render(&mut [&mut l[..], &mut r[..]], None, &mut || None);
+    assert_eq!(rms(&l), 0.0, "silent before the tap");
+    // Keep the loader busy so a loader hop would show up as a miss.
+    p.shared().send(Job::Load("/nonexistent/clip.mp4".into()));
+    assert!(p.shared().live(Live::Fire(0, tap())));
+    p.render(&mut [&mut l[..], &mut r[..]], None, &mut || None);
+    assert!(rms(&l) > 0.01, "the tap sounds in the next block: rms {}", rms(&l));
+    let first = l.iter().position(|s| s.abs() > 1e-4).unwrap();
+    assert!(first < 32, "from the start of the block (first sample at {first})");
+    assert_eq!(p.shared().visible_grains.load(Ordering::Relaxed), 1, "and shows on the canvas");
+}
+
+/// Allocation-free on the audio side, many taps per block.
+#[cfg(debug_assertions)]
+#[test]
+fn taps_do_not_allocate_on_the_audio_thread() {
+    let mut p = ready_plugin();
+    let (mut l, mut r) = (vec![0.0f32; 512], vec![0.0f32; 512]);
+    p.render(&mut [&mut l[..], &mut r[..]], None, &mut || None);
+    for k in 0..50 {
+        for _ in 0..8 {
+            assert!(p.shared().live(Live::Fire(0, GrainEvent { id: k, ..tap() })));
+        }
+        assert_no_alloc::assert_no_alloc(|| p.render(&mut [&mut l[..], &mut r[..]], None, &mut || None));
+    }
 }

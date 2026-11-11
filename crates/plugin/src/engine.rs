@@ -9,7 +9,10 @@
 //!   `chromagrain_core::media` (so the active `MediaBackend`: ffmpeg on the
 //!   desktop, AVFoundation on iOS), prepares key changes
 //!   ([`KeyFx::prepare`]) when the key/scale params move, and frees trash.
-//! * **GUI / host main thread** only sends [`Job`]s.
+//! * **GUI / host main thread** sends [`Job`]s to the loader, and
+//!   time-critical, allocation-free messages ([`Live`]: emitter grains,
+//!   pad launches) straight to the audio thread over a third SPSC ring, so
+//!   a tap sounds in the next block the host renders.
 //!
 //! Everything here is plain Rust with no nih-plug process context, so the
 //! tests drive exactly the code the host does.
@@ -29,6 +32,9 @@ use std::time::Duration;
 /// Longest sub-block handed to the instrument (it reserves 8192).
 const MAX_SUB_BLOCK: usize = 4096;
 const RING: usize = 64;
+/// Editor messages per block, with lots of room (four emitters at a few
+/// hundred grains/s, pads).
+const LIVE_RING: usize = 1024;
 
 /// Loader -> audio.
 pub enum ToAudio {
@@ -36,10 +42,17 @@ pub enum ToAudio {
     Add(Source),
     /// Install key-dependent look state.
     Key(KeyFx),
-    /// A one-shot grain from the editor (an emitter on the Play grid).
-    Fire(usize, GrainEvent),
     /// New step lanes from the editor's Sequence view.
     Pattern(Box<StepPattern>),
+}
+
+/// Editor -> audio, direct (no loader hop). Plain values: pushing and
+/// popping never allocates.
+#[derive(Debug, Clone)]
+pub enum Live {
+    /// A one-shot grain (an emitter on the Play grid), played at the
+    /// start of the next block.
+    Fire(usize, GrainEvent),
 }
 
 /// Audio -> loader: replaced things, to be dropped off the audio thread.
@@ -55,8 +68,8 @@ pub enum Job {
     Load(PathBuf),
     /// Already-decoded media (a host with its own decoder, or tests).
     Decoded(Box<Source>),
-    /// Editor -> audio (via this thread, the ring's only producer).
-    Fire(usize, GrainEvent),
+    /// Editor -> audio (via this thread: patterns allocate, and what they
+    /// replace is freed here).
     Pattern(Box<StepPattern>),
     Stop,
 }
@@ -65,6 +78,9 @@ pub enum Job {
 /// touches the atomics.
 pub struct Shared {
     jobs: mpsc::Sender<Job>,
+    /// The editor's end of the [`Live`] ring. The lock only orders
+    /// editor-side callers (the audio thread never takes it).
+    live: Mutex<rtrb::Producer<Live>>,
     /// Output sample rate (decode target, key-state rate).
     pub sample_rate: AtomicU32,
     /// Paths decoded so far this session, in load order.
@@ -87,6 +103,12 @@ pub struct Shared {
 impl Shared {
     pub fn send(&self, job: Job) {
         let _ = self.jobs.send(job);
+    }
+
+    /// Straight to the audio thread; false if the ring is full (the audio
+    /// thread is not running) and the message was dropped.
+    pub fn live(&self, msg: Live) -> bool {
+        self.live.lock().map(|mut q| q.push(msg).is_ok()).unwrap_or(false)
     }
 
     pub fn status(&self) -> String {
@@ -143,6 +165,7 @@ impl Ev {
 pub struct AudioSide {
     pub inst: Instrument,
     rx: rtrb::Consumer<ToAudio>,
+    live: rtrb::Consumer<Live>,
     trash: rtrb::Producer<Trash>,
     shared: Arc<Shared>,
 }
@@ -151,9 +174,11 @@ pub struct AudioSide {
 pub fn spawn(params: Arc<CgParams>, sample_rate: u32) -> (AudioSide, Arc<Shared>) {
     let (to_audio, rx) = rtrb::RingBuffer::new(RING);
     let (trash, trash_rx) = rtrb::RingBuffer::new(RING);
+    let (live, live_rx) = rtrb::RingBuffer::new(LIVE_RING);
     let (jobs, job_rx) = mpsc::channel();
     let shared = Arc::new(Shared {
         jobs,
+        live: Mutex::new(live),
         sample_rate: AtomicU32::new(sample_rate),
         loaded: Mutex::new(Vec::new()),
         status: Mutex::new(String::from("no video loaded")),
@@ -171,7 +196,7 @@ pub fn spawn(params: Arc<CgParams>, sample_rate: u32) -> (AudioSide, Arc<Shared>
         .expect("spawn loader thread");
     let mut inst = Instrument::new(sample_rate);
     inst.set_key(None);
-    (AudioSide { inst, rx, trash, shared: shared.clone() }, shared)
+    (AudioSide { inst, rx, live: live_rx, trash, shared: shared.clone() }, shared)
 }
 
 impl AudioSide {
@@ -271,10 +296,6 @@ impl AudioSide {
                     }
                 }
                 ToAudio::Key(fx) => Some(Trash::Key(self.inst.swap_key(fx))),
-                ToAudio::Fire(src, ev) => {
-                    self.inst.trigger(src, ev);
-                    None
-                }
                 ToAudio::Pattern(p) => {
                     let old = self.inst.swap_pattern(Some(*p));
                     old.map(|o| Trash::Pattern(Box::new(o)))
@@ -284,6 +305,13 @@ impl AudioSide {
                 // The trash ring only fills if the loader is stuck; then
                 // freeing here is the lesser evil.
                 let _ = self.trash.push(t);
+            }
+        }
+        // After the loader's messages, so a grain on a just-added source
+        // finds it.
+        while let Ok(msg) = self.live.pop() {
+            match msg {
+                Live::Fire(src, ev) => self.inst.trigger(src, ev),
             }
         }
     }
@@ -319,7 +347,6 @@ impl Loader {
                     self.shared.mirror_source(&src);
                     self.pending.push(ToAudio::Add(*src));
                 }
-                Ok(Job::Fire(src, ev)) => self.pending.push(ToAudio::Fire(src, ev)),
                 Ok(Job::Pattern(p)) => {
                     // Only the newest pattern matters.
                     self.pending.retain(|m| !matches!(m, ToAudio::Pattern(_)));

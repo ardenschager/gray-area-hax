@@ -5,8 +5,8 @@
 //! v1 scope (what the plugin exposes):
 //! * **Play** — the clip grid and the four emitters. Emitter grains are
 //!   computed in the editor with the same `grain_step` / `MacroMap` the
-//!   instrument uses and sent to the audio thread as one-shots
-//!   (`Instrument::trigger`); they sound through the instrument's SMEAR +
+//!   instrument uses and sent straight to the audio thread as one-shots
+//!   (`engine::Live` ring -> `Instrument::trigger`, next block); they sound through the instrument's SMEAR +
 //!   LOOK. The four knobs ARE the plugin's GRAIN / PITCH / SMEAR / LOOK
 //!   parameters (automatable; every emitter shares them in v1).
 //! * **Sequence** — one scene of step lanes (slice / pitch / length /
@@ -16,7 +16,7 @@
 //! * Not in v1: Perform (pads, output window), Rec takes, export, tempo /
 //!   transport control (the host owns them), the classic editors.
 
-use crate::engine::{Job, Shared};
+use crate::engine::{Job, Live, Shared};
 use crate::params::{CgParams, Root, Scale};
 use chromagrain_core::fx::AvEffect;
 use chromagrain_core::grain::GrainEvent;
@@ -176,7 +176,7 @@ impl Host for PluginHost {
         self.clock.elapsed().as_secs_f64()
     }
     fn fire(&mut self, bus: u8, source: usize, ev: GrainEvent) {
-        self.shared.send(Job::Fire(source, ev.clone()));
+        self.shared.live(Live::Fire(source, ev.clone()));
         self.live.push((source, bus, ev));
     }
     fn set_bus(&mut self, _bus: u8, _chain: Vec<AvEffect>) {
