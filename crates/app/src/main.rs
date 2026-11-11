@@ -19,8 +19,11 @@
 //!   looping pads. Each pad is a track whose first clip loops forever;
 //!   pads start/stop on the next beat or bar. Sources, patterns and the
 //!   master bus are shared with the arrangement.
+//! * **Output** (`O` / top-bar button) — a second window with only the
+//!   picture, fullscreen on the second display (see `ui_output`).
 
 mod browser;
+mod displays;
 mod gpu;
 mod history;
 mod midi;
@@ -29,6 +32,7 @@ mod theme;
 mod ui_browse;
 mod ui_inspector;
 mod ui_library;
+mod ui_output;
 mod ui_perform;
 mod ui_synth;
 mod ui_timeline;
@@ -105,8 +109,12 @@ fn main() -> eframe::Result<()> {
     // `chromagrain clip.mp4 other.mov` — open with those files placed on
     // their own tracks at the start. `--perform` opens on the pads (the
     // files land on pads instead). Starts blank; `--demo` loads the demo.
+    // `--output` opens the performance output window, `--play` starts the
+    // transport (together: an unattended installation).
     let perform = args.iter().any(|a| a == "--perform");
     let demo = args.iter().any(|a| a == "--demo");
+    let output = args.iter().any(|a| a == "--output");
+    let autoplay = args.iter().any(|a| a == "--play");
     let open: Vec<PathBuf> =
         args.iter().skip(1).map(PathBuf::from).filter(|p| p.is_file()).collect();
     eframe::run_native(
@@ -124,6 +132,12 @@ fn main() -> eframe::Result<()> {
             }
             for p in open {
                 app.import_path(p, Some(Place { track: 0, new_track: true, beat: 0.0 }));
+            }
+            if output {
+                app.toggle_output();
+            }
+            if autoplay {
+                app.start_play();
             }
             Ok(Box::new(app))
         }),
@@ -296,6 +310,8 @@ pub struct App {
     scene: Arc<Mutex<Option<gpu::Scene>>>,
     /// App frame counter (`Scene::frame`).
     frame_no: u64,
+    /// The performance output window (`O`).
+    output: ui_output::OutputWin,
 
     busy: Option<String>,
     jobs: VecDeque<Job>,
@@ -398,6 +414,7 @@ impl App {
             gpu_failed: Arc::new(AtomicBool::new(false)),
             scene: Arc::new(Mutex::new(None)),
             frame_no: 0,
+            output: ui_output::OutputWin::default(),
             busy: None,
             jobs: VecDeque::new(),
             rx,
@@ -1344,6 +1361,9 @@ impl App {
         if redo {
             self.redo();
         }
+        if ctx.input(|i| i.key_pressed(egui::Key::O) && !i.modifiers.any()) {
+            self.toggle_output();
+        }
         if ctx.input(|i| i.key_pressed(egui::Key::Tab) && !i.modifiers.any()) {
             let m = if self.mode == AppMode::Perform { AppMode::Arrange } else { AppMode::Perform };
             self.set_mode(m);
@@ -1478,6 +1498,7 @@ impl eframe::App for App {
             ctx.request_repaint_after(std::time::Duration::from_millis(90));
         }
         self.publish_scene();
+        self.output_ui(ctx);
 
         if self.fullscreen {
             egui::CentralPanel::default()

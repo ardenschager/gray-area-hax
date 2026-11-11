@@ -98,6 +98,17 @@ impl App {
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let mut out = self.output.open;
+                let r = ui.toggle_value(&mut out, "⧉ output").on_hover_ui(|ui| {
+                    ui.label(if crate::displays::pick_output(&crate::displays::list()).is_some() {
+                        "show only the picture, fullscreen on the second display  (O)"
+                    } else {
+                        "show only the picture in its own fullscreen window — esc = window  (O)"
+                    });
+                });
+                if r.changed() {
+                    self.toggle_output();
+                }
                 ui.menu_button("export", |ui| {
                     ui.set_min_width(170.0);
                     if ui.button("render video (mp4)…").clicked() {
