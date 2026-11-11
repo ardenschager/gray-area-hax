@@ -167,6 +167,41 @@ impl App {
         }
     }
 
+    /// The most recent hit at or before the playhead in the current scene
+    /// (source, media seconds): the Sequence monitor holds it between hits.
+    pub(crate) fn seq_last_hit(&self) -> Option<(usize, f64)> {
+        let (scene, at) = self.seq_current();
+        let pid = self.seq_pattern(scene)?;
+        let lay = self.seq_chain_layout();
+        let start = at.and_then(|(i, _)| lay.get(i)).map(|e| e.2).unwrap_or(0.0);
+        let slot = ((self.playhead_beats - start).max(0.0) * 4.0).floor() as i64;
+        let p = self.project.lock().unwrap();
+        let pat = p.patterns.get(pid)?;
+        let mut best: Option<(i64, usize, f32)> = None;
+        for row in pat.rows.iter().filter(|r| !r.muted) {
+            let Some(src) = p.sources.get(row.source) else { continue };
+            let n = row.steps.len() as i64;
+            if n == 0 || src.duration() <= 0.0 {
+                continue;
+            }
+            // Look back up to one bar for this lane's latest hit.
+            for back in 0..16i64 {
+                let k = slot - back;
+                let st = row.steps[k.rem_euclid(n) as usize];
+                if st.on {
+                    if best.is_none_or(|b| back < b.0) {
+                        let pos = if st.slice >= 0.0 { st.slice } else { row.grains.position };
+                        best = Some((back, row.source, pos));
+                    }
+                    break;
+                }
+            }
+        }
+        let (_, src, pos) = best?;
+        let len = p.sources[src].duration();
+        Some((src, pos as f64 * len))
+    }
+
     pub(crate) fn seq_step(&self, scene: usize, lane: usize, step: usize) -> Option<chromagrain_core::seq::Step> {
         let pid = self.seq_pattern(scene)?;
         let p = self.project.lock().unwrap();
@@ -449,8 +484,8 @@ impl App {
         let h = rect.height();
         for (i, (s, n, start)) in lay.iter().enumerate() {
             let label = format!("{} ×{}", s + 1, n);
-            let w = p.layout_no_wrap(label.clone(), mono(12.0), INK).size().x + 22.0 + (*n as f32 - 1.0).min(3.0) * 8.0;
-            if x + w > rect.right() - 24.0 {
+            let w = p.layout_no_wrap(label.clone(), mono(12.0), INK).size().x + 16.0 + (*n as f32 - 1.0).min(3.0) * 5.0;
+            if x + w > rect.right() - 16.0 {
                 break;
             }
             let cr = Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(w, h));
@@ -471,7 +506,7 @@ impl App {
             if resp.clicked() {
                 self.seek(*start);
             }
-            x = cr.right() + 6.0;
+            x = cr.right() + 5.0;
         }
         draw_loop_glyph(&p, egui::pos2(x + 8.0, rect.center().y), INK3);
     }

@@ -352,3 +352,39 @@ fn the_song_chain_becomes_the_arrangement() {
     assert!(app.loop_on && (app.loop_end - 48.0).abs() < 1e-9, "the transport loops the song");
     assert!(seq.clips.windows(2).all(|w| (w[0].end_beat() - w[1].start_beat).abs() < 1e-9));
 }
+
+#[test]
+fn two_fingers_play_two_emitters() {
+    let mut h = harness(SIZES[0], View::Play, |app| app.studio.sel_emitter = 0);
+    h.run_steps(3);
+    let grid = h.get_by_label("play grid").rect();
+    let at = |c: f32, r: f32| egui::pos2(grid.left() + grid.width() * c / 8.0, grid.top() + grid.height() * r / 8.0);
+    let touch = |id: u64, phase: egui::TouchPhase, pos: egui::Pos2| egui::Event::Touch {
+        device_id: egui::TouchDeviceId(1),
+        id: egui::TouchId(id),
+        phase,
+        pos,
+        force: None,
+    };
+    push(&mut h, touch(1, egui::TouchPhase::Start, at(1.5, 2.5)));
+    push(&mut h, touch(2, egui::TouchPhase::Start, at(6.5, 4.5)));
+    h.run_steps(3);
+    {
+        let st = &h.state().studio;
+        let held: Vec<usize> = (0..EMITTERS).filter(|i| st.emitters[*i].held).collect();
+        assert_eq!(held.len(), 2, "two fingers, two emitters: {held:?}");
+        let cols: Vec<usize> = held.iter().map(|i| st.emitters[*i].col).collect();
+        assert!(cols.contains(&1) && cols.contains(&6), "{cols:?}");
+    }
+    let buses: std::collections::HashSet<u8> = h.state().live_events.iter().map(|(_, b, _)| *b).collect();
+    assert!(buses.len() >= 2, "both spray, each on its own bus: {buses:?}");
+    // Second finger slides to column 7, then lifts.
+    push(&mut h, touch(2, egui::TouchPhase::Move, at(7.5, 1.5)));
+    h.run_steps(2);
+    let second = h.state().studio.touches.iter().find(|(t, _)| *t == 2).map(|(_, e)| *e).unwrap();
+    assert_eq!(h.state().studio.emitters[second].col, 7);
+    push(&mut h, touch(2, egui::TouchPhase::End, at(7.5, 1.5)));
+    push(&mut h, touch(1, egui::TouchPhase::End, at(1.5, 2.5)));
+    h.run_steps(2);
+    assert!(h.state().studio.emitters.iter().all(|e| !e.held), "all fingers up, all quiet");
+}

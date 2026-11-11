@@ -109,19 +109,69 @@ impl App {
             let c = center_of(col, row);
             egui::pos2(c.x, c.y.clamp(grid.top() + 16.0, grid.bottom() - 16.0))
         };
-        let down = resp.is_pointer_button_down_on() || resp.clicked();
+        let pick = |st: &super::Studio, pos: egui::Pos2, taken: &[usize]| -> usize {
+            let near = (0..EMITTERS)
+                .filter(|i| !taken.contains(i))
+                .map(|i| (i, (ring_pos(st.emitters[i].col, st.emitters[i].row) - pos).length()))
+                .filter(|(_, d)| *d < 24.0)
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(i, _)| i);
+            near.or_else(|| (!taken.contains(&st.sel_emitter)).then_some(st.sel_emitter))
+                .or_else(|| (0..EMITTERS).find(|i| !taken.contains(i) && !st.emitters[*i].held))
+                .unwrap_or(st.sel_emitter)
+        };
+
+        // Multi-touch: every finger plays its own emitter (egui also
+        // turns the first finger into pointer events — those are ignored
+        // while fingers are down).
+        let touches: Vec<(u64, egui::TouchPhase, egui::Pos2)> = ui.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::Touch { id, phase, pos, .. } => Some((id.0, *phase, *pos)),
+                    _ => None,
+                })
+                .collect()
+        });
+        for (id, phase, pos) in touches {
+            let slot = self.studio.touches.iter().position(|(t, _)| *t == id);
+            match phase {
+                egui::TouchPhase::Start if grid.contains(pos) && slot.is_none() => {
+                    let taken: Vec<usize> = self.studio.touches.iter().map(|(_, e)| *e).collect();
+                    let i = pick(&self.studio, pos, &taken);
+                    self.studio.touches.push((id, i));
+                    self.studio.sel_emitter = i;
+                    let (c, row) = to_grid(pos);
+                    let e = &mut self.studio.emitters[i];
+                    (e.col, e.row, e.held) = (c, row, true);
+                }
+                egui::TouchPhase::Move => {
+                    if let Some(k) = slot {
+                        let i = self.studio.touches[k].1;
+                        let (c, row) = to_grid(pos);
+                        let e = &mut self.studio.emitters[i];
+                        (e.col, e.row) = (c, row);
+                    }
+                }
+                egui::TouchPhase::End | egui::TouchPhase::Cancel => {
+                    if let Some(k) = slot {
+                        let (_, i) = self.studio.touches.remove(k);
+                        self.studio.emitters[i].held = false;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let fingers = !self.studio.touches.is_empty();
+        let down = !fingers && (resp.is_pointer_button_down_on() || resp.clicked());
         if down {
             if let Some(pos) = resp.interact_pointer_pos() {
                 let grabbing = ui.data(|d| d.get_temp::<Option<usize>>(resp.id)).flatten();
                 let who = match grabbing {
                     Some(i) => i,
                     None => {
-                        let near = (0..EMITTERS)
-                            .map(|i| (i, (ring_pos(self.studio.emitters[i].col, self.studio.emitters[i].row) - pos).length()))
-                            .filter(|(_, d)| *d < 24.0)
-                            .min_by(|a, b| a.1.total_cmp(&b.1))
-                            .map(|(i, _)| i);
-                        let i = near.unwrap_or(self.studio.sel_emitter);
+                        let i = pick(&self.studio, pos, &[]);
                         ui.data_mut(|d| d.insert_temp(resp.id, Some(i)));
                         i
                     }
@@ -134,10 +184,12 @@ impl App {
                 e.held = !resp.clicked() || resp.is_pointer_button_down_on();
             }
         }
-        if !resp.is_pointer_button_down_on() {
+        if !resp.is_pointer_button_down_on() || fingers {
             // Release: only the emitter this pointer was playing stops.
             if let Some(i) = ui.data(|d| d.get_temp::<Option<usize>>(resp.id)).flatten() {
-                self.studio.emitters[i].held = false;
+                if !self.studio.touches.iter().any(|(_, e)| *e == i) {
+                    self.studio.emitters[i].held = false;
+                }
             }
             ui.data_mut(|d| d.insert_temp(resp.id, None::<usize>));
         }

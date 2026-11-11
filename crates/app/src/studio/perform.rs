@@ -83,7 +83,8 @@ impl App {
                     // Label + mode glyph on a soft bottom scrim.
                     let scrim = Rect::from_min_max(egui::pos2(rc.left(), rc.bottom() - 30.0), rc.max);
                     p.rect_filled(scrim, egui::CornerRadius { nw: 0, ne: 0, sw: 10, se: 10 }, Color32::from_black_alpha(70));
-                    let name = short(&self.source_name(src), 16);
+                    let room = ((pw - 40.0) / 6.6).max(3.0) as usize;
+                    let name = short(&self.source_name(src), room.min(18));
                     p.text(egui::pos2(rc.left() + 10.0, rc.bottom() - 9.0), Align2::LEFT_BOTTOM, name, font_medium(11.5), if on { INK } else { INK2 });
                     let icon = match kind {
                         ClipKind::Snippet => Icon::Loop,
