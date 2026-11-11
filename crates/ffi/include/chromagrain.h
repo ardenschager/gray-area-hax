@@ -281,10 +281,28 @@ bool cg_instrument_post_key(const CgInstrument *inst, int32_t root, uint32_t sca
 void cg_instrument_request_key(const CgInstrument *inst, int32_t root, uint32_t scale);
 
 /**
+ * [`cg_instrument_request_key`] for just the root (-1 = chromatic), for
+ * hosts with separate key and scale parameters.
+ */
+void cg_instrument_request_key_root(const CgInstrument *inst, int32_t root);
+
+/**
+ * [`cg_instrument_request_key`] for just the scale.
+ */
+void cg_instrument_request_key_scale(const CgInstrument *inst, uint32_t scale);
+
+/**
  * Non-realtime housekeeping, e.g. from a ~30 ms timer: posts a requested
  * key change and frees garbage. Returns true if a key change was posted.
  */
 bool cg_instrument_service(const CgInstrument *inst);
+
+/**
+ * Non-realtime: post the last requested key again, e.g. after
+ * [`cg_instrument_reset`] changed the sample rate (key state is
+ * rate-specific).
+ */
+bool cg_instrument_repost_key(const CgInstrument *inst);
 
 /**
  * Thread-safe: set a macro from the next block on.

@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>chromagrain</string>
+	<key>CFBundleExecutable</key>
+	<string>ChromagrainAU</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.creativelab.chromagrain.au</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>ChromagrainAU</string>
+	<key>CFBundlePackageType</key>
+	<string>XPC!</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>CFBundleSupportedPlatforms</key>
+	<array>
+		<string>MacOSX</string>
+	</array>
+	<key>LSMinimumSystemVersion</key>
+	<string>12.0</string>
+	<key>NSExtension</key>
+	<dict>
+		<key>NSExtensionAttributes</key>
+		<dict>
+			<key>AudioComponents</key>
+			<array>
+				<dict>
+					<key>description</key>
+					<string>Play video like a sampler</string>
+					<key>factoryFunction</key>
+					<string>ChromagrainAudioUnitFactory</string>
+					<key>manufacturer</key>
+					<string>CrLb</string>
+					<key>name</key>
+					<string>Creative Lab: chromagrain</string>
+					<key>sandboxSafe</key>
+					<true/>
+					<key>subtype</key>
+					<string>chgr</string>
+					<key>tags</key>
+					<array>
+						<string>Synthesizer</string>
+						<string>Sampler</string>
+					</array>
+					<key>type</key>
+					<string>aumu</string>
+					<key>version</key>
+					<integer>256</integer>
+				</dict>
+			</array>
+		</dict>
+		<key>NSExtensionPointIdentifier</key>
+		<string>com.apple.AudioUnit-UI</string>
+		<key>NSExtensionPrincipalClass</key>
+		<string>ChromagrainAudioUnitFactory</string>
+	</dict>
+</dict>
+</plist>

@@ -1,0 +1,140 @@
+# XcodeGen spec for the chromagrain AUv3 (macOS + iOS), for when Xcode is
+# installed:  cd apple && xcodegen && xcodebuild -scheme Chromagrain-macOS ...
+#
+# Not exercised yet (this Mac has only the Command Line Tools). The
+# no-Xcode macOS build in build-macos.sh is the tested path; this file
+# mirrors its sources, Info.plists and entitlements. The Rust engine is
+# built by a pre-build script per platform (libchromagrain_ffi.a).
+name: Chromagrain
+options:
+  bundleIdPrefix: com.creativelab
+  deploymentTarget:
+    macOS: "12.0"
+    iOS: "15.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    SWIFT_OBJC_BRIDGING_HEADER: ../crates/ffi/include/chromagrain.h
+    CODE_SIGN_IDENTITY: "-"
+    CODE_SIGN_STYLE: Manual
+    DEVELOPMENT_TEAM: ""
+    OTHER_LDFLAGS: ["-lchromagrain_ffi", "-liconv"]
+
+targets:
+  ChromagrainAU-macOS:
+    type: app-extension
+    platform: macOS
+    productName: ChromagrainAU
+    sources:
+      - Shared
+      - Extension/AudioUnitFactory.swift
+    info:
+      path: Extension/Info.plist
+    entitlements:
+      path: Extension/Extension.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.creativelab.chromagrain.au
+        LIBRARY_SEARCH_PATHS: ["$(SRCROOT)/../target/universal-apple-darwin/release"]
+        APPLICATION_EXTENSION_API_ONLY: YES
+    preBuildScripts:
+      - name: Rust engine (macOS universal)
+        script: |
+          set -e
+          cd "$SRCROOT/.."
+          for t in aarch64-apple-darwin x86_64-apple-darwin; do cargo build -p chromagrain-ffi --release --target $t; done
+          mkdir -p target/universal-apple-darwin/release
+          lipo -create target/aarch64-apple-darwin/release/libchromagrain_ffi.a target/x86_64-apple-darwin/release/libchromagrain_ffi.a \
+            -output target/universal-apple-darwin/release/libchromagrain_ffi.a
+    dependencies:
+      - sdk: AudioToolbox.framework
+      - sdk: AVFoundation.framework
+      - sdk: CoreAudioKit.framework
+      - sdk: Accelerate.framework
+
+  Chromagrain-macOS:
+    type: application
+    platform: macOS
+    productName: chromagrain
+    sources: [App]
+    info:
+      path: App/Info.plist
+    entitlements:
+      path: App/App.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.creativelab.chromagrain
+        OTHER_LDFLAGS: []
+    dependencies:
+      - target: ChromagrainAU-macOS
+        embed: true
+
+  ChromagrainAU-iOS:
+    type: app-extension
+    platform: iOS
+    productName: ChromagrainAU
+    sources:
+      - Shared
+      - Extension/AudioUnitFactory.swift
+    info:
+      path: Extension/Info-iOS.plist
+      properties:
+        CFBundleDisplayName: chromagrain
+        CFBundlePackageType: XPC!
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.AudioUnit-UI
+          NSExtensionPrincipalClass: ChromagrainAudioUnitFactory
+          NSExtensionAttributes:
+            AudioComponents:
+              - description: Play video like a sampler
+                factoryFunction: ChromagrainAudioUnitFactory
+                manufacturer: CrLb
+                name: "Creative Lab: chromagrain"
+                sandboxSafe: true
+                subtype: chgr
+                tags: [Synthesizer, Sampler]
+                type: aumu
+                version: 256
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.creativelab.chromagrain.ios.au
+        LIBRARY_SEARCH_PATHS: ["$(SRCROOT)/../target/aarch64-apple-ios/release"]
+        APPLICATION_EXTENSION_API_ONLY: YES
+    preBuildScripts:
+      - name: Rust engine (iOS arm64)
+        script: |
+          set -e
+          cd "$SRCROOT/.."
+          cargo build -p chromagrain-ffi --release --target aarch64-apple-ios
+    dependencies:
+      - sdk: AudioToolbox.framework
+      - sdk: AVFoundation.framework
+      - sdk: CoreAudioKit.framework
+      - sdk: Accelerate.framework
+
+  Chromagrain-iOS:
+    type: application
+    platform: iOS
+    productName: chromagrain
+    sources: [App]
+    info:
+      path: App/Info-iOS.plist
+      properties:
+        UILaunchScreen: {}
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.creativelab.chromagrain.ios
+        OTHER_LDFLAGS: []
+    dependencies:
+      - target: ChromagrainAU-iOS
+        embed: true
+
+schemes:
+  Chromagrain-macOS:
+    build:
+      targets:
+        Chromagrain-macOS: all
+  Chromagrain-iOS:
+    build:
+      targets:
+        Chromagrain-iOS: all

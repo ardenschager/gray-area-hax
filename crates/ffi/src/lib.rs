@@ -62,13 +62,14 @@ struct Mail {
     dirty: AtomicU32,
     gain: AtomicU32,
     sources: AtomicUsize,
-    /// Key asked for by [`cg_instrument_request_key`] / last posted
-    /// (packed by [`pack_key`]; NO_KEY_REQUEST = nothing asked).
-    wanted_key: AtomicU32,
+    /// Key asked for by the `request_key*` calls (root + 1, scale) and
+    /// whether it changed since the last service; last posted (packed by
+    /// [`pack_key`]).
+    want_root: AtomicU32,
+    want_scale: AtomicU32,
+    key_dirty: AtomicU32,
     posted_key: AtomicU32,
 }
-
-const NO_KEY_REQUEST: u32 = u32::MAX;
 
 fn pack_key(root: i32, scale: u32) -> u32 {
     ((root.clamp(-1, 11) + 1) as u32) << 8 | scale.min(255)
@@ -251,7 +252,9 @@ pub extern "C" fn cg_instrument_new(sample_rate: u32) -> *mut CgInstrument {
             dirty: AtomicU32::new(0),
             gain: AtomicU32::new(1f32.to_bits()),
             sources: AtomicUsize::new(0),
-            wanted_key: AtomicU32::new(NO_KEY_REQUEST),
+            want_root: AtomicU32::new(0),
+            want_scale: AtomicU32::new(0),
+            key_dirty: AtomicU32::new(0),
             posted_key: AtomicU32::new(pack_key(-1, 0)),
         },
         rt: Rt { inst, inbox, trash, gain: 1.0 },
@@ -526,8 +529,26 @@ pub unsafe extern "C" fn cg_instrument_post_key(inst: *const CgInstrument, root:
 /// work.
 #[no_mangle]
 pub unsafe extern "C" fn cg_instrument_request_key(inst: *const CgInstrument, root: i32, scale: u32) {
+    cg_instrument_request_key_root(inst, root);
+    cg_instrument_request_key_scale(inst, scale);
+}
+
+/// [`cg_instrument_request_key`] for just the root (-1 = chromatic), for
+/// hosts with separate key and scale parameters.
+#[no_mangle]
+pub unsafe extern "C" fn cg_instrument_request_key_root(inst: *const CgInstrument, root: i32) {
     if let Some(m) = mail(inst) {
-        m.wanted_key.store(pack_key(root, scale), Ordering::Release);
+        m.want_root.store((root.clamp(-1, 11) + 1) as u32, Ordering::Release);
+        m.key_dirty.store(1, Ordering::Release);
+    }
+}
+
+/// [`cg_instrument_request_key`] for just the scale.
+#[no_mangle]
+pub unsafe extern "C" fn cg_instrument_request_key_scale(inst: *const CgInstrument, scale: u32) {
+    if let Some(m) = mail(inst) {
+        m.want_scale.store(scale.min(255), Ordering::Release);
+        m.key_dirty.store(1, Ordering::Release);
     }
 }
 
@@ -536,14 +557,24 @@ pub unsafe extern "C" fn cg_instrument_request_key(inst: *const CgInstrument, ro
 #[no_mangle]
 pub unsafe extern "C" fn cg_instrument_service(inst: *const CgInstrument) -> bool {
     let Some(m) = mail(inst) else { return false };
-    let wanted = m.wanted_key.swap(NO_KEY_REQUEST, Ordering::AcqRel);
-    let posted = if wanted != NO_KEY_REQUEST && wanted != m.posted_key.load(Ordering::Acquire) {
-        cg_instrument_post_key(inst, (wanted >> 8) as i32 - 1, wanted & 0xff)
-    } else {
-        false
-    };
+    let mut posted = false;
+    if m.key_dirty.swap(0, Ordering::AcqRel) != 0 {
+        let (root, scale) = (m.want_root.load(Ordering::Acquire) as i32 - 1, m.want_scale.load(Ordering::Acquire));
+        if pack_key(root, scale) != m.posted_key.load(Ordering::Acquire) {
+            posted = cg_instrument_post_key(inst, root, scale);
+        }
+    }
     m.collect();
     posted
+}
+
+/// Non-realtime: post the last requested key again, e.g. after
+/// [`cg_instrument_reset`] changed the sample rate (key state is
+/// rate-specific).
+#[no_mangle]
+pub unsafe extern "C" fn cg_instrument_repost_key(inst: *const CgInstrument) -> bool {
+    let Some(m) = mail(inst) else { return false };
+    cg_instrument_post_key(inst, m.want_root.load(Ordering::Acquire) as i32 - 1, m.want_scale.load(Ordering::Acquire))
 }
 
 /// Thread-safe: set a macro from the next block on.
