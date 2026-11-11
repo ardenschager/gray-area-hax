@@ -1,0 +1,3 @@
+[alias]
+# nih-plug's bundler (see xtask/): cargo xtask bundle chromagrain-plugin --release
+xtask = "run --package xtask --release --"

@@ -426,6 +426,31 @@ chromagrain --demo --output --play             # installation: output window + a
 chromagrain --render-demo out.mp4              # render the built-in demo project
 ```
 
+### Plugin — VST3 / CLAP
+
+`crates/plugin` wraps the playable instrument (`core::instrument`) as a
+nih-plug instrument: MIDI notes in, stereo out, host tempo/transport
+driving beat-synced grains. Parameters: GRAIN / PITCH / SMEAR / LOOK
+macros, key + scale, sync grid, follow-transport and gain (all
+automatable). Loaded videos are saved in the plugin state as file paths
+and decoded again on a background thread when a session opens; decoded
+media and key changes reach the audio thread over wait-free rings, and
+`process` never allocates or locks (nih-plug's `assert_process_allocs`
+aborts debug builds if it does). The editor is a deliberately thin egui
+placeholder (load a video, the macros, a canvas) until the real UI is
+embedded.
+
+```sh
+cargo xtask bundle chromagrain-plugin --release   # -> target/bundled/chromagrain.{vst3,clap}
+clap-validator validate target/bundled/chromagrain.clap
+```
+
+Bundles are not installed anywhere; copy them to
+`~/Library/Audio/Plug-Ins/{VST3,CLAP}/` yourself to try them in a host.
+Media decoding goes through `core::media::MediaBackend`: ffmpeg
+subprocesses on the desktop (compiled out on iOS, where an AUv3 host
+installs an AVFoundation backend with `media::set_backend`).
+
 ## Scripting
 
 ```rhai
@@ -527,8 +552,9 @@ crates/core        chromagrain-core (headless, fully tested)
   instrument.rs    Instrument: the plugin-shaped facade (decoded media in,
                    note on/off, GRAIN/PITCH/SMEAR/LOOK macros, host
                    transport, process() + FrameState snapshots)
-  media.rs         wav/png IO, ffmpeg decode/encode, yt-dlp fetch,
-                   segmentation sidecars (Apple Vision / SAM 3)
+  media.rs         wav/png IO; MediaBackend (desktop: ffmpeg decode/encode,
+                   yt-dlp fetch, segmentation sidecars (Apple Vision /
+                   SAM 3); compiled out on iOS, where the host installs one)
   sc.rs            SuperCollider instruments via plyphon: catalog, parts,
                    seamless-loop + single-note offline renders
   sc_defs.rs       the 12 instrument SynthDefs, in Rust
@@ -549,6 +575,12 @@ crates/app         chromagrain (desktop app)
   midi.rs          midir input, note pads, CC mappings with learn
   ui_synth.rs      instrument editor (knobs + piano roll), debounced
                    background re-renders, note auditions
+crates/plugin      chromagrain-plugin (VST3 + CLAP via nih-plug)
+  lib.rs           Plugin impl: params -> Instrument, host transport, MIDI
+  engine.rs        audio side (lock-free hand-off) + loader thread
+  params.rs        macros, key/scale, sync, gain; persisted media paths
+  editor.rs        thin egui editor (placeholder for the real UI)
+xtask/             nih-plug bundler (cargo xtask bundle ...)
 tools/             segment_vision.swift (Vision) and segment.py (SAM 3)
 vendor/            plyphon-unit with block-interpolation fixes
 ```
@@ -561,4 +593,6 @@ grains, samples, and pixels — renders are reproducible and testable.
 chromagrain's own code is MIT. The built app links
 [plyphon](https://github.com/nannou-org/plyphon) (GPL-3.0-or-later, partly
 vendored in `vendor/plyphon-unit`) for the SuperCollider instruments, so
-distributed binaries fall under the GPL-3.0.
+distributed binaries fall under the GPL-3.0. The plugin crate
+(`crates/plugin`, which also uses nih-plug's VST3 bindings) is
+GPL-3.0-or-later.
