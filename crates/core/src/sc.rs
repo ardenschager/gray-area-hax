@@ -682,6 +682,36 @@ mod tests {
         }
     }
 
+    /// Listening phrases for sound design: every instrument's starter loop
+    /// at 120 bpm (repeated to at least 6 s), plus each drum on its own.
+    /// `SC_WAV_DIR=/some/dir cargo test --release -p chromagrain-core sc::tests::dump_phrases -- --ignored`
+    #[test]
+    #[ignore]
+    fn dump_phrases() {
+        let dir = std::env::var("SC_WAV_DIR").unwrap_or_else(|_| "/tmp/cg_phrases".into());
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut parts: Vec<(String, SynthPart)> = INSTRUMENTS.iter().map(|i| (i.id.to_string(), SynthPart::new(i.id, 0))).collect();
+        for (pitch, def, _, _) in KIT.iter().filter(|d| d.0 != 46) {
+            let mut p = SynthPart::new("kit", 0);
+            p.notes.retain(|n| n.pitch == *pitch || (*pitch == 42 && n.pitch == 46));
+            parts.push((def.to_string(), p));
+        }
+        for (name, part) in parts {
+            let a = render_part(&part, 120.0, 48000).unwrap();
+            let spec = hound::WavSpec { channels: 2, sample_rate: 48000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+            let mut w = hound::WavWriter::create(format!("{dir}/{name}.wav"), spec).unwrap();
+            let (l, r) = a.left_right();
+            let reps = (6.0 / a.duration()).ceil().max(1.0) as usize;
+            for _ in 0..reps {
+                for (x, y) in l.iter().zip(&r) {
+                    w.write_sample((x.clamp(-1.0, 1.0) * 32767.0) as i16).unwrap();
+                    w.write_sample((y.clamp(-1.0, 1.0) * 32767.0) as i16).unwrap();
+                }
+            }
+            w.finalize().unwrap();
+        }
+    }
+
     /// plyphon once read audio-rate MulAdd operands once per 64-sample
     /// block (vendor/plyphon-unit/PATCHES.md): the output was a staircase
     /// with jumps at every block boundary. Guard against that coming back.
