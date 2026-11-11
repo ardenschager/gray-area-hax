@@ -659,8 +659,9 @@ impl Instrument {
         }
     }
 
+    /// Stop every note (allocation- and free-free, so safe on the audio thread).
     pub fn all_notes_off(&mut self) {
-        for v in std::mem::take(&mut self.voices) {
+        while let Some(v) = self.voices.pop() {
             self.cut_future(v.serial);
         }
     }
