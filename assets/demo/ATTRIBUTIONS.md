@@ -12,28 +12,21 @@ Trimmed and graded from the local `vibecut/videos/` archival collection:
 | `sub_highway.mp4` | `calvin_0302.mp4` (Calvin Productions / Prelinger Archives, Public Domain) | `00:02:53.8` – `00:02:57.8` | Oncoming car headlights streaking across wet dark highway asphalt |
 | `kick_tunnel.mp4` | `arteries_of_new_york_city.mp4` (Encyclopaedia Britannica / Prelinger Archives, 1941, Public Domain) | `00:03:24.0` – `00:03:25.2` | NYC subway train tunnel POV rushing into shadow (plus subtle archival subway thud layered into kick) |
 | `rim_train.mp4` | `home_movie_098559_new_york_subway_platform_scenes.mp4` (Prelinger Home Movies, Public Domain) | `00:04:08.0` – `00:04:09.2` | Motion-blurred silver subway car windows streaking horizontally (plus archival subway foley room tail from `arteries_of_new_york_city.mp4`) |
-| `hat_glitter.mp4` | `calvin_0302.mp4` (Prelinger Archives, Public Domain) | `00:02:58.5` – `00:03:00.5` | Out-of-focus night traffic lights & headlights bokeh orbs on pure black (plus subway turnstile clack in slice 4 from `arteries_of_new_york_city.mp4`) |
-| `vocal_bench.mp4` | `home_movie_098559_new_york_subway_platform_scenes.mp4` (Prelinger Home Movies, Public Domain) | `00:11:54.0` – `00:12:12.0` | Solitary woman sitting on wooden bench at 7th Avenue subway station |
-| `vocal_street.mp4` | `ask_me_don_t_tell_me_b_roll.mp4` (Prelinger Archives, 1961, Public Domain) | `00:01:50.1` – `00:01:55.5` (ping-pong loop) | Close-up profile on San Francisco twilight street corner |
+| `hat_glitter.mp4` | `calvin_0302.mp4` (Prelinger Archives, Public Domain) | `00:02:58.5` – `00:03:00.5` | Out-of-focus night traffic lights & headlights bokeh orbs on pure black (paired with archival subway rail/pneumatic/turnstile foley from `arteries_of_new_york_city.mp4`) |
+| `vocal_bench.mp4` | `home_movie_098559_new_york_subway_platform_scenes.mp4` (Prelinger Home Movies, Public Domain) | `00:11:54.0` – `00:12:06.0` | Solitary woman sitting on wooden bench at 7th Avenue subway station |
+| `vocal_street.mp4` | `ask_me_don_t_tell_me_b_roll.mp4` (Prelinger Archives, 1961, Public Domain) | `00:01:50.1` – `00:01:53.3` (ping-pong loop) | Close-up profile on San Francisco night street corner (trimmed strictly before background daytime-lit car) |
 | `holdout_forest.mp4` | `tranquil_forest.mp4` (CC0 / Public Domain stock) | `00:00:02.0` – `00:00:16.0` | Sunlight filtering through tall pine forest (held-out ambient benchmark) |
 | `holdout_waterfall.mp4` | `forest_waterfall.mp4` (CC0 / Public Domain stock) | `00:00:01.0` – `00:00:13.0` | Misty waterfall cascading down mossy dark rock (held-out ambient benchmark) |
 | `holdout_ocean.mp4` | `ocean_waves.mp4` (CC0 / Public Domain stock) | `00:00:00.5` – `00:00:08.5` | Turquoise ocean surf breaking on pale sand (held-out ambient benchmark) |
 
 ## 2. Original Generated Audio Stems (`gm` CLI — Gemini / Lyria API)
 
-- **Female Soul/R&B Vocal Hook (`vocal_bench.mp4` audio)**:
-  - Model: `lyria-3.5` (`--wav`)
-  - Prompt: `"Solo female R&B soul vocal acapella in F minor, 67 bpm, intimate late-night vocal booth recording, NO drums, NO percussion, NO bass, almost completely solo dry-ish emotive voice with generous silence between phrases for sampling. Aching, breathy 2000s UK R&B singer singing slow melismatic hooks: 'Hold on... through the night... ooh, don't fade away... stay with me in the rain...'"`
-- **Male Falsetto R&B Ad-libs (`vocal_street.mp4` slots 1–2)**:
-  - Model: `lyria-3.5` (`--wav`)
-  - Prompt: `"Solo male falsetto soul R&B vocal ad-libs in F minor, 67 bpm, isolated vocal stem, NO drums, NO percussion, NO bass, sparse pauses between phrases. Emotional breathy falsetto 'ooh-woah', 'in the dark', 'can't let go', 'waiting for you', raw aching soul vocals."`
-- **Late-Night UK Spoken Voice Lines (`vocal_street.mp4` slots 3–4)**:
-  - Model: `gemini-3.8-flash-tts`, voice `en-gb-storyteller-1`
-    - Style: `"intimate, quiet, melancholic, late at night on an empty rainy London bus, slow with pauses"`
-    - Prompt: `"I thought I saw your face through the rain... waiting on the platform... don't let the city take you."`
-  - Model: `gemini-3.8-flash-tts`, voice `achernar`
-    - Style: `"breathy, vulnerable, soft late-night whisper, slow and unhurried"`
-    - Prompt: `"Stay here... until the streetlights go out... we're still awake."`
+- **Wordless Female Hum & Vowel Stems (`vocal_bench.mp4` audio, 0:00–0:12)**:
+  - Model: `lyria-3.5` (`--wav`) — strictly the wordless closed-lip humming (`2.2–6.2s`) and breathy `"ooh"` vowel melisma (`11.0–19.3s`) isolated before any lyrics begin, low-passed for warm analog chest tone.
+  - Generation prompt: `"Solo female R&B soul vocal acapella in F minor, 67 bpm, intimate late-night vocal booth recording, NO drums, NO percussion, NO bass, almost completely solo dry-ish emotive voice with generous silence between phrases for sampling..."`
+- **Wordless Male Falsetto & Chest Breath Stems (`vocal_street.mp4` audio, 0:00–0:10.6 + 1941 subway air)**:
+  - Model: `lyria-3.5` (`--wav`) — strictly wordless falsetto `"ooh"` (`2.3–6.3s`), chest `"oh"` (`27.2–31.2s`), and breathy exhale (`11.95–14.55s`), paired with 1941 archival NYC subway station pneumatic air (`arteries_of_new_york_city.mp4` `191.4–192.8s`); zero sung lyrics or TTS speech.
+  - Generation prompt: `"Solo male falsetto soul R&B vocal ad-libs in F minor, 67 bpm, isolated vocal stem, NO drums, NO percussion, NO bass, sparse pauses between phrases..."`
 - **Nocturnal Dusty Rhodes & Pad Chords (`night_chords.mp4` audio, 0:00.2–0:12.2 drumless intro)**:
   - Model: `lyria-3-clip-preview` (`--wav`)
   - Prompt: `"30 second dark melancholic UK garage pad and dusty Rhodes electric piano chords in F minor, 67 bpm, NO drums, NO percussion, NO vocals. Warm analog tape saturation, deep aching Fm9 to DbMaj7 to AbMaj7 to Cm7 chords, nocturnal rainy South London mood."`

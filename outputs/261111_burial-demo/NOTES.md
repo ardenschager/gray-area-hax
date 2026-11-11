@@ -1,29 +1,38 @@
 # Burial AV Demo & Holdout Benchmark — Iteration Notes (`261111_burial-demo`)
 
-- **Benchmark piece**: [examples/burial.rhai](../../../examples/burial.rhai) — *"Half Past Three"*, 71.6 s (160 beats @ 134 BPM, F minor)
+- **Benchmark piece**: [examples/burial.rhai](../../../examples/burial.rhai) — *"Night Platform"*, 72.2 s (160 beats @ 133 BPM, F minor)
 - **Held-out sketch**: [examples/holdout_ambient.rhai](../../../examples/holdout_ambient.rhai) — 32.0 s (32 beats @ 60 BPM, D dorian)
 - **System log**: [SYSTEM_LOG.md](./SYSTEM_LOG.md)
 - **Media attributions**: [assets/demo/ATTRIBUTIONS.md](../../../assets/demo/ATTRIBUTIONS.md)
 
 ---
 
-## v001 — Stock Engine Baseline
-- **Burial output**: `outputs/261111_burial-demo/v001/261111_chromagrain_burial-demo_v001.mp4` (71.6 s, 1720 frames, `-9.3 LUFS` integrated, `LRA 8.4 LU`, True Peak `+1.0 dBFS`)
-- **Holdout output**: `outputs/261111_burial-demo/holdout/v001/261111_chromagrain_holdout-ambient_v001.mp4` (32.0 s, 768 frames, `-8.6 LUFS` integrated, `LRA 13.4 LU`, True Peak `+0.6 dBFS`)
-- **Engine state**: Unmodified `overhaul` baseline prior to SYSTEM improvements (130 tests passing).
-- **Curated AV sample palette (`assets/demo/`, 7.48 MB total)**:
-  - `rain_window.mp4` (raindrops on dark glass w/ sodium bokeh + stereo rain & vinyl dust/pops)
-  - `night_chords.mp4` (nocturnal amber/cyan reflections + `gm` Lyria drumless Fm9/DbMaj7 Rhodes & pad chords, paulstretched 6×)
-  - `sub_highway.mp4` (headlights on wet night highway + F1 43.65 Hz sine sub & low-passed F2 stereo Reese)
-  - `kick_tunnel.mp4`, `rim_train.mp4`, `hat_glitter.mp4` (4-slice perc strip: closed hat, open hat, shaker/casing, woodblock/turnstile)
-  - `vocal_bench.mp4` (7th Ave solitary bench woman + `gm` Lyria solo female R&B acapella phrases, segmented via Apple Vision)
-  - `vocal_street.mp4` (SF street profile + `gm` Lyria falsetto ad-libs & `gm` Gemini TTS late-night UK whispers, segmented via Apple Vision)
-  - `holdout_forest.mp4`, `holdout_waterfall.mp4`, `holdout_ocean.mp4` (`gm` Lyria Nordic chamber cello/harp/choir + nature footage)
-- **Composer self-critique after watching & listening to v001**:
-  - *What works*: Intro atmosphere (`0:00–0:14`), Breakdown emotion (`0:36–0:49`, *"Watch the clock, it's half past three..."* over segmented bench silhouette & rain reflections), and Outro fade (`1:04–1:11`).
-  - *SYSTEM issues exposed by v001*:
-    1. **Hard rectangular visual patches (`video.rs`)**: Sub-frame grains (`0:14–0:35`, `0:50–1:03` in burial; `0:07–0:21` in holdout) draw sharp 90° rectangular boxes with zero edge feathering.
-    2. **Track bus compositing ignores additive blend (`render.rs:484`)**: `blend_layer(frame, &tl, 0.0, opacity)` hardcodes `additive = 0.0` across tracks, so dark background pixels of `sub_highway` and `kick_tunnel` paint opaque black/grey rectangles over the rainy window & pad layers underneath.
-    3. **Straight-quantized step sequencer (`seq.rs`)**: Zero swing/shuffle or per-step micro-timing offset makes the 2-step UKG drum groove stiff (`0:14–0:35`) rather than stumbled/shuffled.
-    4. **Fixed-hop snippet stretch comb-filtering (`render.rs:snippet_events`)**: Setting `speed = 0.92` with `pitch = 0.0` triggers fixed 150 ms / 75 ms OLA grains without phase alignment, causing audible 13 Hz chorus/comb warble on bare vocals (`0:04–0:07`, `0:38–0:44`).
-    5. **Hot grain-overlap summing, `+1.0 dBFS` true peak, & missing sidechain ducking (`grain.rs`, `audio.rs`, `render.rs`)**: Dense clouds lack overlap gain normalization, `soft_clip` allows `+0.6..+1.0 dBFS` AAC true peaks, and pads/sub cannot sidechain-duck under the kick.
+## v001 — Stock Engine Baseline (`commit f684c60`)
+- **Burial output**: `outputs/261111_burial-demo/v001/261111_chromagrain_burial-demo_v001.mp4` (`71.6 s`, `-9.3 LUFS`, `LRA 8.4 LU`, `+1.0 dBTP`)
+- **Holdout output**: `outputs/261111_burial-demo/holdout/v001/261111_chromagrain_holdout-ambient_v001.mp4` (`32.0 s`, `-8.6 LUFS`, `LRA 13.4 LU`, `+0.6 dBTP`)
+- **Multi-model critic consensus (`@critic`, `@critic-argon`, `@critic-opus`) + Arden (`#12`, `#14`)**:
+  1. **AI Cheese (`FAIL` on `v001`)**: Full Lyria R&B lyric hooks (*"half past three"*, *"in the dark"*, *"memory of your touch"*) and theatrical TTS lines (*"I thought I saw your face..."*) sounded unmistakably AI-generated and overly literal Burial pastiche.
+  2. **Squeaky & High-Pitched**: `+3/+5/+12 st` upward vocal shifts + narrow paulstretch Rhodes tine whistles (`1242–1869 Hz`) + 5-sine `hat_glitter` oscillators + `soft_clip` step discontinuity (`hi/lo = -11.1 dB`, worst 2s `-1.4 dB`).
+  3. **Strobing (`496` full-frame / `380` center-ROI 1-frame reversals)**: 13.3 Hz Porter-Duff alpha ripple on stretched snippets + 0 ms percussive visual flashes over blacked-out track layers.
+  4. **Groove, Mix & Visual Pacing**: Straight 16th step grid lacked UKG shuffle; sub & kick collided without sidechain ducking; Drop II duplicated Drop I's pattern; white 1950s car intruded in `vocal_street`.
+
+---
+
+## v002 — Engine Overhaul + Wordless Micro-Chop & Swung 2-Step Rewrite
+- **Burial output**: `outputs/261111_burial-demo/v002/261111_chromagrain_burial-demo_v002.mp4` (`72.2 s`, 1733 frames, `-14.2 LUFS`, `LRA 10.9 LU`, `-1.1 dBTP`)
+- **Holdout output**: `outputs/261111_burial-demo/holdout/v002/261111_chromagrain_holdout-ambient_v002.mp4` (`32.0 s`, 768 frames, `-13.6 LUFS`, `LRA 13.4 LU`, `-1.0 dBTP`)
+- **What changed (`v001 -> v002`)**:
+  - **SYSTEM (`crates/core`, 181 tests green)**: Continuous blended video for stretched snippets + WSOLA audio stretch; `VisualGrainStyle::{flicker, feather}` + fixed straight-alpha additive glow + `s.track_blend` + cutout `alpha_focus`; 5-tap pitch anti-aliasing + overlap/upward-pitch gain warmth + paulstretch bin smoothing + 8-comb/4-allpass HPF Freeverb + C1 `-1.0 dBFS` master ceiling; `swing`/`offset`/`humanize`, z-independent `track_duck`, streaming `TapeSettings`, `detect_slices` (`s.slices`), and Vision mask cache.
+  - **SOURCES & PIECE (`assets/demo/` 6.99 MB, `examples/burial.rhai`, `examples/holdout_ambient.rhai`)**:
+    - Removed **100% of sung lyric sentences and TTS speech**. Rebuilt `vocal_bench.mp4` and `vocal_street.mp4` strictly from wordless closed-lip hums, breaths, `"ooh/oh"` vowels, and 1941 archival NYC subway station pneumatic air; rebuilt `hat_glitter.mp4` from archival subway rail/turnstile foley + band-shaped noise (zero sine oscillators).
+    - **Whisper (`mlx-community/whisper-small-mlx`) legibility check on `burial v002`**: **0 segments transcribed** across the entire 72.2 s render (down from 14 lyric sentences in `v001`).
+    - Sequenced sparse `0.32–0.63 s` downward-pitched (`0, -2, -3, -5, -7, -12 st` varispeed, F minor) vocal micro-chops via `s.slices` + `s.step_slice`; added 60–62% UKG shuffle, laid-back backbeat rim offsets, sidechain ducking (`t_drums -> t_sub` & `t_pad`), pre-drop breaths of silence (`0:14`, `0:50`), and a distinct evolved `p_drop2` pattern with mirrored dual-tile reflections.
+- **Measurable improvements (`v001 -> v002`)**:
+  - `burial` 1-frame luma reversals (`>3`): **Full-frame `496 -> 0`**, **Center-ROI `380 -> 2`** (`max |dY|: 54.1 -> 27.7`).
+  - `holdout` 1-frame luma reversals (`>3`): **Full-frame `294 -> 0`**, **Center-ROI `206 -> 1`** (`max |dY|: 20.6 -> 8.6`).
+  - `burial` spectral warmth: `hi/lo` **`-11.1 dB -> -22.0 dB`** (worst 2s `-1.4 -> -13.5 dB`); loudness **`-9.3 -> -14.2 LUFS`**, `LRA` **`8.4 -> 10.9 LU`**, True Peak **`+1.0 -> -1.1 dBTP`**.
+- **Composer honest self-critique after watching & listening to `v002` (queued to verify with critics for `v003`)**:
+  1. **White 1950s car fender still visible at `0:41`**: Even trimmed to `110.1–113.3s`, the white car enters behind the man's shoulder at `111.5s` and Apple Vision's saliency mask keeps its fender/wheel at `0:41`. Must replace or crop `vocal_street` video cleanly in `v003`.
+  2. **Pre-drop visual dip to near-black (`0:14.0`, `0:50.2`) & sharp rectangular bokeh patch at `0:48.5`**: Dimming `t_pad` while `t_rain` has low gain causes a brief dark blink before each drop, and the dry `0:48.5` rim throw has a hard-edged white window box in the quiet breakdown.
+  3. **Static background framing across 72 s**: Because `rain_window` now stays cleanly visible underneath additive upper tracks, the single central orange streetlight orb sits at the exact same pixel `(x=0.38, y=0.52)` for all 72 s; evolving camera scale/drift or cutting to tunnel/night-water scenes in the Breakdown will deepen visual storytelling.
+  4. **Breakdown `1242 Hz` Rhodes fifth partial (`0:40–0:44`)**: Much warmer than `v001`, though `chord_wash` still holds a noticeable `1242 Hz` partial during the quiet breakdown.
