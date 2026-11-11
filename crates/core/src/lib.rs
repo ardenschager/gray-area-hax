@@ -21,12 +21,15 @@
 //! * [`timeline::Project`] — beat-based multitrack sequencing
 //! * [`script`] — rhai scripting over the whole engine
 //! * [`media`] — ffmpeg decode/encode + yt-dlp YouTube scraping
+//! * [`instrument::Instrument`] — the playable, plugin-shaped facade
+//!   (notes, 4 macros, host transport, audio blocks + frame snapshots)
 
 pub mod audio;
 pub mod auto;
 pub mod dsp;
 pub mod fx;
 pub mod grain;
+pub mod instrument;
 pub mod media;
 pub mod music;
 pub mod realtime;
