@@ -278,6 +278,13 @@ The window has three places, and every thing lives in exactly one of them:
    shift+scroll = rotate. The inspector's *picture* section has the same
    plus one-click 50% / 100% / fill / ±90° / center / reset. **F** (or
    double-click the preview) goes fullscreen; esc comes back.
+   **O** (or *⧉ output* in the top bar) opens the **performance output**:
+   a second window with only the picture — black, letterboxed, no
+   cursor. With a projector / second screen attached it goes fullscreen
+   there and the controls stay on the laptop; with one screen it goes
+   fullscreen on it (esc turns it into a window you can drag, F or
+   double-click toggles, O closes). Space, enter and the pad keys still
+   play while it has focus.
 8. **Put it in a key**: the inspector's *key* section picks a root + scale
    once and uses it two ways — *snap notes* re-pitches every grain/hit to
    the key; *tune the sound* runs a resonator bank on every note of the key
@@ -384,6 +391,7 @@ balance control. Mono files stay mono at no extra cost.
 chromagrain --script examples/sequencer.rhai   # build + render a composition from a script
 chromagrain --script examples/crunchy.rhai
 chromagrain --demo                             # open the app on the demo project
+chromagrain --demo --output --play             # installation: output window + autoplay
 chromagrain --render-demo out.mp4              # render the built-in demo project
 ```
 
@@ -484,6 +492,9 @@ crates/core        chromagrain-core (headless, fully tested)
   timeline.rs      Source / Clip (granular|snippet|pattern) / Track / Project
   render.rs        offline renderer: clip -> track -> master, z-ordered
   realtime.rs      streaming performance engine (loop region, live edits)
+  instrument.rs    Instrument: the plugin-shaped facade (decoded media in,
+                   note on/off, GRAIN/PITCH/SMEAR/LOOK macros, host
+                   transport, process() + FrameState snapshots)
   media.rs         wav/png IO, ffmpeg decode/encode, yt-dlp fetch,
                    segmentation sidecars (Apple Vision / SAM 3)
   sc.rs            SuperCollider instruments via plyphon: catalog, parts,
@@ -491,8 +502,11 @@ crates/core        chromagrain-core (headless, fully tested)
   script.rs        rhai bindings over all of the above
 crates/app         chromagrain (desktop app)
   main.rs          eframe GUI: preview, timeline, sequencer, inspector
-  gpu.rs           glow/OpenGL realtime pipeline: grain quads + effect
-                   shader passes + track compositing + live pad layer
+  gpu.rs           wgpu realtime pipeline (Metal/D3D12/Vulkan): grain
+                   quads + WGSL effect passes + track compositing + live
+                   pad layer; renders once per frame, any window presents
+  ui_output.rs     performance output window (second viewport)
+  displays.rs      which displays are attached (CoreGraphics on macOS)
   playback.rs      always-on engine: lock-free ring into cpal, transport
                    start/stop, live pad triggers any time
   midi.rs          midir input, note pads, CC mappings with learn
