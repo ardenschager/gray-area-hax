@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>chromagrain · design v001 — play, sequence, perform</title>
+<meta name="description" content="Interactive design prototype for chromagrain, an audiovisual granular video sampler where every audio grain is a visual grain.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div id="app" data-view="play">
+
+  <!-- ───────────── top bar: tiny, global ───────────── -->
+  <header class="topbar">
+    <div class="tb-left">
+      <div class="brand" aria-label="chromagrain">
+        <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></span>
+        <h1>chromagrain</h1>
+      </div>
+      <div class="transport">
+        <button id="btn-play" class="tbtn" aria-label="Play / stop (space)" title="Play / stop · space">
+          <svg class="i-play" viewBox="0 0 24 24"><path d="M8 5.5v13l11-6.5z"/></svg>
+          <svg class="i-stop" viewBox="0 0 24 24"><rect x="6.5" y="6.5" width="11" height="11" rx="1.5"/></svg>
+        </button>
+        <button id="btn-rec" class="tbtn rec" aria-label="Record take" title="Record what you play as a take"><span class="rec-dot"></span></button>
+        <div class="readout" id="readout-pos"><span class="bar">001</span><span class="sep">.</span><span class="beat">1</span><span class="sep">.</span><span class="six">1</span></div>
+      </div>
+    </div>
+
+    <nav class="views" role="tablist" aria-label="Views">
+      <span class="views-thumb" aria-hidden="true"></span>
+      <button role="tab" data-view="play" id="tab-play">Play<kbd>1</kbd></button>
+      <button role="tab" data-view="seq" id="tab-seq">Sequence<kbd>2</kbd></button>
+      <button role="tab" data-view="perform" id="tab-perform">Perform<kbd>3</kbd></button>
+    </nav>
+
+    <div class="tb-right">
+      <button id="chip-tempo" class="chip drag" title="Drag up/down to change tempo">
+        <span class="num" id="tempo-val">112</span><span class="unit">bpm</span>
+      </button>
+      <button id="chip-key" class="chip" title="Tap to change the global key">
+        <span class="num" id="key-root">A</span><span class="unit" id="key-scale">minor</span>
+      </button>
+      <span class="tb-div" aria-hidden="true"></span>
+      <button id="btn-deep" class="chip ghost" title="Deep drawer: effects, automation, links, script">
+        <svg viewBox="0 0 24 24" class="ico"><path d="M4 7h16M4 12h10M4 17h6"/></svg><span class="lbl">Deep</span>
+      </button>
+      <button id="btn-export" class="chip ghost" title="Export mp4 + wav">
+        <svg viewBox="0 0 24 24" class="ico"><path d="M12 4v11M7.5 9.5 12 4l4.5 5.5M5 15v4h14v-4"/></svg><span class="lbl">Export</span>
+      </button>
+    </div>
+  </header>
+
+  <main class="views-host">
+
+    <!-- ═════════════ PLAY ═════════════ -->
+    <section class="view view-play" id="view-play" aria-label="Play">
+      <div class="vgrid-cell">
+        <div class="vgrid" id="vgrid"></div>
+      </div>
+
+      <div class="side">
+        <div class="stage" id="play-stage">
+          <canvas id="cv-play"></canvas>
+          <div class="stage-ov"><div class="ov-tr"><span class="look-tag" id="play-look-tag">clean</span></div></div>
+        </div>
+
+        <div class="brush">
+          <div class="emitters" id="emitters" role="radiogroup" aria-label="Emitters"></div>
+          <div class="knobs">
+            <div class="knob" data-macro="grain"></div>
+            <div class="knob" data-macro="pitch"></div>
+            <div class="knob" data-macro="smear"></div>
+            <div class="knob" data-macro="look"></div>
+          </div>
+          <div class="brush-foot">
+            <button class="rec-big" id="btn-rec-big"><span class="rec-dot"></span><span class="rb-l">Rec</span><span class="rb-t mono" id="rec-time">0:00</span></button>
+            <button class="btn more" id="btn-more-emitter" title="Everything else about this emitter"><svg viewBox="0 0 24 24" class="ico"><circle cx="6" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="18" cy="12" r="1.6"/></svg></button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═════════════ SEQUENCE ═════════════ -->
+    <section class="view view-seq" id="view-seq" aria-label="Sequence">
+      <div class="grid-wrap" id="grid-wrap">
+        <div class="lanes" id="lanes"></div>
+      </div>
+
+      <aside class="song">
+        <div class="stage small" id="seq-stage"><canvas id="cv-seq"></canvas></div>
+        <div class="scenes" id="scenes" aria-label="Scenes"></div>
+        <div class="chain" id="chain" aria-label="Song"></div>
+      </aside>
+
+      <div class="hold-pop" id="hold-pop" role="dialog" aria-label="Step">
+        <div class="hp-chop" id="hp-chop"></div>
+        <div class="hp-params">
+          <div class="hp-p" data-p="pitch"><span class="hp-v mono" id="hp-pitch">0</span><span class="hp-l">pitch</span></div>
+          <div class="hp-p" data-p="gate"><span class="hp-v mono" id="hp-gate">1</span><span class="hp-l">length</span></div>
+          <div class="hp-p" data-p="chance"><span class="hp-v mono" id="hp-chance">100</span><span class="hp-l">chance</span></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═════════════ PERFORM ═════════════ -->
+    <section class="view view-perform" id="view-perform" aria-label="Perform">
+      <div class="out-cell">
+        <div class="stage perf" id="perf-stage">
+          <canvas id="cv-perf"></canvas>
+          <div class="d2-cover" id="d2-cover">
+            <div class="d2-inner">
+              <svg viewBox="0 0 48 32" class="d2-ico"><rect x="1" y="1" width="30" height="20" rx="2"/><rect x="17" y="11" width="30" height="20" rx="2"/></svg>
+              <div class="d2-t">Live on Display 2</div>
+              <div class="d2-s mono">1920×1080 · 60 fps · no chrome</div>
+            </div>
+          </div>
+          <div class="hud" id="hud">
+            <div class="hud-top"><span class="mono" id="hud-time">001.1</span><button class="hud-x" id="hud-exit">Exit <kbd>F</kbd></button></div>
+            <div class="hud-bot">
+              <div class="hud-info">
+                <span class="mono hud-big" id="hud-bpm">112</span><span class="hud-u">bpm</span>
+                <span class="hud-beats" id="hud-beats"><i></i><i></i><i></i><i></i></span>
+                <span class="hud-now" id="hud-now"></span>
+              </div>
+              <div class="hud-pads" id="hud-pads"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="pads-cell">
+        <div class="pads" id="pads"></div>
+      </div>
+
+      <div class="perf-bar">
+        <div class="pb-group">
+          <span class="cap">Launch</span>
+          <div class="seg" id="seg-quant">
+            <button data-q="0">Now</button><button data-q="4">Beat</button><button data-q="16" class="on">Bar</button>
+          </div>
+          <span class="beat-dots" id="beat-dots"><i></i><i></i><i></i><i></i></span>
+        </div>
+        <div class="pb-group">
+          <span class="cap">Output</span>
+          <div class="seg" id="seg-out">
+            <button data-out="here" class="on">This screen</button><button data-out="d2">Display 2</button>
+          </div>
+        </div>
+        <div class="pb-group right">
+          <button class="btn" id="btn-stopall"><svg viewBox="0 0 24 24" class="ico"><rect x="7" y="7" width="10" height="10" rx="1.5"/></svg>Stop all</button>
+          <button class="btn primary" id="btn-fs"><svg viewBox="0 0 24 24" class="ico"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>Fullscreen <kbd>F</kbd></button>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- ───────────── the one deep drawer ───────────── -->
+  <div class="scrim" id="scrim"></div>
+  <aside class="deep" id="deep" aria-label="Deep drawer">
+    <div class="deep-head">
+      <div><div class="deep-t">Deep</div><div class="deep-s">everything that isn't playing</div></div>
+      <button class="chip ghost" id="deep-close" aria-label="Close">Done</button>
+    </div>
+    <div class="deep-tabs seg" id="deep-tabs">
+      <button class="on" data-dt="links">Links</button><button data-dt="fx">Effects</button><button data-dt="auto">Automation</button><button data-dt="script">Script</button>
+    </div>
+    <div class="deep-body" id="deep-body"></div>
+  </aside>
+
+  <div class="toast" id="toast"></div>
+  <div class="media-bin" id="media-bin" aria-hidden="true"></div>
+</div>
+<script src="app.js"></script>
+</body>
+</html>
