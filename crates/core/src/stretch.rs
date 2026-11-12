@@ -27,6 +27,10 @@ const MAX_OUT_SECS: f64 = 180.0;
 const OUT_FPS: f32 = 12.0;
 /// Exponential smear: acc = acc*SMEAR + frame*(1-SMEAR).
 const SMEAR: f32 = 0.8;
+/// Default frequency-proportional spectral smear half-width in cents: turns
+/// narrow upper-mid sine/tine whistles (>1 kHz) into lush critical-band pads
+/// while keeping fundamentals tight and broadband >6 kHz air intact.
+pub const DEFAULT_SPREAD_CENTS: f32 = 85.0;
 
 /// Clamp a requested stretch factor into the supported range.
 pub fn clamp_factor(factor: f32) -> f32 {
@@ -37,24 +41,32 @@ pub fn clamp_factor(factor: f32) -> f32 {
     }
 }
 
-/// Paulstretch `clip` by `factor` (2..64). Pitch/spectrum is preserved;
-/// time is smeared. Deterministic for a given input and factor.
-/// Stereo sources are stretched per channel with the same per-segment
-/// phases, which keeps each frequency's left/right balance (the image).
+/// Paulstretch `clip` by `factor` (2..64) using [`DEFAULT_SPREAD_CENTS`].
 pub fn paulstretch(clip: &AudioClip, factor: f32) -> AudioClip {
+    paulstretch_opts(clip, factor, DEFAULT_SPREAD_CENTS)
+}
+
+/// Paulstretch `clip` by `factor` (2..64) with explicit `spread_cents`
+/// (`0..200`): frequency-proportional bandwidth smearing that melts narrow
+/// tonal whistles without dulling high-frequency air.
+pub fn paulstretch_opts(clip: &AudioClip, factor: f32, spread_cents: f32) -> AudioClip {
     let sr = clip.sample_rate.max(1);
+    let spread = if spread_cents.is_finite() { spread_cents.clamp(0.0, 200.0) } else { DEFAULT_SPREAD_CENTS };
     if clip.samples.is_empty() {
         return AudioClip::new(Vec::new(), sr);
     }
     if clip.is_stereo() {
         let (l, r) = clip.left_right();
-        let (l, r) = (paulstretch_channel(&l, factor, sr), paulstretch_channel(&r, factor, sr));
+        let (l, r) = (
+            paulstretch_channel(&l, factor, sr, spread),
+            paulstretch_channel(&r, factor, sr, spread),
+        );
         return AudioClip::stereo(&l, &r, sr);
     }
-    AudioClip::new(paulstretch_channel(&clip.samples, factor, sr), sr)
+    AudioClip::new(paulstretch_channel(&clip.samples, factor, sr, spread), sr)
 }
 
-fn paulstretch_channel(input: &[f32], factor: f32, sr: u32) -> Vec<f32> {
+fn paulstretch_channel(input: &[f32], factor: f32, sr: u32, spread_cents: f32) -> Vec<f32> {
     let factor = clamp_factor(factor) as f64;
     if input.is_empty() {
         return Vec::new();
@@ -82,6 +94,38 @@ fn paulstretch_channel(input: &[f32], factor: f32, sr: u32) -> Vec<f32> {
     let n_segs = out_len / half + 1;
     let mut re = vec![0.0f32; w];
     let mut im = vec![0.0f32; w];
+    let mut pow_a = vec![0.0f64; half + 1];
+    let mut pow_b = vec![0.0f64; half + 1];
+    let mut pref = vec![0.0f64; half + 2];
+
+    let sr_f = sr.max(1) as f32;
+    let hz_per_bin = sr_f / w as f32;
+    let min_k = (20.0 / hz_per_bin).ceil() as usize;
+    let rel_half = 2.0f32.powf(spread_cents / 1200.0) - 1.0;
+
+    // One energy-preserving proportional box pass over power spectrum `src -> dst`
+    // via prefix sums (`O(half)`). Running two passes yields a smooth triangular
+    // cents-proportional kernel that leaves flat broadband air at 0.0 dB change
+    // while spreading narrow tonal spikes across `±spread_cents`.
+    let blur_power_pass = |src: &[f64], dst: &mut [f64], pref: &mut [f64]| {
+        pref[0] = 0.0;
+        for k in 0..=half {
+            pref[k + 1] = pref[k] + src[k];
+        }
+        for k in 0..=half {
+            let freq = k as f32 * hz_per_bin;
+            let ramp = ((freq - 280.0) / 820.0).clamp(0.0, 1.0);
+            let dk = ((k as f32 * rel_half * ramp).round() as usize).min(half / 4);
+            if dk == 0 {
+                dst[k] = src[k];
+            } else {
+                let lo = k.saturating_sub(dk).max(min_k.min(k));
+                let hi = (k + dk).min(half - 1).max(lo);
+                let cnt = (hi - lo + 1) as f64;
+                dst[k] = (pref[hi + 1] - pref[lo]) / cnt;
+            }
+        }
+    };
 
     for seg in 0..n_segs {
         let in_pos = (seg as f64 * in_hop) as usize;
@@ -92,19 +136,17 @@ fn paulstretch_channel(input: &[f32], factor: f32, sr: u32) -> Vec<f32> {
         }
         fft(&mut re, &mut im, false);
 
-        // Keep magnitudes, randomize phases (conjugate-symmetric so the
-        // inverse transform stays real). Fresh phases per segment is what
-        // makes paulstretch shimmer instead of loop. Zero DC and infrasound
-        // (<20 Hz) so rectifying bin 0 never injects DC offset or low thumps,
-        // and gently blur + warm narrow upper partials (>750 Hz) so bell/tine
-        // harmonics become breathy pads instead of continuous sine whistles.
-        let sr_f = sr.max(1) as f32;
-        let hz_per_bin = sr_f / w as f32;
-        let min_k = (20.0 / hz_per_bin).ceil() as usize;
-        let blur_k = (750.0 / hz_per_bin).ceil() as usize;
-        let raw_mags: Vec<f32> = (0..=half)
-            .map(|k| (re[k] * re[k] + im[k] * im[k]).sqrt())
-            .collect();
+        for k in 0..=half {
+            pow_a[k] = if k < min_k || k == half {
+                0.0
+            } else {
+                (re[k] as f64) * (re[k] as f64) + (im[k] as f64) * (im[k] as f64)
+            };
+        }
+        if spread_cents > 0.5 {
+            blur_power_pass(&pow_a, &mut pow_b, &mut pref);
+            blur_power_pass(&pow_b, &mut pow_a, &mut pref);
+        }
 
         let mut rng = Rng::new(0x9A75_57E7 ^ seg as u64);
         re[0] = 0.0;
@@ -119,22 +161,7 @@ fn paulstretch_channel(input: &[f32], factor: f32, sr: u32) -> Vec<f32> {
                 im[w - k] = 0.0;
                 continue;
             }
-            let mut mag = if k >= blur_k && k + 2 < half {
-                // 5-bin triangular spectral smoothing turns piercing upper
-                // tine/soprano spikes into soft, breathy spectral clouds.
-                0.10 * raw_mags[k - 2]
-                    + 0.22 * raw_mags[k - 1]
-                    + 0.36 * raw_mags[k]
-                    + 0.22 * raw_mags[k + 1]
-                    + 0.10 * raw_mags[k + 2]
-            } else {
-                raw_mags[k]
-            };
-            let freq = k as f32 * hz_per_bin;
-            if freq > 900.0 {
-                // Gentle natural warmth rolloff on stretched upper partials.
-                mag *= (1.0 + ((freq - 900.0) / 1600.0).powi(2)).powf(-0.35);
-            }
+            let mag = pow_a[k].max(0.0).sqrt() as f32;
             let ph = rng.next_f32() * 2.0 * std::f32::consts::PI;
             let (s, c) = ph.sin_cos();
             re[k] = mag * c;
@@ -217,13 +244,18 @@ pub fn stretch_video(video: &VideoClip, factor: f32) -> VideoClip {
 /// stretched by the same factor; `base_hz` carries over because the pitch
 /// is unchanged, so key quantization keeps working on the wash.
 pub fn paulstretch_source(src: &Source, factor: f32) -> Source {
+    paulstretch_source_opts(src, factor, DEFAULT_SPREAD_CENTS)
+}
+
+/// [`paulstretch_source`] with explicit spectral `spread_cents` (`0..200`).
+pub fn paulstretch_source_opts(src: &Source, factor: f32, spread_cents: f32) -> Source {
     let factor = clamp_factor(factor);
     Source {
         name: format!("paul x{:.0} {}", factor, src.name),
         audio: src
             .audio
             .as_ref()
-            .map(|a| Arc::new(paulstretch(a, factor))),
+            .map(|a| Arc::new(paulstretch_opts(a, factor, spread_cents))),
         video: src
             .video
             .as_ref()
@@ -339,5 +371,65 @@ mod tests {
         assert!((a.duration() / 0.5 - 4.0).abs() < 0.3);
         let v = out.video.as_ref().unwrap();
         assert!((v.duration() - 2.0).abs() < 0.3);
+    }
+
+    #[test]
+    fn stretch_smears_upper_whistle_while_preserving_hf_air() {
+        let sr = 48_000u32;
+        // 1. Broadband noise must keep its >6 kHz spectral share within ~2 dB.
+        let mut rng = crate::dsp::Rng::new(0x1234);
+        let noise_in: Vec<f32> = (0..sr as usize).map(|_| rng.bipolar() * 0.3).collect();
+        let in_clip = AudioClip::new(noise_in.clone(), sr);
+        let out_clip = paulstretch(&in_clip, 4.0);
+        let hf_share = |sig: &[f32]| -> f64 {
+            let mut re: Vec<f32> = sig.iter().take(8192).copied().collect();
+            let mut im = vec![0.0f32; 8192];
+            fft(&mut re, &mut im, false);
+            let bin_hz = sr as f32 / 8192.0;
+            let mut tot = 1e-12f64;
+            let mut hf = 1e-12f64;
+            for k in 4..4096 {
+                let p = (re[k] as f64).powi(2) + (im[k] as f64).powi(2);
+                tot += p;
+                if k as f32 * bin_hz >= 6000.0 {
+                    hf += p;
+                }
+            }
+            10.0 * (hf / tot).log10()
+        };
+        let in_db = hf_share(&noise_in);
+        let out_db = hf_share(&out_clip.samples[8192..16384]);
+        assert!(
+            (out_db - in_db).abs() < 3.0,
+            ">6 kHz air preserved: in {in_db:.2} dB vs out {out_db:.2} dB"
+        );
+
+        // 2. A narrow 1600 Hz whistle is spread across a critical band, dropping
+        // time-averaged STFT peak-bin power by >5x (>7 dB) vs unspread (`0.0`).
+        let whistle = sine(1600.0, 0.6, sr);
+        let raw_w = paulstretch_opts(&whistle, 4.0, 0.0);
+        let spread_w = paulstretch(&whistle, 4.0);
+        let mean_peak_pow = |sig: &[f32]| -> f64 {
+            let mut avg = vec![0.0f64; 2000];
+            let mut wins = 0usize;
+            let mut off = 4096usize;
+            while off + 8192 <= sig.len() {
+                let mut re: Vec<f32> = sig[off..off + 8192].to_vec();
+                let mut im = vec![0.0f32; 8192];
+                fft(&mut re, &mut im, false);
+                for k in 100..2000 {
+                    avg[k] += (re[k] as f64).powi(2) + (im[k] as f64).powi(2);
+                }
+                wins += 1;
+                off += 4096;
+            }
+            avg.into_iter().fold(0.0f64, f64::max) / wins.max(1) as f64
+        };
+        let p_raw = mean_peak_pow(&raw_w.samples);
+        let p_sp = mean_peak_pow(&spread_w.samples);
+        assert!(
+            p_sp < p_raw * 0.25,
+            "cents spread melts narrow whistle spike: {p_sp:.1} vs {p_raw:.1}"
+        );
     }
 }

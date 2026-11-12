@@ -477,6 +477,7 @@ mod tests {
             amount: 0.6,
             attack: 0.008,
             release: 0.16,
+            key_hz: 165.0,
         });
         p.tracks[t1].tape = crate::audio::TapeSettings {
             wow: 0.3,

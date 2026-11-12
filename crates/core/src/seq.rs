@@ -235,17 +235,22 @@ pub fn pattern_events(
                         .clamp(0.0, (clip_len_secs - 1e-6).max(0.0));
                     let g = eff_at(t);
 
+                    let at = if step.slice >= 0.0 { step.slice.min(1.0) } else { g.position };
+                    let mut pos = at as f64 * source_len + g.spray as f64 * spray_j as f64;
+                    pos = pos.rem_euclid(source_len.max(1e-6));
+                    let step_base_hz = if key.is_some() && (step.slice >= 0.0 || g.position > 0.02) {
+                        source.base_hz_at(pos)
+                    } else {
+                        base_hz
+                    };
                     let st = g.pitch + step.pitch + g.pitch_jitter * pitch_j;
                     let ratio = crate::music::effective_ratio(
                         st,
                         key,
-                        base_hz,
+                        step_base_hz,
                         g.quantize_amount,
                         g.detune_cents,
                     );
-                    let at = if step.slice >= 0.0 { step.slice.min(1.0) } else { g.position };
-                    let mut pos = at as f64 * source_len + g.spray as f64 * spray_j as f64;
-                    pos = pos.rem_euclid(source_len.max(1e-6));
 
                     events.push(GrainEvent {
                         onset: clip_start_secs + t,

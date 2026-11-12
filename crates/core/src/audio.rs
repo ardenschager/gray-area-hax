@@ -433,8 +433,11 @@ pub struct TapeState {
     lp: [f32; 2],
     rng: crate::dsp::Rng,
     pop_env: [f32; 2],
-    pop_freq: [f32; 2],
-    pop_ph: [f32; 2],
+    pop_sign: [f32; 2],
+    pop_lp: [f32; 2],
+    pop_hp: [f32; 2],
+    thump_env: [f32; 2],
+    thump_lp: [f32; 2],
     hiss_lp: [f32; 2],
 }
 
@@ -447,8 +450,11 @@ impl TapeState {
             lp: [0.0; 2],
             rng: crate::dsp::Rng::new(seed ^ 0x7A9E_D057),
             pop_env: [0.0; 2],
-            pop_freq: [2400.0; 2],
-            pop_ph: [0.0; 2],
+            pop_sign: [1.0; 2],
+            pop_lp: [0.0; 2],
+            pop_hp: [0.0; 2],
+            thump_env: [0.0; 2],
+            thump_lp: [0.0; 2],
             hiss_lp: [0.0; 2],
         }
     }
@@ -469,14 +475,19 @@ impl TapeState {
         let age = cfg.age.clamp(0.0, 1.0);
         let dust = cfg.dust.clamp(0.0, 1.0);
 
-        let drive = 1.0 + warmth * 1.5;
-        let bias = 0.085 * warmth;
+        let drive = 1.0 + warmth * 1.4;
+        let bias = 0.075 * warmth;
         let bias_t = bias.tanh();
-        let norm_g = 1.0 / drive.tanh().max(0.82);
+        let norm_g = 1.0 / drive.tanh().max(0.84);
 
-        let cutoff = 18000.0 * (2600.0f32 / 18000.0).powf(age);
+        // Gentler tape head curve (20 kHz -> 4.2 kHz at age=1) so gentle age
+        // settings (0.1..0.3) keep 5-12 kHz air alive.
+        let cutoff = 20000.0 * (4200.0f32 / 20000.0).powf(age);
         let lp_a = 1.0 - (-2.0 * std::f32::consts::PI * cutoff / sr).exp();
-        let hiss_a = 1.0 - (-2.0 * std::f32::consts::PI * 2800.0 / sr).exp();
+        let hiss_a = 1.0 - (-2.0 * std::f32::consts::PI * 2400.0 / sr).exp();
+        let pop_lp_a = 1.0 - (-2.0 * std::f32::consts::PI * 7600.0 / sr).exp();
+        let pop_hp_a = 1.0 - (-2.0 * std::f32::consts::PI * 1650.0 / sr).exp();
+        let thump_lp_a = 1.0 - (-2.0 * std::f32::consts::PI * 340.0 / sr).exp();
 
         let n = left.len().min(right.len());
         for i in 0..n {
@@ -487,22 +498,25 @@ impl TapeState {
             self.ring[0][p] = left[i];
             self.ring[1][p] = right[i];
 
-            // Vinyl dust / pop generator (deterministic, sparse, resonant)
+            // Authentic broadband vinyl crackle & needle dust (placed AFTER
+            // tape `age` LP so vinyl surface dust retains crisp 2-8 kHz snap).
             if dust > 1e-4 {
-                let p_tick = (42.0 * dust) / sr;
+                let p_tick = (58.0 * dust) / sr;
                 if self.rng.next_f32() < p_tick {
                     let ch = (self.rng.next_u64() & 1) as usize;
-                    let heavy = self.rng.next_f32() < 0.14;
-                    self.pop_env[ch] = if heavy {
-                        (0.04 + 0.07 * self.rng.next_f32()) * dust
+                    let bleed = 0.35 + 0.35 * self.rng.next_f32();
+                    let sign = if (self.rng.next_u64() & 2) != 0 { 1.0 } else { -1.0 };
+                    if self.rng.next_f32() < 0.12 {
+                        let th = (0.06 + 0.09 * self.rng.next_f32()) * dust;
+                        self.thump_env[ch] += th;
+                        self.thump_env[1 - ch] += th * 0.7;
                     } else {
-                        (0.012 + 0.028 * self.rng.next_f32()) * dust
-                    };
-                    self.pop_freq[ch] = if heavy {
-                        280.0 + 420.0 * self.rng.next_f32()
-                    } else {
-                        1600.0 + 3200.0 * self.rng.next_f32()
-                    };
+                        let amp = (0.045 + 0.11 * self.rng.next_f32().powi(2)) * dust;
+                        self.pop_env[ch] = amp;
+                        self.pop_sign[ch] = sign;
+                        self.pop_env[1 - ch] = self.pop_env[1 - ch].max(amp * bleed);
+                        self.pop_sign[1 - ch] = sign;
+                    }
                 }
             }
 
@@ -538,12 +552,21 @@ impl TapeState {
                 if dust > 1e-4 {
                     let white = self.rng.bipolar();
                     self.hiss_lp[c] += hiss_a * (white - self.hiss_lp[c]);
-                    let surface = (white - self.hiss_lp[c]) * 0.0045 * dust;
-                    let pop = self.pop_env[c] * (2.0 * std::f32::consts::PI * self.pop_freq[c] * self.pop_ph[c]).sin();
-                    self.pop_ph[c] = (self.pop_ph[c] + 1.0 / sr).fract();
-                    let decay = if self.pop_freq[c] < 900.0 { 260.0 } else { 950.0 };
-                    self.pop_env[c] *= (-decay / sr).exp();
-                    x += surface + pop;
+                    let surface = (white - self.hiss_lp[c]) * 0.0065 * dust;
+
+                    // Broadband needle tick shaped through 1.65-7.6 kHz bandpass (zero sine whistle!)
+                    let raw_tick = self.pop_env[c] * (self.pop_sign[c] * 0.7 + white * 0.5);
+                    self.pop_lp[c] += pop_lp_a * (raw_tick - self.pop_lp[c]);
+                    self.pop_hp[c] += pop_hp_a * (self.pop_lp[c] - self.pop_hp[c]);
+                    let crackle = (self.pop_lp[c] - self.pop_hp[c]) * 1.6;
+                    self.pop_env[c] *= (-2400.0 / sr).exp();
+
+                    // Warm low-end vinyl dust thump (<340 Hz)
+                    let raw_thump = self.thump_env[c] * (0.6 + 0.4 * white);
+                    self.thump_lp[c] += thump_lp_a * (raw_thump - self.thump_lp[c]);
+                    self.thump_env[c] *= (-280.0 / sr).exp();
+
+                    x += surface + crackle + self.thump_lp[c];
                 }
 
                 *val = x;

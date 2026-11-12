@@ -15,8 +15,8 @@ use crate::grain::{schedule_grains_auto, GrainEvent};
 use crate::seq::pattern_events;
 use crate::timeline::{Clip, ClipKind, DuckState, Project, Source};
 use crate::video::{
-    blend_layer, blend_layer_over, composite_grains_frame, composite_grains_frame_opts, Frame,
-    VisualGrainStyle,
+    apply_video_tape, blend_layer, blend_layer_over, composite_grains_frame,
+    composite_grains_frame_opts, Frame, VisualGrainStyle,
 };
 
 pub struct RenderOutput {
@@ -96,7 +96,12 @@ fn snippet_events(
 ) -> Vec<GrainEvent> {
     let g = &clip.grains;
     let source_len = source.duration();
-    let base_hz = source.effective_base_hz();
+    let start_pos = (g.position as f64 * source_len).min(source_len);
+    let base_hz = if clip.key.is_some() && g.position > 0.02 {
+        source.base_hz_at(start_pos)
+    } else {
+        source.effective_base_hz()
+    };
     let quantized = |st: f32, g: &crate::grain::GrainSettings| -> f32 {
         crate::music::effective_ratio(
             st,
@@ -113,19 +118,64 @@ fn snippet_events(
         return textured_events(clip, source_len, clip_t0, clip_len, secs_per_beat, &quantized);
     }
     if clip.automation.is_empty() && (eff_speed0 - base_ratio).abs() < 1e-3 {
-        // Record-player coupling: a single unbroken grain.
-        return vec![GrainEvent {
-            onset: clip_t0,
-            source_pos: (g.position as f64 * source_len).min(source_len),
-            duration: clip_len as f32,
-            pitch_ratio: base_ratio,
-            gain: g.gain,
-            pan: g.pan.clamp(-1.0, 1.0),
-            envelope: g.envelope,
-            env_skew: g.env_skew,
-            reverse: g.reverse_prob >= 0.5,
-            id: g.seed,
-        }];
+        let rev = g.reverse_prob >= 0.5;
+        let audio_len = source.audio.as_ref().map(|a| a.duration()).unwrap_or(source_len);
+        let first_avail = if rev {
+            audio_len
+        } else {
+            (audio_len - start_pos).max(0.05)
+        };
+        let first_out_dur = first_avail / base_ratio.max(0.05) as f64;
+        // If the snippet fits inside the source media, emit a single pristine grain.
+        if clip_len <= first_out_dur + 1e-4 || audio_len < 0.25 {
+            return vec![GrainEvent {
+                onset: clip_t0,
+                source_pos: start_pos,
+                duration: clip_len as f32,
+                pitch_ratio: base_ratio,
+                gain: g.gain,
+                pan: g.pan.clamp(-1.0, 1.0),
+                envelope: g.envelope,
+                env_skew: g.env_skew,
+                reverse: rev,
+                id: g.seed,
+            }];
+        }
+        // Otherwise seamlessly crossfade-loop across `audio_len` using raised-cosine
+        // Tukey overlaps (`cos^2` / complementary half-cosines sum to exact 1.0),
+        // while `snippet_video_events` renders video as ONE unbroken pass!
+        let full_cycle_dur = (audio_len / base_ratio.max(0.05) as f64).max(0.1);
+        let xfade = 0.16_f64.min(full_cycle_dur * 0.25).min(first_out_dur * 0.4);
+        let mut events = Vec::new();
+        let mut t = 0.0f64;
+        let mut pass_idx = 0u64;
+        while t < clip_len {
+            let src_p = if pass_idx == 0 { start_pos } else { 0.0 };
+            let max_dur = if pass_idx == 0 { first_out_dur } else { full_cycle_dur };
+            let dur = max_dur.min(clip_len - t);
+            if dur <= 0.005 {
+                break;
+            }
+            let env_frac = ((2.0 * xfade) / dur).clamp(g.envelope as f64, 0.95) as f32;
+            events.push(GrainEvent {
+                onset: clip_t0 + t,
+                source_pos: src_p,
+                duration: dur as f32,
+                pitch_ratio: base_ratio,
+                gain: g.gain,
+                pan: g.pan.clamp(-1.0, 1.0),
+                envelope: env_frac,
+                env_skew: 0.0,
+                reverse: rev,
+                id: g.seed.wrapping_add(pass_idx),
+            });
+            if t + dur >= clip_len - 1e-5 {
+                break;
+            }
+            t += (dur - xfade).max(0.02);
+            pass_idx += 1;
+        }
+        return events;
     }
 
     // WSOLA-aligned granular time-stretch train: 200 ms Hann grains at 50%
@@ -197,20 +247,33 @@ fn snippet_video_events(
         return None;
     }
     let source_len = source.duration();
+    let start_pos = (g.position as f64 * source_len).min(source_len);
+    let bh = if clip.key.is_some() && g.position > 0.02 {
+        source.base_hz_at(start_pos)
+    } else {
+        source.effective_base_hz()
+    };
     let base_ratio = crate::music::effective_ratio(
         g.pitch,
         clip.key.as_ref(),
-        source.effective_base_hz(),
+        bh,
         g.quantize_amount,
         g.detune_cents,
     );
     let eff_speed = if g.varispeed { base_ratio } else { g.speed };
-    if clip.automation.is_empty() && (eff_speed - base_ratio).abs() < 1e-3 {
+    let audio_len = source.audio.as_ref().map(|a| a.duration()).unwrap_or(source_len);
+    let first_avail = if g.reverse_prob >= 0.5 {
+        audio_len
+    } else {
+        (audio_len - start_pos).max(0.05)
+    };
+    let wraps_audio = clip_len > first_avail / base_ratio.max(0.05) as f64 + 1e-4 && audio_len >= 0.25;
+    if clip.automation.is_empty() && (eff_speed - base_ratio).abs() < 1e-3 && !wraps_audio {
         return None; // `parts` is already a single unbroken grain
     }
     Some(vec![GrainEvent {
         onset: clip_t0,
-        source_pos: (g.position as f64 * source_len).min(source_len),
+        source_pos: start_pos,
         duration: clip_len as f32,
         pitch_ratio: eff_speed.max(0.05),
         gain: g.gain,
@@ -562,30 +625,30 @@ pub fn render_project(project: &Project, from_beat: f64, to_beat: f64) -> Render
         track_buses[ti] = Some(track_bus);
     }
 
-    // ---- Pass 2 (audio sum + z-independent sidechain ducking) ----
-    let mut track_duck_frames: Vec<Vec<f32>> = vec![Vec::new(); n_tracks];
+    // ---- Pass 2 (audio sum + z-independent sidechain & visual ducking) ----
+    let mut track_duck_shaped: Vec<Vec<f32>> = vec![Vec::new(); n_tracks];
     for (ti, track) in project.tracks.iter().enumerate() {
         let Some(bus) = &track_buses[ti] else { continue };
         let n_samp = master_audio.len().min(bus.len());
         if let Some(spec) = &track.duck {
             if spec.source_track < n_tracks && spec.source_track != ti {
                 let mut dstate = DuckState::default();
-                let mut frame_gains = vec![1.0f32; n_frames];
+                let mut frame_shaped = vec![0.0f32; n_frames];
                 let sr = project.sample_rate;
                 let sc_opt = track_buses[spec.source_track].as_ref();
                 for i in 0..n_samp {
                     let (sl, sr_c) = sc_opt
                         .map(|sc| (sc.left[i], sc.right[i]))
                         .unwrap_or((0.0, 0.0));
-                    let g = dstate.step(sl, sr_c, spec, sr);
-                    master_audio.left[i] += bus.left[i] * g;
-                    master_audio.right[i] += bus.right[i] * g;
+                    let (audio_g, shaped) = dstate.step_av(sl, sr_c, spec, sr);
+                    master_audio.left[i] += bus.left[i] * audio_g;
+                    master_audio.right[i] += bus.right[i] * audio_g;
                     let fi = ((i as f64 / sr as f64) * project.fps as f64) as usize;
                     if fi < n_frames {
-                        frame_gains[fi] = g;
+                        frame_shaped[fi] = frame_shaped[fi].max(shaped);
                     }
                 }
-                track_duck_frames[ti] = frame_gains;
+                track_duck_shaped[ti] = frame_shaped;
                 continue;
             }
         }
@@ -706,10 +769,18 @@ pub fn render_project(project: &Project, from_beat: f64, to_beat: f64) -> Render
             let mut tl = track_layer
                 .unwrap_or_else(|| Frame::transparent(project.width, project.height));
             fx::apply_video_chain(&mut tl, &track.effects, &mut track_vstates);
+            if track.tape.is_active() {
+                apply_video_tape(&mut tl, &track.tape, fi, project.fps, 0x5452_4B00 ^ ti as u64);
+            }
             let mut opacity =
                 track.opacity_at((t0 + fi as f64 / project.fps as f64) * project.bpm / 60.0);
-            if let Some(&dg) = track_duck_frames[ti].get(fi) {
-                opacity *= 1.0 - (1.0 - dg) * track.duck_to_opacity.clamp(0.0, 1.0);
+            if let (Some(&shaped), Some(spec)) = (track_duck_shaped[ti].get(fi), &track.duck) {
+                let v_amt = if spec.amount <= 1e-4 {
+                    track.duck_to_opacity.clamp(0.0, 1.0)
+                } else {
+                    spec.amount.clamp(0.0, 1.0) * track.duck_to_opacity.clamp(0.0, 1.0)
+                };
+                opacity *= (1.0 - v_amt * shaped).clamp(0.0, 1.0);
             }
             let track_add = track
                 .additive
@@ -730,8 +801,11 @@ pub fn render_project(project: &Project, from_beat: f64, to_beat: f64) -> Render
         );
     }
     let mut master_states = fx::video_chain_states(&project.master_effects, project.fps);
-    for frame in &mut frames {
+    for (fi, frame) in frames.iter_mut().enumerate() {
         fx::apply_video_chain(frame, &project.master_effects, &mut master_states);
+        if project.master_tape.is_active() {
+            apply_video_tape(frame, &project.master_tape, fi, project.fps, 0x4D41_5354);
+        }
     }
 
     master_audio.soft_clip();
@@ -1506,6 +1580,7 @@ mod tests {
             amount: 0.85,
             attack: 0.005,
             release: 0.15,
+            key_hz: 165.0,
         });
         p.tracks[t_pad].duck_to_opacity = 0.8;
         let ducked = render_project(&p, 0.0, 4.0);
@@ -1519,5 +1594,75 @@ mod tests {
 
         // Video luma also dips during the kick at t ~ 0.6s (frame 14).
         assert!(ducked.frames[14].mean_luma() < unducked.frames[14].mean_luma() * 0.75);
+    }
+
+    #[test]
+    fn long_snippet_crossfade_loops_without_seam_blackouts() {
+        let mut p = Project { bpm: 120.0, width: 32, height: 24, fps: 24.0, ..Default::default() };
+        let sid = p.add_source(crate::timeline::Source {
+            name: "short".into(),
+            audio: Some(std::sync::Arc::new(crate::audio::AudioClip::sine(220.0, 1.0, p.sample_rate))),
+            video: Some(std::sync::Arc::new(solid_video(200, 180, 140))),
+            base_hz: 220.0,
+        });
+        let t = p.add_track("bed");
+        let mut c = Clip::new_snippet(sid, 0.0, 8.0);
+        c.grains.envelope = 0.04;
+        p.tracks[t].clips.push(c);
+
+        let out = render_project(&p, 0.0, 8.0);
+        let sr = p.sample_rate as usize;
+        let late_rms = (out.audio.left[sr * 22 / 10..sr * 28 / 10]
+            .iter()
+            .map(|s| s * s)
+            .sum::<f32>()
+            / (sr * 6 / 10) as f32)
+            .sqrt();
+        assert!(late_rms > 0.15, "snippet looped seamlessly, late rms {late_rms}");
+        for w in out.frames[8..out.frames.len() - 8].windows(2) {
+            let dl = (w[1].mean_luma() - w[0].mean_luma()).abs();
+            assert!(dl < 0.5, "seam blink of {dl} luma");
+        }
+    }
+
+    #[test]
+    fn low_band_sidechain_ignores_hihat_chatter() {
+        let mut p = Project { bpm: 120.0, width: 16, height: 16, fps: 12.0, ..Default::default() };
+        let sub_src = p.add_source(crate::timeline::Source {
+            name: "sub".into(),
+            audio: Some(std::sync::Arc::new(crate::audio::AudioClip::sine(55.0, 2.0, p.sample_rate))),
+            video: None,
+            base_hz: 55.0,
+        });
+        let hat_src = p.add_source(crate::timeline::Source {
+            name: "hat".into(),
+            audio: Some(std::sync::Arc::new(crate::audio::AudioClip::sine(6000.0, 2.0, p.sample_rate))),
+            video: None,
+            base_hz: 6000.0,
+        });
+        let t_sub = p.add_track("sub");
+        let mut cs = Clip::new_snippet(sub_src, 0.0, 2.0);
+        cs.grains.pan = -1.0;
+        p.tracks[t_sub].clips.push(cs);
+
+        let t_hat = p.add_track("hat");
+        let mut ch = Clip::new_snippet(hat_src, 0.0, 2.0);
+        ch.grains.pan = 1.0;
+        ch.grains.gain = 1.0;
+        p.tracks[t_hat].clips.push(ch);
+
+        let base = render_project(&p, 0.0, 2.0);
+        p.tracks[t_sub].duck = Some(crate::timeline::DuckSpec {
+            source_track: t_hat,
+            amount: 0.9,
+            attack: 0.005,
+            release: 0.15,
+            key_hz: 165.0,
+        });
+        let with_hat = render_project(&p, 0.0, 2.0);
+        let rms = |v: &[f32]| (v.iter().map(|s| s * s).sum::<f32>() / v.len() as f32).sqrt();
+        let r0 = rms(&base.audio.left[4000..40000]);
+        let r1 = rms(&with_hat.audio.left[4000..40000]);
+        assert!(r1 > r0 * 0.92, "6 kHz hi-hat must not duck 165 Hz-keyed sub: {r1} vs {r0}");
     }
 }

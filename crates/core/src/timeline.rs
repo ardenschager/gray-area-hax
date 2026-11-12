@@ -38,6 +38,27 @@ impl Source {
         }
     }
 
+    /// Detect the local fundamental pitch (Hz) around `pos_secs` in the audio
+    /// clip (falling back to [`Self::effective_base_hz`] on unvoiced/percussive
+    /// slices), so `Key` quantization on multi-note vocal/instrument reels
+    /// snaps each slice accurately to the scale.
+    pub fn base_hz_at(&self, pos_secs: f64) -> f32 {
+        if let Some(audio) = &self.audio {
+            if audio.sample_rate > 0 && audio.samples.len() >= 2048 {
+                let sr = audio.sample_rate as usize;
+                let win = (sr * 26 / 100).clamp(1024, audio.samples.len());
+                let center = ((pos_secs.max(0.0) * sr as f64) as usize) % audio.samples.len();
+                let start = center.saturating_sub(win / 4).min(audio.samples.len() - win);
+                if let Some(hz) = crate::dsp::detect_pitch(&audio.samples[start..start + win], audio.sample_rate) {
+                    if (45.0..1600.0).contains(&hz) {
+                        return hz;
+                    }
+                }
+            }
+        }
+        self.effective_base_hz()
+    }
+
     /// A new source holding `[start, start + len)` seconds of this one
     /// (audio and video alike, wrapping past the end like the read head).
     pub fn slice(&self, start: f64, len: f64) -> Source {
@@ -292,12 +313,22 @@ pub const FOREVER_TAIL_BEATS: f64 = 64.0;
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DuckSpec {
     pub source_track: usize,
-    /// Maximum gain reduction `0..1` (`0.6` ducks down toward `40%` on peaks).
+    /// Maximum audio gain reduction `0..1` (`0.0` = visual-only ducking via
+    /// `Track::duck_to_opacity`).
     pub amount: f32,
     /// Attack time in seconds (e.g. `0.008`).
     pub attack: f32,
     /// Release time in seconds (e.g. `0.18`).
     pub release: f32,
+    /// 2-pole low-pass cutoff (Hz) on the sidechain detector input. Defaults
+    /// to `165 Hz` so kicks/low-percussion carve deep sub/pad pocket while
+    /// hi-hats and shakers pass without chattering the gain!
+    #[serde(default = "default_duck_key_hz")]
+    pub key_hz: f32,
+}
+
+pub fn default_duck_key_hz() -> f32 {
+    165.0
 }
 
 /// Streaming envelope follower state for [`DuckSpec`], shared by offline and
@@ -305,13 +336,33 @@ pub struct DuckSpec {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DuckState {
     pub env: f32,
+    pub lp1: [f32; 2],
+    pub lp2: [f32; 2],
 }
 
 impl DuckState {
+    /// Advance one sample of sidechain detection, returning `(audio_gain, shaped_env)`
+    /// where `shaped_env` is `0..1` detector deflection (used for both audio
+    /// gain reduction and visual ducking).
     #[inline]
-    pub fn step(&mut self, sc_l: f32, sc_r: f32, spec: &DuckSpec, sample_rate: u32) -> f32 {
+    pub fn step_av(
+        &mut self,
+        sc_l: f32,
+        sc_r: f32,
+        spec: &DuckSpec,
+        sample_rate: u32,
+    ) -> (f32, f32) {
         let sr = sample_rate.max(1) as f32;
-        let x = sc_l.abs().max(sc_r.abs());
+        let x = if spec.key_hz > 10.0 && spec.key_hz < sr * 0.42 {
+            let a = 1.0 - (-2.0 * std::f32::consts::PI * spec.key_hz / sr).exp();
+            for (c, inp) in [sc_l, sc_r].into_iter().enumerate() {
+                self.lp1[c] += a * (inp - self.lp1[c]);
+                self.lp2[c] += a * (self.lp1[c] - self.lp2[c]);
+            }
+            (self.lp2[0].abs().max(self.lp2[1].abs()) * 1.25).min(2.0)
+        } else {
+            sc_l.abs().max(sc_r.abs())
+        };
         let att_c = (-1.0 / (spec.attack.max(0.0005) * sr)).exp();
         let rel_c = (-1.0 / (spec.release.max(0.005) * sr)).exp();
         if x > self.env {
@@ -319,11 +370,15 @@ impl DuckState {
         } else {
             self.env = rel_c * self.env + (1.0 - rel_c) * x;
         }
-        // Soft-knee detector Curve: 0.30 amplitude (~ -10 dBFS) reaches ~80% of
-        // the requested duck amount without pumping violently on tiny hiss.
-        let drive = (self.env * 3.2).min(4.0);
+        let drive = (self.env * 3.4).min(4.0);
         let shaped = drive / (1.0 + drive);
-        (1.0 - spec.amount.clamp(0.0, 1.0) * shaped).clamp(0.0, 1.0)
+        let audio_g = (1.0 - spec.amount.clamp(0.0, 1.0) * shaped).clamp(0.0, 1.0);
+        (audio_g, shaped)
+    }
+
+    #[inline]
+    pub fn step(&mut self, sc_l: f32, sc_r: f32, spec: &DuckSpec, sample_rate: u32) -> f32 {
+        self.step_av(sc_l, sc_r, spec, sample_rate).0
     }
 }
 

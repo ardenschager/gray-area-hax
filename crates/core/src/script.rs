@@ -215,6 +215,23 @@ pub fn build_engine(session: Session, log: Arc<Mutex<String>>) -> Engine {
             Ok(p.add_source(stretched) as i64)
         },
     );
+    engine.register_fn(
+        "paulstretch",
+        |s: &mut Session, src: i64, factor: f64, spread_cents: f64| -> ScriptResult<i64> {
+            let mut p = s.project.lock().unwrap();
+            let source = p
+                .sources
+                .get(src as usize)
+                .ok_or_else(|| rt_err(format!("no source {src}")))?
+                .clone();
+            let stretched = crate::stretch::paulstretch_source_opts(
+                &source,
+                factor as f32,
+                spread_cents as f32,
+            );
+            Ok(p.add_source(stretched) as i64)
+        },
+    );
 
     engine.register_fn(
         "segment",
@@ -563,6 +580,65 @@ pub fn build_engine(session: Session, log: Arc<Mutex<String>>) -> Engine {
                 amount: (amount as f32).clamp(0.0, 1.0),
                 attack: (attack as f32).clamp(0.0005, 1.0),
                 release: (release as f32).clamp(0.005, 4.0),
+                key_hz: 165.0,
+            });
+            Ok(())
+        },
+    );
+    engine.register_fn(
+        "track_duck",
+        |s: &mut Session,
+         track: i64,
+         src_track: i64,
+         amount: f64,
+         attack: f64,
+         release: f64,
+         key_hz: f64|
+         -> ScriptResult<()> {
+            let mut p = s.project.lock().unwrap();
+            let n = p.tracks.len();
+            if src_track < 0 || src_track as usize >= n {
+                return Err(rt_err(format!("no source track {src_track}")));
+            }
+            let t = p
+                .tracks
+                .get_mut(track as usize)
+                .ok_or_else(|| rt_err(format!("no track {track}")))?;
+            t.duck = Some(crate::timeline::DuckSpec {
+                source_track: src_track as usize,
+                amount: (amount as f32).clamp(0.0, 1.0),
+                attack: (attack as f32).clamp(0.0005, 1.0),
+                release: (release as f32).clamp(0.005, 4.0),
+                key_hz: (key_hz as f32).clamp(20.0, 24000.0),
+            });
+            Ok(())
+        },
+    );
+    engine.register_fn(
+        "track_visual_duck",
+        |s: &mut Session,
+         track: i64,
+         src_track: i64,
+         opacity_amount: f64,
+         attack: f64,
+         release: f64|
+         -> ScriptResult<()> {
+            let mut p = s.project.lock().unwrap();
+            let n = p.tracks.len();
+            if src_track < 0 || src_track as usize >= n {
+                return Err(rt_err(format!("no source track {src_track}")));
+            }
+            let t = p
+                .tracks
+                .get_mut(track as usize)
+                .ok_or_else(|| rt_err(format!("no track {track}")))?;
+            t.duck_to_opacity = (opacity_amount as f32).clamp(0.0, 1.0);
+            t.duck = Some(crate::timeline::DuckSpec {
+                source_track: src_track as usize,
+                amount: 0.0,
+                attack: (attack as f32).clamp(0.0005, 1.0),
+                release: (release as f32).clamp(0.005, 4.0),
+                key_hz: 18000.0,
             });
             Ok(())
         },

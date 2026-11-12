@@ -1195,7 +1195,10 @@ fn video_compress(frame: &mut Frame, quality: f32) {
     let (w, h) = (frame.width as usize, frame.height as usize);
 
     let mut block = [[0.0f32; 8]; 8];
+    let mut tmp = [[0.0f32; 8]; 8];
     let mut coef = [[0.0f32; 8]; 8];
+    let mut mags = [0.0f32; 64];
+    let keep = (1.0 + 63.0 * quality * quality) as usize;
     for by in (0..h).step_by(8) {
         for bx in (0..w).step_by(8) {
             for c in 0..3 {
@@ -1207,30 +1210,38 @@ fn video_compress(frame: &mut Frame, quality: f32) {
                         block[y][x] = frame.data[(sy * w + sx) * 4 + c] as f32 - 128.0;
                     }
                 }
-                // Forward DCT: coef = B * block * B^T
-                for (u, coef_row) in coef.iter_mut().enumerate() {
-                    for (v, cv) in coef_row.iter_mut().enumerate() {
+                // Separable Forward DCT: tmp = block * B^T, coef = B * tmp
+                for y in 0..8 {
+                    for v in 0..8 {
                         let mut s = 0.0f32;
-                        for y in 0..8 {
-                            for x in 0..8 {
-                                s += basis[u][y] * block[y][x] * basis[v][x];
-                            }
+                        for x in 0..8 {
+                            s += block[y][x] * basis[v][x];
                         }
-                        *cv = s;
+                        tmp[y][v] = s;
                     }
                 }
-                // Keep only the strongest coefficients (like the audio
-                // spectral crush keeps the strongest bins), then quantize
-                // the survivors — harsher at higher spatial frequencies.
-                let keep = (1.0 + 63.0 * quality * quality) as usize;
+                for u in 0..8 {
+                    for v in 0..8 {
+                        let mut s = 0.0f32;
+                        for y in 0..8 {
+                            s += basis[u][y] * tmp[y][v];
+                        }
+                        coef[u][v] = s;
+                    }
+                }
+                // Keep only the strongest coefficients via stack quickselect
+                // (zero heap allocations), then quantize the survivors.
                 if keep < 64 {
-                    let mut mags: Vec<f32> = coef
-                        .iter()
-                        .flatten()
-                        .map(|c| c.abs())
-                        .collect();
-                    mags.sort_by(|a, b| b.partial_cmp(a).unwrap());
-                    let threshold = mags[keep.min(63)];
+                    let mut idx = 0;
+                    for coef_row in &coef {
+                        for &cv in coef_row {
+                            mags[idx] = cv.abs();
+                            idx += 1;
+                        }
+                    }
+                    let (_, &mut threshold, _) = mags.select_nth_unstable_by(keep.min(63), |a, b| {
+                        b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
+                    });
                     for coef_row in coef.iter_mut() {
                         for cv in coef_row.iter_mut() {
                             if cv.abs() <= threshold {
@@ -1245,7 +1256,16 @@ fn video_compress(frame: &mut Frame, quality: f32) {
                         *cv = (*cv / q).round() * q;
                     }
                 }
-                // Inverse DCT: block = B^T * coef * B
+                // Separable Inverse DCT: tmp = B^T * coef, block = tmp * B
+                for y in 0..8 {
+                    for v in 0..8 {
+                        let mut s = 0.0f32;
+                        for u in 0..8 {
+                            s += basis[u][y] * coef[u][v];
+                        }
+                        tmp[y][v] = s;
+                    }
+                }
                 for y in 0..8 {
                     let sy = by + y;
                     if sy >= h {
@@ -1257,10 +1277,8 @@ fn video_compress(frame: &mut Frame, quality: f32) {
                             continue;
                         }
                         let mut s = 0.0f32;
-                        for (u, coef_row) in coef.iter().enumerate() {
-                            for (v, cv) in coef_row.iter().enumerate() {
-                                s += basis[u][y] * *cv * basis[v][x];
-                            }
+                        for v in 0..8 {
+                            s += tmp[y][v] * basis[v][x];
                         }
                         frame.data[(sy * w + sx) * 4 + c] =
                             (s + 128.0).clamp(0.0, 255.0) as u8;

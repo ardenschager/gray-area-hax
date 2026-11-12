@@ -298,8 +298,24 @@ impl ColorFilter {
         } else {
             1.0 - (d - (half - soft)) / (2.0 * soft)
         };
-        // Low-sat / low-val pixels have no meaningful hue: treat as out-of-band.
-        let colored = if s >= self.sat_min && v >= self.val_min { 1.0 } else { 0.0 };
+        // Low-sat / low-val pixels have no meaningful hue: ramp smoothly
+        // across `sat_min` and `val_min` so foam/mist edges never stipple
+        // between binary 0 and 1.
+        let s_ramp = if self.sat_min <= 1e-4 {
+            1.0
+        } else {
+            let w = (0.06 * (0.25 + self.softness.clamp(0.0, 1.0))).min(self.sat_min);
+            let t = ((s - (self.sat_min - w * 0.5)) / w.max(1e-4)).clamp(0.0, 1.0);
+            t * t * (3.0 - 2.0 * t)
+        };
+        let v_ramp = if self.val_min <= 1e-4 {
+            1.0
+        } else {
+            let w = (0.06 * (0.25 + self.softness.clamp(0.0, 1.0))).min(self.val_min);
+            let t = ((v - (self.val_min - w * 0.5)) / w.max(1e-4)).clamp(0.0, 1.0);
+            t * t * (3.0 - 2.0 * t)
+        };
+        let colored = s_ramp * v_ramp;
         let band = in_band * colored;
         match self.mode {
             ColorFilterMode::Keep => band,
@@ -811,6 +827,105 @@ pub fn blend_layer_over(dst: &mut Frame, src: &Frame, additive: f32) {
             d[c] = (over * (1.0 - add) + additive_v * add) as u8;
         }
         d[3] = (out_a * 255.0) as u8;
+    }
+}
+
+/// Visual counterpart of [`crate::audio::TapeSettings`], making `track_tape`
+/// and `master_tape` genuine chromagrain AV processors:
+/// - `wow`: subtle sub-Hz analog film-gate vertical weave
+/// - `warmth` / `age`: warm amber highlight halation + lifted celluloid shadows
+/// - `dust`: sparse deterministic film dust specks & faint celluloid hairlines
+pub fn apply_video_tape(
+    frame: &mut Frame,
+    cfg: &crate::audio::TapeSettings,
+    frame_idx: usize,
+    fps: f32,
+    seed: u64,
+) {
+    if !cfg.is_active() || frame.width == 0 || frame.height == 0 {
+        return;
+    }
+    let wow = cfg.wow.clamp(0.0, 1.0);
+    let warmth = cfg.warmth.clamp(0.0, 1.0);
+    let age = cfg.age.clamp(0.0, 1.0);
+    let dust = cfg.dust.clamp(0.0, 1.0);
+    let t = frame_idx as f64 / fps.max(1.0) as f64;
+    let (w, h) = (frame.width as usize, frame.height as usize);
+
+    // 1. Subtle film-gate vertical weave synced to the audio wow frequencies.
+    if wow > 0.02 {
+        let weave = (0.7 * (2.0 * std::f64::consts::PI * 0.51 * t).sin()
+            + 0.3 * (2.0 * std::f64::consts::PI * 0.19 * t).sin()) as f32
+            * wow
+            * (h as f32 * 0.006).max(1.0);
+        let dy = weave.round() as isize;
+        if dy != 0 {
+            let orig = frame.data.clone();
+            let row_bytes = w * 4;
+            for y in 0..h {
+                let sy = (y as isize - dy).clamp(0, h as isize - 1) as usize;
+                frame.data[y * row_bytes..(y + 1) * row_bytes]
+                    .copy_from_slice(&orig[sy * row_bytes..(sy + 1) * row_bytes]);
+            }
+        }
+    }
+
+    // 2. Warm tungsten/amber film tone (`warmth`) + lifted celluloid blacks (`age`).
+    if warmth > 0.01 || age > 0.01 {
+        let lift = age * 7.5;
+        let r_gain = 1.0 + warmth * 0.085;
+        let g_gain = 1.0 + warmth * 0.02;
+        let b_gain = 1.0 - warmth * 0.075 - age * 0.04;
+        for px in frame.data.chunks_exact_mut(4) {
+            if px[3] == 0 {
+                continue;
+            }
+            let a_frac = px[3] as f32 / 255.0;
+            let lf = lift * a_frac;
+            px[0] = (px[0] as f32 * r_gain + lf).clamp(0.0, 255.0) as u8;
+            px[1] = (px[1] as f32 * g_gain + lf * 0.85).clamp(0.0, 255.0) as u8;
+            px[2] = (px[2] as f32 * b_gain + lf * 0.70).clamp(0.0, 255.0) as u8;
+        }
+    }
+
+    // 3. Sparse celluloid dust specks & occasional faint vertical hairline.
+    if dust > 0.01 {
+        let mut rng = crate::dsp::Rng::new(seed ^ (frame_idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let max_specks = ((dust * 5.0).ceil() as usize).min(6);
+        for _ in 0..max_specks {
+            if rng.next_f32() < dust * 0.55 {
+                let cx = (rng.next_u64() as usize) % w;
+                let cy = (rng.next_u64() as usize) % h;
+                let rad = if rng.next_f32() < 0.25 { 1isize } else { 0isize };
+                let bright = (155.0 + 75.0 * rng.next_f32()) as f32;
+                let blend = (0.18 + 0.28 * dust).min(0.5);
+                for oy in -rad..=rad {
+                    for ox in -rad..=rad {
+                        let x = (cx as isize + ox).clamp(0, w as isize - 1) as usize;
+                        let y = (cy as isize + oy).clamp(0, h as isize - 1) as usize;
+                        let idx = (y * w + x) * 4;
+                        if frame.data[idx + 3] > 16 {
+                            frame.data[idx] = (frame.data[idx] as f32 * (1.0 - blend) + bright * blend) as u8;
+                            frame.data[idx + 1] = (frame.data[idx + 1] as f32 * (1.0 - blend) + bright * 0.94 * blend) as u8;
+                            frame.data[idx + 2] = (frame.data[idx + 2] as f32 * (1.0 - blend) + bright * 0.82 * blend) as u8;
+                        }
+                    }
+                }
+            }
+        }
+        // Occasional faint vertical 16mm scratch line (~once every several frames)
+        if rng.next_f32() < dust * 0.22 {
+            let sx = (rng.next_u64() as usize) % w;
+            let b_add = (18.0 + 24.0 * dust) as u8;
+            for y in 0..h {
+                let idx = (y * w + sx) * 4;
+                if frame.data[idx + 3] > 32 {
+                    frame.data[idx] = frame.data[idx].saturating_add(b_add);
+                    frame.data[idx + 1] = frame.data[idx + 1].saturating_add((b_add as u16 * 9 / 10) as u8);
+                    frame.data[idx + 2] = frame.data[idx + 2].saturating_add((b_add as u16 * 7 / 10) as u8);
+                }
+            }
+        }
     }
 }
 
