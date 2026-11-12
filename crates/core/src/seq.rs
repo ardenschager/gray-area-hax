@@ -27,6 +27,10 @@ pub struct Step {
     /// Micro-timing nudge in fractions of a step (-0.5..0.5; positive = late,
     /// negative = early) for unquantized / drunken pocket.
     pub offset: f32,
+    /// Pass-modulo period (`1` = every pass, `2` = every 2nd pass, etc.).
+    pub every_n: u8,
+    /// Which 0-based pass within `0..every_n` triggers this step.
+    pub every_offset: u8,
 }
 
 impl Default for Step {
@@ -39,6 +43,8 @@ impl Default for Step {
             length: 1.0,
             chance: 1.0,
             offset: 0.0,
+            every_n: 1,
+            every_offset: 0,
         }
     }
 }
@@ -214,6 +220,7 @@ pub fn pattern_events(
                     if grid_t >= clip_len_secs {
                         break;
                     }
+                    let pass_idx = slot / row.steps.len();
                     let step = row.steps[slot % row.steps.len()];
                     // Consume jitter deterministically for EVERY slot so
                     // toggling one step doesn't reshuffle the others.
@@ -225,7 +232,9 @@ pub fn pattern_events(
                     let hum_j = hum_rng.bipolar();
                     let is_odd = slot % 2 == 1;
                     slot += 1;
-                    if !step.on || roll >= step.chance {
+                    let every = step.every_n.max(1) as usize;
+                    let pass_ok = every == 1 || (pass_idx % every) == (step.every_offset as usize % every);
+                    if !step.on || !pass_ok || roll >= step.chance {
                         continue;
                     }
                     let swing_shift = if is_odd { (eff_swing - 0.5) * 2.0 * step_secs } else { 0.0 };
@@ -501,5 +510,20 @@ mod tests {
         assert!(p.rows[0].steps[0].on);
         assert!(p.rows[0].steps[4].on);
         assert_eq!(p.rows[0].steps.len(), 32);
+    }
+
+    #[test]
+    fn step_every_fires_only_on_matching_passes() {
+        let mut p = StepPattern::new("cond");
+        let r = p.add_row(0); // 16 steps = 4 beats = 2.0 s @ 120 BPM
+        p.rows[r].steps[0].on = true;
+        p.rows[r].steps[0].every_n = 2;
+        p.rows[r].steps[0].every_offset = 1; // fire on pass 1, 3, ... (skip pass 0, 2)
+        let sources = source_440();
+        let parts = pattern_events(&p, &sources, 0.0, 8.0, 0.5, None, &[]); // 4 passes
+        let evs = &parts[0].1;
+        assert_eq!(evs.len(), 2);
+        assert!((evs[0].onset - 2.0).abs() < 1e-6);
+        assert!((evs[1].onset - 6.0).abs() < 1e-6);
     }
 }

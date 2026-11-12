@@ -450,6 +450,7 @@ pub fn build_engine(session: Session, log: Arc<Mutex<String>>) -> Engine {
                     "scatter_y" => v.scatter_y = x.clamp(0.0, 1.0),
                     "feather" => v.feather = x.clamp(0.0, 1.0),
                     "flicker" => v.flicker = x.clamp(0.0, 1.0),
+                    "shadow" | "silhouette" => v.shadow = x.clamp(0.0, 1.0),
                     // Correspondence dials (gain_to_opacity, pitch_to_hue,
                     // pitch_to_rate, pan_to_x, envelope_to_opacity,
                     // reverse_video, hue_per_semitone alias).
@@ -497,7 +498,23 @@ pub fn build_engine(session: Session, log: Arc<Mutex<String>>) -> Engine {
     engine.register_fn(
         "clear_audio_filters",
         |s: &mut Session, c: ClipRef| -> ScriptResult<()> {
-            s.with_clip(c, |clip| clip.audio_filters.clear())
+            s.with_clip(c, |clip| {
+                clip.audio_filters.clear();
+                clip.eq.clear();
+            })
+        },
+    );
+
+    engine.register_fn(
+        "clip_eq",
+        |s: &mut Session, c: ClipRef, freq: f64, q: f64, gain_db: f64| -> ScriptResult<()> {
+            s.with_clip(c, |clip| {
+                clip.eq.push(crate::dsp::EqBand {
+                    freq: freq as f32,
+                    q: q as f32,
+                    gain_db: gain_db as f32,
+                })
+            })
         },
     );
 
@@ -538,6 +555,34 @@ pub fn build_engine(session: Session, log: Arc<Mutex<String>>) -> Engine {
             if let Some(t) = s.project.lock().unwrap().tracks.get_mut(track as usize) {
                 t.level_to_opacity = (v as f32).clamp(0.0, 1.0);
             }
+        },
+    );
+    engine.register_fn(
+        "track_rms_opacity",
+        |s: &mut Session, track: i64, v: f64| -> ScriptResult<()> {
+            let mut p = s.project.lock().unwrap();
+            let t = p
+                .tracks
+                .get_mut(track as usize)
+                .ok_or_else(|| rt_err(format!("no track {track}")))?;
+            t.rms_to_opacity = (v as f32).clamp(0.0, 1.0);
+            Ok(())
+        },
+    );
+    engine.register_fn(
+        "track_eq",
+        |s: &mut Session, track: i64, freq: f64, q: f64, gain_db: f64| -> ScriptResult<()> {
+            let mut p = s.project.lock().unwrap();
+            let t = p
+                .tracks
+                .get_mut(track as usize)
+                .ok_or_else(|| rt_err(format!("no track {track}")))?;
+            t.eq.push(crate::dsp::EqBand {
+                freq: freq as f32,
+                q: q as f32,
+                gain_db: gain_db as f32,
+            });
+            Ok(())
         },
     );
     engine.register_fn("track_mute", |s: &mut Session, track: i64, mute: bool| {
@@ -632,13 +677,73 @@ pub fn build_engine(session: Session, log: Arc<Mutex<String>>) -> Engine {
                 .tracks
                 .get_mut(track as usize)
                 .ok_or_else(|| rt_err(format!("no track {track}")))?;
-            t.duck_to_opacity = (opacity_amount as f32).clamp(0.0, 1.0);
+            t.duck_to_opacity = (opacity_amount as f32).clamp(-1.0, 1.0);
             t.duck = Some(crate::timeline::DuckSpec {
                 source_track: src_track as usize,
                 amount: 0.0,
                 attack: (attack as f32).clamp(0.0005, 1.0),
                 release: (release as f32).clamp(0.005, 4.0),
                 key_hz: 18000.0,
+            });
+            Ok(())
+        },
+    );
+    engine.register_fn(
+        "track_visual_duck",
+        |s: &mut Session,
+         track: i64,
+         src_track: i64,
+         opacity_amount: f64,
+         attack: f64,
+         release: f64,
+         key_hz: f64|
+         -> ScriptResult<()> {
+            let mut p = s.project.lock().unwrap();
+            let n = p.tracks.len();
+            if src_track < 0 || src_track as usize >= n {
+                return Err(rt_err(format!("no source track {src_track}")));
+            }
+            let t = p
+                .tracks
+                .get_mut(track as usize)
+                .ok_or_else(|| rt_err(format!("no track {track}")))?;
+            t.duck_to_opacity = (opacity_amount as f32).clamp(-1.0, 1.0);
+            t.duck = Some(crate::timeline::DuckSpec {
+                source_track: src_track as usize,
+                amount: 0.0,
+                attack: (attack as f32).clamp(0.0005, 1.0),
+                release: (release as f32).clamp(0.005, 4.0),
+                key_hz: (key_hz as f32).clamp(20.0, 24000.0),
+            });
+            Ok(())
+        },
+    );
+    engine.register_fn(
+        "track_visual_pulse",
+        |s: &mut Session,
+         track: i64,
+         src_track: i64,
+         boost_amount: f64,
+         attack: f64,
+         release: f64,
+         key_hz: f64|
+         -> ScriptResult<()> {
+            let mut p = s.project.lock().unwrap();
+            let n = p.tracks.len();
+            if src_track < 0 || src_track as usize >= n {
+                return Err(rt_err(format!("no source track {src_track}")));
+            }
+            let t = p
+                .tracks
+                .get_mut(track as usize)
+                .ok_or_else(|| rt_err(format!("no track {track}")))?;
+            t.duck_to_opacity = -(boost_amount as f32).clamp(0.0, 1.0);
+            t.duck = Some(crate::timeline::DuckSpec {
+                source_track: src_track as usize,
+                amount: 0.0,
+                attack: (attack as f32).clamp(0.0005, 1.0),
+                release: (release as f32).clamp(0.005, 4.0),
+                key_hz: (key_hz as f32).clamp(20.0, 24000.0),
             });
             Ok(())
         },
@@ -651,7 +756,7 @@ pub fn build_engine(session: Session, log: Arc<Mutex<String>>) -> Engine {
                 .tracks
                 .get_mut(track as usize)
                 .ok_or_else(|| rt_err(format!("no track {track}")))?;
-            t.duck_to_opacity = (amount as f32).clamp(0.0, 1.0);
+            t.duck_to_opacity = (amount as f32).clamp(-1.0, 1.0);
             Ok(())
         },
     );
@@ -882,6 +987,28 @@ pub fn build_engine(session: Session, log: Arc<Mutex<String>>) -> Engine {
                     .get_mut(idx as usize)
                     .ok_or_else(|| format!("no step {idx}"))?;
                 st.chance = (chance as f32).clamp(0.0, 1.0);
+                Ok(())
+            })?
+            .map_err(rt_err)
+        },
+    );
+    engine.register_fn(
+        "step_every",
+        |s: &mut Session,
+         pid: i64,
+         row: i64,
+         idx: i64,
+         every_n: i64,
+         offset: i64|
+         -> ScriptResult<()> {
+            with_row(s, pid, row, |r| -> Result<(), String> {
+                let st = r
+                    .steps
+                    .get_mut(idx as usize)
+                    .ok_or_else(|| format!("no step {idx}"))?;
+                let n = every_n.clamp(1, 64) as u8;
+                st.every_n = n;
+                st.every_offset = (offset.rem_euclid(n as i64)) as u8;
                 Ok(())
             })?
             .map_err(rt_err)

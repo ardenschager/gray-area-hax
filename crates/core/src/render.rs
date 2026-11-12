@@ -262,13 +262,16 @@ fn snippet_video_events(
     );
     let eff_speed = if g.varispeed { base_ratio } else { g.speed };
     let audio_len = source.audio.as_ref().map(|a| a.duration()).unwrap_or(source_len);
+    let video_len = source.video.as_ref().map(|v| v.duration()).unwrap_or(source_len);
     let first_avail = if g.reverse_prob >= 0.5 {
         audio_len
     } else {
         (audio_len - start_pos).max(0.05)
     };
     let wraps_audio = clip_len > first_avail / base_ratio.max(0.05) as f64 + 1e-4 && audio_len >= 0.25;
-    if clip.automation.is_empty() && (eff_speed - base_ratio).abs() < 1e-3 && !wraps_audio {
+    let wraps_video = video_len >= 0.20
+        && clip_len * eff_speed.max(0.05) as f64 > (video_len - start_pos.min(video_len)).max(0.05) + 1e-4;
+    if clip.automation.is_empty() && (eff_speed - base_ratio).abs() < 1e-3 && !wraps_audio && !wraps_video {
         return None; // `parts` is already a single unbroken grain
     }
     Some(vec![GrainEvent {
@@ -540,10 +543,10 @@ fn render_audio_part(
     let Some(source) = project.sources.get(source_id) else { return };
     let Some(audio_src) = &source.audio else { return };
     let (pan_offset, gain_mult, _) = clip_spatial(clip);
-    if clip.audio_filters.is_empty() {
+    if clip.audio_filters.is_empty() && clip.eq.is_empty() {
         render_grains_audio_spatial(audio_src, events, bus, t0, pan_offset, gain_mult);
     } else {
-        let filtered = audio_src.filtered(&clip.audio_filters);
+        let filtered = audio_src.filtered_and_eq(&clip.audio_filters, &clip.eq);
         render_grains_audio_spatial(&filtered, events, bus, t0, pan_offset, gain_mult);
     }
 }
@@ -569,7 +572,7 @@ pub fn render_project(project: &Project, from_beat: f64, to_beat: f64) -> Render
             continue;
         }
         let clip_plans: Vec<&ClipPlan> = plan.iter().filter(|p| p.track == ti).collect();
-        if clip_plans.is_empty() && track.effects.is_empty() && !track.tape.is_active() {
+        if clip_plans.is_empty() && track.effects.is_empty() && !track.tape.is_active() && track.eq.is_empty() {
             continue;
         }
 
@@ -601,6 +604,10 @@ pub fn render_project(project: &Project, from_beat: f64, to_beat: f64) -> Render
                     track_bus.right[i] += clip_bus.right[i];
                 }
             }
+        }
+        if !track.eq.is_empty() {
+            crate::dsp::apply_eq_chain(&mut track_bus.left, &track.eq, project.sample_rate as f32);
+            crate::dsp::apply_eq_chain(&mut track_bus.right, &track.eq, project.sample_rate as f32);
         }
         fx::apply_audio_chain(&mut track_bus, &track.effects);
         if track.tape.is_active() {
@@ -687,6 +694,33 @@ pub fn render_project(project: &Project, from_beat: f64, to_beat: f64) -> Render
             .iter()
             .map(|cp| cp.style.additive)
             .fold(0.0f32, f32::max);
+        let track_rms_env: Vec<f32> = if track.rms_to_opacity > 1e-4 {
+            if let Some(bus) = &track_buses[ti] {
+                let mut out_env = vec![0.0f32; n_frames];
+                let sr = project.sample_rate.max(1) as f32;
+                let att_c = (-1.0 / (0.024 * sr)).exp();
+                let rel_c = (-1.0 / (0.175 * sr)).exp();
+                let mut env = 0.0f32;
+                for i in 0..bus.len() {
+                    let x = bus.left[i].abs().max(bus.right[i].abs());
+                    if x > env {
+                        env = att_c * env + (1.0 - att_c) * x;
+                    } else {
+                        env = rel_c * env + (1.0 - rel_c) * x;
+                    }
+                    let fi = ((i as f64 / sr as f64) * project.fps as f64) as usize;
+                    if fi < n_frames {
+                        let d = (env * 4.2).min(6.0);
+                        out_env[fi] = out_env[fi].max(d / (1.0 + d));
+                    }
+                }
+                out_env
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
 
         for (fi, frame) in frames.iter_mut().enumerate() {
             let ft = t0 + fi as f64 / project.fps as f64;
@@ -774,13 +808,24 @@ pub fn render_project(project: &Project, from_beat: f64, to_beat: f64) -> Render
             }
             let mut opacity =
                 track.opacity_at((t0 + fi as f64 / project.fps as f64) * project.bpm / 60.0);
+            if track.rms_to_opacity > 1e-4 {
+                let r_amt = track.rms_to_opacity.clamp(0.0, 1.0);
+                let env_v = track_rms_env.get(fi).copied().unwrap_or(0.0);
+                opacity *= ((1.0 - r_amt) + r_amt * env_v).clamp(0.0, 1.0);
+            }
             if let (Some(&shaped), Some(spec)) = (track_duck_shaped[ti].get(fi), &track.duck) {
+                let raw_link = track.duck_to_opacity.clamp(-1.0, 1.0);
                 let v_amt = if spec.amount <= 1e-4 {
-                    track.duck_to_opacity.clamp(0.0, 1.0)
+                    raw_link
                 } else {
-                    spec.amount.clamp(0.0, 1.0) * track.duck_to_opacity.clamp(0.0, 1.0)
+                    spec.amount.clamp(0.0, 1.0) * raw_link
                 };
-                opacity *= (1.0 - v_amt * shaped).clamp(0.0, 1.0);
+                if v_amt >= 0.0 {
+                    opacity *= (1.0 - v_amt * shaped).clamp(0.0, 1.0);
+                } else {
+                    let pulse = (-v_amt).clamp(0.0, 1.0);
+                    opacity = (opacity * (1.0 - 0.55 * pulse) + pulse * shaped).clamp(0.0, 1.0);
+                }
             }
             let track_add = track
                 .additive

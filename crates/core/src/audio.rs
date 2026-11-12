@@ -94,11 +94,19 @@ impl AudioClip {
 
     /// Return a filtered copy of this clip.
     pub fn filtered(&self, chain: &[FilterSpec]) -> AudioClip {
+        self.filtered_and_eq(chain, &[])
+    }
+
+    /// Return a copy of this clip with both standard biquad filters and
+    /// parametric peaking EQ bands applied in order.
+    pub fn filtered_and_eq(&self, chain: &[FilterSpec], eq: &[crate::dsp::EqBand]) -> AudioClip {
         let mut out = self.clone();
         apply_filter_chain(&mut out.samples, chain, self.sample_rate as f32);
+        crate::dsp::apply_eq_chain(&mut out.samples, eq, self.sample_rate as f32);
         // Linear filters: filtering mid and side == filtering L and R.
         if let Some(side) = out.side.as_mut() {
             apply_filter_chain(side, chain, self.sample_rate as f32);
+            crate::dsp::apply_eq_chain(side, eq, self.sample_rate as f32);
         }
         out
     }

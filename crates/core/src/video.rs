@@ -97,6 +97,58 @@ impl Frame {
         }
         Some(((x_sum / w_sum) as f32, (y_sum / w_sum) as f32))
     }
+
+    /// Padded normalized `[x0, y0, w, h]` bounding box of opaque foreground
+    /// cutout pixels when the frame is a segmented cutout (`0.2%..55%` opaque).
+    /// Allows grain rendering to frame the entire segmented figure intact
+    /// instead of guillotining limbs along a square sub-patch crop.
+    pub fn alpha_bounds(&self) -> Option<[f32; 4]> {
+        if self.width == 0 || self.height == 0 {
+            return None;
+        }
+        let step_x = (self.width / 64).max(1);
+        let step_y = (self.height / 48).max(1);
+        let mut x_min = self.width;
+        let mut x_max = 0u32;
+        let mut y_min = self.height;
+        let mut y_max = 0u32;
+        let mut opaque = 0u64;
+        let mut total = 0u64;
+        let mut y = 0u32;
+        while y < self.height {
+            let mut x = 0u32;
+            while x < self.width {
+                total += 1;
+                let a = self.data[((y * self.width + x) * 4 + 3) as usize];
+                if a > 32 {
+                    opaque += 1;
+                    x_min = x_min.min(x);
+                    x_max = x_max.max(x);
+                    y_min = y_min.min(y);
+                    y_max = y_max.max(y);
+                }
+                x += step_x;
+            }
+            y += step_y;
+        }
+        let frac = opaque as f64 / total.max(1) as f64;
+        if !(0.002..0.58).contains(&frac) || x_min > x_max || y_min > y_max {
+            return None;
+        }
+        let fw = self.width as f32;
+        let fh = self.height as f32;
+        let mut bw = ((x_max - x_min + step_x) as f32 / fw) * 1.16;
+        let mut bh = ((y_max - y_min + step_y) as f32 / fh) * 1.16;
+        // Keep square-ish normalized aspect so the figure never stretches.
+        let span = bw.max(bh).clamp(0.18, 1.0);
+        bw = span;
+        bh = span;
+        let cx = ((x_min + x_max) as f32 * 0.5 + step_x as f32 * 0.5) / fw;
+        let cy = ((y_min + y_max) as f32 * 0.5 + step_y as f32 * 0.5) / fh;
+        let bx = (cx - bw * 0.5).clamp(0.0, (1.0 - bw).max(0.0));
+        let by = (cy - bh * 0.5).clamp(0.0, (1.0 - bh).max(0.0));
+        Some([bx, by, bw, bh])
+    }
 }
 
 /// A decoded (or procedural) video clip held in memory.
@@ -158,6 +210,56 @@ impl VideoClip {
         Some(std::borrow::Cow::Owned(Frame {
             width: f0.width,
             height: f0.height,
+            data,
+        }))
+    }
+
+    /// Seamless loop-crossfaded frame at elapsed playback time `t` seconds:
+    /// when `t` runs past a single clip duration `D`, overlaps the outgoing
+    /// tail `[D - X .. D]` with the incoming head `[0 .. X]` via a raised-cosine
+    /// RGB/alpha blend (`X = crossfade_sec.min(0.35 * D)`), keeping opaque clips
+    /// at full `alpha = 255` with zero jump-cut or straight-alpha dip.
+    pub fn frame_looped_at(
+        &self,
+        t: f64,
+        crossfade_sec: f64,
+    ) -> Option<std::borrow::Cow<'_, Frame>> {
+        let dur = self.duration();
+        if dur <= 0.0 || self.frames.is_empty() {
+            return None;
+        }
+        let xfade = crossfade_sec.clamp(0.0, dur * 0.35);
+        if t < 0.0 || xfade <= 1.0 / self.fps.max(1.0) as f64 || self.frames.len() < 4 || t < dur - xfade {
+            return self.frame_blended_at(t);
+        }
+        let eff_period = (dur - xfade).max(1e-4);
+        let u_total = t - (dur - xfade);
+        let cycle_pos = u_total.rem_euclid(eff_period);
+        if cycle_pos >= xfade {
+            return self.frame_blended_at(cycle_pos);
+        }
+        let w = (0.5 * (1.0 - (std::f64::consts::PI * (cycle_pos / xfade)).cos())) as f32;
+        if w <= 0.005 {
+            return self.frame_blended_at(dur - xfade + cycle_pos);
+        }
+        if w >= 0.995 {
+            return self.frame_blended_at(cycle_pos);
+        }
+        let out_f = self.frame_blended_at(dur - xfade + cycle_pos)?;
+        let in_f = self.frame_blended_at(cycle_pos)?;
+        if out_f.width != in_f.width || out_f.height != in_f.height {
+            return Some(out_f);
+        }
+        let inv = 1.0 - w;
+        let data: Vec<u8> = out_f
+            .data
+            .iter()
+            .zip(&in_f.data)
+            .map(|(&a, &b)| (a as f32 * inv + b as f32 * w + 0.5) as u8)
+            .collect();
+        Some(std::borrow::Cow::Owned(Frame {
+            width: out_f.width,
+            height: out_f.height,
             data,
         }))
     }
@@ -354,6 +456,11 @@ pub struct VisualGrainStyle {
     /// Defaults to `0.30` so 16th-note percussion glows instead of strobing.
     #[serde(default = "default_flicker")]
     pub flicker: f32,
+    /// Optional nocturnal shadow/silhouette crush (`0..1`, default `0.0`):
+    /// darkens foreground RGB into high-contrast silhouettes while keeping
+    /// cutout alpha intact.
+    #[serde(default)]
+    pub shadow: f32,
 }
 
 fn default_flicker() -> f32 {
@@ -370,6 +477,7 @@ impl Default for VisualGrainStyle {
             scatter_y: 0.7,
             feather: 0.0,
             flicker: 0.30,
+            shadow: 0.0,
         }
     }
 }
@@ -402,6 +510,7 @@ impl VisualGrainStyle {
             scatter_y: lin(0.0, cloud.scatter_y),
             feather: lin(0.0, cloud.feather),
             flicker: lin(1.0, cloud.flicker),
+            shadow: lin(0.0, cloud.shadow),
         }
     }
 
@@ -415,6 +524,7 @@ impl VisualGrainStyle {
             scatter_y: 0.0,
             feather: 0.0,
             flicker: 1.0,
+            shadow: 0.0,
         }
     }
 }
@@ -564,6 +674,11 @@ pub fn grain_draws_opts(
                 1.0
             };
             (taper, skew, damp)
+        } else if !parked && style.min_size >= 0.99 && ev.duration > 0.35 && ev.envelope > 0.005 {
+            // Full-frame snippets get at least ~3.5 frames (0.14s) of smooth
+            // entry/exit fade so hard cuts into bright footage never flash.
+            let min_taper = (0.28 / vis_dur.max(0.28)) as f32;
+            (ev.envelope.max(min_taper), ev.env_skew, 1.0)
         } else {
             (ev.envelope, ev.env_skew, 1.0)
         };
@@ -675,11 +790,12 @@ pub fn composite_grains_frame_opts(
     let aspect = ow / oh.max(1.0);
     let add = style.additive.clamp(0.0, 1.0);
     let feath = style.feather.clamp(0.0, 1.0);
+    let shad = style.shadow.clamp(0.0, 1.0);
     let draws = grain_draws(events, style, link, transform, clip.duration(), t, aspect);
 
     for d in draws {
         let src_cow = if blend_frames {
-            clip.frame_blended_at(d.src_time)
+            clip.frame_looped_at(d.src_time, 0.32)
         } else {
             clip.frame_at(d.src_time).map(std::borrow::Cow::Borrowed)
         };
@@ -687,13 +803,14 @@ pub fn composite_grains_frame_opts(
         let alpha = d.alpha;
         let hue_shift = hue_override.unwrap_or(d.hue_shift);
 
-        // If the source frame is a segmented cutout (`alpha_focus` is Some)
-        // and the grain patch is smaller than the whole frame, bias the patch
-        // gently toward the cutout's centroid so cropped grains actually
-        // capture the subject rather than transparent void.
+        // If the source frame is a segmented cutout (`alpha_bounds` is Some),
+        // sample the entire padded silhouette bounding box rather than cropping
+        // a small square window that guillotines limbs along a rectangle edge.
         let mut patch = d.patch;
         if patch[2] < 0.98 {
-            if let Some((fx, fy)) = src.alpha_focus() {
+            if let Some(bounds) = src.alpha_bounds() {
+                patch = bounds;
+            } else if let Some((fx, fy)) = src.alpha_focus() {
                 let target_x = (fx - patch[2] * 0.5).clamp(0.0, (1.0 - patch[2]).max(0.0));
                 let target_y = (fy - patch[3] * 0.5).clamp(0.0, (1.0 - patch[3]).max(0.0));
                 patch[0] = patch[0] * 0.25 + target_x * 0.75;
@@ -754,6 +871,13 @@ pub fn composite_grains_frame_opts(
                     let (h, s, v) = rgb_to_hsv(r, g, b);
                     let (nr, ng, nb) = hsv_to_rgb(h + hue_shift, s, v);
                     (r, g, b) = (nr, ng, nb);
+                }
+                if shad > 0.002 {
+                    let luma = (0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32) / 255.0;
+                    let keep = (1.0 - 0.84 * shad) * (0.65 + 0.35 * luma * luma);
+                    r = (r as f32 * keep).clamp(0.0, 255.0) as u8;
+                    g = (g as f32 * keep).clamp(0.0, 255.0) as u8;
+                    b = (b as f32 * keep).clamp(0.0, 255.0) as u8;
                 }
 
                 // Straight-alpha accumulation into the layer, with an
@@ -1258,5 +1382,49 @@ mod tests {
         let vc = VideoClip { frames: vec![f0, f1], fps: 10.0 };
         let mid = vc.frame_blended_at(0.05).unwrap();
         assert!((mid.get(0, 0)[0] as i32 - 100).abs() <= 2);
+    }
+
+    #[test]
+    fn video_loop_crossfade_wraps_without_jump_or_alpha_dip() {
+        // 1.0s clip (10 frames @ 10 fps) ramping luma from 20 -> 200.
+        let mut frames = Vec::new();
+        for i in 0..10 {
+            let mut f = Frame::black(8, 8);
+            let v = (20 + i * 20) as u8;
+            for px in f.data.chunks_exact_mut(4) {
+                px[0] = v;
+                px[1] = v;
+                px[2] = v;
+                px[3] = 255;
+            }
+            frames.push(f);
+        }
+        let vc = VideoClip { frames, fps: 10.0 };
+        let mut prev_luma = vc.frame_looped_at(0.0, 0.30).unwrap().mean_luma();
+        let mut max_step = 0.0f32;
+        for step in 1..=30 {
+            let t = step as f64 * 0.1;
+            let f = vc.frame_looped_at(t, 0.30).unwrap();
+            assert_eq!(f.get(0, 0)[3], 255, "opaque loop crossfade keeps alpha=255");
+            let l = f.mean_luma();
+            max_step = max_step.max((l - prev_luma).abs());
+            prev_luma = l;
+        }
+        // Without crossfade, wrap jump is 180 -> 20 = 160 luma in 1 frame;
+        // with 0.30s cosine loop crossfade, max 1-frame step is <= 65.
+        assert!(max_step < 70.0, "loop crossfade smoothed wrap jump: max_step={max_step}");
+    }
+
+    #[test]
+    fn alpha_bounds_frames_entire_segmented_cutout() {
+        let mut f = Frame::transparent(32, 32);
+        for y in 8..24 {
+            for x in 12..20 {
+                f.put(x, y, [180, 160, 140, 255]);
+            }
+        }
+        let b = f.alpha_bounds().expect("segmented cutout detected");
+        assert!(b[0] <= 12.0 / 32.0 && b[0] + b[2] >= 20.0 / 32.0);
+        assert!(b[1] <= 8.0 / 32.0 && b[1] + b[3] >= 24.0 / 32.0);
     }
 }

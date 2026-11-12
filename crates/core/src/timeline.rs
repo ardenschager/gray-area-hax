@@ -40,23 +40,31 @@ impl Source {
 
     /// Detect the local fundamental pitch (Hz) around `pos_secs` in the audio
     /// clip (falling back to [`Self::effective_base_hz`] on unvoiced/percussive
-    /// slices), so `Key` quantization on multi-note vocal/instrument reels
-    /// snaps each slice accurately to the scale.
+    /// slices), locked to the parent source's chromatic tuning reference so
+    /// `Key` quantization on multi-note vocal/instrument reels snaps each slice
+    /// to pure in-tune scale intervals without quarter-tone drift.
     pub fn base_hz_at(&self, pos_secs: f64) -> f32 {
+        let fallback = self.effective_base_hz();
         if let Some(audio) = &self.audio {
             if audio.sample_rate > 0 && audio.samples.len() >= 2048 {
                 let sr = audio.sample_rate as usize;
-                let win = (sr * 26 / 100).clamp(1024, audio.samples.len());
+                let win = (sr * 60 / 100).clamp(2048, audio.samples.len());
                 let center = ((pos_secs.max(0.0) * sr as f64) as usize) % audio.samples.len();
-                let start = center.saturating_sub(win / 4).min(audio.samples.len() - win);
-                if let Some(hz) = crate::dsp::detect_pitch(&audio.samples[start..start + win], audio.sample_rate) {
-                    if (45.0..1600.0).contains(&hz) {
-                        return hz;
+                let start = center.saturating_sub(win / 3).min(audio.samples.len() - win);
+                if let Some(hz) =
+                    crate::dsp::detect_pitch(&audio.samples[start..start + win], audio.sample_rate)
+                {
+                    if (45.0..1250.0).contains(&hz) {
+                        let ref_midi = 69.0 + 12.0 * (fallback / 440.0).log2();
+                        let ref_frac = ref_midi - ref_midi.round();
+                        let loc_midi = 69.0 + 12.0 * (hz / 440.0).log2();
+                        let snapped_midi = (loc_midi - ref_frac).round() + ref_frac;
+                        return 440.0 * 2.0f32.powf((snapped_midi - 69.0) / 12.0);
                     }
                 }
             }
         }
-        self.effective_base_hz()
+        fallback
     }
 
     /// A new source holding `[start, start + len)` seconds of this one
@@ -89,7 +97,15 @@ impl Source {
                 fps: v.fps,
             })
         });
-        Source { name: self.name.clone(), audio, video, base_hz: self.base_hz }
+        let sliced_base = if len >= 0.55 {
+            audio
+                .as_ref()
+                .and_then(|a| crate::dsp::detect_pitch(&a.samples, a.sample_rate))
+                .unwrap_or_else(|| self.base_hz_at(start + len * 0.35))
+        } else {
+            self.base_hz_at(start + len * 0.35)
+        };
+        Source { name: self.name.clone(), audio, video, base_hz: sliced_base }
     }
 
     /// Combine `self`'s audio (and `base_hz`) with `video_src`'s video frames,
@@ -149,6 +165,8 @@ pub struct Clip {
     pub key: Option<Key>,
     /// Audio frequency filtering, applied to the source before granulation.
     pub audio_filters: Vec<FilterSpec>,
+    /// Parametric peaking bell EQ bands applied alongside `audio_filters`.
+    pub eq: Vec<crate::dsp::EqBand>,
     /// Color (hue-band) filtering applied to visual grains.
     pub color_filter: Option<ColorFilter>,
     pub visual: VisualGrainStyle,
@@ -193,6 +211,7 @@ impl Clip {
             grains: GrainSettings::default(),
             key: None,
             audio_filters: Vec::new(),
+            eq: Vec::new(),
             color_filter: None,
             visual: VisualGrainStyle::default(),
             link: AvLink::default(),
@@ -407,6 +426,12 @@ pub struct Track {
     pub additive: Option<f32>,
     /// Per-track analog tape / vinyl stage.
     pub tape: crate::audio::TapeSettings,
+    /// Per-track parametric peaking EQ bands.
+    pub eq: Vec<crate::dsp::EqBand>,
+    /// Real-time audio-RMS-to-visual-opacity coupling (`0..1`): modulates the
+    /// track's visual layer directly from its smoothed audio envelope so swells
+    /// and hits visibly breathe on screen (`0` = static fader opacity only).
+    pub rms_to_opacity: f32,
 }
 
 impl Default for Track {
@@ -423,6 +448,8 @@ impl Default for Track {
             duck_to_opacity: 0.35,
             additive: None,
             tape: crate::audio::TapeSettings::default(),
+            eq: Vec::new(),
+            rms_to_opacity: 0.0,
         }
     }
 }

@@ -18,6 +18,7 @@ pub struct RealtimeAudio {
     part_audio: Vec<Vec<Option<crate::audio::AudioClip>>>,
     clip_states: Vec<Vec<AudioFxState>>,
     tilt_states: Vec<crate::dsp::TiltState>,
+    track_eq_states: Vec<Vec<[crate::dsp::Biquad; 2]>>,
     track_states: Vec<Vec<AudioFxState>>,
     track_tape_states: Vec<TapeState>,
     duck_states: Vec<DuckState>,
@@ -55,10 +56,10 @@ impl RealtimeAudio {
                     .iter()
                     .map(|(sid, _)| {
                         let audio = project.sources.get(*sid).and_then(|s| s.audio.as_ref())?;
-                        if clip.audio_filters.is_empty() {
+                        if clip.audio_filters.is_empty() && clip.eq.is_empty() {
                             None // use the source directly
                         } else {
-                            Some(audio.filtered(&clip.audio_filters))
+                            Some(audio.filtered_and_eq(&clip.audio_filters, &clip.eq))
                         }
                     })
                     .collect()
@@ -71,6 +72,18 @@ impl RealtimeAudio {
                     &project.tracks[cp.track].clips[cp.clip_index].effects,
                     sr,
                 )
+            })
+            .collect();
+        let track_eq_states = project
+            .tracks
+            .iter()
+            .map(|t| {
+                t.eq.iter()
+                    .map(|b| {
+                        let bq = crate::dsp::Biquad::peaking(sr as f32, b.freq, b.q, b.gain_db);
+                        [bq.clone(), bq]
+                    })
+                    .collect()
             })
             .collect();
         let track_states = project
@@ -98,6 +111,7 @@ impl RealtimeAudio {
             part_audio,
             clip_states,
             tilt_states,
+            track_eq_states,
             track_states,
             track_tape_states,
             duck_states,
@@ -232,7 +246,8 @@ impl RealtimeAudio {
             tbus.right.resize(n, 0.0);
             tbus.left.fill(0.0);
             tbus.right.fill(0.0);
-            let mut track_touched = !track.effects.is_empty() || track.tape.is_active();
+            let mut track_touched =
+                !track.effects.is_empty() || track.tape.is_active() || !track.eq.is_empty();
 
             for (pi, cp) in self.plan.iter().enumerate() {
                 if cp.track != ti {
@@ -285,6 +300,10 @@ impl RealtimeAudio {
 
             if !track_touched {
                 continue;
+            }
+            for [bql, bqr] in &mut self.track_eq_states[ti] {
+                bql.process_buffer(&mut tbus.left);
+                bqr.process_buffer(&mut tbus.right);
             }
             fx::process_audio_chain(
                 &mut tbus.left,
@@ -485,6 +504,7 @@ mod tests {
             age: 0.25,
             dust: 0.2,
         };
+        p.tracks[t1].eq.push(crate::dsp::EqBand { freq: 320.0, q: 1.2, gain_db: -3.5 });
         p.master_tape = crate::audio::TapeSettings {
             wow: 0.15,
             warmth: 0.2,

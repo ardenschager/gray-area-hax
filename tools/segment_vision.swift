@@ -170,7 +170,8 @@ final class PersonSegmenter: Segmenter {
             }
         }
         guard useInstances, #available(macOS 14.0, *) else { return person }
-        guard let inst = try instancesOverlappingEvidence(frame, w, h) else {
+        let personPixels = person.reduce(0) { $0 + ($1 >= 0.35 ? 1 : 0) }
+        guard let inst = try instancesOverlappingEvidence(frame, w, h, personPixels: personPixels) else {
             return person
         }
         var out = person
@@ -184,7 +185,7 @@ final class PersonSegmenter: Segmenter {
     }
 
     @available(macOS 14.0, *)
-    func instancesOverlappingEvidence(_ frame: CVPixelBuffer, _ w: Int, _ h: Int) throws -> [Float]? {
+    func instancesOverlappingEvidence(_ frame: CVPixelBuffer, _ w: Int, _ h: Int, personPixels: Int) throws -> [Float]? {
         let fg = VNGenerateForegroundInstanceMaskRequest()
         let handler = VNImageRequestHandler(cvPixelBuffer: frame, options: [:])
         try handler.perform([fg])
@@ -196,8 +197,13 @@ final class PersonSegmenter: Segmenter {
             sum[Int(labels[i])] += evidence[i]
             cnt[Int(labels[i])] += 1
         }
+        let maxArea = (w * h * 35) / 100
+        let maxVsPerson = personPixels > 0 ? Int(Float(personPixels) * 1.40) + 64 : maxArea
+        let minPrecision: Float = personPixels > 0 ? 0.55 : keepThreshold
         var keep = IndexSet()
-        for k in obs.allInstances where cnt[k] > 0 && sum[k] / Float(cnt[k]) >= keepThreshold {
+        for k in obs.allInstances where cnt[k] > 0
+            && cnt[k] <= min(maxArea, maxVsPerson)
+            && sum[k] / Float(cnt[k]) >= minPrecision {
             keep.insert(k)
         }
         if keep.isEmpty { return nil }

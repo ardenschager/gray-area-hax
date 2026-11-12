@@ -690,7 +690,7 @@ pub fn segment_video(
     let mask_dir = work_dir.join("masks");
     let key_path = work_dir.join("cache_key.txt");
     let cache_key = format!(
-        "{:016x}:{}:{}",
+        "v2:{:016x}:{}:{}",
         video_fingerprint(video, prompt),
         cmd.join(" "),
         prompt
