@@ -116,6 +116,9 @@ impl Host for App {
         }
         self.live_events.push((source, bus, ev));
     }
+    fn release_voice(&mut self, voice: u64) {
+        self.playback.release_voice(voice);
+    }
     fn set_bus(&mut self, bus: u8, chain: Vec<AvEffect>) {
         self.playback.set_bus(bus, chain);
     }

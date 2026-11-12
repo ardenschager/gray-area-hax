@@ -249,6 +249,9 @@ pub trait Host {
     }
     /// Stop an audition (where the host can).
     fn stop_audition(&mut self) {}
+    /// A live voice (an emitter gesture, `GrainEvent::tag.voice`) was
+    /// released: grains already queued learn the note-off.
+    fn release_voice(&mut self, _voice: u64) {}
     /// A source's slices changed in the document (the plugin forwards
     /// them to its instrument).
     fn slices_changed(&mut self, _source: usize) {}

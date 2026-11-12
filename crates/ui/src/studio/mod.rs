@@ -350,6 +350,7 @@ impl Studio {
         let tile = host.tile_layout() == Some(true);
         let pan_by_tile = tile && host.project().lock().unwrap().layout_pan;
         self.tiles.expire(now);
+        let mut released = Vec::new();
         for (i, e) in self.emitters.iter_mut().enumerate() {
             // Gestures: press = note-on, release = note-off; grains keep
             // coming through the release so sound and picture end together.
@@ -363,6 +364,7 @@ impl Studio {
                 (false, Some((v, on, None))) => {
                     e.gesture = Some((v, on, Some(now)));
                     self.tiles.release(v, now + e.adsr.release_secs());
+                    released.push(v);
                 }
                 (false, Some((_, _, Some(off)))) if now >= off + e.adsr.release_secs() => e.gesture = None,
                 _ => {}
@@ -402,6 +404,9 @@ impl Studio {
             if e.next_t < now - 0.5 {
                 e.next_t = now;
             }
+        }
+        for v in released {
+            host.release_voice(v);
         }
         for (src, bus, ev, cell) in fired {
             if let Some(rec) = self.rec.as_mut() {

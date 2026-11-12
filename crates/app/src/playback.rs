@@ -31,6 +31,8 @@ struct Shared {
     /// Live hits waiting for the engine (onset filled engine-side):
     /// (bus, source, event).
     live_queue: Mutex<Vec<(u8, usize, GrainEvent)>>,
+    /// Live voices to release now (emitter gestures ending).
+    releases: Mutex<Vec<u64>>,
     /// Effect chains of the live buses (1-based), re-applied whenever the
     /// engine is rebuilt.
     live_buses: Mutex<Vec<Vec<chromagrain_core::fx::AvEffect>>>,
@@ -98,6 +100,7 @@ impl Playback {
             loop_region: Mutex::new(None),
             transport_cmd: Mutex::new(None),
             live_queue: Mutex::new(Vec::new()),
+            releases: Mutex::new(Vec::new()),
             live_buses: Mutex::new(Vec::new()),
             buses_dirty: AtomicBool::new(false),
             auditions: Mutex::new(Vec::new()),
@@ -218,6 +221,7 @@ impl Playback {
 
     /// [`Playback::trigger`] through live effect bus `bus` (0 = dry).
     pub fn trigger_bus(&self, bus: u8, source: usize, mut event: GrainEvent) {
+        env_relative(&mut event);
         event.onset = 0.0;
         self.shared.live_queue.lock().unwrap().push((bus, source, event));
     }
@@ -225,8 +229,14 @@ impl Playback {
     /// [`Playback::trigger_bus`], sounding `delay` seconds after the engine
     /// picks it up (keeps grain spacing when hits arrive once per frame).
     pub fn trigger_bus_in(&self, bus: u8, source: usize, mut event: GrainEvent, delay: f64) {
+        env_relative(&mut event);
         event.onset = delay.max(0.0);
         self.shared.live_queue.lock().unwrap().push((bus, source, event));
+    }
+
+    /// End a live voice now (its ADSR releases; queued grains learn it).
+    pub fn release_voice(&self, voice: u64) {
+        self.shared.releases.lock().unwrap().push(voice);
     }
 
     pub fn is_offline(&self) -> bool {
@@ -380,9 +390,19 @@ impl Driver {
         }
         let mut queue = shared.live_queue.lock().unwrap();
         for (bus, source, mut ev) in queue.drain(..) {
-            // The queued onset is a delay from "now" (0 = immediately).
+            // The queued onset is a delay from "now" (0 = immediately);
+            // the envelope was made relative to it (`env_relative`).
             ev.onset = self.engine.live_now_secs() + ev.onset.max(0.0);
+            if let Some(env) = ev.tag.env.as_mut() {
+                env.on += ev.onset;
+                env.off += ev.onset;
+            }
             self.engine.trigger_live_bus(bus, source, ev);
+        }
+        drop(queue);
+        let now = self.engine.live_now_secs();
+        for voice in shared.releases.lock().unwrap().drain(..) {
+            self.engine.release_voice(voice, now);
         }
     }
 
@@ -459,5 +479,62 @@ fn producer_loop(device_rate: u32, mut producer: rtrb::Producer<f32>, shared: Ar
         if !pending.is_empty() {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+    }
+}
+
+/// Live hits are timed on the app clock; the engine re-stamps onsets on
+/// its own live clock. Make a voice envelope relative to the grain's onset
+/// so the engine can re-anchor it (`env.on/off += onset` at pickup).
+fn env_relative(ev: &mut GrainEvent) {
+    if let Some(env) = ev.tag.env.as_mut() {
+        env.on -= ev.onset;
+        env.off -= ev.onset; // INFINITY stays INFINITY
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chromagrain_core::audio::AudioClip;
+    use chromagrain_core::envelope::{Adsr, VoiceEnv};
+    use chromagrain_core::grain::VoiceTag;
+    use chromagrain_core::timeline::Source;
+
+    fn rms(x: &[f32]) -> f32 {
+        (x.iter().map(|s| s * s).sum::<f32>() / x.len().max(1) as f32).sqrt()
+    }
+
+    /// An emitter grain is timed on the app clock (here: 1000 s in) with a
+    /// held envelope; the engine re-stamps it on its own live clock, so the
+    /// envelope must be re-anchored — and a release cuts it.
+    #[test]
+    fn live_envelopes_follow_the_engine_clock_and_release() {
+        let mut pb = Playback::new_offline();
+        let mut p = Project::default();
+        p.add_source(Source { name: "tone".into(), audio: Some(Arc::new(AudioClip::sine(220.0, 4.0, p.sample_rate))), base_hz: 220.0, ..Default::default() });
+        pb.set_project(p);
+        pb.render_offline(512);
+        let app_t = 1000.0;
+        let adsr = Adsr { attack: 0.0, decay: 0.0, sustain: 1.0, release: 0.02, ..Default::default() };
+        let ev = GrainEvent {
+            onset: app_t,
+            source_pos: 0.5,
+            duration: 2.0,
+            pitch_ratio: 1.0,
+            gain: 0.8,
+            pan: 0.0,
+            envelope: 0.01,
+            env_skew: 0.0,
+            reverse: false,
+            id: 1,
+            tag: VoiceTag { voice: 0xE000_0000_0001, env: Some(VoiceEnv::held(adsr, app_t)), tile: None },
+        };
+        pb.trigger_bus(0, 0, ev);
+        let (l, _) = pb.render_offline(4800);
+        assert!(rms(&l[1000..]) > 0.05, "the held grain sounds (envelope re-anchored): {}", rms(&l[1000..]));
+        pb.release_voice(0xE000_0000_0001);
+        pb.render_offline(4800); // release (20 ms) happens here
+        let (l, _) = pb.render_offline(4800);
+        assert!(rms(&l) < 1e-3, "released: silent although the grain is 2 s long ({})", rms(&l));
     }
 }

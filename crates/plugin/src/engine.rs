@@ -397,7 +397,16 @@ impl AudioSide {
         // finds it.
         while let Ok(msg) = self.live.pop() {
             match msg {
-                Live::Fire(src, ev) => self.inst.trigger(src, ev),
+                Live::Fire(src, mut ev) => {
+                    // Re-anchor the editor's (relative) envelope: the grain
+                    // starts now on the instrument clock.
+                    let now = self.inst.now_secs();
+                    if let Some(env) = ev.tag.env.as_mut() {
+                        env.on += now;
+                        env.off += now;
+                    }
+                    self.inst.trigger(src, ev)
+                }
                 Live::Pad(n, slot) => self.inst.set_pad(n, slot),
                 Live::TogglePad(n) => self.inst.toggle_pad(n),
                 Live::StopPads => self.inst.stop_pads(),

@@ -252,7 +252,14 @@ impl Host for PluginHost {
         self.clock.elapsed().as_secs_f64()
     }
     fn fire(&mut self, bus: u8, source: usize, ev: GrainEvent) {
-        self.shared.live(Live::Fire(source, ev.clone()));
+        // The audio thread re-stamps the onset on the instrument clock:
+        // send the envelope relative to the grain (re-anchored there).
+        let mut rel = ev.clone();
+        if let Some(env) = rel.tag.env.as_mut() {
+            env.on -= rel.onset;
+            env.off -= rel.onset;
+        }
+        self.shared.live(Live::Fire(source, rel));
         self.live.push((source, bus, ev));
     }
     fn set_bus(&mut self, _bus: u8, _chain: Vec<AvEffect>) {
@@ -395,13 +402,21 @@ impl Host for PluginHost {
 impl PerformHost for PluginHost {
     fn pads(&self) -> Vec<Pad> {
         let slots = self.shared.pad_slots.lock().map(|s| *s).unwrap_or([None; PADS]);
+        let doc = self.project.lock().unwrap();
+        // Slice pads read "clip · N".
+        let name_of = |s: &PadSlot| -> Option<String> {
+            let sl = s.slice?;
+            let src = doc.sources.get(s.source)?;
+            let k = src.slices.iter().position(|x| (x.start - sl.start).abs() < 1e-6)?;
+            Some(format!("{} · {}", src.name, k + 1))
+        };
         slots
             .iter()
             .enumerate()
             .map(|(i, s)| {
                 let (on, queued) = self.shared.pad_state(i);
                 Pad {
-                    name: None,
+                    name: s.as_ref().and_then(name_of),
                     source: s.map(|s| s.source),
                     kind: if s.is_some_and(|s| s.slice.is_some()) { PadKind::Chop } else { PadKind::Loop },
                     len_beats: s.map_or(4.0, |s| s.len_beats as f64),
