@@ -33,6 +33,7 @@ CHROMAGRAIN_PARITY_DIR=$PWD/outputs/.../parity cargo test -p chromagrain-ui --li
   - Placeholders get a loading glyph and pulsing dots.
   - Browse snapshots read a real fixture library.
   - Adds the plugin editor shots.
+- **v004**: merged the core's tile fix (`fix-tile-mute` 59d66e2). Muted pad tracks no longer take tile slots, so 3 playing pads give a clean 2×2 grid; `perform-tile` was 3×3 with holes in v003. No UI code changed.
 - **v003**:
   - The GPU tile pass lands, mirroring the core compositor. Tile shots now show real tiles.
   - Slice pads in the plugin are named.
