@@ -22,6 +22,7 @@
 //! * **Output** (`O` / top-bar button) — a second window with only the
 //!   picture, fullscreen on the second display (see `ui_output`).
 
+mod adds;
 mod browser;
 mod demo;
 mod displays;
@@ -33,6 +34,8 @@ mod showcase;
 mod studio_host;
 #[cfg(test)]
 mod studio_tests;
+#[cfg(test)]
+mod studio_tests_v003;
 mod theme;
 mod ui_browse;
 mod ui_inspector;
@@ -387,6 +390,13 @@ pub struct App {
 
     lib_tab: LibTab,
     browser: browser::Browser,
+    /// The studio's Add-sheet jobs (files, Browse, links, digs).
+    pub(crate) adds: adds::Adds,
+    /// Paths behind the last Browse list the studio showed.
+    pub(crate) browse_last: Vec<PathBuf>,
+    /// Answers the Files tab instead of a dialog (tests, the showcase).
+    #[allow(clippy::type_complexity)]
+    pub(crate) pick_override: Option<Box<dyn FnMut() -> Vec<PathBuf>>>,
     /// File path -> source id, so a file is only ever decoded once.
     imported: HashMap<PathBuf, usize>,
     /// Paths queued/decoding right now (avoid double-queueing).
@@ -522,6 +532,9 @@ impl App {
             peaks: HashMap::new(),
             lib_tab: LibTab::Project,
             browser,
+            adds: adds::Adds::default(),
+            browse_last: Vec::new(),
+            pick_override: None,
             imported: HashMap::new(),
             loading: HashSet::new(),
             fullscreen: false,
@@ -1544,6 +1557,9 @@ impl eframe::App for App {
         self.synth_update(ctx);
         bg += self.project_rev - r;
         self.browser.poll(ctx);
+        if self.adds.poll(&self.project, &mut self.imported) {
+            self.mark_now();
+        }
         if self.classic {
             self.handle_shortcuts(ctx);
         } else {

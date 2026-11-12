@@ -9,14 +9,16 @@
 //!   when there is no eframe.
 
 pub mod atlas;
+pub mod envelope;
 pub mod gpu;
 pub mod host;
 pub mod studio;
 pub mod surface;
 pub mod theme;
+pub mod wave;
 pub mod widgets;
 
-pub use host::{Caps, Host, Pad, PadKind, PerformHost};
+pub use host::{AddRoute, AddTarget, Added, BrowseItem, Caps, Host, Pad, PadKind, Pending, PerformHost};
 pub use studio::{DeepTab, DeepTarget, Studio, View};
 
 /// Largest rect of `aspect` (w/h) centered inside `outer` (letterbox /

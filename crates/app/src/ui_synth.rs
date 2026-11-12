@@ -124,6 +124,7 @@ impl App {
                 audio: Some(audio),
                 video: Some(video),
                 base_hz: part.base_hz(),
+                ..Default::default()
             });
             part.source = src;
             let beats = part.length_beats;

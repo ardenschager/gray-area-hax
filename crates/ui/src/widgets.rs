@@ -114,6 +114,22 @@ pub fn segmented(
     font: FontId,
     thumb_hi: bool,
 ) -> Option<usize> {
+    segmented_named(ui, rect, id, labels, labels, hints, selected, font, thumb_hi)
+}
+
+/// [`segmented`] with separate accessibility names per segment.
+#[allow(clippy::too_many_arguments)]
+pub fn segmented_named(
+    ui: &mut Ui,
+    rect: Rect,
+    id: egui::Id,
+    labels: &[&str],
+    names: &[&str],
+    hints: &[&str],
+    selected: usize,
+    font: FontId,
+    thumb_hi: bool,
+) -> Option<usize> {
     let painter = ui.painter().clone();
     painter.rect_filled(rect, r(12), G1);
     painter.rect_stroke(rect, r(12), hair(LINE), StrokeKind::Inside);
@@ -131,7 +147,7 @@ pub fn segmented(
     let mut picked = None;
     for (i, label) in labels.iter().enumerate() {
         let cell = Rect::from_min_size(egui::pos2(inner.left() + i as f32 * w, inner.top()), egui::vec2(w, inner.height()));
-        let resp = hit(ui, cell, id.with(i), Sense::click(), label);
+        let resp = hit(ui, cell, id.with(i), Sense::click(), names.get(i).copied().unwrap_or(label));
         if resp.clicked() {
             picked = Some(i);
         }
@@ -175,7 +191,13 @@ pub fn chip(ui: &mut Ui, rect: Rect, id: egui::Id, label: &str, ghost: bool, on:
 
 /// Primary / secondary button with an icon painter and a label.
 pub fn button(ui: &mut Ui, rect: Rect, id: egui::Id, label: &str, primary: bool, icon: Option<Icon>, kbd: Option<&str>) -> Response {
-    let resp = hit(ui, rect, id, Sense::click(), label);
+    button_named(ui, rect, id, label, label, primary, icon, kbd)
+}
+
+/// [`button`] with an accessibility name other than its label.
+#[allow(clippy::too_many_arguments)]
+pub fn button_named(ui: &mut Ui, rect: Rect, id: egui::Id, label: &str, name: &str, primary: bool, icon: Option<Icon>, kbd: Option<&str>) -> Response {
+    let resp = hit(ui, rect, id, Sense::click(), name);
     let p = ui.painter().clone();
     let pressed = resp.is_pointer_button_down_on();
     if primary {
@@ -223,6 +245,12 @@ pub enum Icon {
     Cloud,
     Chop,
     Display2,
+    Folder,
+    Dig,
+    Link,
+    Grid,
+    Tile,
+    Stack,
 }
 
 /// Line icons drawn as shapes (no icon font needed).
@@ -295,6 +323,35 @@ pub fn draw_icon(p: &Painter, icon: Icon, c: Pos2, size: f32, col: Color32) {
         Icon::Display2 => {
             p.rect_stroke(Rect::from_min_max(pt(2.0, 4.0), pt(15.0, 13.0)), r(1), st, StrokeKind::Middle);
             p.rect_stroke(Rect::from_min_max(pt(9.0, 10.0), pt(22.0, 19.0)), r(1), st, StrokeKind::Middle);
+        }
+        Icon::Folder => {
+            p.add(Shape::closed_line(vec![pt(3.5, 7.0), pt(9.5, 7.0), pt(11.5, 9.0), pt(20.5, 9.0), pt(20.5, 18.5), pt(3.5, 18.5)], st));
+        }
+        Icon::Dig => {
+            // A spade: blade + shaft.
+            p.add(Shape::closed_line(vec![pt(8.0, 12.0), pt(16.0, 12.0), pt(16.0, 16.0), pt(12.0, 20.5), pt(8.0, 16.0)], st));
+            p.line_segment([pt(12.0, 12.0), pt(12.0, 3.5)], st);
+            p.line_segment([pt(9.5, 3.5), pt(14.5, 3.5)], st);
+        }
+        Icon::Link => {
+            p.add(Shape::line(vec![pt(10.5, 8.0), pt(13.0, 5.5), pt(15.5, 5.5), pt(18.5, 8.5), pt(18.5, 11.0), pt(16.0, 13.5)], st));
+            p.add(Shape::line(vec![pt(13.5, 16.0), pt(11.0, 18.5), pt(8.5, 18.5), pt(5.5, 15.5), pt(5.5, 13.0), pt(8.0, 10.5)], st));
+            p.line_segment([pt(9.5, 14.5), pt(14.5, 9.5)], st);
+        }
+        Icon::Grid => {
+            for (x, y) in [(4.0, 4.0), (13.0, 4.0), (4.0, 13.0), (13.0, 13.0)] {
+                p.rect_stroke(Rect::from_min_size(pt(x, y), egui::vec2(7.0 * s, 7.0 * s)), r(1), st, StrokeKind::Middle);
+            }
+        }
+        Icon::Tile => {
+            p.rect_stroke(Rect::from_min_max(pt(3.5, 5.5), pt(11.2, 11.2)), r(1), st, StrokeKind::Middle);
+            p.rect_stroke(Rect::from_min_max(pt(12.8, 5.5), pt(20.5, 11.2)), r(1), st, StrokeKind::Middle);
+            p.rect_stroke(Rect::from_min_max(pt(3.5, 12.8), pt(11.2, 18.5)), r(1), st, StrokeKind::Middle);
+            p.rect_stroke(Rect::from_min_max(pt(12.8, 12.8), pt(20.5, 18.5)), r(1), st, StrokeKind::Middle);
+        }
+        Icon::Stack => {
+            p.rect_stroke(Rect::from_min_max(pt(7.0, 4.0), pt(20.0, 13.0)), r(1), st, StrokeKind::Middle);
+            p.rect_stroke(Rect::from_min_max(pt(4.0, 8.0), pt(17.0, 17.0)), r(1), st, StrokeKind::Middle);
         }
     }
 }

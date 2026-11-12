@@ -13,7 +13,7 @@ use chromagrain_core::fx::{AvEffect, EffectKind};
 use chromagrain_core::music::{Key, ScaleKind};
 use chromagrain_core::seq::StepPattern;
 use chromagrain_core::timeline::{Clip, Source, Track};
-use chromagrain_ui::studio::{COLUMNS, EMITTERS, LANES, SCENES, STEPS};
+use chromagrain_ui::studio::{COLUMNS, EMITTERS, LANES, SCENES};
 use std::path::{Path, PathBuf};
 
 /// One clip of a demo: a file in the demo folder, its display name, and
@@ -452,6 +452,7 @@ mod tests {
                 audio: Some(Arc::new(chromagrain_core::audio::AudioClip::saw_stack(110.0 + i as f32 * 20.0, 4.0, 48000))),
                 video: Some(Arc::new(chromagrain_core::video::VideoClip::test_pattern(64, 36, 12.0, 4.0))),
                 base_hz: c.base_hz,
+                ..Default::default()
             })
             .collect()
     }
@@ -465,7 +466,7 @@ mod tests {
         let n = spec.clips.len();
         assert!(spec.grid.iter().all(|c| *c < n) && spec.lanes.iter().all(|l| l.clip < n));
         for s in &spec.scenes {
-            assert!(s.hits.iter().all(|h| h.lane < spec.lanes.len() && h.step < STEPS), "hits land on real lanes and steps");
+            assert!(s.hits.iter().all(|h| h.lane < spec.lanes.len() && h.step < chromagrain_ui::studio::STEPS), "hits land on real lanes and steps");
         }
         assert!(spec.chain.iter().all(|(s, n)| *s < spec.scenes.len() && *n > 0));
         assert_eq!(spec.pads.len(), PADS);

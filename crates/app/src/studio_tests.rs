@@ -27,7 +27,7 @@ const DESIGN_CLIPS: [(&str, &str); 7] = [
 
 /// The design's 7 archival clips (decoded with ffmpeg) when available,
 /// else procedural stand-ins, so the tests run anywhere.
-fn clips() -> &'static Vec<Source> {
+pub(crate) fn clips() -> &'static Vec<Source> {
     static CLIPS: OnceLock<Vec<Source>> = OnceLock::new();
     CLIPS.get_or_init(|| {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../design/v001/media");
@@ -52,13 +52,14 @@ fn clips() -> &'static Vec<Source> {
                     audio: Some(Arc::new(chromagrain_core::audio::AudioClip::saw_stack(110.0 * (1.0 + i as f32 * 0.25), 3.0, 48000))),
                     video: Some(Arc::new(chromagrain_core::video::VideoClip::test_pattern(160, 90, 12.0, 3.0))),
                     base_hz: 110.0,
+                    ..Default::default()
                 })
                 .collect()
         })
     })
 }
 
-fn harness(size: (f32, f32), view: View, setup: impl FnOnce(&mut App) + 'static) -> Harness<'static, App> {
+pub(crate) fn harness(size: (f32, f32), view: View, setup: impl FnOnce(&mut App) + 'static) -> Harness<'static, App> {
     Harness::builder()
         .with_size(egui::vec2(size.0, size.1))
         .with_pixels_per_point(1.0)
@@ -89,7 +90,7 @@ fn harness(size: (f32, f32), view: View, setup: impl FnOnce(&mut App) + 'static)
 }
 
 /// The scripted state the design shots show.
-fn showcase(app: &mut App) {
+pub(crate) fn showcase(app: &mut App) {
     let looks = |name: &str| {
         let i = chromagrain_core::instrument::LOOKS.iter().position(|l| *l == Some(name)).unwrap_or(0);
         (i as f32 + 0.5) / chromagrain_core::instrument::LOOKS.len() as f32
@@ -130,7 +131,7 @@ fn showcase(app: &mut App) {
     app.playhead_beats = 1.5;
 }
 
-fn shot(h: &mut Harness<'static, App>, name: &str) {
+pub(crate) fn shot(h: &mut Harness<'static, App>, name: &str) {
     let img = h.render().expect("render");
     if let Ok(dir) = std::env::var("CHROMAGRAIN_UI_SHOTS") {
         let dir = std::path::Path::new(&dir);
@@ -148,11 +149,11 @@ fn step_of(h: &Harness<'static, App>, scene: usize, lane: usize, step: usize) ->
     p.patterns.get(pid)?.rows.get(lane)?.steps.get(step).copied()
 }
 
-fn push(h: &mut Harness<'static, App>, e: egui::Event) {
+pub(crate) fn push(h: &mut Harness<'static, App>, e: egui::Event) {
     h.input_mut().events.push(e);
 }
 
-const SIZES: [(f32, f32); 3] = [(1600.0, 1000.0), (1180.0, 820.0), (960.0, 600.0)];
+pub(crate) const SIZES: [(f32, f32); 3] = [(1600.0, 1000.0), (1180.0, 820.0), (960.0, 600.0)];
 
 #[test]
 fn snapshots_every_view_at_every_size() {

@@ -185,6 +185,7 @@ pub fn fm_source(base_hz: f32, ratio: f32, index: f32, secs: f32, sample_rate: u
         audio: Some(Arc::new(audio)),
         video: Some(Arc::new(video)),
         base_hz,
+        ..Default::default()
     }
 }
 
@@ -197,6 +198,7 @@ pub fn noise_source(color: f32, secs: f32, sample_rate: u32) -> Source {
         audio: Some(Arc::new(audio)),
         video: Some(Arc::new(video)),
         base_hz: 0.0,
+        ..Default::default()
     }
 }
 

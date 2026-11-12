@@ -69,6 +69,7 @@ pub fn bounce(
         audio: Some(Arc::new(AudioClip::stereo(&audio.left, &audio.right, sample_rate))),
         video: Some(Arc::new(VideoClip { frames, fps })),
         base_hz,
+        ..Default::default()
     }
 }
 
@@ -83,6 +84,7 @@ mod tests {
             audio: Some(Arc::new(AudioClip::sine(220.0, 2.0, 48000))),
             video: Some(Arc::new(VideoClip::test_pattern(32, 18, 12.0, 2.0))),
             base_hz: 220.0,
+            ..Default::default()
         };
         let hit = |onset: f64| GrainEvent {
             onset,
@@ -95,6 +97,7 @@ mod tests {
             env_skew: 0.0,
             reverse: false,
             id: onset as u64,
+            ..Default::default()
         };
         let take = bounce(
             "take 1",

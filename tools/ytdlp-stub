@@ -1,0 +1,83 @@
+#!/bin/sh
+# A stand-in for yt-dlp that serves pre-dug "finds" from a folder, so Dig
+# and Link run without the network (tests, the showcase). Point chromagrain
+# at it with:
+#
+#   CHROMAGRAIN_YTDLP=tools/ytdlp-stub CHROMAGRAIN_YTDLP_STUB_DIR=path/to/finds
+#
+# The finds folder holds:
+#   search.jsonl     yt-dlp --flat-playlist --dump-json lines (one per hit),
+#                    returned for every "ytsearchN:<query>"
+#   <id>.json        full metadata for a video (--dump-json URL): title,
+#                    uploader, upload_date, view_count, duration, license, ...
+#   <id>.<ext>       the media "downloaded" for that video (mp4, webm, wav)
+#   empty_searches   optional: a number N; the first N searches return
+#                    nothing (exercises Dig's retry). Calls are counted in
+#                    .calls inside the folder.
+#
+# Video ids are taken from the URL (?v=<id> or the last path segment).
+# Supported invocations are exactly the ones chromagrain makes (see
+# crates/core/src/media.rs: search_videos, video_info, download_video).
+set -eu
+DIR="${CHROMAGRAIN_YTDLP_STUB_DIR:-$(dirname "$0")/../fixtures/dig}"
+
+search=""
+dump=0
+out=""
+url=""
+prev=""
+for a in "$@"; do
+  case "$prev" in -o) out="$a"; prev=""; continue ;; -f|--merge-output-format|--print) prev=""; continue ;; esac
+  case "$a" in
+    --version) echo "2099.01.01-stub"; exit 0 ;;
+    ytsearch*) search="$a" ;;
+    --dump-json) dump=1 ;;
+    -o|-f|--merge-output-format|--print) prev="$a" ;;
+    -*) ;;
+    *) url="$a" ;;
+  esac
+done
+
+video_id() {
+  case "$1" in
+    *v=*) printf '%s' "${1##*v=}" | sed 's/[&#].*//' ;;
+    *) printf '%s' "${1##*/}" ;;
+  esac
+}
+
+if [ -n "$search" ]; then
+  calls=0
+  [ -f "$DIR/.calls" ] && calls=$(cat "$DIR/.calls")
+  calls=$((calls + 1))
+  echo "$calls" > "$DIR/.calls"
+  empty=0
+  [ -f "$DIR/empty_searches" ] && empty=$(cat "$DIR/empty_searches")
+  if [ "$calls" -le "$empty" ]; then exit 0; fi
+  [ -f "$DIR/search.jsonl" ] && cat "$DIR/search.jsonl"
+  exit 0
+fi
+
+id=$(video_id "$url")
+if [ "$dump" = 1 ]; then
+  if [ -f "$DIR/$id.json" ]; then cat "$DIR/$id.json"; exit 0; fi
+  echo "ERROR: [stub] no metadata for $id" >&2
+  exit 1
+fi
+
+if [ -n "$out" ]; then
+  media=""
+  for f in "$DIR/$id".*; do
+    case "$f" in *.json) ;; *) [ -f "$f" ] && media="$f" ;; esac
+  done
+  if [ -z "$media" ]; then echo "ERROR: [stub] no media for $id" >&2; exit 1; fi
+  dest_dir=$(dirname "$out")
+  mkdir -p "$dest_dir"
+  dest="$dest_dir/$id.${media##*.}"
+  for p in 0.0 25.0 50.0 75.0 100.0; do echo "[download]  $p% of 1.00MiB at 1.00MiB/s ETA 00:00"; done
+  cp "$media" "$dest"
+  echo "$dest"
+  exit 0
+fi
+
+echo "ERROR: [stub] unsupported invocation: $*" >&2
+exit 2

@@ -26,7 +26,10 @@
 
 pub mod audio;
 pub mod auto;
+pub mod chop;
+pub mod dig;
 pub mod dsp;
+pub mod envelope;
 pub mod fx;
 pub mod grain;
 pub mod instrument;
@@ -42,5 +45,6 @@ pub mod seq;
 pub mod stretch;
 pub mod synth;
 pub mod take;
+pub mod tile;
 pub mod timeline;
 pub mod video;

@@ -195,6 +195,29 @@ impl RealtimeAudio {
         self.live.push((bus, source, event));
     }
 
+    /// Release a live voice (its `GrainEvent::tag.voice`) at `off`, on the
+    /// live clock ([`RealtimeAudio::live_now_secs`]): queued and sounding
+    /// grains of the voice learn the note-off time, so their ADSR releases
+    /// sample-exactly; grains that would start after the release are
+    /// dropped. Grains without an envelope are left alone. Allocation-free.
+    pub fn release_voice(&mut self, voice: u64, off: f64) {
+        if voice == 0 {
+            return;
+        }
+        let mut end = f64::NEG_INFINITY;
+        for (_, _, e) in self.live.iter_mut() {
+            if e.tag.voice == voice {
+                if let Some(env) = e.tag.env.as_mut() {
+                    env.off = env.off.min(off);
+                    end = end.max(env.end());
+                }
+            }
+        }
+        if end.is_finite() {
+            self.live.retain(|(_, _, e)| !(e.tag.voice == voice && e.tag.env.is_some() && e.onset >= end));
+        }
+    }
+
     /// Set the effect chain of live bus `bus` (1-based). State is kept
     /// while the chain's shape (effect kinds) stays the same, so wet
     /// amounts can be swept without clicks; a new shape rebuilds it.
@@ -534,6 +557,7 @@ mod tests {
             audio: Some(std::sync::Arc::new(crate::audio::AudioClip::saw_stack(110.0, 3.0, p.sample_rate))),
             video: Some(std::sync::Arc::new(VideoClip::test_pattern(32, 24, 12.0, 2.0))),
             base_hz: 110.0,
+            ..Default::default()
         });
         // Granular clip with a clip-level delay.
         let t0 = p.add_track("grains");
@@ -760,5 +784,212 @@ mod tests {
         let mut r = vec![0.0f32; 1024];
         rt.next_block(&mut l, &mut r);
         assert!(rt.playhead_beats() > 3.0);
+    }
+
+    // ---- v003: ADSR, slices, tiles ----
+
+    /// Two overlapping granular clips (one with a clip ADSR) side by side
+    /// in Tile layout, plus a pattern row with an ADSR playing chop slices.
+    fn v003_project() -> Project {
+        let mut p = Project { bpm: 120.0, width: 32, height: 18, fps: 12.0, ..Default::default() };
+        p.layout = crate::tile::Layout::Tile;
+        let mut src = Source {
+            name: "s".into(),
+            audio: Some(std::sync::Arc::new(crate::audio::AudioClip::saw_stack(110.0, 3.0, p.sample_rate))),
+            video: Some(std::sync::Arc::new(VideoClip::test_pattern(32, 18, 12.0, 3.0))),
+            base_hz: 110.0,
+            ..Default::default()
+        };
+        src.slices = crate::chop::equal_slices(3.0, 8);
+        let sid = p.add_source(src);
+        let t0 = p.add_track("a");
+        let mut a = Clip::new(sid, 0.0, 4.0);
+        a.grains.density = 12.0;
+        a.grains.adsr = Some(crate::envelope::Adsr { attack: 0.2, decay: 0.3, sustain: 0.6, release: 0.4, ..Default::default() });
+        p.tracks[t0].clips.push(a);
+        let t1 = p.add_track("b");
+        let mut b = Clip::new(sid, 1.0, 2.0);
+        b.grains.density = 10.0;
+        p.tracks[t1].clips.push(b);
+        let mut pat = crate::seq::StepPattern::new("chops");
+        let r = pat.add_row(sid);
+        for (k, i) in (0..16).step_by(4).enumerate() {
+            pat.rows[r].steps[i].on = true;
+            pat.rows[r].steps[i].slice_index = Some(k as u16 * 2);
+        }
+        pat.rows[r].grains.adsr = Some(crate::envelope::Adsr { attack: 0.005, decay: 0.05, sustain: 0.7, release: 0.08, ..Default::default() });
+        let pid = p.add_pattern(pat);
+        let t2 = p.add_track("seq");
+        p.tracks[t2].clips.push(Clip::new_pattern(pid, 0.0, 4.0));
+        p
+    }
+
+    #[test]
+    fn v003_adsr_slices_tiles_stream_matches_offline() {
+        let p = v003_project();
+        let offline = render_project(&p, 0.0, 4.0);
+        let total = offline.audio.len();
+        let mut rt = RealtimeAudio::new(p, 0.0, None);
+        let (mut left, mut right) = (vec![0.0f32; total], vec![0.0f32; total]);
+        let sizes = [512usize, 64, 2048, 733, 4096];
+        let (mut pos, mut k) = (0, 0);
+        while pos < total {
+            let b = sizes[k % sizes.len()].min(total - pos);
+            rt.next_block(&mut left[pos..pos + b], &mut right[pos..pos + b]);
+            pos += b;
+            k += 1;
+        }
+        let mut max_diff = 0.0f32;
+        for i in 0..total {
+            max_diff = max_diff.max((left[i] - offline.audio.left[i]).abs());
+            max_diff = max_diff.max((right[i] - offline.audio.right[i]).abs());
+        }
+        assert!(max_diff < 1e-5, "realtime == offline with ADSR + tiles + slices: {max_diff}");
+        assert!(offline.audio.rms() > 0.01);
+
+        // Every grain is tiled; the clips got different slots.
+        let slots = |ci: usize| offline.events[ci].iter().filter_map(|e| e.tag.tile).collect::<std::collections::BTreeSet<_>>();
+        assert!(offline.events.iter().flatten().all(|e| e.tag.tile.is_some()));
+        let (sa, sb) = (slots(0), slots(1));
+        assert_eq!(sa.len(), 1);
+        assert_eq!(sb.len(), 1);
+        assert_ne!(sa, sb, "overlapping clips get their own tiles");
+        // The clip ADSR rides on clip a's grains.
+        assert!(offline.events[0].iter().all(|e| e.tag.env.is_some_and(|v| v.on == 0.0 && (v.end() - 2.0).abs() < 1e-6)));
+        // Slice steps start at their slice.
+        let starts: Vec<f64> = offline.events[2].iter().map(|e| e.source_pos).collect();
+        for s in &starts {
+            assert!((s / 0.375 - (s / 0.375).round()).abs() < 1e-6, "on a slice boundary: {s}");
+        }
+
+        // The picture: while a and b overlap (1–2 s, after a's attack),
+        // both halves are lit.
+        let f = &offline.frames[(1.5 * 12.0) as usize];
+        let half = |x0: u32, x1: u32| {
+            let mut sum = 0.0;
+            for y in 0..18u32 {
+                for x in x0..x1 {
+                    let k = ((y * 32 + x) * 4) as usize;
+                    sum += f.data[k] as f32 + f.data[k + 1] as f32 + f.data[k + 2] as f32;
+                }
+            }
+            sum / ((x1 - x0) * 18 * 3) as f32
+        };
+        assert!(half(0, 15) > 5.0 && half(17, 32) > 5.0, "{} {}", half(0, 15), half(17, 32));
+        // After a's release (2 s) the picture is cut: by 2.5 s only the
+        // pattern's short hits remain.
+        let grids = crate::render::frame_tile_grids(&crate::render::plan_project(&v003_project()), 0.0, 12.0, 48);
+        assert_eq!(grids.len(), 48);
+        assert!(grids[18].0 >= 2, "two tiles mid-overlap: {:?}", grids[18]);
+    }
+
+    #[test]
+    fn assign_tiles_gives_overlapping_voices_distinct_slots() {
+        let ev = |onset: f64, voice: u64| GrainEvent { onset, duration: 1.0, tag: crate::grain::VoiceTag { voice, ..Default::default() }, ..Default::default() };
+        let mut plans = vec![
+            crate::render::ClipPlan { track: 0, clip_index: 0, parts: vec![(0, vec![ev(0.0, 1), ev(0.5, 1)])], video_parts: None, style: Default::default() },
+            crate::render::ClipPlan { track: 1, clip_index: 0, parts: vec![(0, vec![ev(0.25, 2)])], video_parts: None, style: Default::default() },
+            crate::render::ClipPlan { track: 2, clip_index: 0, parts: vec![(0, vec![ev(3.0, 3)])], video_parts: None, style: Default::default() },
+        ];
+        crate::render::assign_tiles(&mut plans, true);
+        let tile = |p: usize, i: usize| plans[p].parts[0].1[i].tag.tile;
+        assert_eq!(tile(0, 0), Some(0));
+        assert_eq!(tile(0, 1), Some(0));
+        assert_eq!(tile(1, 0), Some(1));
+        assert_eq!(tile(2, 0), Some(0), "slot 0 is free again by 3 s");
+        // Pans follow the grid at each grain's onset.
+        assert_eq!(plans[0].parts[0].1[0].pan, 0.0, "alone: centered");
+        assert!((plans[0].parts[0].1[1].pan + 0.8).abs() < 1e-6, "with voice 2: left");
+        assert!((plans[1].parts[0].1[0].pan - 0.8).abs() < 1e-6);
+        assert_eq!(plans[2].parts[0].1[0].pan, 0.0);
+        let grids = crate::render::frame_tile_grids(&plans, 0.0, 4.0, 16);
+        assert_eq!(grids[0], (1, 1));
+        assert_eq!(grids[1], (2, 1));
+        assert_eq!(grids[5], (1, 1), "1.25 s: voice 2 is over, voice 1 (0.5..1.5) remains");
+    }
+
+    #[test]
+    fn release_voice_releases_live_grains() {
+        let p = perf_project();
+        let sr = p.sample_rate as usize;
+        let mut rt = RealtimeAudio::new(p, 0.0, None);
+        rt.transport = false;
+        rt.project.master_tape.dust = 0.0;
+        let adsr = crate::envelope::Adsr { attack: 0.001, decay: 0.0, sustain: 1.0, release: 0.05, ..Default::default() };
+        let now = rt.live_now_secs();
+        let voice = 0xE000_0000_0000_0042u64;
+        for k in 0..8 {
+            let mut ev = crate::grain::grain_from_note(&crate::grain::GrainSettings { gain: 1.0, duration: 0.3, ..Default::default() }, 60, 100, 3.0, now + k as f64 * 0.25, 10 + k);
+            ev.tag = crate::grain::VoiceTag { voice, env: Some(crate::envelope::VoiceEnv::held(adsr, now)), tile: None };
+            rt.trigger_live(0, ev);
+        }
+        let (mut l, mut r) = (vec![0.0f32; sr / 4], vec![0.0f32; sr / 4]);
+        rt.next_block(&mut l, &mut r);
+        let held: f32 = l.iter().map(|s| s * s).sum::<f32>();
+        assert!(held > 1e-3, "sounds while held");
+        let off = rt.live_now_secs();
+        rt.release_voice(voice, off);
+        rt.release_voice(0, off); // voice 0 = untagged: ignored
+        let n_live = rt.live.len();
+        assert!(n_live <= 2, "grains past the release are dropped: {n_live}");
+        let (mut l2, mut r2) = (vec![0.0f32; sr / 2], vec![0.0f32; sr / 2]);
+        rt.next_block(&mut l2, &mut r2);
+        // Past the release (+ effect tails: perf_project's buses are dry for live grains).
+        let tail = &l2[(0.06 * sr as f64) as usize..];
+        let e: f32 = tail.iter().map(|s| s * s).sum::<f32>() / tail.len() as f32;
+        assert!(e.sqrt() < 1e-4, "silent after the release: {}", e.sqrt());
+    }
+
+    #[test]
+    fn muted_tracks_get_no_tiles_and_pads_keep_their_tile() {
+        // Six looping pad tracks (Perform: pad i = track i, ON = unmuted,
+        // the loop refilled with copies), three playing, entering at
+        // different times: they take slots 0, 1, 2 in a 2×2 grid, each
+        // pad keeps its slot on every pass, and muted pads get no tile.
+        let mut p = Project { bpm: 120.0, width: 32, height: 18, fps: 12.0, ..Default::default() };
+        p.layout = crate::tile::Layout::Tile;
+        let sid = p.add_source(Source {
+            name: "s".into(),
+            audio: Some(std::sync::Arc::new(crate::audio::AudioClip::saw_stack(110.0, 3.0, p.sample_rate))),
+            video: Some(std::sync::Arc::new(VideoClip::test_pattern(32, 18, 12.0, 3.0))),
+            base_hz: 110.0,
+            ..Default::default()
+        });
+        let entry = [None, Some(2.0), None, Some(0.0), Some(1.0), None]; // beats
+        for (k, e) in entry.iter().enumerate() {
+            let t = p.add_track(&format!("pad{k}"));
+            let from = e.unwrap_or(0.0);
+            let mut b = from;
+            while b < 8.0 {
+                let mut c = Clip::new_snippet(sid, b, 1.0);
+                c.grains.density = 10.0;
+                p.tracks[t].clips.push(c);
+                b += 1.0;
+            }
+            p.tracks[t].muted = e.is_none();
+        }
+        let plans = crate::render::plan_project(&p);
+        let slots = |track: usize| {
+            plans
+                .iter()
+                .filter(|cp| cp.track == track)
+                .flat_map(|cp| cp.parts.iter().chain(cp.video_parts.iter().flatten()).flat_map(|(_, e)| e.iter().map(|e| e.tag.tile)))
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_eq!(slots(3), [Some(0)].into(), "first in: slot 0, every pass");
+        assert_eq!(slots(4), [Some(1)].into());
+        assert_eq!(slots(1), [Some(2)].into());
+        for t in [0, 2, 5] {
+            assert!(slots(t).iter().all(|s| s.is_none()), "muted track {t} has no tile");
+        }
+        let grids = crate::render::frame_tile_grids(&plans, 0.0, 12.0, 48);
+        assert_eq!(grids[3], (1, 1), "0.25 s: pad 3 alone");
+        assert_eq!(grids[9], (2, 1), "0.75 s: pads 3 + 4");
+        for (f, g) in grids.iter().enumerate().skip(13) {
+            assert_eq!(*g, (2, 2), "frame {f}: three pads → 2×2 (no 3×3 with holes)");
+        }
+        let out = render_project(&p, 0.0, 4.0);
+        assert!(out.events.iter().flatten().all(|e| e.tag.tile.is_none_or(|s| s <= 2)));
+        assert!(out.frames[18].mean_luma() > 1.0, "the tiles draw");
     }
 }

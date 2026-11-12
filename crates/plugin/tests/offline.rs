@@ -22,6 +22,7 @@ fn sine_source() -> Source {
         audio: Some(Arc::new(AudioClip::sine(220.0, 3.0, SR))),
         video: Some(Arc::new(VideoClip::test_pattern(32, 18, 12.0, 3.0))),
         base_hz: 220.0,
+        ..Default::default()
     }
 }
 
@@ -173,7 +174,7 @@ fn reports_latency_for_the_current_look() {
 }
 
 fn tap() -> GrainEvent {
-    GrainEvent { onset: 0.0, source_pos: 0.5, duration: 0.08, pitch_ratio: 1.0, gain: 0.8, pan: 0.0, envelope: 0.5, env_skew: -1.0, reverse: false, id: 7 }
+    GrainEvent { onset: 0.0, source_pos: 0.5, duration: 0.08, pitch_ratio: 1.0, gain: 0.8, pan: 0.0, envelope: 0.5, env_skew: -1.0, reverse: false, id: 7, ..Default::default() }
 }
 
 /// An emitter tap goes editor -> audio thread directly (no loader hop):

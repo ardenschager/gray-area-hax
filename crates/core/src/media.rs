@@ -56,6 +56,29 @@ pub trait MediaBackend: Send + Sync {
     fn segment_masks(&self, _video_file: &Path, _prompt: &str, _mask_dir: &Path) -> MediaResult<()> {
         Err(format!("segmentation is not available with the {} media backend", self.name()))
     }
+    /// Search for videos (yt-dlp `ytsearchN:query`, metadata only).
+    fn search_videos(&self, _query: &str, _n: u32) -> MediaResult<Vec<crate::dig::VideoHit>> {
+        Err(format!("video search is not available with the {} media backend", self.name()))
+    }
+    /// Full metadata (license, upload date, ...) for one video URL.
+    fn video_info(&self, _url: &str) -> MediaResult<crate::dig::VideoHit> {
+        Err(format!("video lookup is not available with the {} media backend", self.name()))
+    }
+    /// Download `url` at ≤ `max_height` p into `dir`, reporting 0..1
+    /// progress; returns the file.
+    fn download_video(&self, _url: &str, _dir: &Path, _max_height: u32, _progress: &mut dyn FnMut(f32)) -> MediaResult<PathBuf> {
+        Err(format!("video download is not available with the {} media backend", self.name()))
+    }
+    /// Decode `len` seconds of a file's audio from `start`.
+    fn decode_audio_range(&self, path: &Path, sample_rate: u32, start: f64, len: f64) -> MediaResult<AudioClip> {
+        let a = self.decode_audio(path, sample_rate)?;
+        Ok(a.trimmed(start, len))
+    }
+    /// Decode `len` seconds of a file's video from `start`.
+    fn decode_video_range(&self, path: &Path, start: f64, len: f64) -> MediaResult<VideoClip> {
+        let v = self.decode_video(path)?;
+        Ok(v.trimmed(start, len))
+    }
     fn ffmpeg_available(&self) -> bool {
         false
     }
@@ -233,7 +256,32 @@ pub fn load_source(path: &Path, sample_rate: u32) -> MediaResult<Source> {
         audio: audio.map(std::sync::Arc::new),
         video: video.map(std::sync::Arc::new),
         base_hz,
+        ..Default::default()
     })
+}
+
+/// Load `len` seconds of a media file from `start` into a `Source` (Dig's
+/// random window). WAV is read natively; everything else goes through the
+/// backend's range decoders.
+pub fn load_source_window(path: &Path, start: f64, len: f64, sample_rate: u32) -> MediaResult<Source> {
+    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.to_string_lossy().to_string());
+    let (audio, video);
+    if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("wav")) {
+        audio = Some(load_wav(path)?.trimmed(start, len));
+        video = None;
+    } else {
+        let b = backend();
+        b.decoder_ready()?;
+        let a = b.decode_audio_range(path, sample_rate, start, len).ok();
+        let v = b.decode_video_range(path, start, len).ok();
+        if a.is_none() && v.is_none() {
+            return Err(format!("{name}: no decodable audio or video"));
+        }
+        audio = a;
+        video = v;
+    }
+    let base_hz = audio.as_ref().and_then(|a| crate::dsp::detect_pitch(&a.samples, a.sample_rate)).unwrap_or(0.0);
+    Ok(Source { name, audio: audio.map(std::sync::Arc::new), video: video.map(std::sync::Arc::new), base_hz, ..Default::default() })
 }
 
 /// Convenience: fetch a URL and load it as a source.
@@ -521,6 +569,21 @@ impl MediaBackend for DesktopBackend {
     fn fetch_youtube(&self, url: &str, dir: &Path) -> MediaResult<PathBuf> {
         desktop::fetch_youtube(url, dir)
     }
+    fn search_videos(&self, query: &str, n: u32) -> MediaResult<Vec<crate::dig::VideoHit>> {
+        desktop::search_videos(query, n)
+    }
+    fn video_info(&self, url: &str) -> MediaResult<crate::dig::VideoHit> {
+        desktop::video_info(url)
+    }
+    fn download_video(&self, url: &str, dir: &Path, max_height: u32, progress: &mut dyn FnMut(f32)) -> MediaResult<PathBuf> {
+        desktop::download_video(url, dir, max_height, progress)
+    }
+    fn decode_audio_range(&self, path: &Path, sample_rate: u32, start: f64, len: f64) -> MediaResult<AudioClip> {
+        desktop::decode_audio_range(path, sample_rate, start, len)
+    }
+    fn decode_video_range(&self, path: &Path, start: f64, len: f64) -> MediaResult<VideoClip> {
+        desktop::decode_video_range(path, start, len)
+    }
     fn segment_available(&self) -> bool {
         desktop::segment_available()
     }
@@ -559,8 +622,14 @@ mod desktop {
         tool_exists("ffmpeg")
     }
 
+    /// The yt-dlp executable: [`crate::dig::YTDLP_ENV`] (a stub in tests /
+    /// the showcase) or `yt-dlp` on PATH.
+    pub fn ytdlp_bin() -> String {
+        std::env::var(crate::dig::YTDLP_ENV).ok().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "yt-dlp".into())
+    }
+
     pub fn ytdlp_available() -> bool {
-        Command::new("yt-dlp")
+        Command::new(ytdlp_bin())
             .arg("--version")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -572,12 +641,17 @@ mod desktop {
     /// Decode any media file's audio track via ffmpeg (stereo when the source
     /// has distinct channels; mono sources come back as mono).
     pub fn decode_audio(path: &Path, sample_rate: u32) -> MediaResult<AudioClip> {
+        decode_audio_range(path, sample_rate, 0.0, MAX_DECODE_SECONDS)
+    }
+
+    /// [`decode_audio`] of `len` seconds from `start` (fast input seek).
+    pub fn decode_audio_range(path: &Path, sample_rate: u32, start: f64, len: f64) -> MediaResult<AudioClip> {
         let out = Command::new("ffmpeg")
-            .args(["-v", "error", "-i"])
+            .args(["-v", "error", "-ss", &format!("{:.3}", start.max(0.0)), "-i"])
             .arg(path)
             .args([
                 "-t",
-                &MAX_DECODE_SECONDS.to_string(),
+                &format!("{:.3}", len.clamp(0.0, MAX_DECODE_SECONDS)),
                 "-vn",
                 "-f",
                 "f32le",
@@ -646,6 +720,11 @@ mod desktop {
     /// Decode a media file's video track to RGBA frames via ffmpeg (rawvideo
     /// pipe), downscaled and rate-limited to keep memory reasonable.
     pub fn decode_video(path: &Path) -> MediaResult<VideoClip> {
+        decode_video_range(path, 0.0, MAX_DECODE_SECONDS)
+    }
+
+    /// [`decode_video`] of `len` seconds from `start` (fast input seek).
+    pub fn decode_video_range(path: &Path, start: f64, len: f64) -> MediaResult<VideoClip> {
         let (src_w, src_h) = probe_video_size(path)?;
         let scale = (MAX_DECODE_WIDTH as f32 / src_w as f32).min(1.0);
         // Even dimensions keep every downstream encoder happy.
@@ -653,11 +732,11 @@ mod desktop {
         let h = ((src_h as f32 * scale) as u32).max(2) & !1;
 
         let mut child = Command::new("ffmpeg")
-            .args(["-v", "error", "-i"])
+            .args(["-v", "error", "-ss", &format!("{:.3}", start.max(0.0)), "-i"])
             .arg(path)
             .args([
                 "-t",
-                &MAX_DECODE_SECONDS.to_string(),
+                &format!("{:.3}", len.clamp(0.0, MAX_DECODE_SECONDS)),
                 "-an",
                 "-f",
                 "rawvideo",
@@ -792,7 +871,7 @@ mod desktop {
         }
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         let template = dir.join("%(id)s.%(ext)s");
-        let out = Command::new("yt-dlp")
+        let out = Command::new(ytdlp_bin())
             .args([
                 "-f",
                 "bv*[height<=480]+ba/b[height<=480]/b",
@@ -826,6 +905,123 @@ mod desktop {
         if !p.exists() {
             return Err(format!("yt-dlp output missing: {p:?}"));
         }
+        Ok(p)
+    }
+
+    fn hit_from_json(v: &serde_json::Value) -> crate::dig::VideoHit {
+        let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let id = s("id");
+        let url = [s("webpage_url"), s("url")]
+            .into_iter()
+            .find(|u| u.starts_with("http"))
+            .unwrap_or_else(|| if id.is_empty() { String::new() } else { format!("https://www.youtube.com/watch?v={id}") });
+        let uploader = [s("uploader"), s("channel"), s("uploader_id")].into_iter().find(|u| !u.is_empty()).unwrap_or_default();
+        let live = v.get("is_live").and_then(|x| x.as_bool()).unwrap_or(false)
+            || matches!(v.get("live_status").and_then(|x| x.as_str()), Some("is_live" | "is_upcoming" | "post_live"));
+        crate::dig::VideoHit {
+            id,
+            url,
+            title: s("title"),
+            uploader,
+            upload_date: s("upload_date"),
+            views: v.get("view_count").and_then(|x| x.as_u64()),
+            duration: v.get("duration").and_then(|x| x.as_f64()),
+            live,
+            license: v.get("license").and_then(|x| x.as_str()).map(String::from),
+        }
+    }
+
+    fn run_ytdlp(args: &[&str]) -> MediaResult<String> {
+        let out = Command::new(ytdlp_bin())
+            .args(args)
+            .output()
+            .map_err(|e| format!("yt-dlp not runnable ({}): {e}", ytdlp_bin()))?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            return Err(format!("yt-dlp failed: {}", err.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim()));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// `yt-dlp --flat-playlist --dump-json "ytsearchN:query"`.
+    pub fn search_videos(query: &str, n: u32) -> MediaResult<Vec<crate::dig::VideoHit>> {
+        let q = format!("ytsearch{}:{query}", n.clamp(1, 100));
+        let out = run_ytdlp(&["--flat-playlist", "--dump-json", "--no-warnings", "--ignore-errors", &q])?;
+        Ok(out.lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()).map(|v| hit_from_json(&v)).collect())
+    }
+
+    /// `yt-dlp --dump-json --skip-download URL`.
+    pub fn video_info(url: &str) -> MediaResult<crate::dig::VideoHit> {
+        let out = run_ytdlp(&["--dump-json", "--skip-download", "--no-warnings", "--no-playlist", url])?;
+        let line = out.lines().find(|l| l.trim_start().starts_with('{')).ok_or("yt-dlp returned no metadata")?;
+        let v: serde_json::Value = serde_json::from_str(line).map_err(|e| format!("yt-dlp metadata: {e}"))?;
+        Ok(hit_from_json(&v))
+    }
+
+    /// Download at ≤ `max_height`p, streaming `[download]  42.0%` progress.
+    pub fn download_video(url: &str, dir: &Path, max_height: u32, progress: &mut dyn FnMut(f32)) -> MediaResult<PathBuf> {
+        use std::io::BufRead;
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        let template = dir.join("%(id)s.%(ext)s");
+        let fmt = format!("bv*[height<={h}]+ba/b[height<={h}]/b", h = max_height.max(144));
+        let mut child = Command::new(ytdlp_bin())
+            .args(["-f", &fmt, "--merge-output-format", "mp4", "--no-playlist", "--newline", "--progress", "--no-warnings"])
+            .args(["--print", "after_move:filepath", "--no-simulate", "-o"])
+            .arg(&template)
+            .arg(url)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("yt-dlp not runnable ({}): {e}", ytdlp_bin()))?;
+        // Progress can arrive on either stream; stderr is drained on a thread.
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let stderr = child.stderr.take().ok_or("no stderr")?;
+        let t = std::thread::spawn(move || {
+            for l in std::io::BufReader::new(stderr).lines().map_while(Result::ok) {
+                let _ = tx.send(l);
+            }
+        });
+        let parse = |l: &str| -> Option<f32> {
+            let l = l.trim();
+            if !l.starts_with("[download]") {
+                return None;
+            }
+            let pct = l.split_whitespace().find(|w| w.ends_with('%'))?;
+            pct.trim_end_matches('%').parse::<f32>().ok().map(|p| (p / 100.0).clamp(0.0, 1.0))
+        };
+        let mut file = None;
+        let mut errors = Vec::new();
+        let stdout = child.stdout.take().ok_or("no stdout")?;
+        for l in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+            while let Ok(e) = rx.try_recv() {
+                match parse(&e) {
+                    Some(p) => progress(p),
+                    None => errors.push(e),
+                }
+            }
+            match parse(&l) {
+                Some(p) => progress(p),
+                None if !l.trim().is_empty() && !l.starts_with('[') => file = Some(l.trim().to_string()),
+                None => {}
+            }
+        }
+        let status = child.wait().map_err(|e| e.to_string())?;
+        let _ = t.join();
+        while let Ok(e) = rx.try_recv() {
+            if let Some(p) = parse(&e) {
+                progress(p);
+            } else {
+                errors.push(e);
+            }
+        }
+        if !status.success() {
+            return Err(format!("yt-dlp download failed: {}", errors.iter().rev().find(|l| !l.trim().is_empty()).map(|s| s.trim()).unwrap_or("")));
+        }
+        let p = PathBuf::from(file.ok_or("yt-dlp reported no file")?);
+        if !p.exists() {
+            return Err(format!("yt-dlp output missing: {p:?}"));
+        }
+        progress(1.0);
         Ok(p)
     }
 
@@ -959,6 +1155,7 @@ pub fn segment_source(src: &Source, prompt: &str, work_dir: &Path) -> MediaResul
         audio: src.audio.clone(),
         video: Some(std::sync::Arc::new(masked)),
         base_hz: src.base_hz,
+        ..Default::default()
     })
 }
 
@@ -1075,6 +1272,7 @@ mod tests {
                     crate::video::VideoClip::test_pattern(160, 120, 12.0, 1.0),
                 )),
                 base_hz: 220.0,
+                ..Default::default()
             }
         };
         let n_in = src.video.as_ref().unwrap().frames.len();
@@ -1145,6 +1343,7 @@ print("ok 4")
                 crate::video::VideoClip::test_pattern(32, 24, 10.0, 0.5),
             )),
             base_hz: 220.0,
+            ..Default::default()
         };
         let out = segment_source(&src, "cat", &dir.join("work")).unwrap();
         std::env::remove_var("CHROMAGRAIN_SEGMENT_CMD");
@@ -1191,6 +1390,7 @@ print("ok 4")
         let ev = crate::grain::GrainEvent {
             onset: 0.0, source_pos: 0.0, duration: a.duration().min(5.0) as f32, pitch_ratio: 1.0,
             gain: 1.0, pan: 0.0, envelope: 0.05, env_skew: 0.0, reverse: false, id: 0,
+            ..Default::default()
         };
         let mut out = StereoBuffer::new(ev.duration as f64, 48000);
         crate::audio::render_grains_audio(&a, &[ev], &mut out, 0.0);

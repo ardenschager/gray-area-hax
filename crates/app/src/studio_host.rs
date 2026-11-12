@@ -7,12 +7,24 @@ use chromagrain_core::grain::GrainEvent;
 use chromagrain_core::timeline::{Clip, ClipKind, Project, Source, Track};
 use chromagrain_core::video::VisualGrainStyle;
 use chromagrain_ui::gpu::Scene;
-use chromagrain_ui::{DeepTab, DeepTarget, Host, Pad, PadKind, PerformHost, Studio, View};
+use chromagrain_ui::{AddTarget, Added, BrowseItem, DeepTab, DeepTarget, Host, Pad, PadKind, Pending, PerformHost, Studio, View};
+use std::path::PathBuf;
 use eframe::egui;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 impl App {
+    /// A file for the Add sheet: decoded in the background (a placeholder
+    /// until then), or placed at once if it was imported before.
+    pub(crate) fn add_path(&mut self, path: PathBuf, target: AddTarget) {
+        if let Some(&source) = self.imported.get(&path) {
+            self.adds.added.push(Added { source, target });
+            return;
+        }
+        let sr = self.project.lock().unwrap().sample_rate;
+        self.adds.file(path, target, sr);
+    }
+
     /// Run `f` with the studio and the app as its host (the studio is
     /// moved out for the call so both can be borrowed mutably).
     pub(crate) fn with_studio<R>(&mut self, f: impl FnOnce(&mut Studio, &mut App) -> R) -> R {
@@ -104,6 +116,9 @@ impl Host for App {
         }
         self.live_events.push((source, bus, ev));
     }
+    fn release_voice(&mut self, voice: u64) {
+        self.playback.release_voice(voice);
+    }
     fn set_bus(&mut self, bus: u8, chain: Vec<AvEffect>) {
         self.playback.set_bus(bus, chain);
     }
@@ -161,6 +176,67 @@ impl Host for App {
             self.import_path(path, None);
         }
     }
+    fn add_files(&mut self, target: AddTarget) {
+        let paths: Vec<PathBuf> = match self.pick_override.as_mut() {
+            Some(f) => f(),
+            None => crate::adds::picked_from_env().unwrap_or_else(|| {
+                rfd::FileDialog::new()
+                    .add_filter("media", &["mp4", "mov", "m4v", "webm", "mkv", "gif", "wav", "mp3", "m4a", "aif", "aiff", "flac"])
+                    .pick_files()
+                    .unwrap_or_default()
+            }),
+        };
+        for (k, path) in paths.into_iter().enumerate() {
+            self.add_path(path, if k == 0 { target } else { AddTarget::Any });
+        }
+    }
+    fn browse(&mut self, _ctx: &egui::Context, query: &str) -> Vec<BrowseItem> {
+        self.browser.ensure_started();
+        let words: Vec<String> = query.to_lowercase().split_whitespace().map(str::to_string).collect();
+        let list: Vec<(PathBuf, String, String, f32)> = self
+            .browser
+            .collections
+            .iter()
+            .flat_map(|c| c.clips.iter().map(move |k| (k.path.clone(), k.title.clone(), c.name.clone(), k.dur)))
+            .filter(|(_, t, c, _)| {
+                let hay = format!("{t} {c}").to_lowercase();
+                words.iter().all(|w| hay.contains(w.as_str()))
+            })
+            .take(240)
+            .collect();
+        self.browse_last.clear();
+        let mut out = Vec::with_capacity(list.len());
+        for (path, title, coll, dur) in list {
+            let thumb = self.browser.thumb(&path);
+            let folder = coll.rsplit('/').next().unwrap_or(&coll).to_string();
+            let detail = if dur > 0.0 { format!("{}:{:02}", dur as u32 / 60, dur as u32 % 60) } else { folder };
+            out.push(BrowseItem { name: title, detail, thumb });
+            self.browse_last.push(path);
+        }
+        out
+    }
+    fn browse_add(&mut self, index: usize, target: AddTarget) {
+        if let Some(path) = self.browse_last.get(index).cloned() {
+            self.add_path(path, target);
+        }
+    }
+    fn add_link(&mut self, url: &str, target: AddTarget) {
+        let sr = self.project.lock().unwrap().sample_rate;
+        self.adds.link(url.to_string(), target, sr);
+    }
+    fn dig(&mut self, n: usize, cc_only: bool, target: AddTarget) {
+        let sr = self.project.lock().unwrap().sample_rate;
+        self.adds.dig(n, cc_only, target, sr);
+    }
+    fn pending(&self) -> Vec<Pending> {
+        self.adds.jobs.clone()
+    }
+    fn dismiss_pending(&mut self, id: u64) {
+        self.adds.dismiss(id);
+    }
+    fn take_added(&mut self) -> Vec<Added> {
+        std::mem::take(&mut self.adds.added)
+    }
     fn export(&mut self) {
         self.start_render(false);
     }
@@ -213,6 +289,13 @@ impl Host for App {
     fn busy(&self) -> Option<String> {
         self.busy.clone()
     }
+    fn tile_layout(&self) -> Option<bool> {
+        Some(self.project.lock().unwrap().layout == chromagrain_core::tile::Layout::Tile)
+    }
+    fn set_tile_layout(&mut self, tile: bool) {
+        self.project.lock().unwrap().layout = if tile { chromagrain_core::tile::Layout::Tile } else { chromagrain_core::tile::Layout::Stack };
+        self.mark_now();
+    }
 }
 
 impl PerformHost for App {
@@ -250,6 +333,44 @@ impl PerformHost for App {
     }
     fn load_pad(&mut self, source: usize, i: usize) {
         App::load_pad(self, source, i, PlayMode::Snippet);
+    }
+    fn load_pad_slice(&mut self, source: usize, t0: f64, t1: f64, i: usize) {
+        if i >= PADS {
+            return;
+        }
+        // Pads are the perform tracks: live in Perform, stashed otherwise.
+        self.studio_seed_pads();
+        let perform = self.mode == AppMode::Perform;
+        let mut p = self.project.lock().unwrap();
+        let Some(src) = p.sources.get(source) else { return };
+        let (src_len, name) = (src.duration(), src.name.clone());
+        let n = src.slices.iter().position(|sl| (sl.start - t0).abs() < 1e-6).map_or(0, |k| k + 1);
+        let slice_beats = p.secs_to_beats((t1 - t0).max(0.0));
+        let mut clip = build_clip(&mut p, source, 0.0, PlayMode::Snippet);
+        // The slice, looping at its own length (quarter beats, at least one).
+        clip.grains.position = if src_len > 0.0 { (t0 / src_len) as f32 } else { 0.0 };
+        clip.length_beats = ((slice_beats * 4.0).floor() / 4.0).max(0.25);
+        let tracks = if perform { &mut p.tracks } else { &mut self.other_tracks };
+        while tracks.len() < PADS {
+            let k = tracks.len();
+            tracks.push(Track { name: format!("pad {}", k + 1), muted: true, ..Default::default() });
+        }
+        let t = &mut tracks[i];
+        t.clips = vec![clip];
+        t.name = if n > 0 { format!("{name} · {n}") } else { format!("pad {}", i + 1) };
+        drop(p);
+        self.mark_now();
+    }
+    fn pad_env(&self, i: usize) -> Option<chromagrain_core::envelope::Adsr> {
+        self.project.lock().unwrap().tracks.get(i).and_then(|t| t.clips.first()).and_then(|c| c.grains.adsr)
+    }
+    fn set_pad_env(&mut self, i: usize, adsr: chromagrain_core::envelope::Adsr) {
+        if let Some(t) = self.project.lock().unwrap().tracks.get_mut(i) {
+            for c in &mut t.clips {
+                c.grains.adsr = Some(adsr);
+            }
+        }
+        self.mark();
     }
     fn quantize(&self) -> usize {
         match self.launch_q {

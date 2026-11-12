@@ -13,6 +13,8 @@
 //! * Rec captures the emitters' grains and bounces them (core `take`) into
 //!   a new source placed on a "takes" track.
 
+pub mod add;
+pub mod clip;
 mod deep;
 mod perform;
 mod play;
@@ -24,14 +26,25 @@ use crate::theme;
 use chromagrain_core::dsp::Rng;
 use chromagrain_core::fx::{AvEffect, EffectKind};
 use chromagrain_core::grain::GrainEvent;
+use chromagrain_core::envelope::{Adsr, VoiceEnv};
+use chromagrain_core::grain::VoiceTag;
 use chromagrain_core::instrument::{grain_step, Cloud, MacroMap, LOOKS};
+use chromagrain_core::tile::{layout_pan, TileAssigner};
 use chromagrain_core::music::{Key, ScaleKind};
 use chromagrain_core::video::{AvLink, VisualGrainStyle};
 use egui::{self, Align2, Color32, Rect};
 use crate::theme::*;
 use crate::widgets::*;
 
+pub use clip::ClipTarget;
 pub use deep::{DeepTab, DeepTarget};
+
+/// A modal sheet over the studio.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sheet {
+    Add(crate::host::AddTarget),
+    Clip(ClipTarget),
+}
 
 pub const COLUMNS: usize = 8;
 pub const ROWS: usize = 8;
@@ -65,6 +78,10 @@ pub struct Emitter {
     pub link: AvLink,
     /// Held by a finger / the pointer: spraying.
     pub held: bool,
+    /// A/D/S/R over a gesture (press .. release), sound and picture.
+    pub adsr: Adsr,
+    /// The current gesture: voice id, note-on, note-off (None while held).
+    gesture: Option<(u64, f64, Option<f64>)>,
     head: f64,
     next_t: f64,
     rng: Rng,
@@ -81,6 +98,8 @@ impl Emitter {
             cloud: Cloud::default(),
             link: AvLink::default(),
             held: false,
+            adsr: Adsr::default(),
+            gesture: None,
             head: 0.0,
             next_t: 0.0,
             rng: Rng::new(0xE111 + i as u64 * 7919),
@@ -151,6 +170,13 @@ pub struct Studio {
     fonts_ready: bool,
     /// Bumped when the studio's sequence model changes.
     pub rev: u64,
+    pub sheet: Option<Sheet>,
+    pub add: add::AddState,
+    pub chop: clip::ChopState,
+    pub(crate) waves: crate::wave::WaveCache,
+    /// Tile slots for emitter gestures (tile layout).
+    tiles: TileAssigner,
+    gestures: u64,
 }
 
 impl Default for Studio {
@@ -182,6 +208,12 @@ impl Default for Studio {
             fonts_installed: false,
             fonts_ready: false,
             rev: 1,
+            sheet: None,
+            add: add::AddState::default(),
+            chop: clip::ChopState::default(),
+            waves: crate::wave::WaveCache::default(),
+            tiles: TileAssigner::new(),
+            gestures: 0,
         }
     }
 }
@@ -258,6 +290,7 @@ impl Studio {
                 self.key_changed(host);
             }
         }
+        self.place_added(host);
         self.sync_columns(host);
         self.seq_ensure(host);
         self.seq_build_arrangement(host);
@@ -314,20 +347,52 @@ impl Studio {
             host.set_bus(i as u8 + 1, b.effects);
         }
         let mut fired: Vec<(usize, u8, GrainEvent, (usize, usize))> = Vec::new();
+        let tile = host.tile_layout() == Some(true);
+        let pan_by_tile = tile && host.project().lock().unwrap().layout_pan;
+        self.tiles.expire(now);
+        let mut released = Vec::new();
         for (i, e) in self.emitters.iter_mut().enumerate() {
+            // Gestures: press = note-on, release = note-off; grains keep
+            // coming through the release so sound and picture end together.
+            match (e.held, e.gesture) {
+                (true, None) | (true, Some((_, _, Some(_)))) => {
+                    self.gestures += 1;
+                    let voice = 0xE000_0000_0000 | ((i as u64) << 32) | self.gestures;
+                    e.gesture = Some((voice, now, None));
+                    self.tiles.assign(voice, now);
+                }
+                (false, Some((v, on, None))) => {
+                    e.gesture = Some((v, on, Some(now)));
+                    self.tiles.release(v, now + e.adsr.release_secs());
+                    released.push(v);
+                }
+                (false, Some((_, _, Some(off)))) if now >= off + e.adsr.release_secs() => e.gesture = None,
+                _ => {}
+            }
+            let sounding = e.held || e.gesture.is_some_and(|(_, _, off)| off.is_some());
             let Some(src) = self.columns.get(e.col).copied().flatten() else { continue };
             let len = sources.get(src).copied().unwrap_or(0.0);
-            if !e.held || len <= 0.0 {
+            if !sounding || len <= 0.0 {
                 e.next_t = now;
                 e.head = e.pos() as f64 * len;
                 continue;
             }
+            let (voice, on, off) = e.gesture.unwrap_or((0, now, None));
+            let env = VoiceEnv { adsr: e.adsr, on, off: off.unwrap_or(f64::INFINITY) };
+            let slot = if tile { self.tiles.slot_of(voice).map(|s| s as u8) } else { None };
+            let (cols, rows) = self.tiles.grid_at(now);
             let map = MacroMap::resolve(&e.macros, Some(&key));
             let mut n = 0;
             while e.next_t <= now && n < 64 {
                 let id = ((i as u64 + 1) << 48) | e.k;
                 let (mut ev, hop) = grain_step(&map, &e.cloud, Some(&key), &mut e.rng, e.head, len, 60, 0.9, id);
                 ev.onset = (e.next_t + ev.onset).max(now - 0.02);
+                ev.tag = VoiceTag { voice, env: Some(env), tile: slot };
+                if let (Some(sl), true) = (slot, pan_by_tile) {
+                    let (pan, gain) = layout_pan(sl as usize, cols, rows);
+                    ev.pan = pan;
+                    ev.gain *= gain;
+                }
                 e.head += hop * map.speed as f64;
                 e.next_t += hop;
                 e.k += 1;
@@ -340,6 +405,9 @@ impl Studio {
                 e.next_t = now;
             }
         }
+        for v in released {
+            host.release_voice(v);
+        }
         for (src, bus, ev, cell) in fired {
             if let Some(rec) = self.rec.as_mut() {
                 let mut r = ev.clone();
@@ -351,7 +419,7 @@ impl Studio {
             self.lit.push((cell, now));
             host.fire(bus, src, ev);
         }
-        if self.emitters.iter().any(|e| e.held) || self.rec.is_some() {
+        if self.emitters.iter().any(|e| e.held || e.gesture.is_some()) || self.rec.is_some() {
             ctx.request_repaint();
         }
     }
@@ -419,6 +487,8 @@ impl Studio {
             }
         });
         self.deep_drawer(host, ctx);
+        self.add_sheet(host, ctx);
+        self.clip_sheet(host, ctx);
         self.grain_overlay(ctx);
     }
 
@@ -436,6 +506,21 @@ impl Studio {
 
     fn shortcuts(&mut self, host: &mut dyn Host, ctx: &egui::Context) {
         if ctx.wants_keyboard_input() {
+            return;
+        }
+        if self.sheet.is_some() {
+            // Sheets are modal: only Esc (close) and Space (transport).
+            let (esc, space) = ctx.input(|i| (i.key_pressed(egui::Key::Escape), i.key_pressed(egui::Key::Space)));
+            if space && self.chop.tap.is_none() {
+                host.toggle_play();
+            }
+            if esc {
+                if self.chop.tap.is_some() {
+                    self.chop.tap = None;
+                    host.stop_audition();
+                }
+                self.sheet = None;
+            }
             return;
         }
         let fullscreen = host.fullscreen();
@@ -483,6 +568,12 @@ impl Studio {
         if esc {
             if fullscreen {
                 host.toggle_fullscreen(ctx);
+            } else if self.sheet.is_some() {
+                if self.chop.tap.is_some() {
+                    self.chop.tap = None;
+                    host.stop_audition();
+                }
+                self.sheet = None;
             } else if self.seq.hold.is_some() {
                 self.seq.hold = None;
             } else {
@@ -708,6 +799,26 @@ impl Studio {
         Some((a.tex.id(), atlas::AtlasView::of(a)))
     }
 
+    /// "uploader · 2014-03-02 · 212 views · CC" for dug / linked media.
+    pub fn provenance_line(&self, host: &dyn Host, src: usize) -> String {
+        let p = host.project().lock().unwrap();
+        let Some(pv) = p.sources.get(src).and_then(|s| s.provenance.as_ref()) else { return String::new() };
+        let mut parts: Vec<String> = Vec::new();
+        if !pv.uploader.is_empty() {
+            parts.push(pv.uploader.clone());
+        }
+        if pv.upload_date.len() == 8 {
+            parts.push(format!("{}-{}-{}", &pv.upload_date[..4], &pv.upload_date[4..6], &pv.upload_date[6..]));
+        }
+        if let Some(v) = pv.views {
+            parts.push(if v == 1 { "1 view".into() } else { format!("{v} views") });
+        }
+        if pv.license.to_lowercase().contains("creative commons") {
+            parts.push("CC".into());
+        }
+        parts.join(" · ")
+    }
+
     pub fn source_name(&self, host: &dyn Host, src: usize) -> String {
         host.project().lock().unwrap().sources.get(src).map(|s| s.name.clone()).unwrap_or_default()
     }
@@ -721,6 +832,30 @@ impl Studio {
         }
         mask_corners(&p, rect, radius, G0);
         p.rect_stroke(rect, r(radius as u8), hair(LINE), egui::StrokeKind::Inside);
+    }
+
+    /// The small `stack | tile` switch in a stage's bottom-left corner.
+    pub fn layout_switch(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, stage: Rect) {
+        let Some(tile) = host.tile_layout() else { return };
+        let r0 = Rect::from_min_size(egui::pos2(stage.left() + 10.0, stage.bottom() - 10.0 - 36.0), egui::vec2(132.0, 36.0));
+        let p = ui.painter().clone();
+        p.rect_filled(r0, r(10), Color32::from_black_alpha(150));
+        let half = r0.width() / 2.0;
+        for (k, (icon, name)) in [(Icon::Stack, "stack"), (Icon::Tile, "tile")].into_iter().enumerate() {
+            let rc = Rect::from_min_size(egui::pos2(r0.left() + k as f32 * half, r0.top()), egui::vec2(half, r0.height())).shrink(3.0);
+            let on = tile == (k == 1);
+            if on {
+                p.rect_filled(rc, r(8), Color32::from_white_alpha(28));
+            }
+            let col = if on { INK } else { INK3 };
+            draw_icon(&p, icon, egui::pos2(rc.left() + 15.0, rc.center().y), 13.0, col);
+            p.text(egui::pos2(rc.left() + 26.0, rc.center().y), Align2::LEFT_CENTER, name, font(11.5), col);
+            // 44 px tall hit areas (they reach past the pill).
+            let hr = Rect::from_min_max(egui::pos2(rc.left(), rc.top() - 4.0), egui::pos2(rc.right(), rc.bottom() + 4.0));
+            if hit(ui, hr, ui.id().with(("layout", k)), egui::Sense::click(), &format!("layout {name}")).clicked() && !on {
+                host.set_tile_layout(k == 1);
+            }
+        }
     }
 }
 

@@ -24,7 +24,7 @@
 use chromagrain_core::fx::{AvEffect, EffectKind};
 use chromagrain_core::render::ClipPlan;
 use chromagrain_core::timeline::Project;
-use chromagrain_core::video::{grain_draws, grain_draws_opts, ColorFilterMode, VisualGrainStyle};
+use chromagrain_core::video::{grain_draws_layout, ColorFilterMode, VisualGrainStyle};
 
 
 use std::collections::HashMap;
@@ -59,6 +59,38 @@ pub struct LiveBus {
     pub effects: Vec<AvEffect>,
     /// Sound↔picture dials for this layer.
     pub link: chromagrain_core::video::AvLink,
+}
+
+/// The frame's tile grid (layout Tile), as the CPU compositor computes it
+/// (`render::frame_tile_grids` / `tile::frame_grid`): the distinct tile
+/// slots of every grain visible now with a picture — the arrangement's at
+/// `t`, live hits at `live_t`. None in stack layout.
+pub fn tile_grid(scene: &Scene) -> Option<(u32, u32)> {
+    if scene.project.layout != chromagrain_core::tile::Layout::Tile {
+        return None;
+    }
+    let mut slots: Vec<u8> = Vec::new();
+    let mut see = |e: &chromagrain_core::grain::GrainEvent, t: f64| {
+        if let Some(slot) = e.tag.tile {
+            if t >= e.onset && t < e.end() && e.tag.picture_at(t) > 0.0 && !slots.contains(&slot) {
+                slots.push(slot);
+            }
+        }
+    };
+    for cp in scene.plan.iter() {
+        if scene.project.tracks.get(cp.track).is_some_and(|tr| tr.muted) {
+            continue;
+        }
+        for (_, evs) in cp.video_parts.as_deref().unwrap_or(&cp.parts) {
+            for e in evs {
+                see(e, scene.t);
+            }
+        }
+    }
+    for (_, _, e) in &scene.live {
+        see(e, scene.live_t);
+    }
+    Some(chromagrain_core::tile::frame_grid(slots))
 }
 
 const MAX_SRC_W: u32 = 256;
@@ -1019,6 +1051,8 @@ impl GpuPreview {
         };
         for d in draws {
             let layer = ((d.src_time / dur).rem_euclid(1.0) * layers as f64).min(layers as f64 - 1.0) as f32;
+            // Tiles (layout Tile): hard-edged, normal blend.
+            let (additive, feather) = if d.tiled { (0.0, 0.0) } else { (additive, feather) };
             let u = Uni {
                 rect: d.dest,
                 patch: d.patch,
@@ -1069,6 +1103,7 @@ impl GpuPreview {
         let t = scene.t;
         let fps = scene.project.fps;
         let aspect = w as f32 / h as f32;
+        let tile_grid = tile_grid(scene);
         for (ti, track) in scene.project.tracks.iter().enumerate() {
             if track.muted {
                 continue;
@@ -1094,7 +1129,7 @@ impl GpuPreview {
                         let Some(gsrc) = self.sources.get(sid) else { continue };
                         let dur = gsrc.duration.max(1e-6);
                         let style: VisualGrainStyle = cp.style;
-                        let draws = grain_draws_opts(
+                        let draws = grain_draws_layout(
                             evs,
                             &style,
                             &clip.link,
@@ -1103,6 +1138,7 @@ impl GpuPreview {
                             t,
                             aspect,
                             scene.parked,
+                            tile_grid,
                         );
                         self.record_grains(*sid, draws, clip.color_filter.as_ref(), style.additive, style.feather);
                     }
@@ -1144,7 +1180,7 @@ impl GpuPreview {
                 self.ensure_source(&scene.project, *sid);
                 let Some(gsrc) = self.sources.get(sid) else { continue };
                 let dur = gsrc.duration.max(1e-6);
-                let draws = grain_draws(
+                let draws = grain_draws_layout(
                     std::slice::from_ref(ev),
                     &style,
                     &link,
@@ -1152,6 +1188,8 @@ impl GpuPreview {
                     dur,
                     scene.live_t,
                     aspect,
+                    false,
+                    tile_grid,
                 );
                 if !draws.is_empty() {
                     self.record_grains(*sid, draws, None, add_in, style.feather);
@@ -1380,6 +1418,7 @@ mod tests {
             audio: None,
             video: Some(Arc::new(VideoClip::test_pattern(160, 96, 12.0, 2.0))),
             base_hz: 0.0,
+            ..Default::default()
         });
         // Additive glow is off: under glow the GPU's premultiplied blend
         // is a documented approximation of the CPU's straight-alpha mix
@@ -1641,5 +1680,73 @@ mod tests {
             assert!(d < tol, "{name}: mean |gpu - cpu| = {d:.2} (tolerance {tol}) — {report:?}");
         }
         eprintln!("gpu vs cpu mean abs diff (0..255): {report:?}");
+    }
+
+    /// v003: the tile layout (every voice its own hard-edged tile, the
+    /// grid from the frame's tile slots) and the ADSR picture weight in
+    /// stack layout render the same on the GPU as in the CPU export.
+    #[test]
+    fn gpu_matches_the_cpu_for_tiles_and_envelopes() {
+        use chromagrain_core::envelope::{Adsr, PictureCut};
+        let Some((device, queue)) = device() else {
+            eprintln!("no wgpu adapter: skipping GPU tile parity test");
+            return;
+        };
+        let mut g = GpuPreview::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
+        let mut report = Vec::new();
+        for (k, (name, t)) in [("tile2", 1.25), ("tile3", 1.25), ("adsr-fade", 0.4), ("adsr-cut", 0.4)].into_iter().enumerate() {
+            let mut p = project(None);
+            match name {
+                "tile2" => p.layout = chromagrain_core::tile::Layout::Tile,
+                "tile3" => {
+                    p.layout = chromagrain_core::tile::Layout::Tile;
+                    let ti = p.add_track("third");
+                    let mut c = Clip::new_snippet(0, 0.5, 3.0);
+                    c.visual.additive = 0.0;
+                    c.grains.position = 0.1; // clear of the loop point (the CPU crossfades loops)
+                    p.tracks[ti].clips.push(c);
+                }
+                _ => {
+                    let picture = if name == "adsr-fade" { PictureCut::Fade } else { PictureCut::Cut };
+                    let env = Adsr { attack: 0.6, decay: 0.2, sustain: 0.5, release: 0.3, picture, ..Default::default() };
+                    p.tracks[0].clips[0].grains.adsr = Some(env);
+                    p.tracks[1].clips[0].grains.adsr = Some(env);
+                }
+            }
+            let gpu = gpu_frame(&mut g, &p, t, 100 + k as u64);
+            let beat = t * 2.0;
+            let cpu = render_project(&p, beat, beat + 0.01).frames.remove(0);
+            let d = mean_abs_diff(&gpu, &cpu);
+            if let Ok(dir) = std::env::var("CHROMAGRAIN_PARITY_DIR") {
+                let dir = std::path::Path::new(&dir);
+                let _ = chromagrain_core::media::save_frame_png(&dir.join(format!("parity_{name}_gpu.png")), &gpu);
+                let _ = chromagrain_core::media::save_frame_png(&dir.join(format!("parity_{name}_cpu.png")), &cpu);
+            }
+            report.push(format!("{name}: {d:.2}"));
+            if name.starts_with("tile") {
+                // Tiling really changes the picture (vs the same frame
+                // stacked), and every tile is drawn (each half is lit).
+                let mut stacked = p.clone();
+                stacked.layout = chromagrain_core::tile::Layout::Stack;
+                let stack = render_project(&stacked, beat, beat + 0.01).frames.remove(0);
+                assert!(mean_abs_diff(&cpu, &stack) > 4.0, "{name}: tile looks like stack");
+                let (w, h) = (p.width as usize, p.height as usize);
+                let half = |f: &Frame, right: bool| {
+                    let xs = if right { w / 2..w } else { 0..w / 2 };
+                    let mut sum = 0u64;
+                    for y in 0..h {
+                        for x in xs.clone() {
+                            sum += f.data[(y * w + x) * 4] as u64;
+                        }
+                    }
+                    sum / (h * w / 2) as u64
+                };
+                assert!(half(&gpu, false) > 20 && half(&gpu, true) > 20, "{name}: a tile is missing on the GPU");
+            }
+            if std::env::var("CHROMAGRAIN_PARITY_DIR").is_err() {
+                assert!(d < 3.0, "{name}: mean |gpu - cpu| = {d:.2} — {report:?}");
+            }
+        }
+        eprintln!("gpu vs cpu (tiles, envelopes): {report:?}");
     }
 }

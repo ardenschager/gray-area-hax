@@ -119,6 +119,28 @@ impl Launch {
     }
 }
 
+/// The canvas layout (see `chromagrain_core::tile`).
+#[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutParam {
+    Stack,
+    Tile,
+}
+
+impl LayoutParam {
+    pub fn layout(self) -> chromagrain_core::tile::Layout {
+        match self {
+            LayoutParam::Stack => chromagrain_core::tile::Layout::Stack,
+            LayoutParam::Tile => chromagrain_core::tile::Layout::Tile,
+        }
+    }
+}
+
+/// A source's chops in the plugin state: (source index in load order,
+/// slices as (start, end) seconds).
+pub type PersistedSlices = (usize, Vec<(f64, f64)>);
+/// Per-pad extras: (pad, slice (start, end) seconds, envelope).
+pub type PersistedPadExtra = (usize, Option<(f64, f64)>, Option<chromagrain_core::envelope::Adsr>);
+
 /// One loaded perform pad in the plugin state: (pad, source index in
 /// load order, start 0..1, length in beats).
 pub type PersistedPad = (usize, usize, f32, f32);
@@ -134,6 +156,12 @@ pub struct CgParams {
     /// Loaded perform pads.
     #[persist = "pads"]
     pub pads: Mutex<Vec<PersistedPad>>,
+    /// Slices / envelopes of those pads.
+    #[persist = "pad-extra"]
+    pub pad_extra: Mutex<Vec<PersistedPadExtra>>,
+    /// Chops made in the editor.
+    #[persist = "slices"]
+    pub slices: Mutex<Vec<PersistedSlices>>,
 
     #[id = "grain"]
     pub grain: FloatParam,
@@ -155,6 +183,11 @@ pub struct CgParams {
     pub gain: FloatParam,
     #[id = "launch"]
     pub launch: EnumParam<Launch>,
+    #[id = "layout"]
+    pub layout: EnumParam<LayoutParam>,
+    /// Tile column -> pan, row -> level (tile layout).
+    #[id = "layout-pan"]
+    pub layout_pan: BoolParam,
 }
 
 fn macro_param(m: Macro, name: &str) -> FloatParam {
@@ -170,6 +203,8 @@ impl Default for CgParams {
             editor_size: Arc::new(Mutex::new(crate::editor::DEFAULT_SIZE)),
             sources: Mutex::new(Vec::new()),
             pads: Mutex::new(Vec::new()),
+            pad_extra: Mutex::new(Vec::new()),
+            slices: Mutex::new(Vec::new()),
             grain: macro_param(Macro::Grain, "Grain"),
             pitch: FloatParam::new("Pitch", Macro::Pitch.default_value(), FloatRange::Linear { min: 0.0, max: 1.0 })
                 .with_value_to_string(Arc::new(|v| {
@@ -205,6 +240,8 @@ impl Default for CgParams {
             .with_value_to_string(formatters::v2s_f32_gain_to_db(1))
             .with_string_to_value(formatters::s2v_f32_gain_to_db()),
             launch: EnumParam::new("Pad launch", Launch::Beat),
+            layout: EnumParam::new("Layout", LayoutParam::Stack),
+            layout_pan: BoolParam::new("Tile pan", true),
         }
     }
 }

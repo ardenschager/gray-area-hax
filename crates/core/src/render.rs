@@ -16,7 +16,7 @@ use crate::seq::pattern_events;
 use crate::timeline::{Clip, ClipKind, DuckState, Project, Source};
 use crate::video::{
     apply_video_tape, blend_layer, blend_layer_over, composite_grains_frame,
-    composite_grains_frame_opts, Frame, VisualGrainStyle,
+    composite_grains_frame_layout, composite_grains_frame_opts, Frame, VisualGrainStyle,
 };
 
 pub struct RenderOutput {
@@ -139,6 +139,7 @@ fn snippet_events(
                 env_skew: g.env_skew,
                 reverse: rev,
                 id: g.seed,
+                ..Default::default()
             }];
         }
         // Otherwise seamlessly crossfade-loop across `audio_len` using raised-cosine
@@ -168,6 +169,7 @@ fn snippet_events(
                 env_skew: 0.0,
                 reverse: rev,
                 id: g.seed.wrapping_add(pass_idx),
+                ..Default::default()
             });
             if t + dur >= clip_len - 1e-5 {
                 break;
@@ -225,6 +227,7 @@ fn snippet_events(
             env_skew: 0.0,
             reverse: rev,
             id: g.seed.wrapping_add(k),
+            ..Default::default()
         });
         head += HOP * speed.max(0.05) as f64;
         k += 1;
@@ -285,6 +288,7 @@ fn snippet_video_events(
         env_skew: g.env_skew,
         reverse: g.reverse_prob >= 0.5,
         id: g.seed,
+        ..Default::default()
     }])
 }
 
@@ -348,6 +352,7 @@ fn textured_events(
                 env_skew: tex * eff.env_skew,
                 reverse,
                 id: g.seed.wrapping_add(k),
+                ..Default::default()
             });
         }
         head += hop * eff.speed.max(0.05) as f64;
@@ -509,15 +514,156 @@ pub fn plan_project(project: &Project) -> Vec<ClipPlan> {
                     .collect()
             };
             let parts = if clip.loop_beats.is_some() { tile_part_list(parts) } else { parts };
-            let video_parts = if clip.loop_beats.is_some() {
+            let mut video_parts = if clip.loop_beats.is_some() {
                 video_parts.map(tile_part_list)
             } else {
                 video_parts
             };
+            let mut parts = parts;
+            // A clip with an ADSR is one voice: on at its start, released so
+            // the release ends with the clip (sound and picture cut together).
+            if let (Some(adsr), false) = (clip.grains.adsr, matches!(clip.kind, ClipKind::Pattern(_))) {
+                let on = clip_t0;
+                let off = (clip_t0 + full_len - adsr.release_secs()).max(on);
+                let env = crate::envelope::VoiceEnv { adsr, on, off };
+                let voice = clip_voice(ti, ci);
+                for (_, evs) in parts.iter_mut().chain(video_parts.iter_mut().flatten()) {
+                    for e in evs.iter_mut() {
+                        e.tag.voice = voice;
+                        e.tag.env = Some(env);
+                    }
+                }
+            }
             plans.push(ClipPlan { track: ti, clip_index: ci, parts, video_parts, style });
         }
     }
+    if project.layout == crate::tile::Layout::Tile {
+        // Muted tracks aren't heard or drawn, so they get no tile (no
+        // holes in the grid; their grains keep `tag.tile == None`).
+        let muted = |cp: &ClipPlan| project.tracks.get(cp.track).is_some_and(|t| t.muted);
+        assign_tiles_where(&mut plans, project.layout_pan, |cp| !muted(cp));
+    }
     plans
+}
+
+/// Voice id of a whole clip (granular / snippet).
+fn clip_voice(track: usize, clip: usize) -> u64 {
+    0xC000_0000_0000_0000 | ((track as u64 & 0xFFFF) << 32) | (clip as u64 & 0xFFFF_FFFF)
+}
+
+/// Layout `Tile`: give every voice in the plan a stable tile slot, in
+/// voice-start order, preferring the slot its track used last (the same assignment the realtime engine replays,
+/// since it plays this plan). Grains without a voice belong to their
+/// clip's voice. With `layout_pan`, the slot's column sets the grain pan
+/// (keeping a little of the grain's own spread) and its row a subtle gain
+/// cue, from the grid at each grain's onset (the grid the picture shows).
+pub fn assign_tiles(plans: &mut [ClipPlan], layout_pan: bool) {
+    assign_tiles_where(plans, layout_pan, |_| true);
+}
+
+/// [`assign_tiles`] over only the plans `include` accepts (e.g. clips on
+/// unmuted tracks); the others get no tile and don't count toward the grid.
+pub fn assign_tiles_where(plans: &mut [ClipPlan], layout_pan: bool, include: impl Fn(&ClipPlan) -> bool) {
+    use std::collections::BTreeMap;
+    // voice -> (start, end, track)
+    let mut spans: BTreeMap<u64, (f64, f64, usize)> = BTreeMap::new();
+    for cp in plans.iter_mut() {
+        if !include(cp) {
+            continue;
+        }
+        let fallback = clip_voice(cp.track, cp.clip_index);
+        for (_, evs) in cp.parts.iter_mut().chain(cp.video_parts.iter_mut().flatten()) {
+            for e in evs.iter_mut() {
+                if e.tag.voice == 0 {
+                    e.tag.voice = fallback;
+                }
+                let end = e.tag.env.map_or(e.end(), |v| v.end().min(e.end()));
+                let s = spans.entry(e.tag.voice).or_insert((e.onset, end, cp.track));
+                s.0 = s.0.min(e.onset);
+                s.1 = s.1.max(end);
+            }
+        }
+    }
+    let mut order: Vec<(u64, f64, f64, usize)> = spans.into_iter().map(|(v, (a, b, t))| (v, a, b, t)).collect();
+    order.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+    let mut tiles = crate::tile::TileAssigner::new();
+    let mut slot_of: BTreeMap<u64, u8> = BTreeMap::new();
+    let mut spans: Vec<(u8, f64, f64)> = Vec::with_capacity(order.len());
+    // One tile per track (a pad's loop passes) or per pattern lane (step
+    // hits, `seq::hit_voice`): the next pass / hit keeps its tile.
+    let key_of = |voice: u64, track: usize| {
+        let lane = if voice >> 60 == 0xA { 1 + ((voice >> 52) & 0xFF) } else { 0 };
+        ((track as u64) << 9) | lane
+    };
+    // When the key's previous voice ends (continuations at a shared start
+    // claim their slots before new keys pick the lowest free one).
+    let mut key_end: BTreeMap<u64, f64> = BTreeMap::new();
+    let mut g = 0;
+    while g < order.len() {
+        let start = order[g].1;
+        let mut h = g;
+        while h < order.len() && order[h].1 <= start + 1e-9 {
+            h += 1;
+        }
+        let group = &mut order[g..h];
+        group.sort_by_key(|&(voice, s, _, track)| {
+            let cont = key_end.get(&key_of(voice, track)).is_some_and(|&e| e >= s - 1e-9);
+            (!cont, voice)
+        });
+        for &(voice, start, end, track) in group.iter() {
+            let key = key_of(voice, track);
+            let slot = tiles.assign_keyed(voice, key, start);
+            tiles.release(voice, end);
+            slot_of.insert(voice, slot);
+            spans.push((slot, start, end));
+            let e = key_end.entry(key).or_insert(end);
+            *e = e.max(end);
+        }
+        g = h;
+    }
+    let grids = crate::tile::grid_timeline(&spans);
+    for cp in plans.iter_mut() {
+        if !include(cp) {
+            continue;
+        }
+        for (_, evs) in cp.parts.iter_mut().chain(cp.video_parts.iter_mut().flatten()) {
+            for e in evs.iter_mut() {
+                if let Some(&slot) = slot_of.get(&e.tag.voice) {
+                    e.tag.tile = Some(slot);
+                    if layout_pan {
+                        let (cols, rows) = crate::tile::grid_in(&grids, e.onset);
+                        let (pan, gain) = crate::tile::layout_pan(slot as usize, cols, rows);
+                        e.pan = (pan + 0.2 * e.pan).clamp(-1.0, 1.0);
+                        e.gain *= gain;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Tile grid for each frame (layout `Tile`): from the tile slots of every
+/// grain visible in it, across all clips (see [`crate::tile::frame_grid`]).
+pub fn frame_tile_grids(plans: &[ClipPlan], t0: f64, fps: f32, n_frames: usize) -> Vec<(u32, u32)> {
+    let mut slots: Vec<Vec<u8>> = vec![Vec::new(); n_frames];
+    let fps = fps.max(1e-3) as f64;
+    for cp in plans {
+        let vparts = cp.video_parts.as_deref().unwrap_or(&cp.parts);
+        for (_, evs) in vparts {
+            for e in evs {
+                let Some(slot) = e.tag.tile else { continue };
+                let f0 = ((e.onset - t0) * fps).ceil().max(0.0) as usize;
+                let f1 = (((e.end() - t0) * fps).ceil().max(0.0) as usize).min(n_frames);
+                for (fi, list) in slots.iter_mut().enumerate().take(f1).skip(f0) {
+                    let ft = t0 + fi as f64 / fps;
+                    if ft >= e.onset && ft < e.end() && e.tag.picture_at(ft) > 0.0 && !list.contains(&slot) {
+                        list.push(slot);
+                    }
+                }
+            }
+        }
+    }
+    slots.into_iter().map(crate::tile::frame_grid).collect()
 }
 
 /// The clip transform's audio placement: x -> pan offset, scale ->
@@ -560,6 +706,8 @@ pub fn render_project(project: &Project, from_beat: f64, to_beat: f64) -> Render
     let plan = plan_project(project);
     let mut master_audio = StereoBuffer::new(len, project.sample_rate);
     let n_frames = (len * project.fps as f64).ceil() as usize;
+    let tile_grids: Option<Vec<(u32, u32)>> =
+        (project.layout == crate::tile::Layout::Tile).then(|| frame_tile_grids(&plan, t0, project.fps, n_frames));
     let mut frames: Vec<Frame> =
         (0..n_frames).map(|_| Frame::black(project.width, project.height)).collect();
 
@@ -768,7 +916,21 @@ pub fn render_project(project: &Project, from_beat: f64, to_beat: f64) -> Render
                         if let Some(video) =
                             project.sources.get(*sid).and_then(|s| s.video.as_ref())
                         {
-                            if is_stretched_snippet {
+                            if let Some(grids) = &tile_grids {
+                                composite_grains_frame_layout(
+                                    video,
+                                    evs,
+                                    &cp.style,
+                                    &clip.link,
+                                    &clip.transform,
+                                    clip.color_filter.as_ref(),
+                                    &mut clip_layer,
+                                    ft,
+                                    is_stretched_snippet,
+                                    hue_override,
+                                    Some(grids[fi]),
+                                );
+                            } else if is_stretched_snippet {
                                 composite_grains_frame_opts(
                                     video,
                                     evs,
@@ -957,6 +1119,7 @@ mod tests {
             audio: Some(std::sync::Arc::new(crate::audio::AudioClip::sine(220.0, 4.0, p.sample_rate))),
             video: Some(std::sync::Arc::new(VideoClip::test_pattern(96, 54, 12.0, 4.0))),
             base_hz: 220.0,
+            ..Default::default()
         };
         let sid = p.add_source(src);
         let tid = p.add_track("snip");
@@ -1207,12 +1370,14 @@ mod tests {
             audio: Some(std::sync::Arc::new(crate::audio::AudioClip::sine(220.0, 2.0, p.sample_rate))),
             video: Some(std::sync::Arc::new(solid_video(220, 30, 30))),
             base_hz: 220.0,
+            ..Default::default()
         });
         let blue = p.add_source(crate::timeline::Source {
             name: "blue".into(),
             audio: Some(std::sync::Arc::new(crate::audio::AudioClip::sine(330.0, 2.0, p.sample_rate))),
             video: Some(std::sync::Arc::new(solid_video(30, 30, 220))),
             base_hz: 330.0,
+            ..Default::default()
         });
         let order = if order_red_first { [red, blue] } else { [blue, red] };
         for sid in order {
@@ -1384,6 +1549,7 @@ mod tests {
                 fps: 12.0,
             })),
             base_hz: 220.0,
+            ..Default::default()
         });
         let t = p.add_track("t");
         p.tracks[t].clips.push(Clip::new_snippet(sid, 0.0, 4.0));
@@ -1515,6 +1681,7 @@ mod tests {
                 ))),
                 video: None,
                 base_hz: 110.0,
+                ..Default::default()
             });
             let t = p.add_track("t");
             let mut c = Clip::new_snippet(sid, 0.0, 4.0);
@@ -1584,6 +1751,7 @@ mod tests {
             audio: Some(std::sync::Arc::new(crate::audio::AudioClip::sine(440.0, 2.0, p.sample_rate))),
             video: Some(std::sync::Arc::new(VideoClip::test_pattern(64, 36, 12.0, 2.0))),
             base_hz: 440.0,
+            ..Default::default()
         });
         let mut pat = crate::seq::StepPattern::new("p");
         let r = pat.add_row(sid);
@@ -1655,12 +1823,14 @@ mod tests {
             audio: Some(std::sync::Arc::new(crate::audio::AudioClip::sine(220.0, 2.0, p.sample_rate))),
             video: Some(std::sync::Arc::new(solid_video(200, 200, 200))),
             base_hz: 220.0,
+            ..Default::default()
         });
         let kick_src = p.add_source(crate::timeline::Source {
             name: "kick".into(),
             audio: Some(std::sync::Arc::new(crate::audio::AudioClip::sine(60.0, 0.5, p.sample_rate))),
             video: None,
             base_hz: 60.0,
+            ..Default::default()
         });
         let t_pad = p.add_track("pad");
         let mut c_pad = Clip::new_snippet(pad_src, 0.0, 4.0);
@@ -1707,6 +1877,7 @@ mod tests {
             audio: Some(std::sync::Arc::new(crate::audio::AudioClip::sine(220.0, 1.0, p.sample_rate))),
             video: Some(std::sync::Arc::new(solid_video(200, 180, 140))),
             base_hz: 220.0,
+            ..Default::default()
         });
         let t = p.add_track("bed");
         let mut c = Clip::new_snippet(sid, 0.0, 8.0);
@@ -1736,12 +1907,14 @@ mod tests {
             audio: Some(std::sync::Arc::new(crate::audio::AudioClip::sine(55.0, 2.0, p.sample_rate))),
             video: None,
             base_hz: 55.0,
+            ..Default::default()
         });
         let hat_src = p.add_source(crate::timeline::Source {
             name: "hat".into(),
             audio: Some(std::sync::Arc::new(crate::audio::AudioClip::sine(6000.0, 2.0, p.sample_rate))),
             video: None,
             base_hz: 6000.0,
+            ..Default::default()
         });
         let t_sub = p.add_track("sub");
         let mut cs = Clip::new_snippet(sub_src, 0.0, 2.0);
@@ -1779,12 +1952,14 @@ mod tests {
             audio: None,
             video: Some(std::sync::Arc::new(solid_video(45, 50, 60))),
             base_hz: 220.0,
+            ..Default::default()
         });
         let hit_src = p.add_source(crate::timeline::Source {
             name: "hit".into(),
             audio: Some(std::sync::Arc::new(crate::audio::AudioClip::sine(110.0, 0.25, p.sample_rate))),
             video: None,
             base_hz: 110.0,
+            ..Default::default()
         });
         let t0 = p.add_track("bg");
         p.tracks[t0].clips.push(Clip::new_snippet(bed_src, 0.0, 6.0));

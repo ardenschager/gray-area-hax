@@ -133,6 +133,7 @@ pub fn build_engine(session: Session, log: Arc<Mutex<String>>) -> Engine {
             audio: Some(std::sync::Arc::new(AudioClip::saw_stack(110.0, 4.0, sr))),
             video: Some(std::sync::Arc::new(VideoClip::test_pattern(240, 136, 12.0, 4.0))),
             base_hz: 110.0,
+            ..Default::default()
         };
         p.add_source(src) as i64
     });
@@ -147,6 +148,7 @@ pub fn build_engine(session: Session, log: Arc<Mutex<String>>) -> Engine {
                 audio: Some(std::sync::Arc::new(AudioClip::sine(freq as f32, secs as f32, sr))),
                 video: None,
                 base_hz: freq as f32,
+                ..Default::default()
             };
             p.add_source(src) as i64
         },
@@ -345,6 +347,7 @@ pub fn build_engine(session: Session, log: Arc<Mutex<String>>) -> Engine {
                 audio: Some(std::sync::Arc::new(clip)),
                 video: None,
                 base_hz,
+                ..Default::default()
             };
             Ok(s.project.lock().unwrap().add_source(src) as i64)
         },
