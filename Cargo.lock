@@ -843,6 +843,7 @@ dependencies = [
  "cpal",
  "eframe",
  "egui_kittest",
+ "image",
  "midir",
  "pollster",
  "rfd",

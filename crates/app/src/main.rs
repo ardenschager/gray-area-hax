@@ -23,10 +23,13 @@
 //!   picture, fullscreen on the second display (see `ui_output`).
 
 mod browser;
+mod demo;
 mod displays;
 mod history;
 mod midi;
 mod playback;
+#[cfg(test)]
+mod showcase;
 mod studio_host;
 #[cfg(test)]
 mod studio_tests;
@@ -130,7 +133,22 @@ fn main() -> eframe::Result<()> {
             if classic {
                 theme::apply(&cc.egui_ctx);
             }
-            let mut app = App::new(AppOpts { demo, classic, headless: false });
+            // `--demo` opens Night Platform (assets/demo) in the studio; the
+            // classic editor, or a missing folder / ffmpeg, gets the
+            // built-in procedural demo instead.
+            let night = (demo && !classic)
+                .then(demo::DemoSpec::night_platform)
+                .and_then(|spec| match spec.load_found(48000) {
+                    Ok(sources) => Some((spec, sources)),
+                    Err(e) => {
+                        eprintln!("demo: {e} — opening the built-in demo instead");
+                        None
+                    }
+                });
+            let mut app = App::new(AppOpts { demo: demo && night.is_none(), classic, headless: false });
+            if let Some((spec, sources)) = night {
+                app.install_demo(&spec, sources);
+            }
             if !classic {
                 app.studio.install_theme(&cc.egui_ctx);
             }
@@ -346,8 +364,9 @@ pub struct App {
     /// Live pad hits for the GPU preview, on the app clock.
     live_events: Vec<(usize, u8, chromagrain_core::grain::GrainEvent)>,
     live_id: u64,
-    app_clock: std::time::Instant,
-    last_sync: std::time::Instant,
+    app_clock: Clock,
+    /// `app_clock` seconds of the last engine sync (throttle).
+    last_sync: f64,
 
     youtube_url: String,
     stretch_factor: f32,
@@ -410,6 +429,24 @@ pub struct App {
     drops: Vec<(PathBuf, Place, f64)>,
 }
 
+/// The app's monotonic clock (live grain onsets, the canvas, throttles):
+/// wall time, or a simulated clock a frame-locked recorder advances.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Clock {
+    Wall(std::time::Instant),
+    #[cfg_attr(not(test), allow(dead_code))]
+    Sim(f64),
+}
+
+impl Clock {
+    pub(crate) fn secs(&self) -> f64 {
+        match self {
+            Clock::Wall(t0) => t0.elapsed().as_secs_f64(),
+            Clock::Sim(t) => *t,
+        }
+    }
+}
+
 /// How to start the app.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AppOpts {
@@ -467,8 +504,8 @@ impl App {
             cc_mappings: Vec::new(),
             live_events: Vec::new(),
             live_id: 0,
-            app_clock: std::time::Instant::now(),
-            last_sync: std::time::Instant::now(),
+            app_clock: Clock::Wall(std::time::Instant::now()),
+            last_sync: 0.0,
             youtube_url: String::new(),
             stretch_factor: 8.0,
             segment_prompt: String::new(),
@@ -515,7 +552,7 @@ impl App {
     /// moved): skip the throttle so the engine picks it up this frame.
     fn mark_now(&mut self) {
         self.project_rev += 1;
-        self.last_sync = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        self.last_sync = f64::NEG_INFINITY;
     }
 
     fn loop_region(&self) -> Option<(f64, f64)> {
@@ -528,10 +565,11 @@ impl App {
         if self.project_rev == self.plan_rev {
             return;
         }
-        if self.last_sync.elapsed() < std::time::Duration::from_millis(80) {
+        let now = self.app_clock.secs();
+        if now - self.last_sync < 0.08 {
             return; // try again next frame
         }
-        self.last_sync = std::time::Instant::now();
+        self.last_sync = now;
         self.plan_rev = self.project_rev;
         let p = {
             let mut g = self.project.lock().unwrap();
@@ -955,7 +993,7 @@ impl App {
         );
         self.playback.trigger(source, ev.clone());
         let mut vis = ev;
-        vis.onset = self.app_clock.elapsed().as_secs_f64();
+        vis.onset = self.app_clock.secs();
         self.live_events.push((source, 0, vis));
     }
 
@@ -1346,7 +1384,7 @@ impl App {
             plan: self.plan.clone(),
             t,
             live: self.live_events.clone(),
-            live_t: self.app_clock.elapsed().as_secs_f64(),
+            live_t: self.app_clock.secs(),
             buses: if self.classic { Vec::new() } else { self.studio.buses() },
             backdrop: if self.classic { None } else { self.studio.backdrop(self) },
             parked: !self.playback.is_playing(),
@@ -1539,7 +1577,7 @@ impl eframe::App for App {
             ctx.copy_text("chromagrain clip".into());
         }
 
-        let now = self.app_clock.elapsed().as_secs_f64();
+        let now = self.app_clock.secs();
         self.live_events.retain(|(_, _, e)| e.end() + 0.5 > now);
         if !self.live_events.is_empty() {
             ctx.request_repaint();

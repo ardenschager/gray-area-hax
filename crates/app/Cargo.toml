@@ -36,3 +36,5 @@ ureq = { version = "2", default-features = false, features = ["json", "native-tl
 [dev-dependencies]
 pollster = "0.4"
 egui_kittest = { version = "0.32", features = ["wgpu", "snapshot", "eframe"] }
+# Fast PNG encoding for the showcase recorder's frames.
+image = { version = "0.25", default-features = false, features = ["png"] }

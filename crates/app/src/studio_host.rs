@@ -91,12 +91,17 @@ impl Host for App {
         self.playhead_beats
     }
     fn clock(&self) -> f64 {
-        self.app_clock.elapsed().as_secs_f64()
+        self.app_clock.secs()
     }
     fn fire(&mut self, bus: u8, source: usize, ev: GrainEvent) {
-        let mut audio = ev.clone();
-        audio.onset = 0.0; // the engine stamps its own onset
-        self.playback.trigger_bus(bus, source, audio);
+        if self.playback.is_offline() {
+            // Frame-locked: hits arrive once per frame with onsets spread
+            // over the frame just past; replay that spacing one frame late.
+            let delay = ev.onset - self.app_clock.secs() + self.playback.offline_latency;
+            self.playback.trigger_bus_in(bus, source, ev.clone(), delay);
+        } else {
+            self.playback.trigger_bus(bus, source, ev.clone()); // the engine stamps its own onset
+        }
         self.live_events.push((source, bus, ev));
     }
     fn set_bus(&mut self, bus: u8, chain: Vec<AvEffect>) {
@@ -122,7 +127,16 @@ impl Host for App {
                     0
                 }
             };
-            p.tracks[ti].clips = layout.iter().map(|(pid, at, len)| Clip::new_pattern(*pid, *at, *len)).collect();
+            p.tracks[ti].clips = layout
+                .iter()
+                .map(|(pid, at, len)| {
+                    let mut c = Clip::new_pattern(*pid, *at, *len);
+                    // Hits glow in with soft edges instead of hard blocks.
+                    c.visual.feather = 0.3;
+                    c.visual.additive = 0.3;
+                    c
+                })
+                .collect();
         }
         self.loop_on = true;
         self.loop_start = 0.0;

@@ -62,20 +62,33 @@ pub struct Playback {
     start_secs: f64,
     wall_start: Option<std::time::Instant>,
     pub last_error: Option<String>,
+    /// Offline (rendering): no thread, no device — the caller pumps the
+    /// engine block by block with [`Playback::render_offline`].
+    offline: Option<Box<Driver>>,
+    /// Offline: how late live hits sound after the frame that fired them
+    /// (one frame, so their spacing within the frame survives).
+    pub offline_latency: f64,
 }
 
 impl Playback {
     pub fn new() -> Playback {
-        Playback::build(true)
+        Playback::build(true, false)
     }
 
     /// No audio device at all (tests, headless renders): the engine still
     /// runs and the transport clock follows wall time.
     pub fn new_headless() -> Playback {
-        Playback::build(false)
+        Playback::build(false, false)
     }
 
-    fn build(open_device: bool) -> Playback {
+    /// No device and no engine thread: time only moves when the caller
+    /// renders (frame-locked recordings, offline bounces of a live set).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn new_offline() -> Playback {
+        Playback::build(false, true)
+    }
+
+    fn build(open_device: bool, offline: bool) -> Playback {
         let shared = Arc::new(Shared {
             shutdown: AtomicBool::new(false),
             transport: AtomicBool::new(false),
@@ -98,7 +111,12 @@ impl Playback {
             start_secs: 0.0,
             wall_start: None,
             last_error: None,
+            offline: offline.then(|| Box::new(Driver::new())),
+            offline_latency: 1.0 / 30.0,
         };
+        if offline {
+            return pb;
+        }
         if open_device {
             if let Err(e) = pb.init_stream(consumer) {
                 pb.last_error = Some(e);
@@ -170,7 +188,7 @@ impl Playback {
         *self.shared.transport_cmd.lock().unwrap() =
             Some(TransportCmd::Play { start_beat, loop_region });
         self.start_secs = project.beats_to_secs(start_beat);
-        self.wall_start = self.stream.is_none().then(std::time::Instant::now);
+        self.wall_start = (self.stream.is_none() && self.offline.is_none()).then(std::time::Instant::now);
         self.shared.transport.store(true, Ordering::Relaxed);
     }
 
@@ -193,13 +211,38 @@ impl Playback {
 
     /// Fire a live pad hit (MIDI note / on-screen pad). The engine stamps
     /// the onset when it picks the event up.
-    pub fn trigger(&self, source: usize, event: GrainEvent) {
+    pub fn trigger(&self, source: usize, mut event: GrainEvent) {
+        event.onset = 0.0;
         self.shared.live_queue.lock().unwrap().push((0, source, event));
     }
 
     /// [`Playback::trigger`] through live effect bus `bus` (0 = dry).
-    pub fn trigger_bus(&self, bus: u8, source: usize, event: GrainEvent) {
+    pub fn trigger_bus(&self, bus: u8, source: usize, mut event: GrainEvent) {
+        event.onset = 0.0;
         self.shared.live_queue.lock().unwrap().push((bus, source, event));
+    }
+
+    /// [`Playback::trigger_bus`], sounding `delay` seconds after the engine
+    /// picks it up (keeps grain spacing when hits arrive once per frame).
+    pub fn trigger_bus_in(&self, bus: u8, source: usize, mut event: GrainEvent, delay: f64) {
+        event.onset = delay.max(0.0);
+        self.shared.live_queue.lock().unwrap().push((bus, source, event));
+    }
+
+    pub fn is_offline(&self) -> bool {
+        self.offline.is_some()
+    }
+
+    /// Offline only: render the next `frames` samples (project rate),
+    /// applying everything queued since the last call first.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn render_offline(&mut self, frames: usize) -> (Vec<f32>, Vec<f32>) {
+        let mut l = vec![0.0f32; frames];
+        let mut r = vec![0.0f32; frames];
+        if let Some(d) = self.offline.as_mut() {
+            d.block(&self.shared, &mut l, &mut r);
+        }
+        (l, r)
     }
 
     /// Set the effect chain of live bus `bus` (1-based).
@@ -224,6 +267,12 @@ impl Playback {
 
     /// Current playhead in project seconds (loop-folded).
     pub fn playhead_secs(&self, project: &Project) -> f64 {
+        if let Some(d) = &self.offline {
+            if let Some(TransportCmd::Play { .. }) = &*self.shared.transport_cmd.lock().unwrap() {
+                return self.start_secs;
+            }
+            return d.engine.playhead_secs();
+        }
         let consumed = match &self.wall_start {
             Some(t0) => t0.elapsed().as_secs_f64(),
             None => {
@@ -251,69 +300,91 @@ impl Drop for Playback {
     }
 }
 
-fn producer_loop(device_rate: u32, mut producer: rtrb::Producer<f32>, shared: Arc<Shared>) {
-    let mut engine = RealtimeAudio::new(Project::default(), 0.0, None);
-    engine.transport = false;
-    let mut left = vec![0.0f32; BLOCK];
-    let mut right = vec![0.0f32; BLOCK];
-    let mut ratio = engine.sample_rate() as f64 / device_rate as f64;
-    let mut frac = 0.0f64;
-    let mut prev = (0.0f32, 0.0f32);
-    let mut pending: Vec<f32> = Vec::new();
+/// The engine plus everything it picks up from the UI side between blocks
+/// (project swaps, transport commands, bus chains, live hits, auditions).
+/// The device thread pumps it; an offline playback pumps it directly.
+struct Driver {
+    engine: RealtimeAudio,
+}
 
-    while !shared.shutdown.load(Ordering::Relaxed) {
+impl Driver {
+    fn new() -> Driver {
+        let mut engine = RealtimeAudio::new(Project::default(), 0.0, None);
+        engine.transport = false;
+        Driver { engine }
+    }
+
+    /// Apply what the UI queued since the last block.
+    fn apply(&mut self, shared: &Shared) {
         if shared.dirty.swap(false, Ordering::Relaxed) {
             let new_project = shared.new_project.lock().unwrap().take();
             let loop_now = *shared.loop_region.lock().unwrap();
             if let Some(p) = new_project {
-                let beat = engine.playhead_beats();
-                let transport = engine.transport;
-                engine = RealtimeAudio::new(p, beat, loop_now);
+                let beat = self.engine.playhead_beats();
+                let transport = self.engine.transport;
+                let mut engine = RealtimeAudio::new(p, beat, loop_now);
+                engine.adopt_live(&mut self.engine);
                 engine.transport = transport;
+                self.engine = engine;
                 shared.buses_dirty.store(true, Ordering::Relaxed);
-                ratio = engine.sample_rate() as f64 / device_rate as f64;
             } else {
-                engine.loop_region = loop_now;
+                self.engine.loop_region = loop_now;
             }
         }
         if let Some(cmd) = shared.transport_cmd.lock().unwrap().take() {
             match cmd {
                 TransportCmd::Play { start_beat, loop_region } => {
-                    engine.seek_beats(start_beat);
-                    engine.loop_region = loop_region;
-                    engine.transport = true;
+                    self.engine.seek_beats(start_beat);
+                    self.engine.loop_region = loop_region;
+                    self.engine.transport = true;
                 }
-                TransportCmd::Stop => engine.transport = false,
+                TransportCmd::Stop => self.engine.transport = false,
             }
         }
         if shared.buses_dirty.swap(false, Ordering::Relaxed) {
             for (i, chain) in shared.live_buses.lock().unwrap().iter().enumerate() {
-                engine.set_live_bus(i as u8 + 1, chain.clone());
+                self.engine.set_live_bus(i as u8 + 1, chain.clone());
             }
         }
-        {
-            let mut queue = shared.live_queue.lock().unwrap();
-            for (bus, source, mut ev) in queue.drain(..) {
-                ev.onset = engine.live_now_secs();
-                engine.trigger_live_bus(bus, source, ev);
-            }
+        let mut queue = shared.live_queue.lock().unwrap();
+        for (bus, source, mut ev) in queue.drain(..) {
+            // The queued onset is a delay from "now" (0 = immediately).
+            ev.onset = self.engine.live_now_secs() + ev.onset.max(0.0);
+            self.engine.trigger_live_bus(bus, source, ev);
         }
+    }
 
-        if pending.is_empty() {
-            engine.next_block(&mut left, &mut right);
-            {
-                let mut aud = shared.auditions.lock().unwrap();
-                for (buf, pos) in aud.iter_mut() {
-                    let n = BLOCK.min(buf.len().saturating_sub(*pos));
-                    for i in 0..n {
-                        let v = buf[*pos + i] * 0.7;
-                        left[i] += v;
-                        right[i] += v;
-                    }
-                    *pos += n;
-                }
-                aud.retain(|(buf, pos)| *pos < buf.len());
+    /// One block at the project rate, auditions mixed in.
+    fn block(&mut self, shared: &Shared, left: &mut [f32], right: &mut [f32]) {
+        self.apply(shared);
+        self.engine.next_block(left, right);
+        let n = left.len();
+        let mut aud = shared.auditions.lock().unwrap();
+        for (buf, pos) in aud.iter_mut() {
+            let k = n.min(buf.len().saturating_sub(*pos));
+            for i in 0..k {
+                let v = buf[*pos + i] * 0.7;
+                left[i] += v;
+                right[i] += v;
             }
+            *pos += k;
+        }
+        aud.retain(|(buf, pos)| *pos < buf.len());
+    }
+}
+
+fn producer_loop(device_rate: u32, mut producer: rtrb::Producer<f32>, shared: Arc<Shared>) {
+    let mut driver = Driver::new();
+    let mut left = vec![0.0f32; BLOCK];
+    let mut right = vec![0.0f32; BLOCK];
+    let mut frac = 0.0f64;
+    let mut prev = (0.0f32, 0.0f32);
+    let mut pending: Vec<f32> = Vec::new();
+
+    while !shared.shutdown.load(Ordering::Relaxed) {
+        if pending.is_empty() {
+            driver.block(&shared, &mut left, &mut right);
+            let ratio = driver.engine.sample_rate() as f64 / device_rate as f64;
             // Resample to device rate, interleaved.
             let mut i = 0usize;
             while i < BLOCK {

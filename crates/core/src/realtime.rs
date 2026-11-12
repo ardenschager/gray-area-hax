@@ -153,6 +153,18 @@ impl RealtimeAudio {
         self.live_pos as f64 / self.project.sample_rate as f64
     }
 
+    /// Carry the live side (sounding hits, the live clock, bus chains and
+    /// their tails) over from the engine this one replaces, so an edit to
+    /// the arrangement never cuts the grains being played.
+    pub fn adopt_live(&mut self, old: &mut RealtimeAudio) {
+        if old.project.sample_rate != self.project.sample_rate {
+            return;
+        }
+        self.live = std::mem::take(&mut old.live);
+        self.live_buses = std::mem::take(&mut old.live_buses);
+        self.live_pos = old.live_pos;
+    }
+
     /// Fire a one-shot live grain (a MIDI pad hit). The event's `onset`
     /// is on the live clock; pass `live_now_secs()` for "immediately".
     pub fn trigger_live(&mut self, source: usize, event: GrainEvent) {
