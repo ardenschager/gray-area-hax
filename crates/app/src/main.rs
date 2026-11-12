@@ -24,11 +24,12 @@
 
 mod browser;
 mod displays;
-mod gpu;
 mod history;
 mod midi;
 mod playback;
-mod studio;
+mod studio_host;
+#[cfg(test)]
+mod studio_tests;
 mod theme;
 mod ui_browse;
 mod ui_inspector;
@@ -39,6 +40,7 @@ mod ui_synth;
 mod ui_timeline;
 mod ui_topbar;
 
+pub(crate) use chromagrain_ui::gpu;
 use chromagrain_core::media;
 use chromagrain_core::render::{plan_project, render_project, ClipPlan};
 use chromagrain_core::script::run_script;
@@ -130,9 +132,11 @@ fn main() -> eframe::Result<()> {
             }
             let mut app = App::new(AppOpts { demo, classic, headless: false });
             if !classic {
-                app.studio_install_theme(&cc.egui_ctx);
+                app.studio.install_theme(&cc.egui_ctx);
             }
-            if !gpu::install(cc) {
+            if let Some(rs) = cc.wgpu_render_state.as_ref() {
+                gpu::install(rs);
+            } else {
                 eprintln!("gpu preview unavailable (no wgpu render state)");
                 app.gpu_failed.store(true, std::sync::atomic::Ordering::Relaxed);
             }
@@ -328,7 +332,7 @@ pub struct App {
     /// The previous timeline editor instead of the studio (`--classic`).
     classic: bool,
     /// The play-first studio UI state.
-    studio: studio::Studio,
+    studio: chromagrain_ui::Studio,
 
     busy: Option<String>,
     jobs: VecDeque<Job>,
@@ -448,7 +452,7 @@ impl App {
             output: ui_output::OutputWin::default(),
             pending_fullscreen: false,
             classic: opts.classic,
-            studio: studio::Studio::default(),
+            studio: chromagrain_ui::Studio::default(),
             busy: None,
             jobs: VecDeque::new(),
             rx,
@@ -1343,8 +1347,8 @@ impl App {
             t,
             live: self.live_events.clone(),
             live_t: self.app_clock.elapsed().as_secs_f64(),
-            buses: if self.classic { Vec::new() } else { self.studio_buses() },
-            backdrop: self.studio_backdrop(),
+            buses: if self.classic { Vec::new() } else { self.studio.buses() },
+            backdrop: if self.classic { None } else { self.studio.backdrop(self) },
             parked: !self.playback.is_playing(),
             frame: self.frame_no,
         });
@@ -1505,7 +1509,12 @@ impl eframe::App for App {
         if self.classic {
             self.handle_shortcuts(ctx);
         } else {
-            self.studio_update(ctx);
+            // Files dropped from the Finder go to the library.
+            let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
+            for path in dropped {
+                self.import_path(path, None);
+            }
+            self.with_studio(|st, app| st.update(app, ctx));
         }
 
         if self.playback.is_playing() {
@@ -1544,7 +1553,7 @@ impl eframe::App for App {
         }
         self.output_ui(ctx);
         if !self.classic {
-            self.studio_ui(ctx);
+            self.with_studio(|st, app| st.ui(app, ctx));
             return;
         }
 

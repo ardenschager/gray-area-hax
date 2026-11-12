@@ -1,0 +1,18 @@
+[package]
+name = "chromagrain-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "chromagrain's play-first studio UI (egui) and GPU canvas (wgpu), shared by the standalone app and the plugin"
+
+[dependencies]
+chromagrain-core = { path = "../core" }
+egui = "0.32"
+egui-wgpu = "0.32"
+# wgpu backends: Metal on macOS/iOS, D3D12/Vulkan on Windows/Linux, GLES fallback.
+wgpu = { version = "25", default-features = false, features = ["metal", "dx12", "vulkan", "gles", "wgsl"] }
+raw-window-handle = "0.6"
+pollster = "0.4"
+
+[dev-dependencies]
+egui_kittest = { version = "0.32", features = ["wgpu", "snapshot"] }

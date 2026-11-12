@@ -22,6 +22,11 @@
 //!   beat). Drives beat-synced grain onsets ([`Instrument::set_sync`]) and,
 //!   optionally, a read head locked to the song position
 //!   ([`Instrument::set_follow_transport`]).
+//! * **Pads:** a 4×4 bank of loops ([`PadSlot`]: a stretch of a source,
+//!   N beats long) launched quantized to the host's beat grid
+//!   ([`Instrument::toggle_pad`], [`Instrument::set_launch_quantize`]).
+//!   MIDI notes 36–51 ([`PAD_NOTE`]..) launch pads 1–16 when that pad is
+//!   loaded (as the app's Perform view does); otherwise they play notes.
 //! * **Picture:** every audio grain is a visual grain. After each block,
 //!   [`Instrument::frame`] / [`Instrument::fill_frame`] snapshot what is on
 //!   screen as plain data ([`FrameState`]: grains + style + video effect
@@ -179,6 +184,9 @@ const BASE_GAIN: f32 = 0.8;
 const LOOKAHEAD: f64 = 0.1;
 const MAX_VOICES: usize = 16;
 const MAX_GRAINS: usize = 4096;
+/// Sources the instrument holds without reallocating: [`Instrument::add_source`]
+/// is allocation-free (safe on the audio thread) below this count.
+pub const MAX_SOURCES: usize = 16;
 const ECHO_TIME: f32 = 0.33;
 
 /// The cloud end of the GRAIN morph, overridable per emitter / voice
@@ -280,6 +288,70 @@ struct LiveGrain {
     source: SourceId,
     voice: u64,
     ev: GrainEvent,
+    origin: GrainOrigin,
+    /// Handed out by [`Instrument::drain_new_grains`] already.
+    seen: bool,
+}
+
+/// What made a grain (for UIs that already draw some grains themselves).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrainOrigin {
+    /// A held MIDI note.
+    Note,
+    /// Step lanes ([`Instrument::swap_pattern`]).
+    Step,
+    /// A one-shot from [`Instrument::trigger`].
+    Trigger,
+    /// Perform pad `n` (0-based).
+    Pad(usize),
+}
+
+/// Pads in the bank (4×4).
+pub const PADS: usize = 16;
+/// MIDI note of pad 1 (C1); pads 1–16 are notes 36–51.
+pub const PAD_NOTE: u8 = 36;
+/// Grain length of the pad loops' seamless 50%-overlap Hann train.
+const PAD_GRAIN: f64 = 0.08;
+
+/// What a pad plays: a loop `len_beats` long (it follows the host tempo)
+/// starting at `start` (0..1) in a source.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PadSlot {
+    pub source: SourceId,
+    pub start: f32,
+    pub len_beats: f32,
+    pub gain: f32,
+}
+
+impl PadSlot {
+    pub fn new(source: SourceId, len_beats: f32) -> PadSlot {
+        PadSlot { source, start: 0.0, len_beats, gain: 1.0 }
+    }
+}
+
+/// A pad as UIs show it.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct PadState {
+    pub slot: Option<PadSlot>,
+    pub on: bool,
+    /// A launch waiting for its grid line: `Some(true)` = will start.
+    pub queued: Option<bool>,
+    /// Grid beat the loop (re)started on (its bar progress is
+    /// `(beat - start_beat) mod len_beats`).
+    pub start_beat: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct Pad {
+    slot: Option<PadSlot>,
+    on: bool,
+    /// (start?, grid beat it lands on).
+    queued: Option<(bool, f64)>,
+    start_beat: f64,
+    next_t: f64,
+    velocity: f32,
+    serial: u64,
+    k: u64,
 }
 
 /// What the picture is at one moment — plain data for a renderer.
@@ -300,6 +372,41 @@ pub struct FrameState {
     pub effects: Vec<AvEffect>,
     /// Index into [`LOOKS`].
     pub look: usize,
+}
+
+/// Key-dependent look state (the tune look's resonators), built off the
+/// audio thread and installed with [`Instrument::swap_key`].
+pub struct KeyFx {
+    key: Option<Key>,
+    sample_rate: u32,
+    looks: Vec<Option<AvEffect>>,
+    look_states: Vec<Vec<AudioFxState>>,
+}
+
+impl KeyFx {
+    /// Build the look chain for `key` at `sample_rate`. Allocates.
+    pub fn prepare(key: Option<Key>, sample_rate: u32) -> KeyFx {
+        let sample_rate = sample_rate.max(1);
+        let mut looks: Vec<Option<AvEffect>> =
+            LOOKS.iter().map(|n| n.and_then(EffectKind::parse).map(AvEffect::new)).collect();
+        if let Some(k) = key {
+            for fx in looks.iter_mut().flatten() {
+                if let EffectKind::Tune { root, scale, .. } = &mut fx.kind {
+                    *root = k.root as f32;
+                    *scale = k.scale;
+                }
+            }
+        }
+        let look_states = looks
+            .iter()
+            .map(|l| l.as_ref().map(|fx| fx::audio_chain_states(std::slice::from_ref(fx), sample_rate)).unwrap_or_default())
+            .collect();
+        KeyFx { key, sample_rate, looks, look_states }
+    }
+
+    pub fn key(&self) -> Option<Key> {
+        self.key
+    }
 }
 
 /// The playable instrument. See the module docs.
@@ -330,6 +437,12 @@ pub struct Instrument {
     looks: Vec<Option<AvEffect>>,
     look_states: Vec<Vec<AudioFxState>>,
     scratch: StereoBuffer,
+    /// Step lanes played in sync with the host transport.
+    pattern: Option<crate::seq::StepPattern>,
+    pat_rng: Rng,
+    pads: [Pad; PADS],
+    /// Launch grid in beats (0 = now, 1 = beat, 4 = bar).
+    launch_q: f64,
 }
 
 impl Instrument {
@@ -345,11 +458,10 @@ impl Instrument {
             }),
             AvEffect::new(EffectKind::Reverb { size: 0.85, damp: 0.4, mix: 0.0 }),
         ];
-        let looks: Vec<Option<AvEffect>> =
-            LOOKS.iter().map(|n| n.and_then(EffectKind::parse).map(AvEffect::new)).collect();
+        let looks = Vec::new();
         let mut inst = Instrument {
             sample_rate,
-            sources: Vec::new(),
+            sources: Vec::with_capacity(MAX_SOURCES),
             active: None,
             macros: Macro::ALL.map(Macro::default_value),
             key: None,
@@ -367,6 +479,10 @@ impl Instrument {
             looks,
             look_states: Vec::new(),
             scratch: StereoBuffer { left: Vec::new(), right: Vec::new(), sample_rate },
+            pattern: None,
+            pat_rng: Rng::new(0x5E9_0E9C),
+            pads: [Pad::default(); PADS],
+            launch_q: 1.0,
         };
         inst.rebuild_fx();
         inst
@@ -378,6 +494,9 @@ impl Instrument {
         self.scratch.sample_rate = self.sample_rate;
         self.voices.clear();
         self.grains.clear();
+        for p in &mut self.pads {
+            (p.on, p.queued) = (false, None);
+        }
         self.clock = 0;
         self.anchor_t = 0.0;
         self.rebuild_fx();
@@ -386,19 +505,9 @@ impl Instrument {
     fn rebuild_fx(&mut self) {
         let sr = self.sample_rate;
         self.smear_states = fx::audio_chain_states(&self.smear_chain, sr);
-        if let Some(k) = self.key {
-            for fx in self.looks.iter_mut().flatten() {
-                if let EffectKind::Tune { root, scale, .. } = &mut fx.kind {
-                    *root = k.root as f32;
-                    *scale = k.scale;
-                }
-            }
-        }
-        self.look_states = self
-            .looks
-            .iter()
-            .map(|l| l.as_ref().map(|fx| fx::audio_chain_states(std::slice::from_ref(fx), sr)).unwrap_or_default())
-            .collect();
+        let KeyFx { looks, look_states, .. } = KeyFx::prepare(self.key, sr);
+        self.looks = looks;
+        self.look_states = look_states;
         // Room for the largest block a host is likely to send.
         self.scratch.left.reserve(8192);
         self.scratch.right.reserve(8192);
@@ -418,9 +527,7 @@ impl Instrument {
         id
     }
 
-    /// Raw-data entry point (what a C ABI wraps): `pcm` is mono
-    /// (`channels` = 1) or interleaved stereo; `rgba` is `n_frames`
-    /// tightly packed `width × height` RGBA8 frames. Either may be empty.
+    /// Raw-data entry point (what a C ABI wraps): see [`source_from_pcm_rgba`].
     #[allow(clippy::too_many_arguments)]
     pub fn add_source_pcm_rgba(
         &mut self,
@@ -434,26 +541,7 @@ impl Instrument {
         fps: f32,
         base_hz: f32,
     ) -> SourceId {
-        let audio = (!pcm.is_empty() && pcm_rate > 0).then(|| {
-            Arc::new(if channels >= 2 {
-                let n = pcm.len() / channels as usize;
-                let ch = channels as usize;
-                let l: Vec<f32> = (0..n).map(|i| pcm[i * ch]).collect();
-                let r: Vec<f32> = (0..n).map(|i| pcm[i * ch + 1]).collect();
-                AudioClip::stereo(&l, &r, pcm_rate)
-            } else {
-                AudioClip::new(pcm.to_vec(), pcm_rate)
-            })
-        });
-        let frame_bytes = (width as usize) * (height as usize) * 4;
-        let video = (frame_bytes > 0 && rgba.len() >= frame_bytes && fps > 0.0).then(|| {
-            let frames = rgba
-                .chunks_exact(frame_bytes)
-                .map(|d| Frame { width, height, data: d.to_vec() })
-                .collect();
-            Arc::new(VideoClip { frames, fps })
-        });
-        self.add_source(Source { name: name.into(), audio, video, base_hz })
+        self.add_source(source_from_pcm_rgba(name, pcm, channels, pcm_rate, rgba, width, height, fps, base_hz))
     }
 
     /// Swap the media behind an id (sounding grains keep their old audio
@@ -465,6 +553,16 @@ impl Instrument {
                 true
             }
             None => false,
+        }
+    }
+
+    /// [`Instrument::replace_source`] that hands back the old media instead
+    /// of dropping it, so an audio thread can pass it elsewhere to be freed.
+    /// Returns `Err(source)` for an unknown id.
+    pub fn swap_source(&mut self, id: SourceId, source: Source) -> Result<Source, Source> {
+        match self.sources.get_mut(id) {
+            Some(s) => Ok(std::mem::replace(s, source)),
+            None => Err(source),
         }
     }
 
@@ -501,10 +599,28 @@ impl Instrument {
     }
 
     /// The one global key (None = chromatic). Allocates (rebuilds the
-    /// tune look's resonators).
+    /// tune look's resonators); on an audio thread use
+    /// [`KeyFx::prepare`] elsewhere + [`Instrument::swap_key`].
     pub fn set_key(&mut self, key: Option<Key>) {
         self.key = key;
         self.rebuild_fx();
+    }
+
+    /// Change the key without allocating: install look state built off the
+    /// audio thread by [`KeyFx::prepare`]. Returns the replaced state (to
+    /// be dropped elsewhere), or `fx` itself if it was prepared for a
+    /// different sample rate (nothing changes then).
+    pub fn swap_key(&mut self, mut fx: KeyFx) -> KeyFx {
+        if fx.sample_rate != self.sample_rate {
+            return fx;
+        }
+        std::mem::swap(&mut self.looks, &mut fx.looks);
+        std::mem::swap(&mut self.look_states, &mut fx.look_states);
+        let old = self.key;
+        self.key = fx.key;
+        fx.key = old;
+        fx.sample_rate = self.sample_rate;
+        fx
     }
 
     pub fn key(&self) -> Option<Key> {
@@ -563,6 +679,14 @@ impl Instrument {
     }
 
     pub fn note_on(&mut self, note: u8, velocity: f32) {
+        if let Some(i) = pad_of_note(note) {
+            if self.pads[i].slot.is_some() {
+                if velocity > 0.0 {
+                    self.toggle_pad_vel(i, velocity.min(1.0));
+                }
+                return;
+            }
+        }
         let Some(source) = self.active else { return };
         let Some(src) = self.sources.get(source) else { return };
         let len = src.duration();
@@ -604,8 +728,9 @@ impl Instrument {
         }
     }
 
+    /// Stop every note (allocation- and free-free, so safe on the audio thread).
     pub fn all_notes_off(&mut self) {
-        for v in std::mem::take(&mut self.voices) {
+        while let Some(v) = self.voices.pop() {
             self.cut_future(v.serial);
         }
     }
@@ -626,6 +751,79 @@ impl Instrument {
         self.looks[look].as_ref().map(|fx| fx::audio_chain_latency(std::slice::from_ref(fx))).unwrap_or(0)
     }
 
+    /// Play a one-shot grain now (an emitter on the editor's grid, a pad).
+    /// It runs through SMEAR and LOOK like note grains. Allocation-free;
+    /// dropped when the grain pool is full.
+    pub fn trigger(&mut self, source: SourceId, mut ev: GrainEvent) {
+        if self.grains.len() >= MAX_GRAINS || self.sources.get(source).is_none() {
+            return;
+        }
+        ev.onset = self.now_secs();
+        self.grains.push(LiveGrain { source, voice: 0, ev, origin: GrainOrigin::Trigger, seen: false });
+    }
+
+    /// Install step lanes (a `StepPattern`: rows = lanes, steps with
+    /// slice / pitch / length / chance) that play in sync with the host
+    /// transport while it runs. Swaps, so the caller frees the old one off
+    /// the audio thread.
+    pub fn swap_pattern(&mut self, pattern: Option<crate::seq::StepPattern>) -> Option<crate::seq::StepPattern> {
+        std::mem::replace(&mut self.pattern, pattern)
+    }
+
+    pub fn pattern(&self) -> Option<&crate::seq::StepPattern> {
+        self.pattern.as_ref()
+    }
+
+    /// Fire the pattern's steps whose boundary falls in `[t0, t1)`.
+    fn sequence(&mut self, t0: f64, t1: f64) {
+        let Some(pat) = self.pattern.as_ref() else { return };
+        if !self.transport.playing || pat.rows.is_empty() {
+            return;
+        }
+        let spb = pat.steps_per_beat.max(1) as f64;
+        let (b0, b1) = (self.beat_at(t0), self.beat_at(t1));
+        let mut k = (b0 * spb - 1e-9).ceil() as i64;
+        while (k as f64) / spb < b1 {
+            let t = self.grid_time(k as f64 / spb).clamp(t0, t1);
+            for (ri, row) in pat.rows.iter().enumerate() {
+                if row.muted || row.steps.is_empty() {
+                    continue;
+                }
+                let Some(src) = self.sources.get(row.source) else { continue };
+                let len = src.duration();
+                if len <= 0.0 {
+                    continue;
+                }
+                let step = row.steps[k.rem_euclid(row.steps.len() as i64) as usize];
+                let roll = self.pat_rng.next_f32();
+                let jit = self.pat_rng.bipolar();
+                if !step.on || roll >= step.chance || self.grains.len() >= MAX_GRAINS {
+                    continue;
+                }
+                let g = &row.grains;
+                let key = row.key.or(self.key);
+                let st = g.pitch + step.pitch + g.pitch_jitter * jit;
+                let ratio = crate::music::effective_ratio(st, key.as_ref(), src.effective_base_hz(), g.quantize_amount, g.detune_cents);
+                let at = if step.slice >= 0.0 { step.slice.min(1.0) } else { g.position };
+                let ev = GrainEvent {
+                    onset: t,
+                    source_pos: (at as f64 * len).rem_euclid(len.max(1e-6)),
+                    duration: (g.duration * step.length.max(0.05)).clamp(0.01, 5.0),
+                    pitch_ratio: ratio,
+                    gain: g.gain * step.gain,
+                    pan: g.pan.clamp(-1.0, 1.0),
+                    envelope: g.envelope,
+                    env_skew: g.env_skew,
+                    reverse: g.reverse_prob >= 0.5,
+                    id: (1u64 << 62) | ((ri as u64) << 40) | (k as u64 & 0xFF_FFFF_FFFF),
+                };
+                let source = row.source;
+                self.grains.push(LiveGrain { source, voice: 0, ev, origin: GrainOrigin::Step, seen: false });
+            }
+            k += 1;
+        }
+    }
+
     // ------------------------------------------------------------ audio
 
     /// Fill one stereo block. `left` and `right` must be the same length.
@@ -642,7 +840,10 @@ impl Instrument {
         let t1 = t0 + n as f64 / sr;
         let map = self.macro_map();
 
+        self.launch(t0, t1);
         self.schedule(t1 + LOOKAHEAD, &map);
+        self.schedule_pads(t1 + LOOKAHEAD);
+        self.sequence(t0, t1);
 
         // Grains -> scratch (exactly n samples, no realloc in steady state).
         self.scratch.left.clear();
@@ -715,8 +916,170 @@ impl Instrument {
                     next = self.grid_time(b).max(self.voices[vi].next_t + 1e-4);
                 }
                 self.voices[vi].next_t = next;
-                self.grains.push(LiveGrain { source, voice: serial, ev });
+                self.grains.push(LiveGrain { source, voice: serial, ev, origin: GrainOrigin::Note, seen: false });
             }
+        }
+    }
+
+    // ------------------------------------------------------------ pads
+
+    /// Load (or clear) a pad. A pad that was playing keeps playing with the
+    /// new loop. Allocation-free.
+    pub fn set_pad(&mut self, i: usize, slot: Option<PadSlot>) {
+        let Some(p) = self.pads.get_mut(i) else { return };
+        let slot = slot.map(|s| PadSlot { start: s.start.clamp(0.0, 1.0), len_beats: s.len_beats.clamp(0.25, 64.0), gain: s.gain.clamp(0.0, 2.0), ..s });
+        p.slot = slot;
+        if slot.is_none() {
+            let was_on = std::mem::replace(&mut p.on, false);
+            p.queued = None;
+            if was_on {
+                let serial = p.serial;
+                self.cut_future(serial);
+            }
+        }
+    }
+
+    pub fn pad(&self, i: usize) -> PadState {
+        self.pads.get(i).map_or(PadState::default(), |p| PadState {
+            slot: p.slot,
+            on: p.on,
+            queued: p.queued.map(|q| q.0),
+            start_beat: p.start_beat,
+        })
+    }
+
+    pub fn pads(&self) -> [PadState; PADS] {
+        std::array::from_fn(|i| self.pad(i))
+    }
+
+    /// Launch grid in beats: 0 = now, 1 = next beat, 4 = next bar.
+    pub fn set_launch_quantize(&mut self, beats: f64) {
+        self.launch_q = if beats.is_finite() { beats.clamp(0.0, 16.0) } else { 0.0 };
+    }
+
+    pub fn launch_quantize(&self) -> f64 {
+        self.launch_q
+    }
+
+    /// Start / stop a pad on the next launch-grid line of the host's beat
+    /// grid (free-running at the host tempo while it is stopped). Pressing
+    /// a pad whose launch is still queued cancels it. Empty pads ignore it.
+    pub fn toggle_pad(&mut self, i: usize) {
+        self.toggle_pad_vel(i, 1.0);
+    }
+
+    fn toggle_pad_vel(&mut self, i: usize, velocity: f32) {
+        let now = self.now_secs();
+        let beat = self.grid_beat(now);
+        let q = self.launch_q;
+        let Some(p) = self.pads.get_mut(i) else { return };
+        if p.slot.is_none() {
+            return;
+        }
+        if p.queued.take().is_some() {
+            return;
+        }
+        let start = !p.on;
+        if start {
+            p.velocity = velocity;
+        }
+        let at = if q > 0.0 { (beat / q - 1e-9).ceil() * q } else { beat };
+        p.queued = Some((start, at));
+    }
+
+    /// Stop every pad now.
+    pub fn stop_pads(&mut self) {
+        for i in 0..PADS {
+            let p = &mut self.pads[i];
+            p.queued = None;
+            if p.on {
+                p.on = false;
+                let serial = p.serial;
+                self.cut_future(serial);
+            }
+        }
+    }
+
+    /// Apply the queued launches whose grid line falls before `t1`.
+    fn launch(&mut self, t0: f64, t1: f64) {
+        for i in 0..PADS {
+            let Some((start, mut at)) = self.pads[i].queued else { continue };
+            // The host jumped back (a loop, a locate): re-aim at the next
+            // line from here.
+            let b0 = self.grid_beat(t0);
+            if at > b0 + self.launch_q + 1e-6 {
+                at = if self.launch_q > 0.0 { (b0 / self.launch_q - 1e-9).ceil() * self.launch_q } else { b0 };
+                self.pads[i].queued = Some((start, at));
+            }
+            let t = self.grid_time(at).max(t0);
+            if t >= t1 {
+                continue;
+            }
+            self.serial += 1;
+            let serial = self.serial;
+            let p = &mut self.pads[i];
+            p.queued = None;
+            if start {
+                let old = p.serial;
+                (p.on, p.start_beat, p.next_t, p.serial, p.k) = (true, at, t, serial, 0);
+                // A retrigger drops the old loop's pending grains.
+                self.grains.retain(|g| !(g.voice == old && g.origin == GrainOrigin::Pad(i) && g.ev.onset >= t));
+            } else {
+                p.on = false;
+                let old = p.serial;
+                self.grains.retain(|g| !(g.voice == old && g.origin == GrainOrigin::Pad(i) && g.ev.onset >= t));
+            }
+        }
+    }
+
+    /// The playing pads' grains up to `until`: a seamless 50%-overlap Hann
+    /// train reading the loop straight (the sample, unprocessed until SMEAR
+    /// and LOOK), phase-locked to the beat it started on.
+    fn schedule_pads(&mut self, until: f64) {
+        let hop = PAD_GRAIN / 2.0;
+        for i in 0..PADS {
+            let p = self.pads[i];
+            let Some(slot) = p.slot.filter(|_| p.on) else { continue };
+            let Some(len) = self.sources.get(slot.source).map(|s| s.duration()).filter(|l| *l > 0.0) else { continue };
+            let spb = 60.0 / self.transport.bpm;
+            let loop_secs = (slot.len_beats as f64 * spb).min(len);
+            let mut next_t = p.next_t;
+            let mut k = p.k;
+            // Never look ahead past a queued stop.
+            let until = p.queued.filter(|q| !q.0).map_or(until, |q| until.min(self.grid_time(q.1)));
+            while next_t < until {
+                if self.grains.len() >= MAX_GRAINS {
+                    break;
+                }
+                let phase = ((self.grid_beat(next_t) - p.start_beat) * spb).rem_euclid(loop_secs.max(1e-3));
+                let ev = GrainEvent {
+                    onset: next_t,
+                    source_pos: (slot.start as f64 * len + phase).rem_euclid(len),
+                    duration: PAD_GRAIN as f32,
+                    pitch_ratio: 1.0,
+                    gain: slot.gain * p.velocity,
+                    pan: 0.0,
+                    envelope: 1.0,
+                    env_skew: 0.0,
+                    reverse: false,
+                    id: (3u64 << 61) | ((i as u64) << 48) | (k & 0xFFFF_FFFF_FFFF),
+                };
+                self.grains.push(LiveGrain { source: slot.source, voice: p.serial, ev, origin: GrainOrigin::Pad(i), seen: false });
+                next_t += hop;
+                k += 1;
+            }
+            (self.pads[i].next_t, self.pads[i].k) = (next_t, k);
+        }
+    }
+
+    /// Grains made since the last call (notes, pads, steps, triggers), in
+    /// creation order, onsets on the instrument clock ([`Instrument::now_secs`];
+    /// may lie up to ~0.1 s ahead). For a UI on another thread that draws
+    /// the picture itself. Allocation-free.
+    pub fn drain_new_grains(&mut self, mut f: impl FnMut(SourceId, &GrainEvent, GrainOrigin)) {
+        for g in self.grains.iter_mut().filter(|g| !g.seen) {
+            g.seen = true;
+            f(g.source, &g.ev, g.origin);
         }
     }
 
@@ -759,6 +1122,48 @@ impl Instrument {
     pub fn video_frame_events(&self, t: f64) -> impl Iterator<Item = (SourceId, &GrainEvent)> + '_ {
         self.grains.iter().filter(move |g| t >= g.ev.onset && t < g.ev.end()).map(|g| (g.source, &g.ev))
     }
+}
+
+fn pad_of_note(note: u8) -> Option<usize> {
+    (PAD_NOTE..PAD_NOTE + PADS as u8).contains(&note).then(|| (note - PAD_NOTE) as usize)
+}
+
+/// Build a [`Source`] from raw data (what hosts with their own decoders,
+/// e.g. AVFoundation, hand over): `pcm` is mono (`channels` = 1) or
+/// interleaved stereo; `rgba` is tightly packed `width × height` RGBA8
+/// frames at `fps`. Either may be empty. Allocates.
+#[allow(clippy::too_many_arguments)]
+pub fn source_from_pcm_rgba(
+    name: &str,
+    pcm: &[f32],
+    channels: u32,
+    pcm_rate: u32,
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    fps: f32,
+    base_hz: f32,
+) -> Source {
+    let audio = (!pcm.is_empty() && pcm_rate > 0).then(|| {
+        Arc::new(if channels >= 2 {
+            let n = pcm.len() / channels as usize;
+            let ch = channels as usize;
+            let l: Vec<f32> = (0..n).map(|i| pcm[i * ch]).collect();
+            let r: Vec<f32> = (0..n).map(|i| pcm[i * ch + 1]).collect();
+            AudioClip::stereo(&l, &r, pcm_rate)
+        } else {
+            AudioClip::new(pcm.to_vec(), pcm_rate)
+        })
+    });
+    let frame_bytes = (width as usize) * (height as usize) * 4;
+    let video = (frame_bytes > 0 && rgba.len() >= frame_bytes && fps > 0.0).then(|| {
+        let frames = rgba
+            .chunks_exact(frame_bytes)
+            .map(|d| Frame { width, height, data: d.to_vec() })
+            .collect();
+        Arc::new(VideoClip { frames, fps })
+    });
+    Source { name: name.into(), audio, video, base_hz }
 }
 
 /// CPU rasterizer for [`FrameState`]s — the reference picture (thumbnails,
@@ -862,6 +1267,200 @@ mod tests {
     fn pitch_hz(x: &[f32]) -> f32 {
         let crossings = x.windows(2).filter(|w| w[0] <= 0.0 && w[1] > 0.0).count();
         crossings as f32 * SR as f32 / x.len() as f32
+    }
+
+    #[test]
+    fn step_lanes_play_in_sync_with_the_host_transport() {
+        let mut i = inst_with_sine();
+        let mut pat = crate::seq::StepPattern::new("lanes");
+        let r = pat.add_row(0);
+        for k in (0..16).step_by(4) {
+            pat.rows[r].steps[k].on = true;
+        }
+        pat.rows[r].grains.duration = 0.1;
+        assert!(i.swap_pattern(Some(pat)).is_none());
+        // Stopped: nothing.
+        let (l, _) = run(&mut i, 0.5, 256);
+        assert_eq!(rms(&l), 0.0, "transport stopped: silent");
+        // 120 bpm from beat 0: hits every 0.5 s.
+        i.set_transport(Transport { bpm: 120.0, playing: true, beat: 0.0 });
+        let grains = collect(&mut i, 2.0, 256);
+        let onsets: Vec<f64> = grains.iter().map(|e| e.onset - 0.5).collect();
+        assert_eq!(onsets.len(), 4, "{onsets:?}");
+        for (n, o) in onsets.iter().enumerate() {
+            assert!((o - n as f64 * 0.5).abs() < 1e-6, "hit {n} at {o}");
+        }
+        // The host jumps to beat 2 (a loop): the next hit is on beat 2.
+        i.set_transport(Transport { bpm: 120.0, playing: true, beat: 1.9 });
+        let t = i.now_secs();
+        let g = collect(&mut i, 0.2, 128);
+        assert!(g.iter().any(|e| (e.onset - (t + 0.05)).abs() < 1e-6), "beat 2 lands 0.05 s after 1.9");
+        let old = i.swap_pattern(None);
+        assert!(old.is_some());
+    }
+
+    #[test]
+    fn triggered_grains_sound_through_the_macros() {
+        let mut i = inst_with_sine();
+        let ev = GrainEvent {
+            onset: 123.0, // ignored: plays now
+            source_pos: 0.5,
+            duration: 0.2,
+            pitch_ratio: 1.0,
+            gain: 0.8,
+            pan: 0.0,
+            envelope: 0.5,
+            env_skew: 0.0,
+            reverse: false,
+            id: 9,
+        };
+        i.trigger(0, ev.clone());
+        i.trigger(7, ev); // unknown source: ignored
+        let (l, _) = run(&mut i, 0.3, 256);
+        assert!(rms(&l[..9600]) > 0.01);
+        assert_eq!(i.frame().grains.len(), 0, "finished");
+    }
+
+    /// Grains made while running `secs`, with their origins (each once).
+    fn drained(i: &mut Instrument, secs: f64, block: usize) -> (Vec<(GrainEvent, GrainOrigin)>, Vec<f32>) {
+        let blocks = (secs * SR as f64 / block as f64).ceil() as usize;
+        let (mut l, mut r) = (vec![0.0; block], vec![0.0; block]);
+        let (mut all, mut audio) = (Vec::new(), Vec::new());
+        for _ in 0..blocks {
+            i.process(&mut l, &mut r);
+            audio.extend_from_slice(&l);
+            i.drain_new_grains(|_, e, o| all.push((e.clone(), o)));
+        }
+        (all, audio)
+    }
+
+    #[test]
+    fn pads_launch_and_stop_on_the_host_beat_grid() {
+        let mut i = inst_with_sine();
+        i.set_pad(0, Some(PadSlot::new(0, 2.0)));
+        i.set_transport(Transport { bpm: 120.0, playing: true, beat: 0.3 });
+        assert_eq!(i.launch_quantize(), 1.0, "launches on the beat by default");
+        i.toggle_pad(0);
+        assert_eq!(i.pad(0).queued, Some(true));
+        assert!(!i.pad(0).on);
+        // Beat 1 is 0.35 s away at 120 bpm.
+        let (g, audio) = drained(&mut i, 1.0, 256);
+        let first = g.iter().map(|(e, _)| e.onset).fold(f64::MAX, f64::min);
+        assert!((first - 0.35).abs() < 1e-9, "the loop starts on beat 1: {first}");
+        assert!(g.iter().all(|(_, o)| *o == GrainOrigin::Pad(0)));
+        let at = (0.35 * SR as f64) as usize;
+        assert_eq!(rms(&audio[..at - 8]), 0.0, "silent until the beat");
+        assert!(rms(&audio[at + 2_400..at + 12_000]) > 0.05, "a steady loop after it: {}", rms(&audio[at + 2_400..at + 12_000]));
+        let st = i.pad(0);
+        assert!(st.on && st.queued.is_none() && st.start_beat == 1.0, "{st:?}");
+        // Stop on the bar: no grain starts at or after beat 4 (1.85 s from
+        // the start); the sound rings out right after.
+        i.set_launch_quantize(4.0);
+        i.toggle_pad(0);
+        assert_eq!(i.pad(0).queued, Some(false));
+        let (g, audio) = drained(&mut i, 1.5, 256);
+        assert!(g.iter().all(|(e, _)| e.onset < 1.85 - 1e-9), "nothing after the bar line");
+        assert!(g.iter().any(|(e, _)| e.onset > 1.85 - 0.05), "but right up to it");
+        let rel = ((1.85 - 1.0) * SR as f64) as usize;
+        assert!(rms(&audio[..rel - 8]) > 0.05);
+        assert!(rms(&audio[rel + (0.1 * SR as f64) as usize..]) < 1e-3, "rings out after the bar");
+        assert!(!i.pad(0).on);
+    }
+
+    #[test]
+    fn pad_loops_follow_the_host_tempo() {
+        let mut i = inst_with_sine();
+        i.set_launch_quantize(0.0);
+        i.set_pad(3, Some(PadSlot { start: 0.25, ..PadSlot::new(0, 1.0) }));
+        i.set_transport(Transport { bpm: 120.0, playing: true, beat: 0.0 });
+        i.toggle_pad(3);
+        let (g, _) = drained(&mut i, 1.2, 128);
+        let len = 3.0; // the sine source's seconds
+        let pos_at = |t: f64| g.iter().find(|(e, _)| (e.onset - t).abs() < 1e-6).map(|(e, _)| e.source_pos).unwrap();
+        let start = 0.25 * len;
+        assert!((pos_at(0.0) - start).abs() < 1e-6, "starts at the slot's start");
+        assert!((pos_at(0.2) - (start + 0.2)).abs() < 1e-6, "reads straight through");
+        assert!((pos_at(0.52) - (start + 0.02)).abs() < 1e-6, "1 beat = 0.5 s at 120 bpm: loops back");
+        // Half the tempo: the same beat loop is twice as long.
+        i.set_transport(Transport { bpm: 60.0, playing: true, beat: 4.0 });
+        let t = i.now_secs();
+        let (g, _) = drained(&mut i, 1.5, 128);
+        let after: Vec<_> = g.iter().filter(|(e, _)| e.onset >= t + 0.2).collect();
+        let e = after.iter().find(|(e, _)| (e.onset - (t + 0.6)).abs() < 1e-6).unwrap();
+        assert!((e.0.source_pos - (start + 0.6)).abs() < 1e-6, "60 bpm: still inside the 1 s loop at 0.6 s");
+    }
+
+    #[test]
+    fn midi_notes_36_to_51_launch_loaded_pads() {
+        let mut i = inst_with_sine();
+        i.set_launch_quantize(0.0);
+        i.set_pad(2, Some(PadSlot::new(0, 4.0))); // note 38
+        i.note_on(PAD_NOTE + 2, 0.5);
+        assert_eq!(i.held_notes().count(), 0, "a loaded pad's note launches the pad");
+        let (g, _) = drained(&mut i, 0.1, 256);
+        assert!(i.pad(2).on);
+        assert!(g.iter().all(|(e, o)| *o == GrainOrigin::Pad(2) && (e.gain - 0.5).abs() < 1e-6), "velocity = loop gain");
+        i.note_off(PAD_NOTE + 2); // pads toggle; note-off is ignored
+        drained(&mut i, 0.05, 256);
+        assert!(i.pad(2).on);
+        i.note_on(PAD_NOTE + 2, 1.0);
+        drained(&mut i, 0.05, 256);
+        assert!(!i.pad(2).on, "pressed again: stops");
+        // An empty pad's note (and anything outside 36–51) plays the media.
+        i.note_on(PAD_NOTE + 1, 1.0);
+        i.note_on(60, 1.0);
+        assert_eq!(i.held_notes().collect::<Vec<_>>(), vec![PAD_NOTE + 1, 60]);
+        let (g, _) = drained(&mut i, 0.1, 256);
+        assert!(!g.is_empty() && g.iter().all(|(_, o)| *o == GrainOrigin::Note));
+    }
+
+    #[test]
+    fn queued_presses_cancel_and_stop_pads_silences() {
+        let mut i = inst_with_sine();
+        for p in 0..PADS {
+            i.set_pad(p, Some(PadSlot::new(0, 1.0)));
+        }
+        i.set_transport(Transport { bpm: 120.0, playing: true, beat: 0.5 });
+        i.toggle_pad(0);
+        i.toggle_pad(0);
+        assert_eq!(i.pad(0).queued, None, "a second press before the line cancels");
+        i.toggle_pad(5); // empty pads aside, the queue survives a host jump
+        i.set_transport(Transport { bpm: 120.0, playing: true, beat: 0.9 });
+        drained(&mut i, 0.1, 256);
+        assert!(i.pad(5).on);
+        i.set_launch_quantize(0.0);
+        for p in 0..PADS {
+            if !i.pad(p).on {
+                i.toggle_pad(p);
+            }
+        }
+        drained(&mut i, 0.05, 256);
+        assert!(i.pads().iter().all(|p| p.on), "16 loops at once");
+        i.stop_pads();
+        let (g, audio) = drained(&mut i, 0.3, 256);
+        assert!(g.is_empty(), "no new grains after stop");
+        assert!(rms(&audio[(0.12 * SR as f64) as usize..]) < 1e-3);
+        // Clearing a playing pad stops it; triggered grains survive.
+        i.toggle_pad(1);
+        drained(&mut i, 0.05, 256);
+        i.trigger(0, GrainEvent { onset: 0.0, source_pos: 0.1, duration: 0.5, pitch_ratio: 1.0, gain: 0.5, pan: 0.0, envelope: 1.0, env_skew: 0.0, reverse: false, id: 1 });
+        i.set_pad(1, None);
+        assert!(!i.pad(1).on && i.pad(1).slot.is_none());
+        let (g, audio) = drained(&mut i, 0.2, 256);
+        assert!(g.iter().all(|(_, o)| *o == GrainOrigin::Trigger));
+        assert!(rms(&audio) > 0.01, "the one-shot still sounds");
+    }
+
+    #[test]
+    fn new_grains_are_reported_once_with_their_origin() {
+        let mut i = inst_with_sine();
+        i.note_on(60, 1.0);
+        i.trigger(0, GrainEvent { onset: 0.0, source_pos: 0.1, duration: 0.05, pitch_ratio: 1.0, gain: 0.5, pan: 0.0, envelope: 1.0, env_skew: 0.0, reverse: false, id: 1 });
+        let (g, _) = drained(&mut i, 1.0, 256);
+        let ids: std::collections::HashSet<u64> = g.iter().map(|(e, _)| e.id).collect();
+        assert_eq!(ids.len(), g.len(), "each grain once");
+        assert_eq!(g.iter().filter(|(_, o)| *o == GrainOrigin::Trigger).count(), 1);
+        assert!(g.iter().filter(|(_, o)| *o == GrainOrigin::Note).count() > 2);
     }
 
     #[test]
@@ -1118,6 +1717,34 @@ mod tests {
         let cap = snap.grains.capacity();
         i.fill_frame(&mut snap);
         assert_eq!(snap.grains.capacity(), cap);
+    }
+
+    #[test]
+    fn swap_key_matches_set_key_and_swap_source_returns_the_old_media() {
+        let k = Key::new(2, ScaleKind::Dorian);
+        let render = |mut i: Instrument| {
+            i.set_macro(Macro::Look, 1.5 / LOOKS.len() as f32); // tune
+            i.note_on(62, 1.0);
+            run(&mut i, 0.4, 512).0
+        };
+        let mut a = inst_with_sine();
+        a.set_key(Some(k));
+        let mut b = inst_with_sine();
+        let old = b.swap_key(KeyFx::prepare(Some(k), SR));
+        assert_eq!(old.key(), None);
+        assert_eq!(b.key(), Some(k));
+        assert_eq!(render(a), render(b));
+        // Wrong rate: refused, nothing changes.
+        let mut c = inst_with_sine();
+        let back = c.swap_key(KeyFx::prepare(Some(k), 44100));
+        assert_eq!((back.key(), c.key()), (Some(k), None));
+
+        let mut i = inst_with_sine();
+        let old = i.swap_source(0, sine_source(440.0, 1.0)).ok().unwrap();
+        assert_eq!(old.base_hz, 220.0);
+        assert_eq!(i.sources()[0].base_hz, 440.0);
+        assert!(i.swap_source(5, sine_source(1.0, 1.0)).is_err());
+        assert!(i.sources().len() < MAX_SOURCES && i.sources.capacity() >= MAX_SOURCES);
     }
 
     #[test]

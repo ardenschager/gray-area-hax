@@ -1,0 +1,19 @@
+[package]
+name = "chromagrain-ffi"
+version.workspace = true
+edition.workspace = true
+license = "GPL-3.0-or-later"
+description = "C ABI over chromagrain_core::instrument::Instrument (for the Swift AUv3 shell and other hosts)"
+
+[lib]
+name = "chromagrain_ffi"
+# staticlib for Swift/C hosts (the AUv3 extension links libchromagrain_ffi.a),
+# rlib for Rust tests.
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+chromagrain-core = { path = "../core" }
+rtrb = "0.3"
+
+[build-dependencies]
+cbindgen = { version = "0.27", default-features = false }
