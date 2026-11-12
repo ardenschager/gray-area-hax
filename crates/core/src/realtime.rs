@@ -15,6 +15,10 @@ use crate::timeline::{DuckState, Project};
 /// a new one (a LOOK change), so switching effects never clicks.
 const BUS_XFADE: usize = 2048;
 
+/// De-click ramp (samples) on the arrangement either side of a loop wrap:
+/// sounds that run past the loop end fade out instead of being cut.
+const WRAP_RAMP: u64 = 192;
+
 /// One live effect bus: its chain + state, and the chain it is fading out
 /// of (with the samples left in the fade).
 struct LiveBus {
@@ -54,6 +58,8 @@ pub struct RealtimeAudio {
     /// Monotonic sample clock that never pauses (times live events).
     live_pos: u64,
     scratch_clip: StereoBuffer,
+    /// Where the arrangement fades back in after the last loop wrap.
+    wrap_fade_in: Option<u64>,
 }
 
 impl RealtimeAudio {
@@ -139,6 +145,7 @@ impl RealtimeAudio {
             live_buses: Vec::new(),
             live_pos: 0,
             scratch_clip: StereoBuffer { left: Vec::new(), right: Vec::new(), sample_rate: sr },
+            wrap_fade_in: None,
         }
     }
 
@@ -244,6 +251,7 @@ impl RealtimeAudio {
                         (self.project.beats_to_secs(le) * sr).round() as u64;
                     if self.sample_pos >= end_sample {
                         self.seek_beats(ls);
+                        self.wrap_fade_in = Some(self.sample_pos);
                         continue;
                     }
                     remaining.min((end_sample - self.sample_pos) as usize)
@@ -393,7 +401,35 @@ impl RealtimeAudio {
             }
         }
 
+        self.declick_wrap(at, n, left, right);
         self.render_live_and_master(at, n, left, right);
+    }
+
+    /// Ramp the arrangement down into a loop wrap and back up after it.
+    fn declick_wrap(&mut self, at: usize, n: usize, left: &mut [f32], right: &mut [f32]) {
+        let Some((_, le)) = self.loop_region.filter(|(ls, le)| le > ls) else { return };
+        let sr = self.project.sample_rate as f64;
+        let end = (self.project.beats_to_secs(le) * sr).round() as u64;
+        let ramp = |d: u64| 0.5 - 0.5 * (std::f32::consts::PI * d as f32 / WRAP_RAMP as f32).cos();
+        for i in 0..n {
+            let pos = self.sample_pos + i as u64;
+            let mut g = 1.0f32;
+            if pos < end && end - pos <= WRAP_RAMP {
+                g *= ramp(end - pos);
+            }
+            if let Some(s) = self.wrap_fade_in {
+                if pos >= s && pos - s < WRAP_RAMP {
+                    g *= ramp(pos - s);
+                }
+            }
+            if g < 1.0 {
+                left[at + i] *= g;
+                right[at + i] *= g;
+            }
+        }
+        if self.wrap_fade_in.is_some_and(|s| self.sample_pos + n as u64 >= s + WRAP_RAMP) {
+            self.wrap_fade_in = None;
+        }
     }
 
     /// Mix live (MIDI) events on the monotonic clock, then run the master

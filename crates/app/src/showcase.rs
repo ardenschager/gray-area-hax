@@ -156,10 +156,10 @@ pub fn tour() -> Tour {
     // Rec: what you play becomes a take, and plays back hands-free.
     say(27.8, 31.2, "rec turns a phrase into a take");
     at(28.0, Tap(lab("rec")));
-    at(28.6, Touch(rows(1, &[(0.0, 0.0), (0.06, 0.7), (0.0, 1.4)]), 2.2));
-    at(31.2, Tap(lab("rec")));
-    say(32.0, 35.0, "hands off · it plays back");
-    at(32.2, Tap(lab("play")));
+    at(28.6, Touch(rows(1, &[(0.0, 0.0), (0.06, 0.7), (0.0, 1.4)]), 2.5));
+    at(31.25, Tap(lab("rec")));
+    say(31.9, 35.0, "hands off · it plays back");
+    at(31.75, Tap(lab("play")));
 
     // ---- Sequence: tap, drag, hold; scenes and the chain.
     let s = 35.8;
@@ -190,13 +190,16 @@ pub fn tour() -> Tour {
     at(p + 1.2, Tap(lab("pad 5")));
     at(p + 2.9, Tap(lab("pad 6")));
     at(p + 4.6, Tap(lab("pad 7")));
-    say(p + 6.6, p + 9.6, "fullscreen · tap for the hud");
+    say(p + 6.6, p + 9.6, "fullscreen · just the picture");
     at(p + 6.8, Tap(lab("Fullscreen")));
-    at(p + 7.8, Tap(Aim::Screen(0.5, 0.42)));
-    at(p + 13.6, Tap(Aim::Screen(0.46, 0.4)));
-    say(p + 14.0, p + 16.8, "launch from the hud");
-    at(p + 14.6, Tap(lab("mini pad 11")));
-    Tour { cues, captions: cap, title_until: 2.0, end_card: p + 18.4, len: p + 23.2 }
+    say(p + 10.4, p + 13.0, "tap for the hud · launch from it");
+    at(p + 10.6, Tap(Aim::Screen(0.5, 0.42)));
+    at(p + 11.8, Tap(lab("mini pad 9")));
+    say(p + 13.7, p + 16.6, "tap again · it stops on the bar");
+    at(p + 13.8, Tap(lab("mini pad 5")));
+    at(p + 14.4, Tap(lab("mini pad 6")));
+    at(p + 15.0, Tap(lab("mini pad 7")));
+    Tour { cues, captions: cap, title_until: 2.0, end_card: p + 19.6, len: p + 24.2 }
 }
 
 // --------------------------------------------------------------- overlay
@@ -247,7 +250,6 @@ impl Overlay {
             }
             p.circle_filled(f.pos, rad, Color32::from_white_alpha((30.0 * a) as u8));
             p.circle_stroke(f.pos, rad, Stroke::new(1.5, Color32::from_white_alpha((150.0 * a) as u8)));
-            p.circle_filled(f.pos, 3.5, Color32::from_white_alpha((120.0 * a * (1.0 - lift)) as u8));
             if f.knob {
                 let c = f.pos - egui::vec2(0.0, rad + 12.0);
                 let st = Stroke::new(1.5, Color32::from_white_alpha((120.0 * a) as u8));
@@ -257,15 +259,15 @@ impl Overlay {
         }
         if let Some((text, a)) = self.caption {
             // In the caption band under the UI: quiet grey, no box.
+            // Same place and type everywhere; over the fullscreen picture
+            // a soft shadow keeps it legible.
+            let c = egui::pos2(screen.center().x, screen.bottom() - BAND / 2.0 + 4.0 * (1.0 - a));
             if self.floating {
-                let g = p.layout_no_wrap(text.into(), font(16.0), INK);
-                let size = g.size() + egui::vec2(36.0, 20.0);
-                let c = egui::pos2(screen.center().x, screen.bottom() - 34.0 - size.y / 2.0 + 4.0 * (1.0 - a));
-                let rr = egui::CornerRadius::same((size.y / 2.0) as u8);
-                p.rect_filled(Rect::from_center_size(c, size), rr, Color32::from_black_alpha((120.0 * a) as u8));
-                p.text(c, Align2::CENTER_CENTER, text, font(16.0), INK.gamma_multiply(0.8 * a));
+                for (dx, dy) in [(0.0, 1.5), (1.0, 1.0), (-1.0, 1.0), (0.0, 0.0)] {
+                    p.text(c + egui::vec2(dx, dy), Align2::CENTER_CENTER, text, font(16.0), Color32::from_black_alpha((150.0 * a) as u8));
+                }
+                p.text(c, Align2::CENTER_CENTER, text, font(16.0), INK.gamma_multiply(0.82 * a));
             } else {
-                let c = egui::pos2(screen.center().x, screen.bottom() - BAND / 2.0 + 4.0 * (1.0 - a));
                 p.text(c, Align2::CENTER_CENTER, text, font(16.0), INK2.gamma_multiply(a));
             }
         }
@@ -627,7 +629,7 @@ fn write_wav(path: &Path, audio: &[f32], sr: u32) {
 
 /// A gentle glue compressor: the quiet Play opening and the full Perform
 /// set sit closer together without pumping.
-const COMP: &str = "acompressor=threshold=-24dB:ratio=2:attack=30:release=300:knee=6";
+const COMP: &str = "acompressor=threshold=-27dB:ratio=2.5:attack=30:release=350:knee=8";
 
 /// Mux frames + audio: H.264 + AAC, loudness-normalised (two-pass
 /// loudnorm) with a soft fade at the end.

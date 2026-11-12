@@ -63,10 +63,12 @@ pub struct Hit {
     pub pitch: f32,
     pub length: f32,
     pub gain: f32,
+    /// Plays on every `every.0`-th pass of the bar, at pass `every.1`.
+    pub every: (u8, u8),
 }
 
 pub const fn hit(lane: usize, step: usize) -> Hit {
-    Hit { lane, step, slice: -1.0, pitch: 0.0, length: 1.0, gain: 1.0 }
+    Hit { lane, step, slice: -1.0, pitch: 0.0, length: 1.0, gain: 1.0, every: (1, 0) }
 }
 
 impl Hit {
@@ -86,6 +88,10 @@ impl Hit {
         self.gain = g;
         self
     }
+    pub const fn every(mut self, n: u8, at: u8) -> Hit {
+        self.every = (n, at);
+        self
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -98,8 +104,9 @@ pub struct SceneSpec {
 pub enum PadSpec {
     /// The clip straight, looping every `beats`.
     Loop { clip: usize, beats: f64 },
-    /// A soft grain cloud of the clip (`position` 0..1), in key.
-    Cloud { clip: usize, position: f32 },
+    /// A soft grain cloud of the clip (`position` 0..1), in key, under a
+    /// name (None = the clip's).
+    Cloud { clip: usize, position: f32, name: Option<&'static str> },
     /// Some lanes of a scene (in this order; the first one is the pad's
     /// picture), looping, under a name.
     Steps { name: &'static str, scene: usize, lanes: Vec<usize> },
@@ -164,22 +171,20 @@ impl DemoSpec {
         // Lanes: kick, rim, hats, sub, keys, two voices.
         let (l_kick, l_rim, l_hat, l_sub, l_keys, l_bench, l_plat) = (0, 1, 2, 3, 4, 5, 6);
         let lanes = vec![
-            LaneSpec::drum(KICK, 0.30, 0.95, 0.0),
-            LaneSpec::drum(RIM, 0.30, 0.62, -0.18),
-            LaneSpec { pan_spread: 0.7, ..LaneSpec::drum(GLITTER, 0.12, 0.42, 0.0) },
-            LaneSpec { in_key: false, envelope: 0.16, ..LaneSpec::tonal(HIGHWAY, 1.15, 0.66, 0.0, 0.16) },
-            LaneSpec { in_key: false, ..LaneSpec::tonal(KEYS, 1.9, 0.34, 0.0, 0.42) },
-            LaneSpec::tonal(BENCH, 0.46, 0.5, -0.14, 0.32),
-            LaneSpec::tonal(PLATFORM, 0.44, 0.46, 0.18, 0.34),
+            LaneSpec::drum(KICK, 0.30, 1.0, 0.0),
+            LaneSpec::drum(RIM, 0.30, 0.7, -0.18),
+            LaneSpec { pan_spread: 0.7, ..LaneSpec::drum(GLITTER, 0.09, 0.3, 0.0) },
+            LaneSpec { in_key: false, envelope: 0.16, ..LaneSpec::tonal(HIGHWAY, 1.15, 0.78, 0.0, 0.16) },
+            LaneSpec { in_key: false, ..LaneSpec::tonal(KEYS, 1.9, 0.32, 0.0, 0.42) },
+            LaneSpec::tonal(BENCH, 0.46, 0.6, -0.14, 0.32),
+            LaneSpec::tonal(PLATFORM, 0.44, 0.55, 0.18, 0.34),
         ];
         let hats = |gain: f32| [2usize, 6, 10, 14].map(|s| hit(l_hat, s).gain(gain));
         // 1 · rain: keys, a ghost rim, one sigh.
         let mut s1 = vec![
-            hit(l_keys, 0).slice(0.02),
-            hit(l_keys, 8).slice(0.30).gain(0.8),
+            hit(l_keys, 0).slice(0.02).gain(1.5),
+            hit(l_keys, 8).slice(0.30).gain(1.2),
             hit(l_rim, 12).gain(0.6),
-            hit(l_hat, 6).gain(0.5),
-            hit(l_hat, 14).gain(0.4),
         ];
         s1.push(hit(l_bench, 3).slice(0.03).pitch(3.0));
         // 2 · groove: 2-step kick, rims on 2 and 4, offbeat hats, the sub.
@@ -196,14 +201,18 @@ impl DemoSpec {
         s2.extend(hats(0.8));
         s2.push(hit(l_hat, 15).gain(0.4));
         // 3 · platform: the voices answer each other over the groove.
+        // Phrases alternate bar by bar (pass conditions), so the voices
+        // never loop the same chop twice in a row.
         let mut s3 = s2.clone();
         s3.retain(|h| h.lane != l_keys);
         s3.extend([
-            hit(l_keys, 0).slice(0.60),
-            hit(l_keys, 8).slice(0.86).gain(0.8),
-            hit(l_bench, 3).slice(0.03).pitch(3.0),
-            hit(l_bench, 7).slice(0.14).pitch(-2.0).gain(0.8),
-            hit(l_plat, 11).slice(0.35).pitch(-2.0).len(1.15),
+            hit(l_keys, 0).slice(0.60).gain(0.7),
+            hit(l_keys, 8).slice(0.80).gain(0.55),
+            hit(l_bench, 3).slice(0.03).pitch(3.0).every(2, 0),
+            hit(l_bench, 6).slice(0.14).pitch(-2.0).gain(0.8).every(2, 1),
+            hit(l_bench, 13).slice(0.35).pitch(-5.0).len(1.2).gain(0.7).every(4, 3),
+            hit(l_plat, 11).slice(0.35).pitch(-2.0).len(1.15).every(2, 0),
+            hit(l_plat, 9).slice(0.03).pitch(-4.0).len(1.1).gain(0.8).every(4, 1),
             hit(l_kick, 7).gain(0.55),
         ]);
         // The pad bank, one row per role: beds, step layers, clouds, whole
@@ -218,10 +227,10 @@ impl DemoSpec {
             steps("sub", 1, &[l_sub]),
             steps("voices", 2, &[l_bench, l_plat]),
             steps("chords", 2, &[l_keys]),
-            PadSpec::Cloud { clip: BENCH, position: 0.03 },
-            PadSpec::Cloud { clip: PLATFORM, position: 0.35 },
-            PadSpec::Cloud { clip: GLITTER, position: 0.3 },
-            PadSpec::Cloud { clip: TUNNEL, position: 0.5 },
+            PadSpec::Cloud { clip: BENCH, position: 0.03, name: None },
+            PadSpec::Cloud { clip: PLATFORM, position: 0.35, name: None },
+            PadSpec::Cloud { clip: GLITTER, position: 0.3, name: None },
+            PadSpec::Cloud { clip: TUNNEL, position: 0.5, name: Some("tunnel haze") },
             steps("drop", 2, &[l_bench, l_kick, l_rim, l_hat, l_sub, l_keys, l_plat]),
             steps("intro", 0, &[l_keys, l_rim, l_hat, l_bench]),
             steps("ghost rim", 0, &[l_rim, l_hat]),
@@ -338,7 +347,10 @@ impl App {
                 for h in &scene.hits {
                     if let Some(st) = pat.rows.get_mut(h.lane).and_then(|r| r.steps.get_mut(h.step)) {
                         st.on = true;
-                        st.slice = if h.slice >= 0.0 { h.slice } else { (h.step as f32 + 0.5) / STEPS as f32 };
+                        // No slice: the row's own position (drums: the hit's start).
+                        st.slice = h.slice;
+                        st.every_n = h.every.0.max(1);
+                        st.every_offset = h.every.1;
                         st.pitch = h.pitch;
                         st.length = h.length;
                         st.gain = h.gain;
@@ -353,10 +365,13 @@ impl App {
                     PadSpec::Loop { clip, beats } => {
                         let mut c = build_clip(&mut p, clip, 0.0, PlayMode::Snippet);
                         c.length_beats = beats;
-                        c.grains.gain = 0.55;
+                        c.grains.gain = 0.4;
                         t.clips.push(c);
                     }
-                    PadSpec::Cloud { clip, position } => {
+                    PadSpec::Cloud { clip, position, name } => {
+                        if let Some(n) = name {
+                            t.name = n.into();
+                        }
                         let mut c = Clip::new(clip, 0.0, 8.0);
                         c.key = Some(key);
                         let g = &mut c.grains;
@@ -534,3 +549,4 @@ mod tests {
         assert!(sources.iter().all(|s| s.duration() > 0.5));
     }
 }
+

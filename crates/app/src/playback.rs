@@ -305,13 +305,33 @@ impl Drop for Playback {
 /// The device thread pumps it; an offline playback pumps it directly.
 struct Driver {
     engine: RealtimeAudio,
+    /// The project the engine was built from (to rebuild it at a seek).
+    project: Project,
+    /// The engine being replaced, still playing its arrangement (and
+    /// effect tails) for a short crossfade: edits, seeks and stops never
+    /// cut the sound. (samples of fade left)
+    prev: Option<(RealtimeAudio, usize)>,
 }
+
+/// Engine swap crossfade (samples at the project rate).
+const SWAP_XFADE: usize = 1024;
 
 impl Driver {
     fn new() -> Driver {
         let mut engine = RealtimeAudio::new(Project::default(), 0.0, None);
         engine.transport = false;
-        Driver { engine }
+        Driver { engine, project: Project::default(), prev: None }
+    }
+
+    /// Replace the engine with `next`, crossfading out of the current one.
+    fn swap(&mut self, mut next: RealtimeAudio) {
+        next.adopt_live(&mut self.engine);
+        let old = std::mem::replace(&mut self.engine, next);
+        // An already-fading engine is simply dropped (rare: two swaps
+        // within a few ms).
+        if old.transport {
+            self.prev = Some((old, SWAP_XFADE));
+        }
     }
 
     /// Apply what the UI queued since the last block.
@@ -322,10 +342,10 @@ impl Driver {
             if let Some(p) = new_project {
                 let beat = self.engine.playhead_beats();
                 let transport = self.engine.transport;
+                self.project = p.clone();
                 let mut engine = RealtimeAudio::new(p, beat, loop_now);
-                engine.adopt_live(&mut self.engine);
                 engine.transport = transport;
-                self.engine = engine;
+                self.swap(engine);
                 shared.buses_dirty.store(true, Ordering::Relaxed);
             } else {
                 self.engine.loop_region = loop_now;
@@ -334,11 +354,23 @@ impl Driver {
         if let Some(cmd) = shared.transport_cmd.lock().unwrap().take() {
             match cmd {
                 TransportCmd::Play { start_beat, loop_region } => {
-                    self.engine.seek_beats(start_beat);
-                    self.engine.loop_region = loop_region;
-                    self.engine.transport = true;
+                    if self.engine.transport {
+                        // A jump while playing (scene queue, chain tap).
+                        let mut engine = RealtimeAudio::new(self.project.clone(), start_beat, loop_region);
+                        engine.transport = true;
+                        self.swap(engine);
+                    } else {
+                        self.engine.seek_beats(start_beat);
+                        self.engine.loop_region = loop_region;
+                        self.engine.transport = true;
+                    }
                 }
-                TransportCmd::Stop => self.engine.transport = false,
+                TransportCmd::Stop => {
+                    let beat = self.engine.playhead_beats();
+                    let mut engine = RealtimeAudio::new(self.project.clone(), beat, self.engine.loop_region);
+                    engine.transport = false;
+                    self.swap(engine);
+                }
             }
         }
         if shared.buses_dirty.swap(false, Ordering::Relaxed) {
@@ -359,6 +391,20 @@ impl Driver {
         self.apply(shared);
         self.engine.next_block(left, right);
         let n = left.len();
+        if let Some((old, rest)) = self.prev.as_mut() {
+            let (mut ol, mut or) = (vec![0.0f32; n], vec![0.0f32; n]);
+            old.next_block(&mut ol, &mut or);
+            for i in 0..n {
+                let k = rest.saturating_sub(i) as f32 / SWAP_XFADE as f32; // old's weight
+                let g = 0.5 - 0.5 * (std::f32::consts::PI * k).cos();
+                left[i] = left[i] * (1.0 - g) + ol[i] * g;
+                right[i] = right[i] * (1.0 - g) + or[i] * g;
+            }
+            *rest = rest.saturating_sub(n);
+            if *rest == 0 {
+                self.prev = None;
+            }
+        }
         let mut aud = shared.auditions.lock().unwrap();
         for (buf, pos) in aud.iter_mut() {
             let k = n.min(buf.len().saturating_sub(*pos));

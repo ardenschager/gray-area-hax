@@ -257,7 +257,7 @@ impl Studio {
             }
             // A soft bottom scrim keeps the label readable on bright footage.
             let scrim = Rect::from_min_max(egui::pos2(tr.left(), tr.bottom() - 26.0), tr.max);
-            p.rect_filled(scrim, egui::CornerRadius { nw: 0, ne: 0, sw: 10, se: 10 }, Color32::from_black_alpha(90));
+            p.rect_filled(scrim, egui::CornerRadius { nw: 0, ne: 0, sw: 10, se: 10 }, Color32::from_black_alpha(130));
             if sel {
                 p.rect_stroke(tr, r(10), Stroke::new(2.0, HI), StrokeKind::Inside);
             } else {

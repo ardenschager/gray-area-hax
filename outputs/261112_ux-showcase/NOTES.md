@@ -100,3 +100,48 @@ ripple on lift.
     launch from the HUD.
   - The film ends on the picture; audio fades with the end card.
 - Encode: CRF 19, 30.9 MB. Mix: −15.9 LUFS, LRA 6.5.
+- Reviewer verdict (#43): not signed off yet, but called a "huge leap forward".
+  - Remaining audio: clicks at bar boundaries; 2-step and sub buried under the keys;
+    the same "oh" chop for 14 bars.
+  - Fullscreen: the double HUD summon is redundant; the caption jumps when entering
+    fullscreen.
+  - UI-BUGs: an artifact on the emitter badge under the Deep scrim; a duplicate "tunnel"
+    pad name.
+
+### v003 (internal draft, not sent)
+- Audio, in the engine and the app:
+  - **Loop-wrap de-click**: a 4 ms raised-cosine ramp on the arrangement either side of
+    a loop wrap, so sounds running past the loop end fade instead of being cut.
+  - **Engine-swap crossfade** in the playback driver: a project rebuild (any edit), a
+    seek while playing (scene queue, chain tap) or a stop now crossfades over 21 ms from
+    the old engine to the new one. The old one keeps rendering its arrangement and
+    effect tails. Previously each of these was a hard cut.
+- Demo:
+  - Root cause of the per-bar clicks: drum hits used per-step slices, so they read into
+    the tails of the hat/rim samples and past the end of the hat source. Drum hits now
+    play from the hit's start. The keys slice at 0.86 also read past the clip end and
+    is now 0.80.
+  - Scene 3 voices alternate by bar with pass conditions (`every`), so no chop repeats
+    back to back.
+  - Mix: keys −2 dB, keys bed −3 dB; 2-step and sub up.
+  - The tunnel cloud pad is named "tunnel haze".
+- Film:
+  - Fullscreen: pure picture first ("fullscreen · just the picture"), then one tap for
+    the HUD and a launch from it, then "tap again · it stops on the bar". 2-step, sub
+    and voices stop on the bar, so only keys and the cloud ring into the end card.
+  - The caption keeps the same baseline and type in fullscreen, with a soft shadow
+    instead of a pill.
+  - The Rec → playback gap is tighter.
+  - Touch rings lose their centre dot (that dot was the "badge artifact").
+  - The emitter-tile scrim is stronger.
+- Not sent: the glitter (10 kHz hat) source made the hats and the HUD cloud too bright.
+
+### v004 (internal draft, not sent)
+- Hats −4 dB and shorter. No hats in scene 1. The HUD launches the bench cloud instead
+  of glitter.
+- Not sent: Sequence scene 1 still sat about 15 dB under Perform.
+
+### v005
+- Scene-1 keys +3.5 dB; voices +1.6 dB.
+- Glue compressor a little firmer (−27 dB, 2.5:1), so the build from Sequence into
+  Perform is a build, not a jump.
