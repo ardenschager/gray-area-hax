@@ -384,7 +384,7 @@ function layoutGrid() {
 function gridGeom() { const r = vgrid.getBoundingClientRect(); return { r, cw: (r.width + 4) / 8 }; }
 function placeEmitters() {
   const { r, cw } = gridGeom();
-  EMITTERS.forEach(e => { e.mk.style.left = `${e.col * cw + (cw - 4) / 2}px`; e.mk.style.top = `${e.y * r.height}px`; e.mk.classList.toggle('sel', e.i === S.selEm); e.mk.classList.toggle('on', e.on); const sv = e.mk.querySelector('.emr'); if (sv) sv.innerHTML = S.dir === 'C' ? markerRing(e) : ''; });
+  EMITTERS.forEach(e => { e.mk.style.left = `${e.col * cw + (cw - 4) / 2}px`; e.mk.style.top = `${e.y * r.height}px`; e.mk.classList.toggle('sel', e.i === S.selEm); e.mk.classList.toggle('on', e.on); const sv = e.mk.querySelector('.emr'); if (sv) sv.innerHTML = (S.dir === 'C' || S.dir === 'D') ? markerRing(e) : ''; });
   cells.forEach((d, k) => d.classList.toggle('col-on', EMITTERS.some(e => e.on && e.col === k % 8)));
 }
 const touches = new Map();
@@ -520,13 +520,15 @@ function buildLanes() {
   lanesEl.innerHTML = '';
   LANES.forEach(l => {
     const row = el('div', 'lane'); row.dataset.l = l.i;
-    const head = el('button', 'lane-head', `<span class="sw" style="background:${SRC[l.src].sw}"></span><svg class="lov"></svg><span class="len">${l.len === 16 ? '' : l.len}</span><span class="mute-b no-g" role="button" aria-label="Mute">M</span>`);
+    const head = el('button', 'lane-head', `<span class="sw" style="background:${SRC[l.src].sw}"></span><svg class="lov"></svg><span class="len">${l.len === 16 ? '' : l.len}</span><span class="mute-b no-g" role="button" aria-label="Mute">M</span><span class="lane-open no-g" role="button" aria-label="Open clip page">›</span>`);
     head.style.backgroundImage = `url(${SRC[l.src].base}${l.src}_poster.jpg)`;
-    head.title = `${SRC[l.src].name} · tap to mute, hold for lane page`;
+    head.title = `${SRC[l.src].name} · tap to select, › or hold for clip page`;
     let ht, held = false;
     head.querySelector('.mute-b').addEventListener('pointerdown', ev => { ev.stopPropagation(); l.mute = !l.mute; row.classList.toggle('muted', l.mute); });
-    head.addEventListener('pointerdown', ev => { if (ev.target.closest('.mute-b')) return; held = false; ht = setTimeout(() => { held = true; laneHeadHold(l); }, 520); });
-    head.addEventListener('pointerup', ev => { clearTimeout(ht); if (ev.target.closest('.mute-b')) return; if (!held) laneHeadTap(l); });
+    head.querySelector('.lane-open').addEventListener('pointerdown', ev => ev.stopPropagation());
+    head.querySelector('.lane-open').addEventListener('click', ev => { ev.stopPropagation(); openClip({ kind: 'lane', ref: l }); });
+    head.addEventListener('pointerdown', ev => { if (ev.target.closest('.mute-b, .lane-open')) return; held = false; ht = setTimeout(() => { held = true; laneHeadHold(l); }, 520); });
+    head.addEventListener('pointerup', ev => { clearTimeout(ht); if (ev.target.closest('.mute-b, .lane-open')) return; if (!held) laneHeadTap(l); });
     head.addEventListener('pointerleave', () => clearTimeout(ht));
     const steps = el('div', 'steps');
     for (let i = 0; i < 16; i++) { const s = el('div', 'st', '<i class="flash"></i>'); s.dataset.i = i; if (i % 4 === 0) s.classList.add('beat'); bindStep(s, l, i); steps.appendChild(s); }
@@ -669,7 +671,9 @@ function buildPads() {
     const d = el('button', 'pad'); d.id = `pad-${k + 1}`;
     if (!p) { d.classList.add('empty'); d.innerHTML = '<span class="pl">+</span>'; d.addEventListener('click', () => openAdd()); padsEl.appendChild(d); return; }
     const look = LOOKS[p.look];
-    d.innerHTML = `<i class="img"></i><svg class="ov"></svg><span class="pl"><span class="nm">${padName(p)}</span><span class="m">${MODE_GLYPH[p.mode]}</span></span><i class="prog"></i><span class="edit" aria-label="Open clip">›</span>`;
+    d.innerHTML = `<i class="img"></i><svg class="ov"></svg><span class="pl"><span class="nm">${padName(p)}</span><span class="m">${MODE_GLYPH[p.mode]}</span></span><i class="prog"></i><span class="edit no-g" role="button" aria-label="Open clip">›</span>`;
+    d.querySelector('.edit').addEventListener('pointerdown', ev => ev.stopPropagation());
+    d.querySelector('.edit').addEventListener('click', ev => { ev.stopPropagation(); openClip({ kind: 'pad', ref: p }); });
     d.title = `${padName(p)} · ${p.mode}${look !== 'clean' ? ' · ' + look : ''}`;
     attachPad(d, p);
     p.el = d; p.img = d.querySelector('.img'); p.prog = d.querySelector('.prog'); p.ov = d.querySelector('.ov');
@@ -831,22 +835,24 @@ function frame() {
 /* ───────────── 10 · chrome: views, transport, tempo, key, keys ───────────── */
 function setView(v) {
   S.view = v; $('#app').dataset.view = v; closeHold(); closeClip(); hideMini(); closeSheets();
-  if (S.dir === 'A') { if (v === 'seq' && S.sel.kind !== 'lane' && S.sel.kind !== 'project') S.sel = { kind: 'lane', ref: LANES[0] }; if (v === 'perform' && S.sel.kind !== 'pad' && S.sel.kind !== 'project') S.sel = { kind: 'pad', ref: PADS.find(p => p && p.on) || PADS.find(p => p) }; if (v === 'play' && !['emitter', 'clip', 'project'].includes(S.sel.kind)) S.sel = { kind: 'emitter', ref: EMITTERS[S.selEm] }; }
+  if (S.dir === 'A' || S.dir === 'D') { if (v === 'seq' && S.sel.kind !== 'lane' && S.sel.kind !== 'project') S.sel = { kind: 'lane', ref: LANES[0] }; if (v === 'perform' && S.sel.kind !== 'pad' && S.sel.kind !== 'project') S.sel = { kind: 'pad', ref: PADS.find(p => p && p.on) || PADS.find(p => p) }; if (v === 'play' && !['emitter', 'clip', 'project'].includes(S.sel.kind)) S.sel = { kind: 'emitter', ref: EMITTERS[S.selEm] }; }
   $$('.views button').forEach(b => b.setAttribute('aria-selected', b.dataset.view === v));
   const b = $(`.views button[data-view="${v}"]`); const th = $('.views-thumb');
   th.style.width = `${b.offsetWidth}px`; th.style.transform = `translateX(${b.offsetLeft - 3}px)`;
-  requestAnimationFrame(() => { if (v === 'play') layoutGrid(); if (v === 'seq') { renderSong(); layoutLanes(); } if (v === 'perform') PADS.forEach(p => p && bgFrame(p.img, p.src, padFrame(p), p.el.clientWidth / Math.max(1, p.el.clientHeight))); markSelection(); renderStrip(); drawPadOverlays(); drawLaneOverlays(); drawEmCards(); refreshEmCards(); liveDraw(); });
+  requestAnimationFrame(() => { if (v === 'play') layoutGrid(); if (v === 'seq') { renderSong(); layoutLanes(); } if (v === 'perform') PADS.forEach(p => p && bgFrame(p.img, p.src, padFrame(p), p.el.clientWidth / Math.max(1, p.el.clientHeight))); markSelection(); renderStrip(); drawPadOverlays(); drawLaneOverlays(); drawEmCards(); refreshEmCards(); refreshObjBars(); liveDraw(); });
   const u = new URL(location.href); u.hash = v; history.replaceState(null, '', u);
 }
 $$('.views button').forEach(b => b.addEventListener('click', () => setView(b.dataset.view)));
 $('#btn-play').addEventListener('click', () => setPlaying(!S.playing));
 $('#btn-rec').addEventListener('click', () => setRecording(!S.recording));
 $('#btn-rec-big').addEventListener('click', () => setRecording(!S.recording));
+$('#btn-more-emitter')?.addEventListener('click', () => openClip({ kind: 'emitter', ref: EMITTERS[S.selEm] }));
+$('#clip-scrim')?.addEventListener('click', closeClip);
 $('#btn-export').addEventListener('click', () => toast('Export · renders mp4 + wav offline, sample-identical to playback'));
-(() => { // tempo: drag; tap = the project's time & key (A: MAIN page · B: project page · C: pop)
+(() => { // tempo: drag; tap = the project's time & key (A: MAIN page · B/D: project page · C: pop)
   const c = $('#chip-tempo'); let y0, b0, moved = false;
   c.addEventListener('pointerdown', ev => { c.setPointerCapture(ev.pointerId); y0 = ev.clientY; b0 = S.bpm; moved = false; });
-  c.addEventListener('pointerup', ev => { if (moved) return; if (S.dir === 'C') topPop('tempo', c); else if (S.dir === 'B') openProject(); else { S.page.project = 'MAIN'; select({ kind: 'project', ref: PROJ }); } });
+  c.addEventListener('pointerup', ev => { if (moved) return; if (S.dir === 'C') topPop('tempo', c); else if (S.dir === 'B' || S.dir === 'D') openProject(); else { S.page.project = 'MAIN'; select({ kind: 'project', ref: PROJ }); } });
   c.addEventListener('pointermove', ev => { if (!c.hasPointerCapture(ev.pointerId)) return; if (Math.abs(y0 - ev.clientY) > 4) moved = true; if (!moved) return; S.bpm = clamp(Math.round(b0 + (y0 - ev.clientY) / 3), 60, 200); $('#tempo-val').textContent = S.bpm; $('#hud-bpm').textContent = S.bpm; if (A.dly) A.dly.delayTime.value = (60 / S.bpm) * 0.75; });
 })();
 function cycleKey() { S.keyIdx = (S.keyIdx + 1) % KEYS.length; $('#key-root').textContent = key().root; $('#key-scale').textContent = key().scale; knobs.forEach(k => k.draw()); liveDraw(); }
@@ -881,7 +887,7 @@ document.addEventListener('keydown', ev => {
   else if (k === 'r') setRecording(!S.recording);
   else if (k === 'h' && document.fullscreenElement) pokeHUD();
   else if (k === 'escape') { closeHold(); closeSheets(); closeClip(); hideMini(); }
-  else if ((k === 'a' || k === 'b' || k === 'c') && !ev.target.closest('input, [contenteditable]')) setDir(k.toUpperCase());
+  else if ((k === 'a' || k === 'b' || k === 'c' || k === 'd') && !ev.target.closest('input, [contenteditable]')) setDir(k.toUpperCase());
 });
 window.addEventListener('resize', () => { if (S.view === 'play') layoutGrid(); if (S.view === 'seq') layoutLanes(); hideMini(); drawPadOverlays(); drawLaneOverlays(); drawEmCards(); });
 
@@ -978,7 +984,7 @@ function onParam(o, k) {
   if (k === 'len' && o.cells) renderLanes();
   if (k === 'look' && o.btn) refreshEmitterButtons();
   if (S.sel.kind === 'emitter' && o === S.sel.ref) knobs.forEach(kk => kk.draw());
-  if (S.dir === 'C') { drawPadOverlays(); drawLaneOverlays(); drawEmCards(); placeEmitters(); }
+  if (S.dir === 'C' || S.dir === 'D') { drawPadOverlays(); drawLaneOverlays(); drawEmCards(); placeEmitters(); refreshObjBars(); }
   liveDraw();
 }
 
@@ -1348,8 +1354,8 @@ function scriptBlock() { const d = el('div', 'script'); d.contentEditable = 'tru
 
 /* ═════ B · CLIP PAGE ═════ */
 function usersOf(src) {
-  const u = [];
-  EMITTERS.forEach(e => GRID_COLS[e.col] === src && u.push({ kind: 'emitter', ref: e, l: `Emitter ${e.i + 1}` }));
+  const u = [], cname = SRC[src]?.name || '';
+  EMITTERS.forEach(e => GRID_COLS[e.col] === src && u.push({ kind: 'emitter', ref: e, l: S.dir === 'D' ? `Emitter ${e.i + 1} · ${cname}` : `Emitter ${e.i + 1}` }));
   LANES.forEach(l => l.src === src && u.push({ kind: 'lane', ref: l, l: `Lane ${l.i + 1}` }));
   PADS.forEach(p => p && p.src === src && u.push({ kind: 'pad', ref: p, l: `Pad ${p.i + 1}` }));
   return u;
@@ -1412,20 +1418,23 @@ function openProject() {
   cp.append(head, grid); liveDraw();
 }
 
-/* ═════ C · ON-OBJECT ═════ */
+/* ═════ C · ON-OBJECT & D · HYBRID ("touch it · open it") ═════ */
+const isObjDir = () => S.dir === 'C' || S.dir === 'D';
+const isClipDir = () => S.dir === 'B' || S.dir === 'D';
 /* gesture grammar, same on every object:
-   tap = play / select · hold = its mini-strip · swipe ↕ = smear · twist (or drag the pitch dot, or wheel) = pitch
+   tap = play / select · hold = mini-strip (C) or clip page (D) · swipe ↕ = smear · twist (or drag pitch dot, or wheel) = pitch
    pinch (or drag the ring, or ⇧wheel) = grain size · swipe ↔ = level */
 function ringGeo(o, W, H, small) { const R1 = Math.min(W, H) * (small ? 0.34 : 0.36), R0 = Math.min(W, H) * 0.1; return { cx: W / 2, cy: H * (small ? 0.46 : 0.45), rr: lerp(R1, R0, o.grain), R1, R0 }; }
 function gesture(elm, o, cfg) {
   const pts = new Map(); let mode = null, st = null, ht = 0, moved = false;
   const bub = el('span', 'gbub mono'); elm.appendChild(bub);
   const show = k => { const M = PDEF[k]; bub.textContent = `${M.label}  ${M.fmt(o[k])}`; bub.classList.add('show'); };
+  elm._showBub = show;
   const upd = () => { onParam(o, 'gesture'); cfg.redraw && cfg.redraw(); };
   elm.addEventListener('pointerdown', ev => {
     if (ev.target.closest('.no-g')) return;
     ev.stopPropagation(); elm.setPointerCapture(ev.pointerId); pts.set(ev.pointerId, [ev.clientX, ev.clientY]);
-    if (pts.size === 2) { if (cfg.cOnly && S.dir !== 'C') return; clearTimeout(ht); const [a, b] = [...pts.values()]; st = { d: Math.hypot(b[0] - a[0], b[1] - a[1]), ang: Math.atan2(b[1] - a[1], b[0] - a[0]), grain: o.grain, pitch: o.pitch }; mode = 'two'; return; }
+    if (pts.size === 2) { if (cfg.cOnly && !isObjDir()) return; clearTimeout(ht); const [a, b] = [...pts.values()]; st = { d: Math.hypot(b[0] - a[0], b[1] - a[1]), ang: Math.atan2(b[1] - a[1], b[0] - a[0]), grain: o.grain, pitch: o.pitch }; mode = 'two'; return; }
     moved = false; const r = elm.getBoundingClientRect(); const g = ringGeo(o, r.width, r.height, cfg.small);
     const dx = ev.clientX - (r.left + g.cx), dy = ev.clientY - (r.top + g.cy), dist = Math.hypot(dx, dy);
     const ha = (o.pitch / 7) * 0.75 * Math.PI, hx = Math.sin(ha) * g.rr, hy = -Math.cos(ha) * g.rr;
@@ -1436,7 +1445,7 @@ function gesture(elm, o, cfg) {
   });
   elm.addEventListener('pointermove', ev => {
     if (!pts.has(ev.pointerId)) return; pts.set(ev.pointerId, [ev.clientX, ev.clientY]);
-    if (cfg.cOnly && S.dir !== 'C') { if (st && Math.hypot(ev.clientX - st.x, ev.clientY - st.y) > 6) { moved = true; clearTimeout(ht); } return; }
+    if (cfg.cOnly && !isObjDir()) { if (st && Math.hypot(ev.clientX - st.x, ev.clientY - st.y) > 6) { moved = true; clearTimeout(ht); } return; }
     if (mode === 'two' && pts.size >= 2) { const [a, b] = [...pts.values()]; const d = Math.hypot(b[0] - a[0], b[1] - a[1]), da = Math.atan2(b[1] - a[1], b[0] - a[0]) - st.ang; o.grain = clamp(st.grain - Math.log(d / st.d) * 0.9, 0, 1); o.pitch = clamp(Math.round(st.pitch + da / (Math.PI / 10)), -7, 7); show(Math.abs(da) > 0.12 ? 'pitch' : 'grain'); upd(); return; }
     const dx = ev.clientX - st.x, dy = ev.clientY - st.y; if (Math.hypot(dx, dy) > 6) { moved = true; clearTimeout(ht); }
     if (mode === 'twist1') { o.pitch = clamp(Math.round((Math.atan2(ev.clientX - st.cx, -(ev.clientY - st.cy)) / (0.75 * Math.PI)) * 7), -7, 7); show('pitch'); upd(); }
@@ -1447,11 +1456,12 @@ function gesture(elm, o, cfg) {
   });
   const end = ev => { pts.delete(ev.pointerId); if (pts.size) return; clearTimeout(ht); if (!moved && mode === 'maybe') cfg.onTap && cfg.onTap(ev); mode = null; setTimeout(() => bub.classList.remove('show'), 500); };
   elm.addEventListener('pointerup', end); elm.addEventListener('pointercancel', end);
-  elm.addEventListener('wheel', ev => { if (cfg.cOnly && S.dir !== 'C') return; ev.preventDefault(); if (ev.shiftKey) { o.grain = clamp(o.grain - Math.sign(ev.deltaY) * 0.04, 0, 1); show('grain'); } else { o.pitch = clamp(o.pitch - Math.sign(ev.deltaY), -7, 7); show('pitch'); } upd(); clearTimeout(bub._t); bub._t = setTimeout(() => bub.classList.remove('show'), 700); }, { passive: false });
+  elm.addEventListener('wheel', ev => { if (cfg.cOnly && !isObjDir()) return; ev.preventDefault(); if (ev.shiftKey) { o.grain = clamp(o.grain - Math.sign(ev.deltaY) * 0.04, 0, 1); show('grain'); } else { o.pitch = clamp(o.pitch - Math.sign(ev.deltaY), -7, 7); show('pitch'); } upd(); clearTimeout(bub._t); bub._t = setTimeout(() => bub.classList.remove('show'), 700); }, { passive: false });
 }
 /* the on-object drawing: ring = grain size (cloud dots inside), dot on ring = pitch, trail = smear, line = ADSR, bar = level */
-function objSVG(o, W, H, { ring = true, small = false, env = true, src = null } = {}) {
+function objSVG(o, W, H, { ring = true, small = false, env = true, lane = false } = {}) {
   let s = ''; if (W < 30 || H < 30) return s;
+  const hyb = S.dir === 'D';
   if (ring) {
     const g = ringGeo(o, W, H, small);
     s += `<circle cx="${g.cx}" cy="${g.cy}" r="${g.rr}" fill="none" stroke="rgba(243,242,238,.85)" stroke-width="1.5"/>`;
@@ -1463,33 +1473,73 @@ function objSVG(o, W, H, { ring = true, small = false, env = true, src = null } 
     if (o.pitch) s += `<text x="${hx}" y="${hy - 11}" text-anchor="middle" font-size="${small ? 9 : 10.5}" fill="#f3f2ee" font-family="Geist Mono, monospace">${o.pitch > 0 ? '+' : ''}${o.pitch}</text>`;
   }
   if (env) {
-    const p = 8, w = (small ? W * 0.55 : W) - 2 * p, top = small ? 10 : H - 30, h = small ? 14 : 20;
+    const p = lane && hyb ? 10 : 8;
+    const w = (small ? W * (lane ? 0.62 : 0.52) : hyb ? W * 0.62 : W) - 2 * p;
+    const top = lane && hyb ? H - 20 : small ? 9 : H - 28, h = small ? 13 : 19;
     const xA = p + w * 0.25 * Math.sqrt(o.a / 2), xD = xA + w * 0.25 * Math.sqrt(o.d / 2), xS = xD + w * 0.2, xR = xS + w * 0.3 * Math.sqrt(o.r / 3);
     const y = l => top + h * (1 - l);
     s += `<polyline points="${p},${y(0)} ${xA},${y(1)} ${xD},${y(o.s)} ${xS},${y(o.s)} ${xR},${y(0)}" fill="none" stroke="rgba(243,242,238,.9)" stroke-width="1.4" stroke-linejoin="round"/>`;
     if (o.cut !== 'fade') s += `<line x1="${p}" x2="${xR}" y1="${y(o.thresh)}" y2="${y(o.thresh)}" stroke="rgba(243,242,238,.35)" stroke-dasharray="2 2"/>`;
   }
-  s += `<rect x="${W - 6}" y="${H * (1 - o.level) * 0.9 + 6}" width="2" height="${H * o.level * 0.9 - 12}" rx="1" fill="rgba(243,242,238,.5)"/>`;
+  const barTop = hyb && small ? 36 : hyb ? 42 : 6;
+  const barBot = hyb && !small ? 42 : hyb && small ? 22 : 6;
+  const maxBarH = Math.max(8, H - barTop - barBot);
+  const bh = Math.max(4, maxBarH * o.level);
+  s += `<rect x="${W - 5}" y="${H - barBot - bh}" width="2" height="${bh}" rx="1" fill="rgba(243,242,238,.5)"/>`;
   return s;
 }
-function drawEmCards() { if (S.dir !== 'C') return; EMITTERS.forEach(e => { if (!e.card) return; const r = e.card.getBoundingClientRect(); const svg = e.card.querySelector('svg'); svg.setAttribute('viewBox', `0 0 ${r.width} ${r.height}`); svg.innerHTML = objSVG(e, r.width, r.height); }); }
+function drawEmCards() { if (!isObjDir()) return; EMITTERS.forEach(e => { if (!e.card) return; const r = e.card.getBoundingClientRect(); const svg = e.card.querySelector('svg'); svg.setAttribute('viewBox', `0 0 ${r.width} ${r.height}`); svg.innerHTML = objSVG(e, r.width, r.height); }); }
 function buildEmCards() {
   const box = $('#em-cards'); if (!box) return; box.innerHTML = '';
   EMITTERS.forEach(e => {
     const c = el('div', 'emc'); c.id = `emc-${e.i + 1}`;
-    c.innerHTML = `<i class="emc-bg"></i><svg></svg><span class="n">${e.i + 1}</span><button class="look no-g">${LOOKS[e.look]}</button>`;
+    const cname = SRC[GRID_COLS[e.col]]?.name || '';
+    c.innerHTML = `<i class="emc-bg"></i><svg></svg><span class="emc-meta"><span class="n">${e.i + 1}</span><span class="emc-clip">${cname}</span></span><button class="look no-g">${LOOKS[e.look]}</button><button class="emc-open no-g" title="Open clip page">Clip <span class="chev">›</span></button>`;
     c.querySelector('.look').addEventListener('click', ev => { ev.stopPropagation(); e.look = (e.look + 1) % LOOKS.length; ev.target.textContent = LOOKS[e.look]; onParam(e, 'look'); });
-    gesture(c, e, { onTap: () => select({ kind: 'emitter', ref: e }), onHold: () => { select({ kind: 'emitter', ref: e }); showMini(c); }, redraw: drawEmCards });
+    c.querySelector('.emc-open').addEventListener('pointerdown', ev => ev.stopPropagation());
+    c.querySelector('.emc-open').addEventListener('click', ev => { ev.stopPropagation(); openClip({ kind: 'emitter', ref: e }); });
+    gesture(c, e, { onTap: () => select({ kind: 'emitter', ref: e }), onHold: () => { select({ kind: 'emitter', ref: e }); if (S.dir === 'D') openClip({ kind: 'emitter', ref: e }); else showMini(c); }, redraw: drawEmCards });
     e.card = c; box.appendChild(c);
   });
   refreshEmCards(); requestAnimationFrame(drawEmCards);
 }
-function refreshEmCards() { EMITTERS.forEach(e => { if (!e.card) return; const bg = e.card.querySelector('.emc-bg'); bgFrame(bg, GRID_COLS[e.col], ((e.y * 8) | 0) * 6 + 2, e.card.clientWidth / Math.max(1, e.card.clientHeight)); e.card.classList.toggle('sel', S.selEm === e.i); e.card.classList.toggle('on', e.on); }); }
+function refreshEmCards() {
+  EMITTERS.forEach(e => {
+    if (!e.card) return;
+    const bg = e.card.querySelector('.emc-bg');
+    bgFrame(bg, GRID_COLS[e.col], ((e.y * 8) | 0) * 6 + 2, e.card.clientWidth / Math.max(1, e.card.clientHeight));
+    const cl = e.card.querySelector('.emc-clip'); if (cl) cl.textContent = SRC[GRID_COLS[e.col]]?.name || '';
+    e.card.classList.toggle('sel', S.selEm === e.i); e.card.classList.toggle('on', e.on);
+  });
+}
+function refreshObjBars() {
+  if (S.dir !== 'D') return;
+  const pb = $('#play-obj-bar');
+  if (pb) {
+    const em = EMITTERS[S.selEm], cname = SRC[GRID_COLS[em.col]]?.name || 'clip';
+    pb.innerHTML = `<div class="ob-id"><span class="ob-t">Emitter ${em.i + 1} · ${cname}</span><span class="ob-hint">touch to play &amp; shape · tap › to open clip</span></div><button class="open-clip-pill" type="button">Open clip <span class="chev">›</span></button>`;
+    pb.querySelector('.open-clip-pill').addEventListener('click', () => openClip({ kind: 'emitter', ref: em }));
+  }
+  const sb = $('#seq-obj-bar');
+  if (sb) {
+    const l = S.sel.kind === 'lane' ? S.sel.ref : LANES[0];
+    sb.innerHTML = `<div class="ob-id"><span class="ob-t">Lane ${l.i + 1} · ${SRC[l.src].name}</span></div><button class="open-clip-pill" type="button">Open clip <span class="chev">›</span></button>`;
+    sb.querySelector('.open-clip-pill').addEventListener('click', () => openClip({ kind: 'lane', ref: l }));
+  }
+  const pfb = $('#perf-obj-bar');
+  if (pfb) {
+    const p = S.sel.kind === 'pad' && S.sel.ref ? S.sel.ref : (PADS.find(x => x && x.on) || PADS[0]);
+    if (p) {
+      pfb.innerHTML = `<span class="ob-t">Pad ${p.i + 1} · ${padName(p)}</span><button class="open-clip-pill" type="button">Open clip <span class="chev">›</span></button>`;
+      pfb.querySelector('.open-clip-pill').addEventListener('click', () => openClip({ kind: 'pad', ref: p }));
+    }
+  }
+}
 function drawPadOverlays() {
-  PADS.forEach(p => { if (!p || !p.ov) return; if (S.dir !== 'C') { p.ov.innerHTML = ''; return; } const W = p.el.clientWidth, H = p.el.clientHeight; p.ov.setAttribute('viewBox', `0 0 ${W} ${H}`); p.ov.innerHTML = objSVG(p, W, H, { ring: S.sel.ref === p, small: true, env: true }); });
+  PADS.forEach(p => { if (!p || !p.ov) return; if (!isObjDir()) { p.ov.innerHTML = ''; return; } const W = p.el.clientWidth, H = p.el.clientHeight; p.ov.setAttribute('viewBox', `0 0 ${W} ${H}`); p.ov.innerHTML = objSVG(p, W, H, { ring: S.sel.ref === p, small: true, env: true }); });
 }
 function drawLaneOverlays() {
-  LANES.forEach(l => { const s = l.row && l.row.querySelector('.lov'); if (!s) return; if (S.dir !== 'C') { s.innerHTML = ''; return; } const h = l.row.querySelector('.lane-head'); const W = h.clientWidth, H = h.clientHeight; s.setAttribute('viewBox', `0 0 ${W} ${H}`); s.innerHTML = objSVG(l, W, H, { ring: false, small: true }); });
+  LANES.forEach(l => { const s = l.row && l.row.querySelector('.lov'); if (!s) return; if (!isObjDir()) { s.innerHTML = ''; return; } const h = l.row.querySelector('.lane-head'); const W = h.clientWidth, H = h.clientHeight; s.setAttribute('viewBox', `0 0 ${W} ${H}`); s.innerHTML = objSVG(l, W, H, { ring: false, small: true, lane: true }); });
 }
 /* contextual mini-strip: hangs off the selected object, never a panel */
 function miniItems(kind, o) {
@@ -1553,27 +1603,29 @@ function layoutSwitch() { const w = el('div', 'lay-sw'); w.appendChild(layoutSeg
 function attachPad(d, p) {
   gesture(d, p, {
     small: true, ring: false, cOnly: true,
-    onDown: ev => { if (S.dir === 'B' && ev.target.closest('.edit')) return; tapPad(p); select({ kind: 'pad', ref: p }); if (S.dir === 'C') drawPadOverlays(); },
-    onTap: ev => { if (S.dir === 'B' && ev.target.closest('.edit')) openClip({ kind: 'pad', ref: p }); },
-    onHold: () => { if (S.dir === 'A') { S.page.pad = 'SOURCE'; renderStrip(); } else if (S.dir === 'B') openClip({ kind: 'pad', ref: p }); else showMini(d); },
+    onDown: ev => { if (isClipDir() && ev.target.closest('.edit')) return; tapPad(p); select({ kind: 'pad', ref: p }); if (isObjDir()) drawPadOverlays(); },
+    onTap: ev => { if (isClipDir() && ev.target.closest('.edit')) openClip({ kind: 'pad', ref: p }); },
+    onHold: () => { if (S.dir === 'A') { S.page.pad = 'SOURCE'; renderStrip(); } else if (isClipDir()) openClip({ kind: 'pad', ref: p }); else showMini(d); },
     redraw: drawPadOverlays,
   });
 }
 function laneHeadTap(l) { if (S.dir === 'B') openClip({ kind: 'lane', ref: l }); else { select({ kind: 'lane', ref: l }); if (S.dir === 'C') showMini(l.row.querySelector('.lane-head')); } }
-function laneHeadHold(l) { select({ kind: 'lane', ref: l }); if (S.dir === 'B') openClip({ kind: 'lane', ref: l }); else openChop(l.src, l.row.querySelector('.lane-head')); }
-function columnHold(col) { const id = GRID_COLS[col]; if (!id) return; if (S.dir === 'B') { const e = EMITTERS.find(e => e.col === col) || EMITTERS[S.selEm]; openClip({ kind: 'emitter', ref: e }); } else openChop(id, cells[col]); }
-function dirOnSelect() { if (S.dir === 'A') renderStrip(); if (S.dir === 'C') { refreshEmCards(); drawPadOverlays(); } }
+function laneHeadHold(l) { select({ kind: 'lane', ref: l }); if (isClipDir()) openClip({ kind: 'lane', ref: l }); else openChop(l.src, l.row.querySelector('.lane-head')); }
+function columnHold(col) { const id = GRID_COLS[col]; if (!id) return; if (isClipDir()) { const e = EMITTERS.find(e => e.col === col) || EMITTERS[S.selEm]; openClip({ kind: 'emitter', ref: e }); } else openChop(id, cells[col]); }
+function dirOnSelect() { if (S.dir === 'A') renderStrip(); if (isObjDir()) { refreshEmCards(); drawPadOverlays(); refreshObjBars(); } }
 function dirFrame(t) {
   TICKERS.forEach(w => (w.el.isConnected ? w.tick(t) : TICKERS.delete(w)));
-  if (S.dir === 'C' && S.view === 'play') EMITTERS.forEach(e => e.card && e.card.classList.toggle('on', e.on));
+  if (isObjDir() && S.view === 'play') EMITTERS.forEach(e => e.card && e.card.classList.toggle('on', e.on));
 }
-function projectAction(anchor) { if (S.dir === 'A') select({ kind: 'project', ref: PROJ }); else if (S.dir === 'B') openProject(); else topPop('project', anchor); }
+function projectAction(anchor) { if (S.dir === 'A') select({ kind: 'project', ref: PROJ }); else if (isClipDir()) openProject(); else topPop('project', anchor); }
 function setDir(d) {
+  d = (d || 'A').toUpperCase();
+  if (!['A', 'B', 'C', 'D'].includes(d)) d = 'A';
   S.dir = d; $('#app').dataset.dir = d; closeSheets(); closeClip(); hideMini(); $$('.tb-pop').forEach(e => e.remove());
   $$('#dirsw button').forEach(b => b.classList.toggle('on', b.dataset.dir === d));
-  if (d === 'C') buildEmCards();
-  if (d === 'A') { if (S.view === 'seq' && S.sel.kind !== 'lane') select({ kind: 'lane', ref: LANES[0] }); else if (S.view === 'perform' && S.sel.kind !== 'pad') select({ kind: 'pad', ref: PADS.find(p => p && p.on) || PADS[0] }); else renderStrip(); }
-  requestAnimationFrame(() => { layoutGrid(); if (S.view === 'seq') layoutLanes(); PADS.forEach(p => p && p.img && bgFrame(p.img, p.src, padFrame(p), p.el.clientWidth / Math.max(1, p.el.clientHeight))); drawPadOverlays(); drawLaneOverlays(); drawEmCards(); refreshEmCards(); liveDraw(); });
+  if (isObjDir()) buildEmCards();
+  if (d === 'A' || d === 'D') { if (S.view === 'seq' && S.sel.kind !== 'lane') select({ kind: 'lane', ref: LANES[0] }); else if (S.view === 'perform' && S.sel.kind !== 'pad') select({ kind: 'pad', ref: PADS.find(p => p && p.on) || PADS[0] }); else if (d === 'A') renderStrip(); }
+  requestAnimationFrame(() => { layoutGrid(); if (S.view === 'seq') layoutLanes(); PADS.forEach(p => p && p.img && bgFrame(p.img, p.src, padFrame(p), p.el.clientWidth / Math.max(1, p.el.clientHeight))); drawPadOverlays(); drawLaneOverlays(); drawEmCards(); refreshEmCards(); refreshObjBars(); liveDraw(); });
   const u = new URL(location.href); u.searchParams.set('dir', d); history.replaceState(null, '', u);
 }
 
@@ -1583,7 +1635,7 @@ function clipSel(id) { return { kind: 'clip', ref: ensureP(SRC[id]) }; }
 function buildHeads() {
   const hs = $('#vheads'); if (!hs) return; hs.innerHTML = '';
   GRID_COLS.forEach((id, c) => {
-    const b = el('button', 'vh' + (id ? '' : ' empty'), id ? `<span>${SRC[id].name}</span>` : '+'); b.id = `vh-${c + 1}`;
+    const b = el('button', 'vh' + (id ? '' : ' empty'), id ? `<span>${SRC[id].name}</span><i class="vh-chev">›</i>` : '+'); b.id = `vh-${c + 1}`;
     let ht, held = false;
     b.addEventListener('pointerdown', () => { held = false; ht = setTimeout(() => { held = true; if (id) { if (S.dir === 'B') openClip(clipSel(id)); else openChop(id, b); } }, 520); });
     b.addEventListener('pointerup', () => { clearTimeout(ht); if (held) return; if (!id) { openAdd(DIGGING.size ? 'dig' : 'files'); return; } headTap(id, b); });
@@ -1592,8 +1644,8 @@ function buildHeads() {
   });
   markSelection();
 }
-function headTap(id, b) { if (S.dir === 'B') openClip(clipSel(id)); else { select(clipSel(id)); if (S.dir === 'A') { S.page.clip = 'SOURCE'; renderStrip(); } else showMini(b); } }
-function emitterHold(e) { select({ kind: 'emitter', ref: e }); if (S.dir === 'B') openClip(S.sel); else if (S.dir === 'A') { S.page.emitter = 'SHAPE'; renderStrip(); } else showMini(e.card || e.btn); }
+function headTap(id, b) { if (isClipDir()) openClip(clipSel(id)); else { select(clipSel(id)); if (S.dir === 'A') { S.page.clip = 'SOURCE'; renderStrip(); } else showMini(b); } }
+function emitterHold(e) { select({ kind: 'emitter', ref: e }); if (isClipDir()) openClip(S.sel); else if (S.dir === 'A') { S.page.emitter = 'SHAPE'; renderStrip(); } else showMini(e.card || e.btn); }
 function markerRing(e) { const rr = lerp(30, 12, e.grain), ha = (e.pitch / 7) * 0.75 * Math.PI; return `<circle cx="40" cy="40" r="${rr}" fill="none" stroke="rgba(243,242,238,.8)" stroke-width="1.3"/><circle cx="${40 + Math.sin(ha) * rr}" cy="${40 - Math.cos(ha) * rr}" r="3.8" fill="#f3f2ee" stroke="#0b0b0c" stroke-width="1.2"/>`; }
 
 /* ───────────── boot ───────────── */
@@ -1602,7 +1654,8 @@ function boot() {
   buildGrid(); buildEmitterButtons(); $$('.knob').forEach(makeKnob);
   buildLanes(); renderSong(); buildPads();
   ['#play-stage', '#seq-stage', '#perf-stage'].forEach(s => $(s).appendChild(layoutSwitch()));
-  setDir(['A', 'B', 'C'].includes(params.get('dir')) ? params.get('dir') : 'A');
+  const qDir = (params.get('dir') || '').toUpperCase();
+  setDir(['A', 'B', 'C', 'D'].includes(qDir) ? qDir : 'A');
   if (params.get('layout') === 'tile') setLayout('tile');
   const v0 = (location.hash || '').slice(1); setView(['play', 'seq', 'perform'].includes(params.get('view')) ? params.get('view') : ['play', 'seq', 'perform'].includes(v0) ? v0 : 'play');
   ['click', 'pointerdown', 'keydown'].forEach(e => document.addEventListener(e, () => { initAudio(); A.ctx?.resume?.(); }, { once: true }));
@@ -1631,6 +1684,16 @@ function bootDemo() {
   if (params.has('d2')) $('#seg-out button[data-out="d2"]').classList.add('on'), $('#seg-out button[data-out="here"]').classList.remove('on'), $('#view-perform').classList.add('d2');
   const sel = params.get('sel');
   setTimeout(() => {
+    if (params.has('slices')) {
+      slicesToPads(params.get('slices') || 'betty');
+      if (params.has('notoast')) $('#toast')?.classList.remove('show');
+      PADS.forEach((p, k) => { if (p && p.mode === 'slice') { p.a = [0.002, 0.04, 0.01, 0.12][k % 4]; p.d = [0.12, 0.35, 0.2, 0.45][k % 4]; p.s = [0.85, 0.65, 0.75, 0.5][k % 4]; p.r = [0.05, 0.4, 0.18, 0.65][k % 4]; p.cut = k % 3 === 1 ? 'fade' : 'cut'; } });
+      if (params.has('pads')) {
+        params.get('pads').split(',').map(Number).forEach(k => { if (PADS[k]) { PADS[k].on = true; PADS[k].t0 = now() - k * 0.01; PADS[k].gate = 30; } });
+        renderPads();
+      }
+      drawPadOverlays();
+    }
     if (sel) { const [k, n] = sel.split(':'); const i = (+n || 1) - 1; select(k === 'pad' ? { kind: 'pad', ref: PADS[i] } : k === 'lane' ? { kind: 'lane', ref: LANES[i] } : k === 'clip' ? { kind: 'clip', ref: SRC[n] } : k === 'project' ? { kind: 'project', ref: PROJ } : { kind: 'emitter', ref: EMITTERS[i] }); }
     if (params.get('page')) { S.page[S.sel.kind] = params.get('page'); renderStrip(); }
     if (params.has('clip')) openClip(S.sel);
@@ -1642,7 +1705,6 @@ function bootDemo() {
     const mi = params.get('mini');
     if (mi) { const anchor = S.sel.kind === 'pad' ? S.sel.ref.el : S.sel.kind === 'lane' ? S.sel.ref.row.querySelector('.lane-head') : S.sel.ref.card; showMini(anchor); if (mi !== '1') openPop(mi); }
     const tp = params.get('topop'); if (tp) topPop(tp, tp === 'tempo' ? $('#chip-tempo') : tp === 'key' ? $('#chip-key') : $('#btn-deep'));
-    if (params.has('slices')) slicesToPads(params.get('slices') || 'betty');
   }, 500);
   if (params.has('slicesplay')) setInterval(() => { [0, 2, 5].forEach((k, n) => setTimeout(() => PADS[k] && tapPad(PADS[k]), n * 180)); }, 700);
   if (params.has('wheel')) setInterval(() => { const c = EMITTERS[params.get('wheel') - 1 || 1].card; c && c.dispatchEvent(new WheelEvent('wheel', { deltaY: EMITTERS[1].pitch >= 5 ? 100 : -100, cancelable: true })); }, 350);

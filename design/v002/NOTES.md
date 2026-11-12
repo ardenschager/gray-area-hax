@@ -1,11 +1,12 @@
-# chromagrain · design v002: three ways to expose parameters
+# chromagrain · design v002: four ways to expose parameters
 
 Arden, after v001 and the Rust build: *"I'm not sure I like the sidebar with all the hidden
 params. Can we make those more exposed (not swept under the rug), more integrated, but keeping
 the intuitive design?"*
 
-v002 is one interactive prototype with **three switchable directions**. The Deep drawer is gone
-in all three. Switch with **A / B / C** on the keyboard or with the dashed (prototype-only)
+v002 is one interactive prototype with **four switchable directions** (`A · Pages`, `B · Clip`,
+`C · Object`, and **`D · Hybrid ("touch it · open it")`**). The Deep drawer is gone
+in all four. Switch with **A / B / C / D** on the keyboard or with the dashed (prototype-only)
 control in the top bar. Every direction includes the spec-v003 features: **Chop, ADSR with
 picture cut/fade, stack | tile, and the Add sheet (Files / Browse / Link / Dig)**.
 
@@ -18,7 +19,7 @@ v002 reuses `../v001/media` (7 archival clips) and adds three "dug" phone-style 
 adds `media/peaks.js`, which holds real audio peaks plus a per-clip "picture energy" curve used
 when a clip has no sound.
 
-Demo URLs (used for the screenshots): `?demo&dir=A|B|C&view=play|seq|perform`, plus
+Demo URLs (used for the screenshots): `?demo&dir=A|B|C|D&view=play|seq|perform` (case-insensitive `?dir=a|b|c|d`), plus
 `&sel=emitter:N|pad:N|lane:N|project`, `&page=SHAPE`, `&clip`, `&proj`, `&layout=tile`,
 `&sheet=add|dig|chop|tapchop`, `&mini=1|shape|fx|grain|pitch|link`, `&topop=tempo|key|project`,
 `&slices=<clip>`.
@@ -138,6 +139,7 @@ All are `261112_chromagrain_design_<dir>_<view>_v002.png`, each at 1600×1000 an
 | `a-pages` | `play` (emitter MACRO) · `play-source` (SOURCE page with mini-chop) · `sequence` (lane SHAPE page) · `perform` (pad MACRO, **tile** layout) · `project` (LIBRARY page) |
 | `b-clip` | `play` (v001 surface + Clip ›) · `clip-page` (Emitter 2 owner) · `project-page` · `perform-slices` (beanstalk chopped → slice pads playing) |
 | `c-on-object` | `play` (emitter cards with on-object rings, gesture bubble) · `perform` (pad mini-strip + Shape popover) · `sequence` (lane mini-strip) · `project` (Project popover) |
+| `d-hybrid` | `play` (on-object emitter rings/cards + `Clip ›` buttons + object bar `Open clip ›`) · `clip-drawer` (calm Clip sheet opened over Play for `Emitter 1 · horses` with `← Play` and owner tabs) · `perform` (Tile layout with chopped slices, ADSR curves + `›` on pads) |
 | `shared` | `add-dig` (two finds landed, column 8 filled) · `chop-tap` (tap-to-chop running) |
 
 ## Versions

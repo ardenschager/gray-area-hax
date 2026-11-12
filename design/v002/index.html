@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>chromagrain · design v002 — three ways to expose parameters</title>
+<title>chromagrain · design v002 — four ways to expose parameters</title>
 <meta name="description" content="Interactive design prototype for chromagrain, an audiovisual granular video sampler where every audio grain is a visual grain.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -38,8 +38,8 @@
     </nav>
 
     <div class="tb-right">
-      <div class="dirsw seg" id="dirsw" title="Design direction (prototype only) · keys A B C">
-        <button data-dir="A">A<span> pages</span></button><button data-dir="B">B<span> clip</span></button><button data-dir="C">C<span> on-object</span></button>
+      <div class="dirsw seg" id="dirsw" title="Design direction (prototype only) · keys A B C D">
+        <button data-dir="A">A<span> · Pages</span></button><button data-dir="B">B<span> · Clip</span></button><button data-dir="C">C<span> · Object</span></button><button data-dir="D">D<span> · Hybrid</span></button>
       </div>
       <button id="chip-tempo" class="chip drag" title="Drag up/down to change tempo">
         <span class="num" id="tempo-val">112</span><span class="unit">bpm</span>
@@ -73,6 +73,7 @@
         </div>
 
         <div class="brush">
+          <div class="obj-bar" id="play-obj-bar"></div>
           <div class="em-cards" id="em-cards"></div>
           <div class="emitters" id="emitters" role="radiogroup" aria-label="Emitters"></div>
           <div class="knobs">
@@ -97,6 +98,7 @@
 
       <aside class="song">
         <div class="stage small" id="seq-stage"><canvas id="cv-seq"></canvas></div>
+        <div class="obj-bar compact" id="seq-obj-bar"></div>
         <div class="scenes" id="scenes" aria-label="Scenes"></div>
         <div class="chain" id="chain" aria-label="Song"></div>
       </aside>
@@ -155,12 +157,14 @@
             <button data-out="here" class="on">This screen</button><button data-out="d2">Display 2</button>
           </div>
         </div>
+        <div class="pb-group hyb-perf-sel" id="perf-obj-bar"></div>
         <div class="pb-group right">
           <button class="btn" id="btn-stopall"><svg viewBox="0 0 24 24" class="ico"><rect x="7" y="7" width="10" height="10" rx="1.5"/></svg>Stop all</button>
           <button class="btn primary" id="btn-fs"><svg viewBox="0 0 24 24" class="ico"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>Fullscreen <kbd>F</kbd></button>
         </div>
       </div>
     </section>
+    <div class="clip-scrim" id="clip-scrim"></div>
     <div class="clip-page" id="clip-page"></div>
   </main>
 
