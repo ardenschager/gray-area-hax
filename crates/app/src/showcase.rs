@@ -9,7 +9,8 @@
 //!
 //! writes `outputs/261112_ux-showcase/<v>/work/frames/*.png` + the wav and
 //! muxes `outputs/261112_ux-showcase/<v>/261112_chromagrain_ux-showcase_<v>.mp4`
-//! (refuses to overwrite an existing version). The tour itself is
+//! (refuses to overwrite an existing version). The frames are deleted after
+//! a successful mux; `CHROMAGRAIN_SHOWCASE_KEEP_FRAMES=1` keeps them. The tour itself is
 //! [`tour`]: a list of gestures and captions on a timeline.
 
 use crate::demo::DemoSpec;
@@ -743,4 +744,11 @@ fn showcase_film() {
     write_wav(&wav, &rec.audio, rec.sample_rate);
     mux(&frames, &wav, &out, tour.end_card + 0.2, tour.len).expect("mux");
     eprintln!("showcase: wrote {}", out.display());
+    // The PNG frames are several GB per version: gone once muxed, unless
+    // CHROMAGRAIN_SHOWCASE_KEEP_FRAMES=1.
+    if std::env::var("CHROMAGRAIN_SHOWCASE_KEEP_FRAMES").is_ok_and(|v| v == "1") {
+        eprintln!("showcase: kept frames in {}", frames.display());
+    } else {
+        std::fs::remove_dir_all(&frames).expect("remove frames");
+    }
 }

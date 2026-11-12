@@ -21,6 +21,8 @@ CHROMAGRAIN_SHOWCASE=v00N cargo test -p chromagrain showcase_film -- --ignored -
   - It muxes with ffmpeg: H.264 CRF 15 + AAC 256k. Audio goes through a gentle glue
     compressor, then a two-pass loudnorm to −16 LUFS / −1.5 dBTP, with a 3 s fade.
   - It refuses to overwrite an existing version.
+  - After a successful mux it deletes `work/frames` (about 7 GB per version);
+    `CHROMAGRAIN_SHOWCASE_KEEP_FRAMES=1` keeps them.
 - `crates/app/src/demo.rs`: the demo-project builder. `chromagrain --demo` now opens
   **Night Platform** (assets/demo) in the studio at 133 bpm, F minor:
   - 7 clips on the Play grid;
