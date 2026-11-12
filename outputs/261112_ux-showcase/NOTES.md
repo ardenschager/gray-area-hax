@@ -145,3 +145,12 @@ ripple on lift.
 - Scene-1 keys +3.5 dB; voices +1.6 dB.
 - Glue compressor a little firmer (−27 dB, 2.5:1), so the build from Sequence into
   Perform is a build, not a jump.
+- Reviewer verdict (#45): **SIGN-OFF**.
+  - Click-free throughout.
+  - The 2-step and sub have weight, and the voice chops vary.
+  - Fullscreen tells the story: picture, then HUD, then a strip-back on the bar.
+  - Every UI-BUG is verified fixed.
+  - Captions keep a steady baseline.
+- `cargo test --workspace`: 221 passed, 0 failed, 5 ignored (including `showcase_film`),
+  0 warnings.
+- Current pick: `v005/261112_chromagrain_ux-showcase_v005.mp4`.
