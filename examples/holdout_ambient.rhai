@@ -16,25 +16,28 @@ s.set_base_hz(forest, 146.832); // D3
 s.set_base_hz(falls,  146.832);
 s.set_base_hz(ocean,  293.665); // D4
 
+// Cents-proportional critical-band paulstretch keeps upper air while melting whistles
 let forest_wash = s.paulstretch(forest, 4.0);
 
-// Track 0: Slow sunlit pine snippet bed, 0.75x drift (continuous blended video)
+// Track 0: Slow sunlit pine snippet bed, 0.75x drift (seamless crossfade-looped video)
 let t_bed = s.track("forest_bed");
 s.track_opacity_link(t_bed, 0.45);
 s.track_level_point(t_bed, 0.0, 0.0);
-s.track_level_point(t_bed, 5.5, 0.78);
-s.track_level_point(t_bed, 26.5, 0.78);
+s.track_level_point(t_bed, 5.5, 0.76);
+s.track_level_point(t_bed, 26.5, 0.76);
 s.track_level_point(t_bed, 32.0, 0.0);
 
 let bed = s.snippet(t_bed, forest_wash, 0.0, 32.0);
-s.set(bed, "gain", 0.36);
+s.set(bed, "gain", 0.34);
 s.set(bed, "gain_to_opacity", 0.20);
 s.set(bed, "speed", 0.75);
 s.set(bed, "envelope", 0.25);
 
-// Track 1: Evolving misty waterfall granular cloud in D dorian with warm lower-octave body
+// Track 1: Evolving misty waterfall granular cloud in D dorian (full natural HF mist air)
 let t_cloud = s.track("waterfall_cloud");
-s.track_blend(t_cloud, 0.45);
+s.track_blend(t_cloud, 0.48);
+s.track_visual_duck(t_bed, t_cloud, 0.32, 0.08, 0.55);
+
 let cl = s.clip(t_cloud, falls, 2.0, 28.0);
 s.key(cl, "D", "dorian");
 s.set(cl, "quantize_amount", 0.85);
@@ -48,10 +51,10 @@ s.set(cl, "voice_interval", -12.0);
 s.set(cl, "voice_detune", 0.07);
 s.set(cl, "pan_spread", 0.8);
 s.set(cl, "gain", 0.34);
-s.set(cl, "additive", 0.45);
-s.set(cl, "feather", 0.40);
+s.set(cl, "additive", 0.48);
+s.set(cl, "feather", 0.42);
 s.set(cl, "flicker", 0.12);
-s.audio_filter(cl, "lowpass", 3200.0, 0.72);
+s.audio_filter(cl, "highpass", 110.0, 0.70);
 s.automate(cl, "density", 0.0, 4.5);
 s.automate(cl, "density", 14.0, 15.0);
 s.automate(cl, "density", 28.0, 3.5);
@@ -61,12 +64,12 @@ s.automate(cl, "gain", 28.0, 0.05);
 
 let cl_rv = s.track_effect(t_cloud, "reverb");
 s.track_fx(t_cloud, cl_rv, "size", 0.82);
-s.track_fx(t_cloud, cl_rv, "damp", 0.58);
-s.track_fx(t_cloud, cl_rv, "mix", 0.42);
+s.track_fx(t_cloud, cl_rv, "damp", 0.46);
+s.track_fx(t_cloud, cl_rv, "mix", 0.40);
 
-// Track 2: Gentle ocean surf shimmer grains in natural register (fifth / unison drift, occasional reverse)
+// Track 2: Gentle ocean surf shimmer grains in natural register (smooth HSV cyan isolation)
 let t_shimmer = s.track("ocean_shimmer");
-s.track_blend(t_shimmer, 0.60);
+s.track_blend(t_shimmer, 0.62);
 let sh = s.clip(t_shimmer, ocean, 6.0, 22.0);
 s.key(sh, "D", "dorian");
 s.set(sh, "density", 5.5);
@@ -76,24 +79,24 @@ s.set(sh, "pitch_jitter", 5.0);
 s.set(sh, "spray", 1.4);
 s.set(sh, "reverse_prob", 0.35);
 s.set(sh, "pan_spread", 0.88);
-s.set(sh, "gain", 0.24);
-s.set(sh, "additive", 0.60);
+s.set(sh, "gain", 0.25);
+s.set(sh, "additive", 0.62);
 s.set(sh, "feather", 0.45);
 s.set(sh, "flicker", 0.14);
-s.audio_filter(sh, "lowpass", 2800.0, 0.72);
-s.color_keep(sh, 195.0, 130.0); // keep turquoise/cyan surf hues
+s.audio_filter(sh, "highpass", 160.0, 0.70);
+s.color_keep(sh, 195.0, 130.0); // smooth Hermite saturation/value ramp keeps turquoise surf clean
 
 let sh_dl = s.track_effect(t_shimmer, "delay");
 s.track_fx(t_shimmer, sh_dl, "time", 0.65);
-s.track_fx(t_shimmer, sh_dl, "feedback", 0.48);
-s.track_fx(t_shimmer, sh_dl, "mix", 0.38);
+s.track_fx(t_shimmer, sh_dl, "feedback", 0.46);
+s.track_fx(t_shimmer, sh_dl, "mix", 0.36);
 s.track_fx(t_shimmer, sh_dl, "shift_x", 0.03);
 
-s.master_tape(0.12, 0.16, 0.12, 0.0);
+s.master_tape(0.09, 0.14, 0.05, 0.04);
 
 let m_rv = s.master_effect("reverb");
 s.master_fx(m_rv, "size", 0.70);
-s.master_fx(m_rv, "damp", 0.58);
-s.master_fx(m_rv, "mix", 0.20);
+s.master_fx(m_rv, "damp", 0.48);
+s.master_fx(m_rv, "mix", 0.18);
 
-s.render(0.0, 32.0, "outputs/261111_burial-demo/holdout/v002/261111_chromagrain_holdout-ambient_v002.mp4");
+s.render(0.0, 32.0, "outputs/261111_burial-demo/holdout/v003/261111_chromagrain_holdout-ambient_v003.mp4");
