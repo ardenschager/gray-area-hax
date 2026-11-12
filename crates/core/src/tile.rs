@@ -110,6 +110,49 @@ pub fn frame_grid(slots: impl IntoIterator<Item = u8>) -> (u32, u32) {
     grid_for(n.max(hi))
 }
 
+/// Piecewise-constant tile grid over time from voice spans
+/// `(slot, start, end)`: `(from, grid)` segments sorted by `from` (the
+/// grid holds until the next segment). Pair with [`grid_in`]. Used where
+/// every voice is known up front (offline render plans).
+pub fn grid_timeline(spans: &[(u8, f64, f64)]) -> Vec<(f64, (u32, u32))> {
+    let mut edges: Vec<(f64, i32, usize)> = Vec::with_capacity(spans.len() * 2);
+    for &(slot, start, end) in spans {
+        let slot = (slot as usize).min(MAX_TILES - 1);
+        if end > start {
+            edges.push((start, 1, slot));
+            edges.push((end, -1, slot));
+        }
+    }
+    // Ends before starts at the same instant (a voice at `t` is live iff
+    // start <= t < end).
+    edges.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    let mut count = [0i32; MAX_TILES];
+    let mut out: Vec<(f64, (u32, u32))> = vec![(f64::NEG_INFINITY, (1, 1))];
+    let mut k = 0;
+    while k < edges.len() {
+        let t = edges[k].0;
+        while k < edges.len() && edges[k].0 == t {
+            count[edges[k].2] += edges[k].1;
+            k += 1;
+        }
+        let grid = frame_grid((0..MAX_TILES).filter(|&i| count[i] > 0).map(|i| i as u8));
+        if out.last().is_some_and(|l| l.1 != grid) {
+            out.push((t, grid));
+        }
+    }
+    out
+}
+
+/// The grid at `t` in a [`grid_timeline`].
+pub fn grid_in(timeline: &[(f64, (u32, u32))], t: f64) -> (u32, u32) {
+    let i = timeline.partition_point(|s| s.0 <= t);
+    if i == 0 {
+        (1, 1)
+    } else {
+        timeline[i - 1].1
+    }
+}
+
 /// Pan (-1..1) and gain cue for a tile: column → pan across ±0.8, row →
 /// a subtle elevation cue (top row full level, each row lower −1 dB).
 pub fn layout_pan(slot: usize, cols: u32, rows: u32) -> (f32, f32) {
@@ -125,8 +168,9 @@ pub fn layout_pan(slot: usize, cols: u32, rows: u32) -> (f32, f32) {
 /// (fixed table), so the audio thread can own one.
 #[derive(Debug, Clone, Default)]
 pub struct TileAssigner {
-    /// Voice in each slot, and when it ends (`f64::INFINITY` while held).
-    slots: [Option<(u64, f64)>; MAX_TILES],
+    /// Voice in each slot, when it started, and when it ends
+    /// (`f64::INFINITY` while held).
+    slots: [Option<(u64, f64, f64)>; MAX_TILES],
 }
 
 impl TileAssigner {
@@ -137,7 +181,7 @@ impl TileAssigner {
     /// Free the slots of voices that ended at or before `t`.
     pub fn expire(&mut self, t: f64) {
         for s in self.slots.iter_mut() {
-            if s.is_some_and(|(_, end)| end <= t) {
+            if s.is_some_and(|(_, _, end)| end <= t) {
                 *s = None;
             }
         }
@@ -153,7 +197,7 @@ impl TileAssigner {
         self.expire(t);
         match self.slots.iter().position(|s| s.is_none()) {
             Some(i) => {
-                self.slots[i] = Some((voice, f64::INFINITY));
+                self.slots[i] = Some((voice, t, f64::INFINITY));
                 i as u8
             }
             None => (voice % MAX_TILES as u64) as u8,
@@ -164,18 +208,26 @@ impl TileAssigner {
     pub fn release(&mut self, voice: u64, end: f64) {
         if let Some(i) = self.slot_of(voice) {
             if let Some(s) = self.slots[i].as_mut() {
-                s.1 = end;
+                s.2 = end;
             }
         }
     }
 
     pub fn slot_of(&self, voice: u64) -> Option<usize> {
-        self.slots.iter().position(|s| s.is_some_and(|(v, _)| v == voice))
+        self.slots.iter().position(|s| s.is_some_and(|(v, _, _)| v == voice))
     }
 
-    /// Grid covering every slot in use at `t` (for pan at voice start).
+    /// Grid covering every slot in use at `t` (voices with
+    /// `start <= t < end`): the grid a grain starting at `t` is drawn in,
+    /// for its layout pan.
     pub fn grid_at(&self, t: f64) -> (u32, u32) {
-        frame_grid(self.slots.iter().enumerate().filter(|(_, s)| s.is_some_and(|(_, end)| end > t)).map(|(i, _)| i as u8))
+        frame_grid(
+            self.slots
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.is_some_and(|(_, start, end)| start <= t && t < end))
+                .map(|(i, _)| i as u8),
+        )
     }
 
     pub fn clear(&mut self) {
@@ -264,5 +316,33 @@ mod tests {
         assert_eq!(a.assign(999, 2.0), (999 % MAX_TILES as u64) as u8, "overflow shares");
         a.clear();
         assert_eq!(a.assign(5, 3.0), 0);
+    }
+
+    #[test]
+    fn grid_at_counts_only_live_voices() {
+        let mut a = TileAssigner::new();
+        a.assign(1, 0.0);
+        a.assign(2, 1.0);
+        assert_eq!(a.grid_at(0.5), (1, 1), "voice 2 hasn't started");
+        assert_eq!(a.grid_at(1.0), (2, 1));
+        a.release(2, 2.0);
+        assert_eq!(a.grid_at(2.0), (1, 1), "voice 2 is over");
+    }
+
+    #[test]
+    fn grid_timeline_matches_live_spans() {
+        let spans = [(0u8, 0.0, 4.0), (1, 1.0, 2.0), (2, 1.5, 3.0), (0, 4.0, 5.0)];
+        let tl = grid_timeline(&spans);
+        assert_eq!(grid_in(&tl, -1.0), (1, 1));
+        assert_eq!(grid_in(&tl, 0.5), (1, 1));
+        assert_eq!(grid_in(&tl, 1.2), (2, 1));
+        assert_eq!(grid_in(&tl, 1.7), (2, 2));
+        // Slot 2 still live: the grid doesn't shrink.
+        assert_eq!(grid_in(&tl, 2.5), (2, 2));
+        assert_eq!(grid_in(&tl, 3.0), (1, 1));
+        // Back-to-back voices in one slot: no gap.
+        assert_eq!(grid_in(&tl, 4.0), (1, 1));
+        assert!(tl.windows(2).all(|w| w[0].0 < w[1].0 && w[0].1 != w[1].1));
+        assert_eq!(grid_timeline(&[]), vec![(f64::NEG_INFINITY, (1, 1))]);
     }
 }

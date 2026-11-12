@@ -294,7 +294,7 @@ struct Voice {
     origin: GrainOrigin,
     gain: f32,
     /// Tile slot + its (pan, gain) cue (layout `Tile`).
-    tile: Option<(u8, f32, f32)>,
+    tile: Option<u8>,
 }
 
 impl Voice {
@@ -309,28 +309,32 @@ impl Voice {
 }
 
 /// Tag a grain with its voice: id, envelope, and (layout `Tile`) its tile
-/// slot with the column→pan / row→gain cue.
-fn tag_grain(ev: &mut GrainEvent, voice: u64, env: Option<crate::envelope::VoiceEnv>, tile: Option<(u8, f32, f32)>, layout_pan: bool) {
+/// slot with the column→pan / row→gain cue of the grid at the grain's
+/// onset (so a voice's pan follows its tile as the grid grows and shrinks).
+fn tag_grain(
+    ev: &mut GrainEvent,
+    voice: u64,
+    env: Option<crate::envelope::VoiceEnv>,
+    tile: Option<u8>,
+    layout_pan: bool,
+    tiles: &crate::tile::TileAssigner,
+) {
     ev.tag.voice = voice;
     ev.tag.env = env;
-    if let Some((slot, pan, gain)) = tile {
+    if let Some(slot) = tile {
         ev.tag.tile = Some(slot);
         if layout_pan {
+            let (cols, rows) = tiles.grid_at(ev.onset);
+            let (pan, gain) = crate::tile::layout_pan(slot as usize, cols, rows);
             ev.pan = (pan + 0.2 * ev.pan).clamp(-1.0, 1.0);
             ev.gain *= gain;
         }
     }
 }
 
-/// Assign a tile to a starting voice (layout `Tile`).
-fn start_tile(tiles: &mut crate::tile::TileAssigner, layout: crate::tile::Layout, voice: u64, t: f64) -> Option<(u8, f32, f32)> {
-    if layout != crate::tile::Layout::Tile {
-        return None;
-    }
-    let slot = tiles.assign(voice, t);
-    let (cols, rows) = tiles.grid_at(t);
-    let (pan, gain) = crate::tile::layout_pan(slot as usize, cols, rows);
-    Some((slot, pan, gain))
+/// Assign a tile to a voice starting at `t` (layout `Tile`).
+fn start_tile(tiles: &mut crate::tile::TileAssigner, layout: crate::tile::Layout, voice: u64, t: f64) -> Option<u8> {
+    (layout == crate::tile::Layout::Tile).then(|| tiles.assign(voice, t))
 }
 
 #[derive(Clone)]
@@ -417,7 +421,7 @@ struct Pad {
     /// Envelope on / off times of the current loop (off = INFINITY while on).
     env_on: f64,
     env_off: f64,
-    tile: Option<(u8, f32, f32)>,
+    tile: Option<u8>,
 }
 
 /// What the picture is at one moment — plain data for a renderer.
@@ -1057,7 +1061,7 @@ impl Instrument {
                 if let Some(tile) = start_tile(&mut self.tiles, self.layout, voice, t) {
                     self.tiles.release(voice, ev.end());
                     let env = ev.tag.env;
-                    tag_grain(&mut ev, voice, env, Some(tile), self.layout_pan);
+                    tag_grain(&mut ev, voice, env, Some(tile), self.layout_pan, &self.tiles);
                 }
                 let source = row.source;
                 self.grains.push(LiveGrain { source, voice: 0, ev, origin: GrainOrigin::Step, seen: false });
@@ -1182,7 +1186,7 @@ impl Instrument {
                     let room = ((slice_end - ev.source_pos) / ev.pitch_ratio.max(0.01) as f64).max(0.005);
                     ev.duration = ev.duration.min(room as f32);
                 }
-                tag_grain(&mut ev, v.serial, v.env(), v.tile, layout_pan);
+                tag_grain(&mut ev, v.serial, v.env(), v.tile, layout_pan, &self.tiles);
                 let (source, serial, origin) = (v.source, v.serial, v.origin);
                 v.head += hop * map.speed as f64;
                 v.k += 1;
@@ -1376,7 +1380,7 @@ impl Instrument {
                     ..Default::default()
                 };
                 let mut ev = ev;
-                tag_grain(&mut ev, p.serial, env, p.tile, self.layout_pan);
+                tag_grain(&mut ev, p.serial, env, p.tile, self.layout_pan, &self.tiles);
                 self.grains.push(LiveGrain { source: slot.source, voice: p.serial, ev, origin: GrainOrigin::Pad(i), seen: false });
                 next_t += hop;
                 k += 1;
@@ -2092,5 +2096,190 @@ mod tests {
         assert!(l.iter().chain(&r).all(|s| s.is_finite() && s.abs() <= 1.0));
         i.all_notes_off();
         assert_eq!(i.held_notes().count(), 0);
+    }
+
+    // ---- v003: ADSR, slices, tiles ----
+
+    use crate::chop::{equal_slices, Slice};
+    use crate::envelope::Adsr;
+    use crate::tile::Layout;
+
+    fn run_n(i: &mut Instrument, samples: usize, block: usize) -> (Vec<f32>, Vec<f32>) {
+        let (mut l, mut r) = (vec![0.0; samples], vec![0.0; samples]);
+        let mut pos = 0;
+        while pos < samples {
+            let b = block.min(samples - pos);
+            i.process(&mut l[pos..pos + b], &mut r[pos..pos + b]);
+            pos += b;
+        }
+        (l, r)
+    }
+
+    fn quick_adsr() -> Adsr {
+        Adsr { attack: 0.002, decay: 0.0, sustain: 1.0, release: 0.02, ..Adsr::default() }
+    }
+
+    fn sliced() -> Instrument {
+        let mut i = inst_with_sine();
+        assert!(i.set_slices(0, equal_slices(3.0, 4)));
+        assert_eq!(i.sources()[0].slices.len(), 4);
+        i
+    }
+
+    #[test]
+    fn note_adsr_release_silences_after_note_off() {
+        let tail = |adsr: Option<Adsr>| {
+            let mut i = inst_with_sine();
+            i.set_macro(Macro::Smear, 0.0);
+            i.set_note_adsr(adsr);
+            assert_eq!(i.note_adsr(), adsr);
+            i.note_on(60, 1.0);
+            run(&mut i, 0.3, 256);
+            i.note_off(60);
+            assert_eq!(i.held_notes().count(), 0);
+            let (l, _) = run(&mut i, 0.3, 256);
+            // Past the release (+ the pipeline's latency).
+            let skip = ((0.02 + 0.01) * SR as f64) as usize + i.latency_samples();
+            rms(&l[skip..])
+        };
+        let classic = tail(None);
+        let enveloped = tail(Some(quick_adsr()));
+        assert!(classic > 0.01, "classic grains ring out: {classic}");
+        assert!(enveloped < classic * 0.05, "ADSR release cuts: {enveloped} vs {classic}");
+    }
+
+    #[test]
+    fn notes_from_c3_play_slices() {
+        let mut i = sliced();
+        i.note_on(49, 1.0); // slice 1 = 0.75..1.5 s
+        let grains = collect(&mut i, 1.5, 256);
+        assert!(!grains.is_empty());
+        for e in &grains {
+            assert!(e.source_pos >= 0.75 - 1e-9 && e.source_pos < 1.5, "inside slice 1: {}", e.source_pos);
+            assert!(e.source_pos + (e.duration * e.pitch_ratio) as f64 <= 1.5 + 1e-6, "clamped to the slice end");
+            assert!((e.pitch_ratio - 1.0).abs() < 1e-6, "slices play at unity");
+        }
+        // The voice stops at the slice end (0.75 s of media).
+        let first = grains.iter().map(|e| e.onset).fold(f64::INFINITY, f64::min);
+        let last = grains.iter().map(|e| e.onset).fold(0.0, f64::max);
+        assert!(last - first < 0.75 + 1e-6, "{first}..{last}");
+        // Past the slices: the melodic path.
+        let mut m = sliced();
+        m.note_on(60, 1.0);
+        let g = collect(&mut m, 0.2, 256);
+        assert!(!g.is_empty() && g.iter().all(|e| e.source_pos < 0.75 + 0.3));
+    }
+
+    #[test]
+    fn slices_to_pads_make_one_shot_pads() {
+        let mut i = sliced();
+        assert_eq!(i.slices_to_pads(0, 0), 4);
+        assert_eq!(i.slices_to_pads(9, 0), 0);
+        let p = i.pad(2);
+        assert_eq!(p.slot.and_then(|s| s.slice), Some(Slice::new(1.5, 2.25)));
+        i.note_on(PAD_NOTE + 2, 1.0);
+        i.note_off(PAD_NOTE + 2); // one-shot: note-off doesn't stop it
+        assert_eq!(i.held_notes().count(), 0);
+        let grains = collect(&mut i, 1.0, 256);
+        assert!(!grains.is_empty(), "the pad hit plays");
+        assert!(grains.iter().all(|e| e.source_pos >= 1.5 - 1e-9 && e.source_pos < 2.25));
+        // toggle_pad on a slice pad is also a one-shot.
+        let mut j = sliced();
+        j.slices_to_pads(0, 4);
+        j.toggle_pad(4);
+        let g = collect(&mut j, 0.3, 256);
+        assert!(!g.is_empty() && g.iter().all(|e| e.source_pos < 0.75));
+        assert!(!j.pad(4).on, "a slice pad doesn't latch");
+    }
+
+    #[test]
+    fn tile_layout_gives_voices_slots_and_pans() {
+        let mut i = inst_with_sine();
+        i.set_layout(Layout::Tile);
+        assert!(i.layout_pan());
+        i.note_on(60, 1.0);
+        i.note_on(67, 1.0);
+        let grains = collect(&mut i, 0.4, 256);
+        let pans = |slot: u8| grains.iter().filter(|e| e.tag.tile == Some(slot)).map(|e| e.pan).collect::<Vec<_>>();
+        let (a, b) = (pans(0), pans(1));
+        assert!(!a.is_empty() && !b.is_empty());
+        assert!(a.iter().all(|p| *p < -0.5), "slot 0 = left: {a:?}");
+        assert!(b.iter().all(|p| *p > 0.5), "slot 1 = right: {b:?}");
+        assert!(grains.iter().all(|e| e.tag.voice != 0));
+
+        // The picture: left and right halves both lit.
+        let f = i.frame();
+        assert_eq!(f.layout, Layout::Tile);
+        let mut out = Frame::black(32, 18);
+        FrameRenderer::new().render(&f, i.sources(), f.time, 24.0, &mut out);
+        let half = |x0: u32, x1: u32| {
+            let mut sum = 0.0;
+            for y in 0..18u32 {
+                for x in x0..x1 {
+                    let k = ((y * 32 + x) * 4) as usize;
+                    sum += out.data[k] as f32 + out.data[k + 1] as f32 + out.data[k + 2] as f32;
+                }
+            }
+            sum / ((x1 - x0) * 18 * 3) as f32
+        };
+        assert!(half(0, 15) > 10.0 && half(17, 32) > 10.0, "{} {}", half(0, 15), half(17, 32));
+
+        // Without layout pan, pans stay near center.
+        let mut c = inst_with_sine();
+        c.set_layout(Layout::Tile);
+        c.set_layout_pan(false);
+        c.note_on(60, 1.0);
+        c.note_on(67, 1.0);
+        let g = collect(&mut c, 0.3, 256);
+        assert!(g.iter().all(|e| e.pan.abs() < 0.5));
+        // Stack: no tiles.
+        let mut s = inst_with_sine();
+        s.note_on(60, 1.0);
+        assert!(collect(&mut s, 0.2, 256).iter().all(|e| e.tag.tile.is_none()));
+    }
+
+    #[test]
+    fn adsr_tiles_and_slices_are_block_size_independent() {
+        let render = |block: usize| {
+            let mut i = sliced();
+            i.set_layout(Layout::Tile);
+            i.set_note_adsr(Some(Adsr { attack: 0.01, decay: 0.05, sustain: 0.6, release: 0.1, ..Adsr::default() }));
+            i.slices_to_pads(0, 0);
+            let mut l = Vec::new();
+            let mut push = |i: &mut Instrument, n: usize| l.extend(run_n(i, n, block).0);
+            i.note_on(60, 0.9);
+            push(&mut i, 4096);
+            i.note_on(50, 0.7);
+            push(&mut i, 4096);
+            i.note_on(PAD_NOTE + 1, 1.0);
+            push(&mut i, 2048);
+            i.note_off(60);
+            push(&mut i, 8192);
+            i.note_off(50);
+            push(&mut i, 8192);
+            l
+        };
+        let a = render(64);
+        let b = render(512);
+        let c = render(2048);
+        assert!(rms(&a) > 0.01);
+        let diff = |x: &[f32], y: &[f32]| x.iter().zip(y).map(|(p, q)| (p - q).abs()).fold(0.0f32, f32::max);
+        assert!(diff(&a, &b) < 1e-5, "64 vs 512: {}", diff(&a, &b));
+        assert!(diff(&a, &c) < 1e-5, "64 vs 2048: {}", diff(&a, &c));
+    }
+
+    #[test]
+    fn a_voice_pan_follows_its_tile_as_the_grid_grows() {
+        let mut i = inst_with_sine();
+        i.set_layout(Layout::Tile);
+        i.note_on(60, 1.0);
+        let alone = collect(&mut i, 0.3, 256);
+        assert!(alone.iter().all(|e| e.tag.tile == Some(0) && e.pan.abs() <= 0.2 + 1e-6), "a lone voice is centered");
+        i.note_on(67, 1.0);
+        run(&mut i, 0.1, 256); // past the lookahead
+        let t = i.now_secs();
+        let both = collect(&mut i, 0.3, 256);
+        let first: Vec<f32> = both.iter().filter(|e| e.tag.tile == Some(0) && e.onset >= t).map(|e| e.pan).collect();
+        assert!(!first.is_empty() && first.iter().all(|p| *p < -0.5), "slot 0 moves left: {first:?}");
     }
 }

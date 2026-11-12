@@ -553,7 +553,7 @@ fn clip_voice(track: usize, clip: usize) -> u64 {
 /// since it plays this plan). Grains without a voice belong to their
 /// clip's voice. With `layout_pan`, the slot's column sets the grain pan
 /// (keeping a little of the grain's own spread) and its row a subtle gain
-/// cue, computed from the grid at the voice's start.
+/// cue, from the grid at each grain's onset (the grid the picture shows).
 pub fn assign_tiles(plans: &mut [ClipPlan], layout_pan: bool) {
     use std::collections::BTreeMap;
     // voice -> (start, end)
@@ -575,20 +575,23 @@ pub fn assign_tiles(plans: &mut [ClipPlan], layout_pan: bool) {
     let mut order: Vec<(u64, f64, f64)> = spans.into_iter().map(|(v, (a, b))| (v, a, b)).collect();
     order.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
     let mut tiles = crate::tile::TileAssigner::new();
-    let mut slot_of: BTreeMap<u64, (u8, f32, f32)> = BTreeMap::new();
+    let mut slot_of: BTreeMap<u64, u8> = BTreeMap::new();
+    let mut spans: Vec<(u8, f64, f64)> = Vec::with_capacity(order.len());
     for (voice, start, end) in order {
         let slot = tiles.assign(voice, start);
         tiles.release(voice, end);
-        let (cols, rows) = tiles.grid_at(start);
-        let (pan, gain) = crate::tile::layout_pan(slot as usize, cols, rows);
-        slot_of.insert(voice, (slot, pan, gain));
+        slot_of.insert(voice, slot);
+        spans.push((slot, start, end));
     }
+    let grids = crate::tile::grid_timeline(&spans);
     for cp in plans.iter_mut() {
         for (_, evs) in cp.parts.iter_mut().chain(cp.video_parts.iter_mut().flatten()) {
             for e in evs.iter_mut() {
-                if let Some(&(slot, pan, gain)) = slot_of.get(&e.tag.voice) {
+                if let Some(&slot) = slot_of.get(&e.tag.voice) {
                     e.tag.tile = Some(slot);
                     if layout_pan {
+                        let (cols, rows) = crate::tile::grid_in(&grids, e.onset);
+                        let (pan, gain) = crate::tile::layout_pan(slot as usize, cols, rows);
                         e.pan = (pan + 0.2 * e.pan).clamp(-1.0, 1.0);
                         e.gain *= gain;
                     }
