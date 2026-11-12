@@ -276,7 +276,8 @@ impl Studio {
                 crate::gpu::LiveBus {
                     // Sample end: the footage itself (over, not glow); the
                     // cloud end glows like classic grain clouds.
-                    style: VisualGrainStyle::morph(0.0, &VisualGrainStyle { additive: 0.3, ..Default::default() }, map.texture),
+                    // grain end: soft-edged patches that glow, never hard blocks.
+                    style: VisualGrainStyle::morph(0.0, &VisualGrainStyle { additive: 0.3, feather: 0.7, ..Default::default() }, map.texture),
                     effects: emitter_effects(&map, &self.key),
                     link: e.link,
                 }

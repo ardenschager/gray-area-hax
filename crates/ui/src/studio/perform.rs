@@ -69,7 +69,8 @@ impl Studio {
                     let scrim = Rect::from_min_max(egui::pos2(rc.left(), rc.bottom() - 30.0), rc.max);
                     p.rect_filled(scrim, egui::CornerRadius { nw: 0, ne: 0, sw: 10, se: 10 }, Color32::from_black_alpha(70));
                     let room = ((pw - 40.0) / 6.6).max(3.0) as usize;
-                    let name = short(&self.source_name(host, src), room.min(18));
+                    let label = pad.name.clone().unwrap_or_else(|| self.source_name(host, src));
+                    let name = short(&label, room.min(18));
                     p.text(egui::pos2(rc.left() + 10.0, rc.bottom() - 9.0), Align2::LEFT_BOTTOM, name, font_medium(11.5), if on { INK } else { INK2 });
                     let icon = match pad.kind {
                         PadKind::Loop => Icon::Loop,
@@ -218,10 +219,23 @@ impl Studio {
                 host.toggle_fullscreen(ui.ctx());
             }
             runs(&p, xr.center(), Align2::CENTER_CENTER, &[("Exit  ", font_medium(13.0), INK), ("F", mono(10.0), INK3)]);
-            // Bottom: tempo, beat dots, and a mini pad grid.
+            // Bottom left: tempo, beat dots, and what's playing.
             let bpm = host.project().lock().unwrap().bpm;
+            let playing = host.playing();
+            let pads: Vec<Pad> = host.perform().map(|perf| perf.pads()).unwrap_or_default();
+            let on_names: Vec<String> = pads
+                .iter()
+                .filter(|pd| pd.on)
+                .filter_map(|pd| pd.name.clone().or_else(|| pd.source.map(|s| self.source_name(host, s))))
+                .collect();
+            let names = match on_names.len() {
+                0 => String::new(),
+                n if n <= 4 => on_names.join(" · "),
+                n => format!("{} · +{}", on_names[..3].join(" · "), n - 3),
+            };
             let bl = egui::pos2(full.left() + 20.0, full.bottom() - 20.0);
-            let info = Rect::from_min_max(bl - egui::vec2(0.0, 64.0), bl + egui::vec2(260.0, 0.0));
+            let names_w = if names.is_empty() { 0.0 } else { p.layout_no_wrap(names.clone(), font(12.0), INK2).size().x + 22.0 };
+            let info = Rect::from_min_max(bl - egui::vec2(0.0, 64.0), bl + egui::vec2(206.0 + names_w, 0.0));
             p.rect_filled(info, r(12), Color32::from_black_alpha(130));
             runs(
                 &p,
@@ -230,20 +244,38 @@ impl Studio {
                 &[(&format!("{bpm:.0}"), mono_medium(26.0), INK), (" bpm", font(12.0), INK3)],
             );
             let bi = (beats % 4.0).floor() as usize;
-            let playing = host.playing();
             for k in 0..4 {
-                p.circle_filled(egui::pos2(info.left() + 150.0 + k as f32 * 14.0, info.center().y), 3.5, if k == bi && playing { HI } else { G5 });
+                p.circle_filled(egui::pos2(info.left() + 140.0 + k as f32 * 14.0, info.center().y), 3.5, if k == bi && playing { HI } else { G5 });
             }
-            let Some(perf) = host.perform() else { return };
-            let mini = 30.0;
-            let grid = Rect::from_min_size(egui::pos2(full.right() - 20.0 - 4.0 * (mini + 4.0), full.bottom() - 20.0 - 4.0 * (mini + 4.0)), egui::vec2(4.0 * (mini + 4.0), 4.0 * (mini + 4.0)));
+            if !names.is_empty() {
+                p.text(egui::pos2(info.left() + 206.0, info.center().y), Align2::LEFT_CENTER, &names, font(12.0), INK2);
+            }
+            // Bottom right: the pads, as small thumbnails.
+            let (mw, mh, mg) = (52.0, 32.0, 5.0);
+            let gsize = egui::vec2(4.0 * mw + 3.0 * mg, 4.0 * mh + 3.0 * mg);
+            let grid = Rect::from_min_size(egui::pos2(full.right() - 28.0 - gsize.x, full.bottom() - 28.0 - gsize.y), gsize);
             p.rect_filled(grid.expand(8.0), r(12), Color32::from_black_alpha(130));
-            for (i, pad) in perf.pads().into_iter().enumerate().take(16) {
-                let c = Rect::from_min_size(grid.min + egui::vec2((i % 4) as f32 * (mini + 4.0), (i / 4) as f32 * (mini + 4.0)), egui::vec2(mini, mini));
-                p.rect_filled(c, r(6), if pad.on { HI } else if pad.source.is_some() { G3 } else { G1 });
-                if hit(ui, c, ui.id().with(("mini-pad", i)), Sense::click(), &format!("mini pad {}", i + 1)).clicked() && pad.source.is_some() {
-                    perf.toggle_pad(i);
+            let ctx = ui.ctx().clone();
+            let mut toggle = None;
+            for (i, pad) in pads.iter().enumerate().take(16) {
+                let c = Rect::from_min_size(grid.min + egui::vec2((i % 4) as f32 * (mw + mg), (i / 4) as f32 * (mh + mg)), egui::vec2(mw, mh));
+                match pad.source.and_then(|s| self.atlas(host, &ctx, s)) {
+                    Some((tex, a)) => tile(&p, c, 5, tex, a.uv_cover(5, mw / mh), gray(if pad.on { 0.95 } else { 0.45 })),
+                    None => {
+                        p.rect_filled(c, r(5), G1);
+                    }
                 }
+                if pad.on {
+                    p.rect_stroke(c, r(5), Stroke::new(1.5, HI), StrokeKind::Inside);
+                } else if pad.queued.is_some() && (ui.input(|i| i.time) * 3.0).fract() < 0.6 {
+                    p.rect_stroke(c, r(5), Stroke::new(1.0, INK2), StrokeKind::Inside);
+                }
+                if hit(ui, c, ui.id().with(("mini-pad", i)), Sense::click(), &format!("mini pad {}", i + 1)).clicked() && pad.source.is_some() {
+                    toggle = Some(i);
+                }
+            }
+            if let (Some(i), Some(perf)) = (toggle, host.perform()) {
+                perf.toggle_pad(i);
             }
         });
     }

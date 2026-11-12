@@ -344,6 +344,7 @@ impl PerformHost for PluginHost {
             .map(|(i, s)| {
                 let (on, queued) = self.shared.pad_state(i);
                 Pad {
+                    name: None,
                     source: s.map(|s| s.source),
                     kind: PadKind::Loop,
                     len_beats: s.map_or(4.0, |s| s.len_beats as f64),

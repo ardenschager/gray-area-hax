@@ -94,14 +94,15 @@ pub struct SceneSpec {
 }
 
 /// What a Perform pad holds.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum PadSpec {
     /// The clip straight, looping every `beats`.
     Loop { clip: usize, beats: f64 },
     /// A soft grain cloud of the clip (`position` 0..1), in key.
     Cloud { clip: usize, position: f32 },
-    /// A scene's steps, looping.
-    Scene(usize),
+    /// Some lanes of a scene (in this order; the first one is the pad's
+    /// picture), looping, under a name.
+    Steps { name: &'static str, scene: usize, lanes: Vec<usize> },
     Empty,
 }
 
@@ -163,11 +164,11 @@ impl DemoSpec {
         // Lanes: kick, rim, hats, sub, keys, two voices.
         let (l_kick, l_rim, l_hat, l_sub, l_keys, l_bench, l_plat) = (0, 1, 2, 3, 4, 5, 6);
         let lanes = vec![
-            LaneSpec::drum(KICK, 0.30, 0.74, 0.0),
-            LaneSpec::drum(RIM, 0.30, 0.52, -0.18),
-            LaneSpec { pan_spread: 0.7, ..LaneSpec::drum(GLITTER, 0.12, 0.34, 0.0) },
-            LaneSpec { in_key: false, envelope: 0.16, ..LaneSpec::tonal(HIGHWAY, 1.15, 0.5, 0.0, 0.16) },
-            LaneSpec { in_key: false, ..LaneSpec::tonal(KEYS, 1.9, 0.42, 0.0, 0.42) },
+            LaneSpec::drum(KICK, 0.30, 0.95, 0.0),
+            LaneSpec::drum(RIM, 0.30, 0.62, -0.18),
+            LaneSpec { pan_spread: 0.7, ..LaneSpec::drum(GLITTER, 0.12, 0.42, 0.0) },
+            LaneSpec { in_key: false, envelope: 0.16, ..LaneSpec::tonal(HIGHWAY, 1.15, 0.66, 0.0, 0.16) },
+            LaneSpec { in_key: false, ..LaneSpec::tonal(KEYS, 1.9, 0.34, 0.0, 0.42) },
             LaneSpec::tonal(BENCH, 0.46, 0.5, -0.14, 0.32),
             LaneSpec::tonal(PLATFORM, 0.44, 0.46, 0.18, 0.34),
         ];
@@ -205,22 +206,25 @@ impl DemoSpec {
             hit(l_plat, 11).slice(0.35).pitch(-2.0).len(1.15),
             hit(l_kick, 7).gain(0.55),
         ]);
+        // The pad bank, one row per role: beds, step layers, clouds, whole
+        // scenes. Every pad has its own name and picture.
+        let steps = |name, scene, lanes: &[usize]| PadSpec::Steps { name, scene, lanes: lanes.to_vec() };
         let pads = vec![
-            PadSpec::Loop { clip: RAIN, beats: 16.0 },
             PadSpec::Loop { clip: KEYS, beats: 16.0 },
+            PadSpec::Loop { clip: RAIN, beats: 16.0 },
             PadSpec::Loop { clip: TUNNEL, beats: 16.0 },
             PadSpec::Loop { clip: HIGHWAY, beats: 8.0 },
-            PadSpec::Scene(1),
-            PadSpec::Scene(2),
-            PadSpec::Scene(0),
-            PadSpec::Cloud { clip: GLITTER, position: 0.3 },
+            steps("2-step", 1, &[l_kick, l_rim, l_hat]),
+            steps("sub", 1, &[l_sub]),
+            steps("voices", 2, &[l_bench, l_plat]),
+            steps("chords", 2, &[l_keys]),
             PadSpec::Cloud { clip: BENCH, position: 0.03 },
             PadSpec::Cloud { clip: PLATFORM, position: 0.35 },
-            PadSpec::Cloud { clip: KEYS, position: 0.3 },
-            PadSpec::Cloud { clip: RAIN, position: 0.5 },
-            PadSpec::Loop { clip: BENCH, beats: 16.0 },
-            PadSpec::Loop { clip: PLATFORM, beats: 16.0 },
-            PadSpec::Loop { clip: GLITTER, beats: 4.0 },
+            PadSpec::Cloud { clip: GLITTER, position: 0.3 },
+            PadSpec::Cloud { clip: TUNNEL, position: 0.5 },
+            steps("drop", 2, &[l_bench, l_kick, l_rim, l_hat, l_sub, l_keys, l_plat]),
+            steps("intro", 0, &[l_keys, l_rim, l_hat, l_bench]),
+            steps("ghost rim", 0, &[l_rim, l_hat]),
             PadSpec::Empty,
         ];
         DemoSpec {
@@ -235,7 +239,7 @@ impl DemoSpec {
             scenes: vec![SceneSpec { hits: s1 }, SceneSpec { hits: s2 }, SceneSpec { hits: s3 }],
             chain: vec![(0, 4), (1, 4), (2, 4)],
             pads,
-            pads_on: vec![1],
+            pads_on: vec![0],
             emitters: [
                 (0, 2.6, [0.22, 0.5, 0.3, 0.0]),
                 (1, 0.6, [0.35, 0.5, 0.45, 0.0]),
@@ -345,7 +349,7 @@ impl App {
             // Pads: one track each, muted unless playing at the start.
             for (i, pad) in spec.pads.iter().chain(std::iter::repeat(&PadSpec::Empty)).take(PADS).enumerate() {
                 let mut t = Track { name: format!("pad {}", i + 1), muted: !spec.pads_on.contains(&i), ..Default::default() };
-                match *pad {
+                match pad.clone() {
                     PadSpec::Loop { clip, beats } => {
                         let mut c = build_clip(&mut p, clip, 0.0, PlayMode::Snippet);
                         c.length_beats = beats;
@@ -371,10 +375,12 @@ impl App {
                         c.visual.max_size = 0.55;
                         t.clips.push(c);
                     }
-                    PadSpec::Scene(s) => {
-                        if let Some(pid) = scene_pats.get(s).copied().flatten() {
+                    PadSpec::Steps { name, scene, lanes } => {
+                        if let Some(pid) = scene_pats.get(scene).copied().flatten() {
                             let mut pat = p.patterns[pid].clone();
-                            pat.name = format!("pad {} · scene {}", i + 1, s + 1);
+                            pat.name = name.into();
+                            pat.rows = lanes.iter().filter_map(|l| pat.rows.get(*l).cloned()).collect();
+                            t.name = name.into();
                             let own = p.add_pattern(pat);
                             let mut c = Clip::new_pattern(own, 0.0, 4.0);
                             c.visual.feather = 0.3;
@@ -419,6 +425,7 @@ impl App {
 mod tests {
     use super::*;
     use crate::AppOpts;
+    use chromagrain_core::timeline::ClipKind;
     use std::sync::Arc;
 
     fn stand_ins(spec: &DemoSpec) -> Vec<Source> {
@@ -485,8 +492,16 @@ mod tests {
             assert!(pat.rows.iter().all(|r| r.key == Some(spec.key)));
         }
         assert_eq!(app.other_tracks.len(), PADS, "the pad bank waits for Perform");
-        assert!(!app.other_tracks[1].muted, "a bed is playing");
+        assert!(!app.other_tracks[0].muted, "a bed is playing");
         assert!(app.other_tracks[4].muted);
+        let names: Vec<&str> = app.other_tracks.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(&names[4..8], ["2-step", "sub", "voices", "chords"], "step pads are named");
+        {
+            let p = app.project.lock().unwrap();
+            let ClipKind::Pattern(pid) = app.other_tracks[4].clips[0].kind else { panic!("2-step is a pattern pad") };
+            let srcs: Vec<usize> = p.patterns[pid].rows.iter().map(|r| r.source).collect();
+            assert_eq!(srcs, [7, 8, 6], "kick, rim, hats");
+        }
         assert!(app.other_tracks[15].clips.is_empty(), "the last pad is the add slot");
     }
 

@@ -50,4 +50,53 @@ ripple on lift.
   - Deep drawer;
   - end card.
 - Mix: −16 LUFS integrated.
-- Reviewer verdict: pending.
+- Reviewer verdict (#41): not signed off. Main notes:
+  - Cause and effect don't land: two fingers on two grey clips, no payoff for Rec, a
+    hold sheet with identical slices, the HUD hidden in fullscreen, a weak Deep page.
+  - Dead air at 0:00 and 0:29.
+  - The arc is flat.
+  - Audio: a pop on LOOK through crush, and loop clicks.
+  - UI bugs:
+    - visual grains are hard rectangles (the GPU ignored `feather`);
+    - fullscreen is pillarboxed by the band;
+    - the HUD is missing pad names and thumbnails;
+    - Perform pads all say "kick";
+    - the Deep global "Links" tab is really song settings and shows a `--classic` CLI banner;
+    - the LOOK tag lags the knob by one frame;
+    - emitter tile labels are unreadable on bright footage.
+
+### v002
+- Fixes in the app:
+  - **GPU feather**: `fs_grain` tapers patch borders exactly like the CPU compositor,
+    with a new parity case. Emitter clouds now use feather 0.7.
+  - **Live-bus crossfade**: a LOOK change crossfades the old effect chain into the new
+    one over 43 ms instead of rebuilding with a click. Has a test.
+  - **Named pads**: a named pad track names its pad (`Pad::name`).
+  - **Fullscreen HUD to spec**: tempo, beat dots and the names of playing pads; the
+    mini pads are thumbnails with an active border.
+  - **Deep**: the global first tab is labelled "Song" and the CLI banner is gone.
+  - **Play**: knobs update before the emitter tiles and the stage tag, so all three
+    show the same LOOK. Emitter tiles get a bottom scrim.
+- Demo:
+  - The pad bank has one role per row, with unique names: beds (keys, rain, tunnel,
+    highway); step layers (2-step, sub, voices, chords); clouds; whole scenes (drop,
+    intro, ghost rim).
+  - Drums and sub are louder.
+  - The keys loop is the Perform bed.
+- Tour:
+  - The first finger lands under the title, so there's sound from 0.3 s.
+  - Two fingers play keys (teal) + bench (voice), and each finger grabs its own
+    emitter ring.
+  - Knob rings stay on the knob, with a drag-up chevron.
+  - LOOK slips quickly past crush and settles on tint, then kaleido.
+  - Deep opens on Emitter 1 (⋯); pitch → hue is dragged while a finger keeps playing.
+  - After Rec, "hands off · it plays back": the transport plays the take, which also
+    bridges into Sequence with no silence.
+  - The hold sheet is on the keys lane: tap slice 12 (a different chord and frame),
+    then drag chance down.
+  - Scene 3 is queued and the drums drop in on the bar.
+  - Perform layers 2-step → sub → voices on the bar.
+  - Fullscreen is edge to edge, with the HUD summoned after 1 s, pure picture, then a
+    launch from the HUD.
+  - The film ends on the picture; audio fades with the end card.
+- Encode: CRF 19, 30.9 MB. Mix: −15.9 LUFS, LRA 6.5.

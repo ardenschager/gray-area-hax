@@ -34,10 +34,11 @@ pub const BAND: f32 = 58.0;
 pub enum Aim {
     /// Centre of the widget with this label.
     Label(String),
-    /// The Play grid: column (0..8, centre at +0.5) and row (0..8).
-    Grid(f32, f32),
     /// Fractions of the screen.
     Screen(f32, f32),
+    /// Where emitter `i`'s ring is right now (grab it); with `Off`, the
+    /// offset is in grid columns / rows.
+    Emitter(usize),
     /// Another aim, moved by points.
     Off(Box<Aim>, f32, f32),
 }
@@ -46,9 +47,6 @@ pub fn lab(s: &str) -> Aim {
     Aim::Label(s.into())
 }
 
-pub fn grid(c: f32, r: f32) -> Aim {
-    Aim::Grid(c, r)
-}
 
 impl Aim {
     pub fn off(self, dx: f32, dy: f32) -> Aim {
@@ -68,6 +66,9 @@ pub enum Gesture {
     /// pointer: multi-touch).
     Touch(Vec<Aim>, f64),
     Key(egui::Key),
+    /// Turn a knob: press on it and drag vertically by `dy` points at
+    /// each (seconds, dy) key. The ring stays on the knob.
+    Knob(&'static str, Vec<(f64, f32)>),
 }
 
 pub struct Cue {
@@ -97,12 +98,14 @@ impl Gesture {
             Gesture::Tap(_) => 0.14,
             Gesture::Hold(_, s) | Gesture::Drag(_, s) | Gesture::Touch(_, s) => *s,
             Gesture::Key(_) => 0.0,
+            Gesture::Knob(_, keys) => keys.last().map_or(0.0, |k| k.0),
         }
     }
     fn aims(&self) -> Vec<Aim> {
         match self {
             Gesture::Tap(a) | Gesture::Hold(a, _) => vec![a.clone()],
             Gesture::Drag(v, _) | Gesture::Touch(v, _) => v.clone(),
+            Gesture::Knob(l, _) => vec![lab(l)],
             _ => Vec::new(),
         }
     }
@@ -114,7 +117,7 @@ impl Gesture {
 /// The film's scene setup: the Night Platform demo, with a longer first
 /// scene so the Sequence edits are heard before the next scene arrives.
 pub fn setup(app: &mut App) {
-    app.studio.seq.chain = vec![(0, 8), (1, 4), (2, 4)];
+    app.studio.seq.chain = vec![(0, 12), (1, 4), (2, 4)];
     app.studio.rev += 1;
 }
 
@@ -125,71 +128,75 @@ pub fn tour() -> Tour {
     let mut cap = Vec::new();
     let mut at = |t: f64, g: Gesture| cues.push(Cue { t, g });
     let mut say = |t0: f64, t1: f64, text: &'static str| cap.push(Caption { t0, t1, text });
+    let em = |i: usize| Aim::Emitter(i);
+    let rows = |i: usize, path: &[(f32, f32)]| -> Vec<Aim> { path.iter().map(|(dc, dr)| Aim::Off(Box::new(em(i)), *dc, *dr)).collect() };
 
-    // ---- Play: touch the picture.
-    say(3.0, 6.6, "touch a clip to play it");
-    at(2.6, Drag(vec![grid(0.5, 2.4), grid(0.55, 2.9), grid(0.5, 4.2)], 4.2));
-    say(7.4, 11.8, "two fingers, two emitters");
-    at(7.6, Touch(vec![grid(1.5, 0.8), grid(1.45, 1.3), grid(1.5, 1.9)], 4.2));
-    at(8.1, Touch(vec![grid(2.5, 3.0), grid(2.55, 3.8), grid(2.5, 4.6)], 3.6));
+    // ---- Play: touch the picture. The first finger lands under the title.
+    at(0.3, Touch(rows(0, &[(0.0, 0.0), (0.04, 0.6), (0.0, 1.8)]), 5.4));
+    say(2.2, 5.8, "touch a clip to play it");
+    say(6.6, 10.8, "two fingers, two emitters");
+    at(6.8, Touch(rows(0, &[(0.0, 0.0), (0.03, 0.5), (0.0, 1.0)]), 4.2));
+    at(7.2, Touch(rows(1, &[(0.0, 0.0), (-0.04, 0.8), (0.0, 1.8)]), 3.8));
     // One finger keeps playing while the other turns the knobs.
-    at(12.4, Touch(vec![grid(0.5, 3.4), grid(0.5, 3.9)], 10.8));
-    say(12.8, 14.9, "grain · sample to cloud");
-    at(13.0, Drag(vec![lab("Grain"), lab("Grain").off(0.0, -60.0), lab("Grain").off(2.0, -118.0)], 1.6));
-    say(15.6, 17.5, "pitch · always in key");
-    at(15.8, Drag(vec![lab("Pitch"), lab("Pitch").off(0.0, -48.0)], 1.2));
-    say(18.2, 19.9, "smear");
-    at(18.4, Drag(vec![lab("Smear"), lab("Smear").off(0.0, -80.0)], 1.3));
-    say(20.6, 22.6, "look");
-    at(20.8, Drag(vec![lab("Look"), lab("Look").off(0.0, -100.0), lab("Look").off(0.0, -205.0)], 1.4));
-    // Rec: what you play becomes a take.
-    say(24.2, 28.4, "rec turns a phrase into a take");
-    at(24.4, Tap(lab("rec")));
-    at(25.0, Touch(vec![grid(1.5, 2.2), grid(1.6, 2.8), grid(1.5, 3.6)], 2.4));
-    at(27.8, Tap(lab("rec")));
+    at(11.4, Touch(rows(0, &[(0.0, 0.0), (0.0, 0.5)]), 15.6));
+    say(11.8, 13.9, "grain · sample to cloud");
+    at(12.0, Knob("Grain", vec![(0.0, 0.0), (1.5, -118.0)]));
+    say(14.6, 16.5, "pitch · always in key");
+    at(14.8, Knob("Pitch", vec![(0.0, 0.0), (1.1, -48.0)]));
+    say(17.2, 19.1, "smear · space and trails");
+    at(17.4, Knob("Smear", vec![(0.0, 0.0), (1.2, -80.0)]));
+    // LOOK: slip quickly past crush and jpeg, settle on tint, then kaleido.
+    say(19.8, 22.4, "look · picture and sound together");
+    at(20.0, Knob("Look", vec![(0.0, 0.0), (0.25, -26.0), (0.42, -132.0), (1.3, -140.0), (1.9, -205.0)]));
+    // Deep: the emitter's own page, one tap away.
+    at(23.0, Tap(lab("emitter settings")));
+    say(23.4, 26.8, "deep · every sound ↔ picture link is a dial");
+    at(24.4, Drag(vec![lab("pitch → hue"), lab("pitch → hue").off(150.0, 0.0)], 1.4));
+    at(26.6, Tap(lab("Done")));
+    // Rec: what you play becomes a take, and plays back hands-free.
+    say(27.8, 31.2, "rec turns a phrase into a take");
+    at(28.0, Tap(lab("rec")));
+    at(28.6, Touch(rows(1, &[(0.0, 0.0), (0.06, 0.7), (0.0, 1.4)]), 2.2));
+    at(31.2, Tap(lab("rec")));
+    say(32.0, 35.0, "hands off · it plays back");
+    at(32.2, Tap(lab("play")));
 
     // ---- Sequence: tap, drag, hold; scenes and the chain.
-    let s = 29.4;
+    let s = 35.8;
     at(s, Tap(lab("Sequence")));
-    say(s + 0.4, s + 3.2, "one lane per clip");
-    at(s + 1.6, Tap(lab("play")));
-    say(s + 3.9, s + 7.4, "tap a step");
-    at(s + 4.0, Tap(lab("lane 6 step 9")));
-    at(s + 4.6, Tap(lab("lane 6 step 13")));
-    at(s + 5.2, Tap(lab("lane 7 step 7")));
-    at(s + 5.9, Tap(lab("lane 7 step 15")));
-    say(s + 8.1, s + 11.0, "drag up · pitch");
-    at(s + 8.2, Drag(vec![lab("lane 6 step 9"), lab("lane 6 step 9").off(0.0, -50.0)], 1.0));
-    at(s + 9.6, Drag(vec![lab("lane 7 step 15"), lab("lane 7 step 15").off(0.0, -34.0)], 0.8));
-    say(s + 11.7, s + 15.0, "hold a step · slice, length, chance");
-    at(s + 11.8, Hold(lab("lane 6 step 13"), 0.7));
-    at(s + 13.0, Tap(lab("slice 4")));
-    at(s + 13.7, Drag(vec![lab("length"), lab("length").off(0.0, -28.0)], 0.6));
-    at(s + 14.9, Key(egui::Key::Escape));
-    say(s + 15.7, s + 18.0, "queue a scene");
-    at(s + 15.6, Tap(lab("scene 3")));
-    say(s + 18.7, s + 21.6, "an empty scene extends the song");
-    at(s + 19.0, Tap(lab("scene 4")));
+    say(s + 0.4, s + 2.8, "one lane per clip");
+    say(s + 3.5, s + 7.0, "tap a step");
+    at(s + 3.6, Tap(lab("lane 6 step 9")));
+    at(s + 4.2, Tap(lab("lane 6 step 13")));
+    at(s + 4.8, Tap(lab("lane 7 step 7")));
+    at(s + 5.5, Tap(lab("lane 7 step 15")));
+    say(s + 7.7, s + 10.6, "drag up · pitch");
+    at(s + 7.8, Drag(vec![lab("lane 6 step 9"), lab("lane 6 step 9").off(0.0, -50.0)], 1.0));
+    at(s + 9.2, Drag(vec![lab("lane 7 step 15"), lab("lane 7 step 15").off(0.0, -34.0)], 0.8));
+    say(s + 11.3, s + 15.2, "hold a step · slice, length, chance");
+    at(s + 11.4, Hold(lab("lane 5 step 5"), 0.7));
+    at(s + 12.7, Tap(lab("slice 12")));
+    at(s + 13.6, Drag(vec![lab("chance"), lab("chance").off(0.0, 62.0)], 0.8));
+    at(s + 15.0, Key(egui::Key::Escape));
+    say(s + 15.9, s + 18.6, "queue a scene · it lands on the bar");
+    at(s + 16.0, Tap(lab("scene 3")));
+    say(s + 19.3, s + 22.2, "an empty scene extends the song");
+    at(s + 19.6, Tap(lab("scene 4")));
 
-    // ---- Perform: pads on the bar, fullscreen.
-    let p = s + 22.4;
+    // ---- Perform: layers on the bar, then the picture fills the screen.
+    let p = s + 23.0;
     at(p, Tap(lab("Perform")));
-    say(p + 0.6, p + 4.6, "pads launch on the bar");
-    at(p + 1.4, Tap(lab("pad 5")));
-    at(p + 3.6, Tap(lab("pad 9")));
-    say(p + 7.2, p + 10.2, "fullscreen, with a quiet hud");
-    at(p + 7.6, Tap(lab("Fullscreen")));
-    at(p + 14.4, Tap(Aim::Screen(0.5, 0.45)));
-    say(p + 14.8, p + 17.6, "launch from the hud");
-    at(p + 15.4, Tap(lab("mini pad 10")));
-    at(p + 18.0, Tap(lab("exit fullscreen")));
-
-    // ---- Deep: everything else, one drawer away.
-    let d = p + 19.2;
-    at(d, Tap(lab("Deep")));
-    say(d + 0.4, d + 4.6, "everything else lives in deep");
-    at(d + 4.8, Key(egui::Key::Escape));
-    Tour { cues, captions: cap, title_until: 3.4, end_card: d + 5.6, len: d + 10.8 }
+    say(p + 0.6, p + 5.6, "pads launch on the bar");
+    at(p + 1.2, Tap(lab("pad 5")));
+    at(p + 2.9, Tap(lab("pad 6")));
+    at(p + 4.6, Tap(lab("pad 7")));
+    say(p + 6.6, p + 9.6, "fullscreen · tap for the hud");
+    at(p + 6.8, Tap(lab("Fullscreen")));
+    at(p + 7.8, Tap(Aim::Screen(0.5, 0.42)));
+    at(p + 13.6, Tap(Aim::Screen(0.46, 0.4)));
+    say(p + 14.0, p + 16.8, "launch from the hud");
+    at(p + 14.6, Tap(lab("mini pad 11")));
+    Tour { cues, captions: cap, title_until: 2.0, end_card: p + 18.4, len: p + 23.2 }
 }
 
 // --------------------------------------------------------------- overlay
@@ -202,6 +209,8 @@ struct Finger {
     age: f64,
     /// Seconds since it lifted (None = still down).
     up: Option<f64>,
+    /// Turning a knob: drawn with a small "drag up" chevron.
+    knob: bool,
 }
 
 /// What the film paints over the UI this frame.
@@ -209,6 +218,8 @@ struct Finger {
 pub struct Overlay {
     fingers: Vec<(Finger, Vec<Pos2>)>,
     caption: Option<(&'static str, f32)>,
+    /// No caption band (fullscreen): captions float over the picture.
+    floating: bool,
     /// Title card / end card opacity.
     title: f32,
     end: f32,
@@ -237,11 +248,26 @@ impl Overlay {
             p.circle_filled(f.pos, rad, Color32::from_white_alpha((30.0 * a) as u8));
             p.circle_stroke(f.pos, rad, Stroke::new(1.5, Color32::from_white_alpha((150.0 * a) as u8)));
             p.circle_filled(f.pos, 3.5, Color32::from_white_alpha((120.0 * a * (1.0 - lift)) as u8));
+            if f.knob {
+                let c = f.pos - egui::vec2(0.0, rad + 12.0);
+                let st = Stroke::new(1.5, Color32::from_white_alpha((120.0 * a) as u8));
+                p.line_segment([c + egui::vec2(-6.0, 4.0), c], st);
+                p.line_segment([c, c + egui::vec2(6.0, 4.0)], st);
+            }
         }
         if let Some((text, a)) = self.caption {
             // In the caption band under the UI: quiet grey, no box.
-            let c = egui::pos2(screen.center().x, screen.bottom() - BAND / 2.0 + 4.0 * (1.0 - a));
-            p.text(c, Align2::CENTER_CENTER, text, font(16.0), INK2.gamma_multiply(a));
+            if self.floating {
+                let g = p.layout_no_wrap(text.into(), font(16.0), INK);
+                let size = g.size() + egui::vec2(36.0, 20.0);
+                let c = egui::pos2(screen.center().x, screen.bottom() - 34.0 - size.y / 2.0 + 4.0 * (1.0 - a));
+                let rr = egui::CornerRadius::same((size.y / 2.0) as u8);
+                p.rect_filled(Rect::from_center_size(c, size), rr, Color32::from_black_alpha((120.0 * a) as u8));
+                p.text(c, Align2::CENTER_CENTER, text, font(16.0), INK.gamma_multiply(0.8 * a));
+            } else {
+                let c = egui::pos2(screen.center().x, screen.bottom() - BAND / 2.0 + 4.0 * (1.0 - a));
+                p.text(c, Align2::CENTER_CENTER, text, font(16.0), INK2.gamma_multiply(a));
+            }
         }
         for (a, lines) in [(self.title, ["chromagrain", "a granular video sampler"]), (self.end, ["chromagrain", "play  ·  sequence  ·  perform"])] {
             if a <= 0.0 {
@@ -265,11 +291,14 @@ impl eframe::App for Film {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // The caption band claims the bottom before the studio lays out,
         // so captions never cover the interface.
-        egui::TopBottomPanel::bottom("film-band")
-            .exact_height(BAND)
-            .frame(egui::Frame::new().fill(G0))
-            .show_separator_line(false)
-            .show(ctx, |_| {});
+        // (Fullscreen output goes edge to edge: no band, captions float.)
+        if !self.app.fullscreen {
+            egui::TopBottomPanel::bottom("film-band")
+                .exact_height(BAND)
+                .frame(egui::Frame::new().fill(G0))
+                .show_separator_line(false)
+                .show(ctx, |_| {});
+        }
         eframe::App::update(&mut self.app, ctx, frame);
         self.overlay.paint(ctx);
     }
@@ -347,22 +376,46 @@ fn rect_of(h: &Harness<'static, Film>, label: &str) -> Rect {
     Rect::from_min_max((r.min.to_vec2() / ppp).to_pos2(), (r.max.to_vec2() / ppp).to_pos2())
 }
 
+/// The Play grid's rect and cell size (as `play.rs` lays it out).
+fn grid_geom(h: &Harness<'static, Film>) -> (Rect, f32, f32) {
+    let g = rect_of(h, "play grid");
+    (g, (g.width() - 4.0 * 7.0) / 8.0, (g.height() - 4.0 * 7.0) / 8.0)
+}
+
 fn resolve(h: &Harness<'static, Film>, aim: &Aim) -> Pos2 {
     match aim {
         Aim::Label(l) => rect_of(h, l).center(),
-        Aim::Grid(c, row) => {
-            let g = rect_of(h, "play grid");
-            let gap = 4.0;
-            let cw = (g.width() - gap * 7.0) / 8.0;
-            let ch = (g.height() - gap * 7.0) / 8.0;
-            egui::pos2(g.left() + c.floor() * (cw + gap) + c.fract() * cw, g.top() + row * (ch + gap))
-        }
         Aim::Screen(fx, fy) => {
             let s = h.ctx.screen_rect();
             egui::pos2(s.left() + s.width() * fx, s.top() + s.height() * fy)
         }
+        Aim::Emitter(i) => {
+            let (g, cw, ch) = grid_geom(h);
+            let e = &h.state().app.studio.emitters[*i];
+            let y = (g.top() + e.row * (ch + 4.0)).clamp(g.top() + 16.0, g.bottom() - 16.0);
+            egui::pos2(g.left() + e.col as f32 * (cw + 4.0) + cw / 2.0, y)
+        }
+        Aim::Off(a, dx, dy) if matches!(**a, Aim::Emitter(_)) => {
+            let (_, cw, ch) = grid_geom(h);
+            resolve(h, a) + egui::vec2(dx * (cw + 4.0), dy * (ch + 4.0))
+        }
         Aim::Off(a, dx, dy) => resolve(h, a) + egui::vec2(*dx, *dy),
     }
+}
+
+/// A knob gesture's drag offset at `dt` seconds: smooth between keys.
+fn knob_dy(keys: &[(f64, f32)], dt: f64) -> f32 {
+    let Some(last) = keys.last() else { return 0.0 };
+    if dt >= last.0 {
+        return last.1;
+    }
+    for w in keys.windows(2) {
+        if dt >= w[0].0 && dt < w[1].0 {
+            let k = smooth((dt - w[0].0) / (w[1].0 - w[0].0).max(1e-6)) as f32;
+            return w[0].1 + (w[1].1 - w[0].1) * k;
+        }
+    }
+    keys[0].1
 }
 
 /// Point along a polyline at eased progress `t` (0..1), by arc length.
@@ -386,6 +439,8 @@ fn along(pts: &[Pos2], t: f64) -> Pos2 {
 
 struct Live {
     cue: usize,
+    /// Knobs: the ring stays here while the pointer drags.
+    anchor: Option<Pos2>,
     pts: Vec<Pos2>,
     touch_id: u64,
     trail: Vec<Pos2>,
@@ -459,7 +514,8 @@ pub fn record(tour: &Tour, opts: &RecordOpts) -> Recording {
                         h.input_mut().events.push(egui::Event::PointerButton { pos: p0, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
                         0
                     };
-                    live.push(Live { cue: ci, pts, touch_id, trail: vec![p0], up_at: None, last: p0 });
+                    let anchor = matches!(g, Gesture::Knob(..)).then_some(p0);
+                    live.push(Live { cue: ci, anchor, pts, touch_id, trail: vec![p0], up_at: None, last: p0 });
                 }
             }
         }
@@ -468,7 +524,10 @@ pub fn record(tour: &Tour, opts: &RecordOpts) -> Recording {
             let cue = &tour.cues[l.cue];
             let dur = cue.g.secs().max(1e-3);
             let prog = (t - cue.t) / dur;
-            let pos = along(&l.pts, prog.min(1.0));
+            let pos = match &cue.g {
+                Gesture::Knob(_, keys) => l.pts[0] + egui::vec2(0.0, knob_dy(keys, t - cue.t)),
+                _ => along(&l.pts, prog.min(1.0)),
+            };
             if prog >= 1.0 {
                 l.up_at = Some(t);
                 if l.touch_id > 0 {
@@ -495,7 +554,10 @@ pub fn record(tour: &Tour, opts: &RecordOpts) -> Recording {
         // Overlay for this frame.
         let fingers = live
             .iter()
-            .map(|l| (Finger { pos: l.last, age: t - tour.cues[l.cue].t, up: l.up_at.map(|u| t - u) }, l.trail.clone()))
+            .map(|l| match l.anchor {
+                Some(a) => (Finger { pos: a, age: t - tour.cues[l.cue].t, up: l.up_at.map(|u| t - u), knob: true }, Vec::new()),
+                None => (Finger { pos: l.last, age: t - tour.cues[l.cue].t, up: l.up_at.map(|u| t - u), knob: false }, l.trail.clone()),
+            })
             .collect();
         let caption = tour.captions.iter().find(|c| t >= c.t0 - 0.35 && t < c.t1 + 0.35).map(|c| {
             let a = smooth((t - c.t0 + 0.35) / 0.35).min(smooth((c.t1 + 0.35 - t) / 0.35));
@@ -503,7 +565,8 @@ pub fn record(tour: &Tour, opts: &RecordOpts) -> Recording {
         });
         let title = 1.0 - smooth((t - (tour.title_until - 0.9)) / 0.9);
         let end = smooth((t - tour.end_card) / 1.0);
-        h.state_mut().overlay = Overlay { fingers, caption, title: title as f32, end: end as f32 };
+        let floating = h.state().app.fullscreen;
+        h.state_mut().overlay = Overlay { fingers, caption, floating, title: title as f32, end: end as f32 };
         h.input_mut().time = Some(t);
         h.step();
         // Background jobs (a Rec take bouncing) finish before time moves on,
@@ -568,8 +631,9 @@ const COMP: &str = "acompressor=threshold=-24dB:ratio=2:attack=30:release=300:kn
 
 /// Mux frames + audio: H.264 + AAC, loudness-normalised (two-pass
 /// loudnorm) with a soft fade at the end.
-fn mux(frames: &Path, wav: &Path, out: &Path, len: f64) -> Result<(), String> {
-    let fade = format!("afade=t=out:st={:.2}:d=3.0", (len - 3.2).max(0.0));
+fn mux(frames: &Path, wav: &Path, out: &Path, fade_from: f64, len: f64) -> Result<(), String> {
+    // Sound fades with the end card and is silent before the last frame.
+    let fade = format!("afade=t=out:st={:.2}:d={:.2}", fade_from, (len - fade_from - 0.4).max(0.5));
     let pass1 = std::process::Command::new("ffmpeg")
         .args(["-hide_banner", "-nostats", "-i"])
         .arg(wav)
@@ -602,7 +666,7 @@ fn mux(frames: &Path, wav: &Path, out: &Path, len: f64) -> Result<(), String> {
             "-preset",
             "slow",
             "-crf",
-            "15",
+            "19",
             "-pix_fmt",
             "yuv420p",
             "-c:a",
@@ -629,7 +693,7 @@ fn mux(frames: &Path, wav: &Path, out: &Path, len: f64) -> Result<(), String> {
 fn the_tour_is_well_formed() {
     let tour = tour();
     // One pointer at a time; touches may overlap.
-    let mut pointer: Vec<(f64, f64)> = tour.cues.iter().filter(|c| matches!(c.g, Gesture::Tap(_) | Gesture::Hold(..) | Gesture::Drag(..))).map(|c| (c.t, c.t + c.g.secs())).collect();
+    let mut pointer: Vec<(f64, f64)> = tour.cues.iter().filter(|c| matches!(c.g, Gesture::Tap(_) | Gesture::Hold(..) | Gesture::Drag(..) | Gesture::Knob(..))).map(|c| (c.t, c.t + c.g.secs())).collect();
     pointer.sort_by(|a, b| a.0.total_cmp(&b.0));
     for w in pointer.windows(2) {
         assert!(w[0].1 + 1.0 / FPS < w[1].0, "pointer gestures overlap at {:.2}s", w[1].0);
@@ -655,8 +719,8 @@ fn the_recorder_renders_frames_and_audio_in_lockstep() {
     assert_eq!(rec.px, (960, 600));
     let rms = |a: &[f32]| (a.iter().map(|x| x * x).sum::<f32>() / a.len().max(1) as f32).sqrt();
     let spf2 = rec.sample_rate as usize / FPS as usize * 2;
-    let before = rms(&rec.audio[..spf2 * 60]);
-    let after = rms(&rec.audio[spf2 * 100..]);
+    let before = rms(&rec.audio[..spf2 * 8]);
+    let after = rms(&rec.audio[spf2 * 30..]);
     assert!(after > 1e-3 && after > before * 4.0, "the first touch is heard ({before} → {after})");
 }
 
@@ -675,6 +739,6 @@ fn showcase_film() {
     eprintln!("showcase: {} frames ({}×{}) in {:.0}s", rec.frames, rec.px.0, rec.px.1, t0.elapsed().as_secs_f64());
     let wav = root.join(format!("work/261112_chromagrain_ux-showcase_{version}.wav"));
     write_wav(&wav, &rec.audio, rec.sample_rate);
-    mux(&frames, &wav, &out, tour.len).expect("mux");
+    mux(&frames, &wav, &out, tour.end_card + 0.2, tour.len).expect("mux");
     eprintln!("showcase: wrote {}", out.display());
 }

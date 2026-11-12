@@ -25,6 +25,8 @@ impl Studio {
         let stage_h = (side.width() * 9.0 / 16.0).min(side.height() * 0.5).floor();
         let stage = Rect::from_min_size(side.min, egui::vec2(side.width(), stage_h));
         self.stage(host, ui, stage, 14.0);
+        let brush = Rect::from_min_max(egui::pos2(side.left(), stage.bottom() + gap), side.max);
+        self.brush_panel(host, ui, brush);
         let e = &self.emitters[self.sel_emitter];
         let look = e.look_name();
         let tag_font = font(11.0);
@@ -32,8 +34,6 @@ impl Studio {
         let tag = Rect::from_min_size(egui::pos2(stage.right() - tw - 12.0, stage.top() + 12.0), egui::vec2(tw, 22.0));
         ui.painter().rect_filled(tag, r(6), Color32::from_black_alpha(130));
         ui.painter().text(tag.center(), Align2::CENTER_CENTER, look, tag_font, INK2);
-        let brush = Rect::from_min_max(egui::pos2(side.left(), stage.bottom() + gap), side.max);
-        self.brush_panel(host, ui, brush);
     }
 
     fn play_grid(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, grid: Rect) {
@@ -199,8 +199,39 @@ impl Studio {
         let pad = if small { 10.0 } else { 14.0 };
         let inner = rect.shrink(pad);
 
-        // Emitter tiles.
         let th = if small { 48.0 } else { 64.0 };
+        let fh = if small { 44.0 } else { 50.0 };
+        let foot = Rect::from_min_max(egui::pos2(inner.left(), inner.bottom() - fh), inner.max);
+        // Knobs first, so the tiles below show what they just set.
+        let ka = Rect::from_min_max(egui::pos2(inner.left(), inner.top() + th), egui::pos2(inner.right(), foot.top()));
+        let colw = ka.width() / 4.0;
+        let label_h = if small { 34.0 } else { 46.0 };
+        let rad = ((ka.height() - label_h - 16.0) / 2.0).min(colw * 0.3).clamp(22.0, 52.0);
+        let cy = ka.top() + (ka.height() - label_h) / 2.0 + 4.0;
+        let key = self.key;
+        let sel = self.sel_emitter;
+        for (k, (name, mi, default)) in KNOBS.iter().enumerate() {
+            let c = egui::pos2(ka.left() + colw * (k as f32 + 0.5), cy);
+            let mut v = self.emitters[sel].macros[*mi];
+            let detents = if *mi == 3 { chromagrain_core::instrument::LOOKS.len() } else { 0 };
+            let before = v;
+            knob(ui, c, rad, ui.id().with(("knob", k)), name, &mut v, *default, detents);
+            self.emitters[sel].macros[*mi] = v;
+            if v != before {
+                host.set_shared_macro(*mi, v);
+            }
+            let map = MacroMap::resolve(&self.emitters[sel].macros, Some(&key));
+            let value = match mi {
+                0 => format!("{:.0}", v * 100.0),
+                1 => format!("{:+.0} {}", map.pitch_st, super::note_name(key.root + map.pitch_st as i32)).replace("+0 ", "0 "),
+                2 => format!("{:.0}", v * 100.0),
+                _ => super::look_name(map.look).to_string(),
+            };
+            let ly = c.y + rad + if small { 14.0 } else { 22.0 };
+            caps(&p, egui::pos2(c.x, ly), Align2::CENTER_CENTER, name, 10.5);
+            p.text(egui::pos2(c.x, ly + if small { 15.0 } else { 20.0 }), Align2::CENTER_CENTER, value, mono(13.0), INK);
+        }
+        // Emitter tiles.
         let tg = 8.0;
         let tw = (inner.width() - tg * 3.0) / 4.0;
         for i in 0..EMITTERS {
@@ -224,6 +255,9 @@ impl Studio {
             } else if resp.clicked() && !h.held_before {
                 self.sel_emitter = i;
             }
+            // A soft bottom scrim keeps the label readable on bright footage.
+            let scrim = Rect::from_min_max(egui::pos2(tr.left(), tr.bottom() - 26.0), tr.max);
+            p.rect_filled(scrim, egui::CornerRadius { nw: 0, ne: 0, sw: 10, se: 10 }, Color32::from_black_alpha(90));
             if sel {
                 p.rect_stroke(tr, r(10), Stroke::new(2.0, HI), StrokeKind::Inside);
             } else {
@@ -241,8 +275,6 @@ impl Studio {
         }
 
         // Foot: Rec + more.
-        let fh = if small { 44.0 } else { 50.0 };
-        let foot = Rect::from_min_max(egui::pos2(inner.left(), inner.bottom() - fh), inner.max);
         let more = Rect::from_min_max(egui::pos2(foot.right() - fh, foot.top()), foot.max);
         let recr = Rect::from_min_max(foot.min, egui::pos2(more.left() - 8.0, foot.bottom()));
         let recording = self.rec.is_some();
@@ -286,35 +318,6 @@ impl Studio {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
 
-        // Knobs.
-        let ka = Rect::from_min_max(egui::pos2(inner.left(), inner.top() + th), egui::pos2(inner.right(), foot.top()));
-        let colw = ka.width() / 4.0;
-        let label_h = if small { 34.0 } else { 46.0 };
-        let rad = ((ka.height() - label_h - 16.0) / 2.0).min(colw * 0.3).clamp(22.0, 52.0);
-        let cy = ka.top() + (ka.height() - label_h) / 2.0 + 4.0;
-        let key = self.key;
-        let sel = self.sel_emitter;
-        for (k, (name, mi, default)) in KNOBS.iter().enumerate() {
-            let c = egui::pos2(ka.left() + colw * (k as f32 + 0.5), cy);
-            let mut v = self.emitters[sel].macros[*mi];
-            let detents = if *mi == 3 { chromagrain_core::instrument::LOOKS.len() } else { 0 };
-            let before = v;
-            knob(ui, c, rad, ui.id().with(("knob", k)), name, &mut v, *default, detents);
-            self.emitters[sel].macros[*mi] = v;
-            if v != before {
-                host.set_shared_macro(*mi, v);
-            }
-            let map = MacroMap::resolve(&self.emitters[sel].macros, Some(&key));
-            let value = match mi {
-                0 => format!("{:.0}", v * 100.0),
-                1 => format!("{:+.0} {}", map.pitch_st, super::note_name(key.root + map.pitch_st as i32)).replace("+0 ", "0 "),
-                2 => format!("{:.0}", v * 100.0),
-                _ => super::look_name(map.look).to_string(),
-            };
-            let ly = c.y + rad + if small { 14.0 } else { 22.0 };
-            caps(&p, egui::pos2(c.x, ly), Align2::CENTER_CENTER, name, 10.5);
-            p.text(egui::pos2(c.x, ly + if small { 15.0 } else { 20.0 }), Align2::CENTER_CENTER, value, mono(13.0), INK);
-        }
     }
 }
 

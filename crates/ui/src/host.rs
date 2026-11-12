@@ -49,9 +49,11 @@ impl Default for Caps {
 }
 
 /// One perform pad, as the UI draws it.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Pad {
     pub source: Option<usize>,
+    /// Display name (None = the source's name).
+    pub name: Option<String>,
     pub kind: PadKind,
     pub len_beats: f64,
     pub on: bool,

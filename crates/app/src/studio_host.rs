@@ -235,6 +235,8 @@ impl PerformHost for App {
                 };
                 Pad {
                     source,
+                    // A named pad track (not the default "pad N") names the pad.
+                    name: t.filter(|t| !t.name.starts_with("pad ") && !t.name.is_empty()).map(|t| t.name.clone()),
                     kind,
                     len_beats: len,
                     on: t.is_some_and(|t| !t.muted) && source.is_some(),

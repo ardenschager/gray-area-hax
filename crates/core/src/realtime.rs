@@ -11,6 +11,18 @@ use crate::grain::GrainEvent;
 use crate::render::{plan_project, ClipPlan};
 use crate::timeline::{DuckState, Project};
 
+/// Samples over which a live bus crossfades from its old effect chain to
+/// a new one (a LOOK change), so switching effects never clicks.
+const BUS_XFADE: usize = 2048;
+
+/// One live effect bus: its chain + state, and the chain it is fading out
+/// of (with the samples left in the fade).
+struct LiveBus {
+    chain: Vec<crate::fx::AvEffect>,
+    states: Vec<AudioFxState>,
+    old: Option<(Vec<crate::fx::AvEffect>, Vec<AudioFxState>, usize)>,
+}
+
 pub struct RealtimeAudio {
     project: Project,
     plan: Vec<ClipPlan>,
@@ -38,7 +50,7 @@ pub struct RealtimeAudio {
     /// clock: (bus, source, event). Bus 0 is dry; bus b > 0 runs through
     /// `live_buses[b - 1]` (e.g. one per emitter: its smear + look).
     live: Vec<(u8, usize, GrainEvent)>,
-    live_buses: Vec<(Vec<crate::fx::AvEffect>, Vec<AudioFxState>)>,
+    live_buses: Vec<LiveBus>,
     /// Monotonic sample clock that never pauses (times live events).
     live_pos: u64,
     scratch_clip: StereoBuffer,
@@ -185,10 +197,10 @@ impl RealtimeAudio {
         }
         let i = bus as usize - 1;
         while self.live_buses.len() <= i {
-            self.live_buses.push((Vec::new(), Vec::new()));
+            self.live_buses.push(LiveBus { chain: Vec::new(), states: Vec::new(), old: None });
         }
-        let same = self.live_buses[i].0.len() == chain.len()
-            && self.live_buses[i].0.iter().zip(&chain).all(|(a, b)| {
+        let same = self.live_buses[i].chain.len() == chain.len()
+            && self.live_buses[i].chain.iter().zip(&chain).all(|(a, b)| {
                 std::mem::discriminant(&a.kind) == std::mem::discriminant(&b.kind)
                     && match (a.kind, b.kind) {
                         // Time-structuring params live in the state.
@@ -199,10 +211,17 @@ impl RealtimeAudio {
                         _ => true,
                     }
             });
+        let bus = &mut self.live_buses[i];
         if !same {
-            self.live_buses[i].1 = fx::audio_chain_states(&chain, self.project.sample_rate);
+            // New shape: fresh state, and the old chain keeps running
+            // underneath for a short crossfade.
+            let states = fx::audio_chain_states(&chain, self.project.sample_rate);
+            let old_chain = std::mem::replace(&mut bus.chain, chain);
+            let old_states = std::mem::replace(&mut bus.states, states);
+            bus.old = Some((old_chain, old_states, BUS_XFADE));
+        } else {
+            bus.chain = chain;
         }
-        self.live_buses[i].0 = chain;
     }
 
     /// Fill one stereo block, advancing (and looping) the playhead.
@@ -384,7 +403,10 @@ impl RealtimeAudio {
         let t_live = self.live_pos as f64 / sr;
         let n_buses = self.live_buses.len() as u8;
         for bus in 0..=n_buses {
-            let has_fx = bus > 0 && !self.live_buses[bus as usize - 1].0.is_empty();
+            let has_fx = bus > 0 && {
+                let b = &self.live_buses[bus as usize - 1];
+                !b.chain.is_empty() || b.old.is_some()
+            };
             let any = self.live.iter().any(|(b, _, _)| *b == bus);
             if !any && !has_fx {
                 continue; // fx buses keep running so their tails ring out
@@ -403,8 +425,22 @@ impl RealtimeAudio {
                 render_grains_audio(audio, std::slice::from_ref(ev), &mut self.scratch_clip, t_live);
             }
             if has_fx {
-                let (chain, states) = &mut self.live_buses[bus as usize - 1];
-                fx::process_audio_chain(&mut self.scratch_clip.left, &mut self.scratch_clip.right, chain, states);
+                let b = &mut self.live_buses[bus as usize - 1];
+                let dry = b.old.as_ref().map(|_| (self.scratch_clip.left.clone(), self.scratch_clip.right.clone()));
+                fx::process_audio_chain(&mut self.scratch_clip.left, &mut self.scratch_clip.right, &b.chain, &mut b.states);
+                if let (Some((oc, os, left)), Some((mut ol, mut or))) = (b.old.as_mut(), dry) {
+                    fx::process_audio_chain(&mut ol, &mut or, oc, os);
+                    for i in 0..n {
+                        let k = left.saturating_sub(i) as f32 / BUS_XFADE as f32; // old's weight
+                        let g = 0.5 - 0.5 * (std::f32::consts::PI * k).cos();
+                        self.scratch_clip.left[i] = self.scratch_clip.left[i] * (1.0 - g) + ol[i] * g;
+                        self.scratch_clip.right[i] = self.scratch_clip.right[i] * (1.0 - g) + or[i] * g;
+                    }
+                    *left = left.saturating_sub(n);
+                    if *left == 0 {
+                        b.old = None;
+                    }
+                }
             }
             for i in 0..n {
                 left[at + i] += self.scratch_clip.left[i];
@@ -647,6 +683,35 @@ mod tests {
         };
         assert!(tail(0) < 1e-3, "dry bus: no echo ({})", tail(0));
         assert!(tail(1) > 0.05, "bus 1 echoes ({})", tail(1));
+    }
+
+    #[test]
+    fn changing_a_bus_effect_crossfades_instead_of_clicking() {
+        // A long tone through a delay bus; mid-tone the bus switches to a
+        // different effect shape (a LOOK change). The output must not jump.
+        let mut p = perf_project();
+        p.master_tape = crate::audio::TapeSettings::default();
+        let mut rt = RealtimeAudio::new(p, 0.0, None);
+        rt.transport = false;
+        let delay = AvEffect::new(EffectKind::Delay { time: 0.1, feedback: 0.5, mix: 0.6, shift_x: 0.0, shift_y: 0.0 });
+        rt.set_live_bus(1, vec![delay]);
+        let settings = crate::grain::GrainSettings { gain: 1.0, duration: 2.0, envelope: 0.1, ..Default::default() };
+        let ev = crate::grain::grain_from_note(&settings, 60, 120, 3.0, rt.live_now_secs(), 1);
+        rt.trigger_live_bus(1, 0, ev);
+        let (mut l, mut r) = (vec![0.0f32; 256], vec![0.0f32; 256]);
+        let mut out = Vec::new();
+        for k in 0..120 {
+            if k == 60 {
+                rt.set_live_bus(1, vec![AvEffect::new(EffectKind::Reverb { size: 0.8, damp: 0.4, mix: 0.5 })]);
+            }
+            rt.next_block(&mut l, &mut r);
+            out.extend_from_slice(&l);
+        }
+        let jump = |a: &[f32]| a.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
+        let before = jump(&out[256 * 30..256 * 60]);
+        let around = jump(&out[256 * 59..256 * 62]);
+        assert!(before > 1e-3, "the tone sounds ({before})");
+        assert!(around < before * 2.0, "no click at the switch: {around} vs {before}");
     }
 
     #[test]

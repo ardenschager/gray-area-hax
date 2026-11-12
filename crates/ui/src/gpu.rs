@@ -224,6 +224,14 @@ fn fs_grain(i: VOut) -> @location(0) vec4f {
         hsv.x = fract(hsv.x + u.b.x / 360.0 + 10.0);
         rgb = hsv2rgb(hsv);
     }
+    // Feather (d.x): soft cosine border taper, as the CPU compositor.
+    let f = clamp(u.d.x, 0.0, 1.0) * 0.45;
+    if (f > 0.0001) {
+        let q = min(i.uv, vec2f(1.0) - i.uv);
+        let e = clamp(q / f, vec2f(0.0), vec2f(1.0));
+        let w = vec2f(0.5) - 0.5 * cos(3.14159265 * e);
+        a *= w.x * w.y;
+    }
     return vec4f(rgb * a, a * (1.0 - u.b.w));
 }
 
@@ -996,6 +1004,7 @@ impl GpuPreview {
         draws: Vec<chromagrain_core::video::GrainDraw>,
         color_filter: Option<&chromagrain_core::video::ColorFilter>,
         additive: f32,
+        feather: f32,
     ) {
         let Some(gsrc) = self.sources.get(&sid) else { return };
         let (layers, dur) = (gsrc.layers, gsrc.duration.max(1e-6));
@@ -1016,6 +1025,7 @@ impl GpuPreview {
                 cf,
                 a: [d.rotation, aspect, layer.floor(), d.alpha],
                 b: [d.hue_shift, mode, valmin, additive],
+                d: [feather, 0.0, 0.0, 0.0],
                 ..Default::default()
             };
             self.draw(Pipe::Grain, None, None, Some(sid), u);
@@ -1094,7 +1104,7 @@ impl GpuPreview {
                             aspect,
                             scene.parked,
                         );
-                        self.record_grains(*sid, draws, clip.color_filter.as_ref(), style.additive);
+                        self.record_grains(*sid, draws, clip.color_filter.as_ref(), style.additive, style.feather);
                     }
                 }
                 let final_tex = self.apply_chain(
@@ -1144,7 +1154,7 @@ impl GpuPreview {
                     aspect,
                 );
                 if !draws.is_empty() {
-                    self.record_grains(*sid, draws, None, add_in);
+                    self.record_grains(*sid, draws, None, add_in, style.feather);
                 }
             }
             let out = self.apply_chain(effects, 0xB000_0000_0000_0000 | bus as u64, CLIP, fps);
@@ -1600,9 +1610,13 @@ mod tests {
         let beat = t * 2.0; // 120 bpm
         let mut frame = 0;
         let mut report = Vec::new();
-        for name in ["none", "crush", "tint", "tune", "tile", "kaleido", "compress", "delay", "reverb"] {
+        for name in ["none", "feather", "crush", "tint", "tune", "tile", "kaleido", "compress", "delay", "reverb"] {
             let fx = EffectKind::parse(name).map(AvEffect::new);
-            let p = project(fx);
+            let mut p = project(fx);
+            if name == "feather" {
+                // Soft-edged cloud grains taper the same on both renderers.
+                p.tracks[1].clips[0].visual.feather = 0.6;
+            }
             frame += 1;
             let gpu = gpu_frame(&mut g, &p, t, frame);
             let cpu = render_project(&p, beat, beat + 0.01).frames.remove(0);

@@ -8,7 +8,7 @@ use crate::widgets::*;
 use super::Studio;
 use crate::host::Host;
 use chromagrain_core::music::{Key, ScaleKind};
-use egui::{self, Align2, Color32, Rect, Sense, StrokeKind};
+use egui::{self, Align2, Color32, Rect, Sense};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeepTarget {
@@ -116,7 +116,8 @@ impl Studio {
         if !avail.contains(&DeepTab::Links) {
             avail.insert(0, DeepTab::Links);
         }
-        let labels: Vec<&str> = avail.iter().map(|t| t.label()).collect();
+        // The global page's first tab holds song settings, not links.
+        let labels: Vec<&str> = avail.iter().map(|t| if *t == DeepTab::Links && target == DeepTarget::Global { "Song" } else { t.label() }).collect();
         let cur = avail.iter().position(|t| *t == tab).unwrap_or(0);
         let tab = avail[cur];
         if let Some(i) = segmented(ui, tabs, ui.id().with("deep-tabs"), &labels, &[], cur, font(12.5), false) {
@@ -270,13 +271,6 @@ impl Studio {
                     self.key = nk;
                     self.key_changed(host);
                 }
-                if !host.caps().deep_tabs.contains(&DeepTab::Automation) {
-                    return;
-                }
-                section(ui, "Classic editor");
-                let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 44.0), Sense::hover());
-                ui.painter().rect_stroke(rect, r(10), hair(LINE), StrokeKind::Inside);
-                ui.painter().text(rect.left_center() + egui::vec2(14.0, 0.0), Align2::LEFT_CENTER, "the full timeline editor is one launch away:  chromagrain --classic", font(12.0), INK3);
             }
         }
     }
