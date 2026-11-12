@@ -1532,4 +1532,58 @@ mod tests {
         assert!(b[0] <= 12.0 / 32.0 && b[0] + b[2] >= 20.0 / 32.0);
         assert!(b[1] <= 8.0 / 32.0 && b[1] + b[3] >= 24.0 / 32.0);
     }
+
+    #[test]
+    fn picture_follows_the_envelope_and_tiles_fill_their_rects() {
+        let adsr = crate::envelope::Adsr { attack: 0.0, decay: 0.0, sustain: 1.0, release: 0.2, ..Default::default() };
+        let env = crate::envelope::VoiceEnv { adsr, on: 0.0, off: 0.5 };
+        let ev = |voice: u64, tile: Option<u8>| crate::grain::GrainEvent {
+            onset: 0.0,
+            source_pos: 0.5,
+            duration: 2.0,
+            pitch_ratio: 1.0,
+            gain: 1.0,
+            envelope: 0.01,
+            id: voice,
+            tag: crate::grain::VoiceTag { voice, env: Some(env), tile },
+            ..Default::default()
+        };
+        let (style, link, tr) = (VisualGrainStyle::default(), AvLink::default(), crate::timeline::ClipTransform::default());
+        let aspect = 16.0 / 9.0;
+        // Stack: alpha *= picture weight (Cut: full, then a hard cut).
+        let stack = |t: f64| grain_draws_layout(&[ev(1, None)], &style, &link, &tr, 4.0, t, aspect, false, None);
+        let held = stack(0.3);
+        assert!(!held.is_empty() && held.iter().all(|d| d.alpha > 0.0 && !d.tiled));
+        assert!(stack(0.5 + 0.195).iter().all(|d| d.alpha == 0.0), "level < 0.05: cut");
+        // Mid-release (level 0.5): Cut keeps full weight, Fade halves it.
+        let a_cut = stack(0.6).iter().map(|d| d.alpha).fold(0.0f32, f32::max);
+        let mut faded = ev(1, None);
+        faded.tag.env.as_mut().unwrap().adsr.picture = crate::envelope::PictureCut::Fade;
+        let a_fade = grain_draws_layout(&[faded], &style, &link, &tr, 4.0, 0.6, aspect, false, None).iter().map(|d| d.alpha).fold(0.0f32, f32::max);
+        assert!(a_cut > 0.0 && (a_fade / a_cut - 0.5).abs() < 0.01, "cut {a_cut} vs fade {a_fade}");
+
+        // Tiles: dest = tile_rect, full alpha, no rotation; nothing after
+        // the release.
+        let evs = [ev(1, Some(0)), ev(2, Some(1))];
+        let draws = grain_draws_layout(&evs, &style, &link, &tr, 4.0, 0.3, aspect, false, Some((2, 1)));
+        assert_eq!(draws.len(), 2);
+        for (k, d) in draws.iter().enumerate() {
+            let r = crate::tile::tile_rect(k, 2, 1, aspect);
+            assert!(d.tiled);
+            assert_eq!(d.dest, [r.x, r.y, r.w, r.h]);
+            assert_eq!(d.alpha, 1.0);
+            assert_eq!(d.rotation, 0.0);
+            // Centered cover crop: a half-width tile shows the middle of the source.
+            assert!((d.patch[0] + d.patch[2] * 0.5 - 0.5).abs() < 1e-6 && (d.patch[1] + d.patch[3] * 0.5 - 0.5).abs() < 1e-6);
+        }
+        let gone = grain_draws_layout(&evs, &style, &link, &tr, 4.0, 0.8, aspect, false, Some((2, 1)));
+        assert!(gone.iter().all(|d| d.alpha == 0.0));
+
+        // And the composited frame: left tile lit, right tile lit, gap dark.
+        let clip = VideoClip::test_pattern(64, 36, 12.0, 4.0);
+        let mut out = Frame::black(64, 36);
+        composite_grains_frame_layout(&clip, &evs, &style, &link, &tr, None, &mut out, 0.3, false, None, Some((2, 1)));
+        let col = |x: u32| (0..36u32).map(|y| out.data[((y * 64 + x) * 4) as usize] as u32 + out.data[((y * 64 + x) * 4 + 1) as usize] as u32).sum::<u32>();
+        assert!(col(10) > 0 && col(54) > 0);
+    }
 }

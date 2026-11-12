@@ -783,4 +783,47 @@ mod tests {
         assert!(!clip.is_stereo());
         assert_eq!(clip.samples.len(), 1000);
     }
+
+    #[test]
+    fn grain_envelope_is_sample_exact_across_blocks_and_releases_to_zero() {
+        let sr = 48000u32;
+        let clip = AudioClip::sine(220.0, 2.0, sr);
+        let adsr = crate::envelope::Adsr { attack: 0.05, decay: 0.1, sustain: 0.5, release: 0.1, ..Default::default() };
+        let env = crate::envelope::VoiceEnv { adsr, on: 0.1, off: 0.6 };
+        let ev = GrainEvent {
+            onset: 0.1,
+            source_pos: 0.2,
+            duration: 1.0,
+            pitch_ratio: 1.0,
+            gain: 1.0,
+            envelope: 0.01,
+            id: 1,
+            tag: crate::grain::VoiceTag { voice: 5, env: Some(env), tile: None },
+            ..Default::default()
+        };
+        let mut whole = StereoBuffer::new(1.2, sr);
+        render_grains_audio(&clip, std::slice::from_ref(&ev), &mut whole, 0.0);
+        let n = whole.left.len();
+        let mut blocks = vec![0.0f32; n];
+        let mut pos = 0;
+        while pos < n {
+            let b = 64.min(n - pos);
+            let mut buf = StereoBuffer { left: vec![0.0; b], right: vec![0.0; b], sample_rate: sr };
+            render_grains_audio(&clip, std::slice::from_ref(&ev), &mut buf, pos as f64 / sr as f64);
+            blocks[pos..pos + b].copy_from_slice(&buf.left);
+            pos += b;
+        }
+        let diff = whole.left.iter().zip(&blocks).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(diff < 1e-6, "one pass == 64-sample blocks: {diff}");
+        let peak = |a: f64, b: f64| whole.left[(a * sr as f64) as usize..(b * sr as f64) as usize].iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        let (attack, sustain) = (peak(0.1, 0.12), peak(0.4, 0.6));
+        assert!(attack < sustain, "attack ramps: {attack} < {sustain}");
+        assert!(peak(0.55, 0.6) > 0.1, "sustain holds");
+        assert!(peak(0.701, 1.2) < 1e-9, "silent after off + release");
+        // A grain starting after the voice ended is skipped.
+        let late = GrainEvent { onset: 0.8, ..ev };
+        let mut buf = StereoBuffer::new(1.2, sr);
+        render_grains_audio(&clip, std::slice::from_ref(&late), &mut buf, 0.0);
+        assert_eq!(buf.rms(), 0.0);
+    }
 }
