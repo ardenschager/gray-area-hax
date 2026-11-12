@@ -98,11 +98,13 @@ s.track_fx(t_shimmer, sh_dl, "feedback", 0.44);
 s.track_fx(t_shimmer, sh_dl, "mix", 0.34);
 s.track_fx(t_shimmer, sh_dl, "shift_x", 0.03);
 
-s.master_tape(0.08, 0.12, 0.03, 0.04);
+s.master_tape(0.04, 0.12, 0.03, 0.04);
+s.master_gain(1.0);
+s.master_av_bloom(0.24);
 
 let m_rv = s.master_effect("reverb");
 s.master_fx(m_rv, "size", 0.68);
 s.master_fx(m_rv, "damp", 0.36);
 s.master_fx(m_rv, "mix", 0.16);
 
-s.render(0.0, 32.0, "outputs/261111_burial-demo/holdout/v004/261111_chromagrain_holdout-ambient_v004.mp4");
+s.render(0.0, 32.0, "outputs/261111_burial-demo/holdout/v006/261111_chromagrain_holdout-ambient_v006.mp4");

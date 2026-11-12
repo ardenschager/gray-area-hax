@@ -91,3 +91,30 @@ Tracks general engine (`crates/core`) improvements motivated by multi-model crit
   - Verified by `peaking_eq_cuts_and_boosts_target_band`, `step_every_fires_only_on_matching_passes`, and `realtime_stream_matches_offline_render`.
   - `burial` `Sub(<90 Hz)` vs `Box(220–500 Hz)`: `v003` `-22.9 vs -22.9 dB` (`0.0 dB` separation) -> **`v004` `-21.6 vs -29.6 dB` (`+8.0 dB` clean sub authority)**.
   - AV correspondence: `burial` `onset <-> |dY|` **`+0.078 -> +0.261`** (`3.3x`), `onset <-> motion` **`+0.157 -> +0.246`**; `holdout` `onset <-> motion` **`+0.294 -> +0.415`**, `onset <-> |dY|` **`+0.077 -> +0.284`**, `rms <-> luma` **`+0.871`**.
+
+
+---
+
+## v005 / v006 — Symmetric Scatter `paulstretch` Tuning Fix, Rim-Lit Cutout Silhouettes, `master_gain` & Slew-Limited `master_av_bloom` (`commit 41204de`)
+**Test suite**: `191` tests passing (`165` `chromagrain-core` unit + `4` integration + `22` `chromagrain` app/wgpu parity tests, `0` failures).
+
+### 1. Symmetric `O(N)` Difference-Array Scatter in `paulstretch` (`stretch.rs`)
+- **Motivating critique**: `@critic-opus` (`#28` Item 1: `641.6 Hz = E5 -48c` in Breakdown `36–50 s`) & `@critic` (`#29` Item 1: pinpointed variable-width gather box `blur_power_pass` in `stretch.rs:115-128` asymmetrically pulling `Eb5 = 622.25 Hz` upward by `+51 cents` where `dk(k)` grows).
+- **System change**: Replaced variable-width gather averaging with symmetric difference-array scattering (`scatter_power_pass`), distributing each bin `j`'s power `src[j]` symmetrically across `[j - dj, j + dj]` with `dj = 0` below `950 Hz` and ramping across `950..1550 Hz`.
+- **Before -> After evidence**:
+  - Locked by unit test `stretch_preserves_eb5_harmonic_tuning_within_3_cents` (`< 3 cents` error on `622.254 Hz` `6x` stretch) alongside `stretch_smears_upper_whistle_while_preserving_hf_air`.
+  - Breakdown (`36–50 s`) 65k Welch scan: `v004` `641.6 Hz (E5 -48c)` -> **`v006` `G5 (-1c), G4 (+3c), F4 (+4c), Eb4 (-3c), Eb5 (621.1 Hz -3c)`**.
+
+### 2. Alpha-Contour Rim Highlight & Exposure Floor in `VisualGrainStyle::shadow` (`video.rs`)
+- **Motivating critique**: `@critic-opus` (`#28` Item 2 & Top System #3) & `@critic` (`#29` Item 2): uniform shadow darkening made cutouts disappear into dark Breakdown beds.
+- **System change**: `VisualGrainStyle::shadow` now computes a 2-px alpha-edge contour gradient (`ta - min_neighbor_alpha`) + warm rim boost and midtone exposure floor while preserving cutout alpha.
+- **Before -> After evidence**: Breakdown human portraits (`0:37–0:48` in `burial v006`) read with clear, luminous figure-ground separation against glowing nocturnal water.
+
+### 3. `Project::master_gain_db` (`s.master_gain`) + Slew-Limited `Project::master_bloom` (`s.master_av_bloom`) & Reproducible AV-Sync Metrics (`timeline.rs`, `render.rs`, `realtime.rs`, `script.rs`)
+- **Motivating critique**: `@critic-opus` (`#28` Item 3 & AV-sync metric note) & `@critic` (`#29` Item 3).
+- **System change**:
+  - `master_gain_db`: post-tape, pre-`MasterConditioner` dB trim with exact offline/realtime streaming parity (`burial`: `-17.3 -> -14.6 LUFS / -0.8 dBTP`; `holdout`: `-15.3 -> -14.3 LUFS / -1.3 dBTP`).
+  - `master_bloom` + 4-frame `track_duck_shaped` release smoothing: couples positive frame log-RMS onset steps (`(log_rms[t] - log_rms[t-1]).max(0)`) into whole-frame luminance lift with downward slew capped at `<= 1.40 * amount` luma/frame, locked by regression test `master_av_bloom_correlates_audio_onsets_with_frame_changes` (`corr > 0.38`, `0` 1-frame reversals).
+  - **Documented AV-Sync Metrics in `eval_render.py`**:
+    1. *3-frame (~125 ms) positive RMS-onset envelope vs whole-frame `|I_t - I_{t-1}|` (`motion`) and `|dY_t|`*: `burial v006` `r = +0.251` (`motion`), `+0.323` (`|dY|`); `holdout v006` `r = +0.449` (`motion`), `+0.367` (`|dY|`), `rms <-> luma r = +0.871`.
+    2. *Unfiltered 1-frame band log-flux `max(0, diff(log(band_rms)))` vs whole-frame `|I_t - I_{t-1}|` (`@critic-opus` `scratch/avsync.py`, lags `-3..+3`)*: `burial v006` `low<120 = +0.098`, `mid300-3k = +0.118 (@+3)`, `high>5k = +0.107 (@+1)` (moved positive from near-zero/negative while avoiding whole-screen camera-flash strobing over continuous motion footage).

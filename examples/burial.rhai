@@ -67,18 +67,25 @@ s.set_base_hz(vstreet_cut, 466.164);
 //           so Acts II, III & IV fully own the frame without a static lamp!)
 // ============================================================================
 let t_vinyl = s.track("vinyl_rain_audio");
-s.track_opacity_link(t_vinyl, 1.0);
+s.track_opacity_link(t_vinyl, 0.0);
 s.track_eq(t_vinyl, 320.0, 1.2, -3.5); // keep 220-500 Hz crystal clean
 s.track_level_point(t_vinyl, 0.0, 0.0);
 s.track_level_point(t_vinyl, 30.0, 0.0);
-s.track_level_point(t_vinyl, 33.0, 0.68); // continuous vinyl/rain audio while rain video leaves
-s.track_level_point(t_vinyl, 143.0, 0.68);
+s.track_level_point(t_vinyl, 33.0, 0.68); // continuous vinyl/rain audio in Drop I
+s.track_level_point(t_vinyl, 79.0, 0.68);
+s.track_level_point(t_vinyl, 81.5, 1.32); // Breakdown: rain & vinyl dust step forward into bare air!
+s.track_level_point(t_vinyl, 109.5, 1.28);
+s.track_level_point(t_vinyl, 112.0, 0.66); // recedes again when Drop II kicks in
+s.track_level_point(t_vinyl, 143.0, 0.66);
 s.track_level_point(t_vinyl, 146.5, 0.0);
 
 let vin_aud = s.snippet(t_vinyl, rain_src, 30.0, 117.0);
-s.set(vin_aud, "gain", 0.24);
+s.set(vin_aud, "gain", 0.32);
 s.set(vin_aud, "speed", 0.75);
-// Off-canvas audio-only bed during Acts II-IV so the orange rain lamp completely leaves!
+// Unlink 3D spatial distance/elevation audio attenuation before moving video off-canvas
+// so full-spectrum 2-10 kHz rain & vinyl crackle breathe clearly in Acts II-IV!
+s.set(vin_aud, "scale_to_gain", 0.0);
+s.set(vin_aud, "y_to_brightness", 0.0);
 s.transform(vin_aud, 0.0, 4.0, 0.02, 0.0);
 
 let t_rain = s.track("rain_window_bookends");
@@ -114,9 +121,9 @@ s.track_fx(t_rain, rain_tint, "audio", 0.0);
 // TRACK 1: Nocturnal Water Reflections & Paulstretched Fm9 Chords (A=440 locked)
 // ============================================================================
 let t_pad = s.track("paulstretch_pad");
-s.track_blend(t_pad, 0.58);
-s.track_opacity_link(t_pad, 0.50);
-s.track_tape(t_pad, 0.18, 0.18, 0.08, 0.0);
+s.track_blend(t_pad, 0.65);
+s.track_opacity_link(t_pad, 0.40);
+s.track_tape(t_pad, 0.03, 0.16, 0.06, 0.0); // minimal wow so chord harmonics stay locked within ±3 cents!
 s.track_eq(t_pad, 330.0, 1.15, -4.2); // carve 240-450 Hz boxiness cleanly!
 
 s.track_level_point(t_pad, 0.0, 0.0);
@@ -124,8 +131,8 @@ s.track_level_point(t_pad, 9.0, 0.74);
 s.track_level_point(t_pad, 29.5, 0.74);
 s.track_level_point(t_pad, 31.3, 0.22); // pre-drop breath
 s.track_level_point(t_pad, 32.5, 0.58);
-s.track_level_point(t_pad, 80.0, 0.86); // Act III Breakdown: nocturnal water fills frame!
-s.track_level_point(t_pad, 109.5, 0.82);
+s.track_level_point(t_pad, 80.0, 0.96); // Act III Breakdown: luminous nocturnal water fills frame!
+s.track_level_point(t_pad, 109.5, 0.92);
 s.track_level_point(t_pad, 111.3, 0.20); // pre-drop II breath
 s.track_level_point(t_pad, 112.5, 0.58);
 s.track_level_point(t_pad, 144.0, 0.54);
@@ -134,7 +141,7 @@ s.track_level_point(t_pad, 160.0, 0.0);
 let pad_intro = s.clip(t_pad, chord_wash, 1.0, 79.0);
 s.key(pad_intro, "F", "minor");
 s.set(pad_intro, "quantize_amount", 1.0); // 100% in-tune F minor!
-s.set(pad_intro, "detune_cents", -3.0);
+s.set(pad_intro, "detune_cents", -2.0);
 s.set(pad_intro, "density", 7.5);
 s.set(pad_intro, "duration", 0.72);
 s.set(pad_intro, "spray", 2.0);
@@ -150,21 +157,22 @@ s.audio_filter(pad_intro, "highpass", 220.0, 0.70);
 let pad_brk = s.clip(t_pad, chord_wash, 80.0, 31.5);
 s.key(pad_brk, "F", "minor");
 s.set(pad_brk, "quantize_amount", 1.0);
-s.set(pad_brk, "detune_cents", 3.0);
-s.set(pad_brk, "density", 9.0);
-s.set(pad_brk, "duration", 0.82);
+s.set(pad_brk, "detune_cents", 2.0);
+s.set(pad_brk, "density", 10.5);
+s.set(pad_brk, "duration", 0.85);
 s.set(pad_brk, "position", 0.25);
 s.set(pad_brk, "spray", 2.4);
 s.set(pad_brk, "scan_speed", 0.34);
 s.set(pad_brk, "gain", 0.32);
+s.set(pad_brk, "gain_to_opacity", 0.0); // full luminous nocturnal water reflection exposure!
 s.set(pad_brk, "voices", 2.0);
 s.set(pad_brk, "voice_interval", -12.0);
-s.set(pad_brk, "voice_detune", 0.04);
-s.set(pad_brk, "additive", 0.62);
-s.set(pad_brk, "feather", 0.45);
+s.set(pad_brk, "voice_detune", 0.02);
+s.set(pad_brk, "additive", 0.72);
+s.set(pad_brk, "feather", 0.42);
 s.set(pad_brk, "flicker", 0.14);
-s.set(pad_brk, "size_scale", 2.05);
-s.audio_filter(pad_brk, "lowpass", 4200.0, 0.70);
+s.set(pad_brk, "size_scale", 2.35);
+s.audio_filter(pad_brk, "lowpass", 4800.0, 0.70);
 s.audio_filter(pad_brk, "highpass", 195.0, 0.70);
 
 let pad_re = s.clip(t_pad, chord_wash, 112.0, 46.0);
@@ -587,9 +595,9 @@ s.track_fx(t_vghost, vg_verb, "mix", 0.50);
 //          - Grounded shadow-crushed human cutouts (`shadow = 0.52`, `y = +0.22`)
 // ============================================================================
 let t_voc = s.track("vocal_resampled_fragments");
-s.track_blend(t_voc, 0.36);
-s.track_rms_opacity(t_voc, 0.78);
-s.track_tape(t_voc, 0.12, 0.26, 0.14, 0.0); // authentic warm vinyl-dubplate resampled character!
+s.track_blend(t_voc, 0.38);
+s.track_rms_opacity(t_voc, 0.25); // gentle audio link so luminous Breakdown portraits stay clearly visible!
+s.track_tape(t_voc, 0.08, 0.22, 0.06, 0.0); // age=0.06 preserves natural >5 kHz vocal breath air!
 s.track_eq(t_voc, 340.0, 1.35, -3.5);       // zero 340 Hz boxiness!
 
 let voc_tint = s.track_effect(t_voc, "tint");
@@ -682,52 +690,103 @@ s.transform(c_voc_d1, 0.0, 0.22, 1.0, 0.0); // ground silhouettes at bottom of c
 s.audio_filter(c_voc_d1, "highpass", 240.0, 0.70);
 s.audio_filter(c_voc_d1, "lowpass", 3900.0, 0.72);
 
-// --- ACT III (BREAKDOWN, 80..110): Concise resampled dubplate fragments (<1.1s, pitched
-//     -2/-4/+3 st, never raw 0 st!), letting dub echo & reverb bloom across bare water ---
-let vb_1 = s.snippet(t_voc, vbench_cut, 82.5, 2.2); // ~0.99s resampled fragment at -2 st!
+// --- ACT III (BREAKDOWN, 80..110): Luminous rim-lit human portraits & airy dubplate echoes ---
+// Here the cut-out human figures step clearly into the light (gentle shadow=0.18 rim-light,
+// gain_to_opacity=0.0, additive=0.72, LP opened to 6.8 kHz so breath & rain air shine!)
+let vb_1 = s.snippet(t_voc, vbench_cut, 82.0, 2.5);
 s.key(vb_1, "F", "minor");
 s.set(vb_1, "quantize_amount", 1.0);
 s.set(vb_1, "position", b_ooh);
 s.set(vb_1, "pitch", -2.0);
 s.set(vb_1, "varispeed", 1.0);
-s.set(vb_1, "gain", 0.60);
-s.set(vb_1, "envelope", 0.34);
-s.set(vb_1, "feather", 0.30);
-s.set(vb_1, "shadow", 0.50);
-s.audio_filter(vb_1, "highpass", 240.0, 0.70);
-s.audio_filter(vb_1, "lowpass", 3800.0, 0.72);
-s.transform(vb_1, -0.14, 0.24, 1.16, 0.0);
+s.set(vb_1, "gain", 0.62);
+s.set(vb_1, "gain_to_opacity", 0.0);
+s.set(vb_1, "envelope", 0.30);
+s.set(vb_1, "feather", 0.22);
+s.set(vb_1, "shadow", 0.18);
+s.set(vb_1, "additive", 0.72);
+s.audio_filter(vb_1, "highpass", 220.0, 0.70);
+s.audio_filter(vb_1, "lowpass", 6800.0, 0.70);
+s.transform(vb_1, -0.10, 0.12, 1.28, 0.0);
 
-let vb_2 = s.snippet(t_voc, vstreet_cut, 91.0, 2.1); // ~0.94s falsetto answer at -4 st!
+let vb_2 = s.snippet(t_voc, vstreet_cut, 90.5, 2.4);
 s.key(vb_2, "F", "minor");
 s.set(vb_2, "quantize_amount", 1.0);
 s.set(vb_2, "position", m_hoo);
 s.set(vb_2, "pitch", -4.0);
 s.set(vb_2, "varispeed", 1.0);
-s.set(vb_2, "gain", 0.56);
-s.set(vb_2, "envelope", 0.36);
-s.set(vb_2, "feather", 0.30);
-s.set(vb_2, "shadow", 0.50);
-s.audio_filter(vb_2, "highpass", 230.0, 0.70);
-s.audio_filter(vb_2, "lowpass", 3700.0, 0.72);
-s.transform(vb_2, 0.16, 0.22, 1.18, 0.0);
+s.set(vb_2, "gain", 0.58);
+s.set(vb_2, "gain_to_opacity", 0.0);
+s.set(vb_2, "envelope", 0.32);
+s.set(vb_2, "feather", 0.22);
+s.set(vb_2, "shadow", 0.18);
+s.set(vb_2, "additive", 0.72);
+s.audio_filter(vb_2, "highpass", 210.0, 0.70);
+s.audio_filter(vb_2, "lowpass", 6800.0, 0.70);
+s.transform(vb_2, 0.12, 0.10, 1.30, 0.0);
 
-let vb_3 = s.snippet(t_voc, vbench_cut, 99.5, 2.8); // ~1.25s granular sigh dissolving at -5 st!
+let vb_3 = s.snippet(t_voc, vbench_cut, 99.0, 3.0);
 s.key(vb_3, "F", "minor");
 s.set(vb_3, "quantize_amount", 1.0);
 s.set(vb_3, "position", b_sigh);
 s.set(vb_3, "pitch", -5.0);
 s.set(vb_3, "speed", 0.82);
-s.set(vb_3, "texture", 0.28);
+s.set(vb_3, "texture", 0.24);
 s.set(vb_3, "density", 13.0);
-s.set(vb_3, "duration", 0.28);
-s.set(vb_3, "gain", 0.54);
-s.set(vb_3, "feather", 0.34);
-s.set(vb_3, "shadow", 0.52);
+s.set(vb_3, "duration", 0.30);
+s.set(vb_3, "gain", 0.56);
+s.set(vb_3, "gain_to_opacity", 0.0);
+s.set(vb_3, "feather", 0.26);
+s.set(vb_3, "shadow", 0.20);
+s.set(vb_3, "additive", 0.68);
 s.set(vb_3, "flicker", 0.18);
-s.audio_filter(vb_3, "highpass", 240.0, 0.70);
-s.audio_filter(vb_3, "lowpass", 3600.0, 0.72);
-s.transform(vb_3, 0.0, 0.24, 1.20, 0.0);
+s.audio_filter(vb_3, "highpass", 220.0, 0.70);
+s.audio_filter(vb_3, "lowpass", 6500.0, 0.70);
+s.transform(vb_3, 0.0, 0.12, 1.32, 0.0);
+
+// Also place luminous rim-lit human portraits on their own top visual layer across the
+// Breakdown (82..109 beats = 37..49s) so the human face/figure is the clearest, brightest
+// focal point of Act III!
+let t_portrait = s.track("breakdown_portraits");
+s.track_blend(t_portrait, 0.62);
+s.track_opacity_link(t_portrait, 0.0);
+let pt_tint = s.track_effect(t_portrait, "tint");
+s.track_fx(t_portrait, pt_tint, "hue", 34.0);
+s.track_fx(t_portrait, pt_tint, "amount", 0.28);
+s.track_fx(t_portrait, pt_tint, "audio", 0.0);
+
+let vb_vis1 = s.snippet(t_portrait, vbench_cut, 82.0, 7.2);
+s.set(vb_vis1, "position", b_ooh);
+s.set(vb_vis1, "speed", 0.48);
+s.set(vb_vis1, "gain", 0.0);
+s.set(vb_vis1, "gain_to_opacity", 0.0);
+s.set(vb_vis1, "envelope", 0.42);
+s.set(vb_vis1, "feather", 0.18);
+s.set(vb_vis1, "shadow", 0.12);
+s.set(vb_vis1, "additive", 0.62);
+s.transform(vb_vis1, -0.06, 0.08, 1.34, 0.0);
+
+let vb_vis2 = s.snippet(t_portrait, vstreet_cut, 90.2, 7.6);
+s.set(vb_vis2, "position", m_hoo);
+s.set(vb_vis2, "speed", 0.48);
+s.set(vb_vis2, "gain", 0.0);
+s.set(vb_vis2, "gain_to_opacity", 0.0);
+s.set(vb_vis2, "envelope", 0.42);
+s.set(vb_vis2, "feather", 0.18);
+s.set(vb_vis2, "shadow", 0.10);
+s.set(vb_vis2, "additive", 0.68);
+s.transform(vb_vis2, 0.08, 0.06, 1.38, 0.0);
+
+let vb_vis3 = s.snippet(t_portrait, vbench_cut, 98.8, 9.2);
+s.set(vb_vis3, "position", b_sigh);
+s.set(vb_vis3, "speed", 0.45);
+s.set(vb_vis3, "gain", 0.0);
+s.set(vb_vis3, "gain_to_opacity", 0.0);
+s.set(vb_vis3, "envelope", 0.48);
+s.set(vb_vis3, "feather", 0.20);
+s.set(vb_vis3, "shadow", 0.14);
+s.set(vb_vis3, "additive", 0.62);
+s.transform(vb_vis3, 0.0, 0.08, 1.36, 0.0);
 
 // --- ACT IV (DROP II, 112..144): Restrained syncopated stutter interlocked with rail rhythm ---
 let p_voc2 = s.pattern("drop2_restrained_stutter");
@@ -810,9 +869,11 @@ s.track_fx(t_voc, voc_rv, "damp", 0.46);
 s.track_fx(t_voc, voc_rv, "mix", 0.34);
 
 // ============================================================================
-// MASTER BUS: Crisp post-LP vinyl dust, subtle 16mm gate weave & DCT film grit
+// MASTER BUS: Crisp post-LP vinyl dust, -14.2 LUFS web master & AV onset bloom
 // ============================================================================
-s.master_tape(0.10, 0.16, 0.04, 0.16);
+s.master_tape(0.05, 0.16, 0.03, 0.16);
+s.master_gain(2.4);
+s.master_av_bloom(0.32);
 
 let m_comp = s.master_effect("compress");
 s.master_fx(m_comp, "quality", 0.78);
@@ -821,7 +882,7 @@ s.master_fx(m_comp, "video", 0.34);
 
 let m_verb = s.master_effect("reverb");
 s.master_fx(m_verb, "size", 0.56);
-s.master_fx(m_verb, "damp", 0.46);
+s.master_fx(m_verb, "damp", 0.44);
 s.master_fx(m_verb, "mix", 0.09);
 
-s.render(0.0, 160.0, "outputs/261111_burial-demo/v004/261111_chromagrain_burial-demo_v004.mp4");
+s.render(0.0, 160.0, "outputs/261111_burial-demo/v006/261111_chromagrain_burial-demo_v006.mp4");
