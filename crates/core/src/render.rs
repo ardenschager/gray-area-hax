@@ -16,7 +16,7 @@ use crate::seq::pattern_events;
 use crate::timeline::{Clip, ClipKind, DuckState, Project, Source};
 use crate::video::{
     apply_video_tape, blend_layer, blend_layer_over, composite_grains_frame,
-    composite_grains_frame_opts, Frame, VisualGrainStyle,
+    composite_grains_frame_layout, composite_grains_frame_opts, Frame, VisualGrainStyle,
 };
 
 pub struct RenderOutput {
@@ -514,15 +514,112 @@ pub fn plan_project(project: &Project) -> Vec<ClipPlan> {
                     .collect()
             };
             let parts = if clip.loop_beats.is_some() { tile_part_list(parts) } else { parts };
-            let video_parts = if clip.loop_beats.is_some() {
+            let mut video_parts = if clip.loop_beats.is_some() {
                 video_parts.map(tile_part_list)
             } else {
                 video_parts
             };
+            let mut parts = parts;
+            // A clip with an ADSR is one voice: on at its start, released so
+            // the release ends with the clip (sound and picture cut together).
+            if let (Some(adsr), false) = (clip.grains.adsr, matches!(clip.kind, ClipKind::Pattern(_))) {
+                let on = clip_t0;
+                let off = (clip_t0 + full_len - adsr.release_secs()).max(on);
+                let env = crate::envelope::VoiceEnv { adsr, on, off };
+                let voice = clip_voice(ti, ci);
+                for (_, evs) in parts.iter_mut().chain(video_parts.iter_mut().flatten()) {
+                    for e in evs.iter_mut() {
+                        e.tag.voice = voice;
+                        e.tag.env = Some(env);
+                    }
+                }
+            }
             plans.push(ClipPlan { track: ti, clip_index: ci, parts, video_parts, style });
         }
     }
+    if project.layout == crate::tile::Layout::Tile {
+        assign_tiles(&mut plans, project.layout_pan);
+    }
     plans
+}
+
+/// Voice id of a whole clip (granular / snippet).
+fn clip_voice(track: usize, clip: usize) -> u64 {
+    0xC000_0000_0000_0000 | ((track as u64 & 0xFFFF) << 32) | (clip as u64 & 0xFFFF_FFFF)
+}
+
+/// Layout `Tile`: give every voice in the plan a stable tile slot, in
+/// voice-start order (the same assignment the realtime engine replays,
+/// since it plays this plan). Grains without a voice belong to their
+/// clip's voice. With `layout_pan`, the slot's column sets the grain pan
+/// (keeping a little of the grain's own spread) and its row a subtle gain
+/// cue, computed from the grid at the voice's start.
+pub fn assign_tiles(plans: &mut [ClipPlan], layout_pan: bool) {
+    use std::collections::BTreeMap;
+    // voice -> (start, end)
+    let mut spans: BTreeMap<u64, (f64, f64)> = BTreeMap::new();
+    for cp in plans.iter_mut() {
+        let fallback = clip_voice(cp.track, cp.clip_index);
+        for (_, evs) in cp.parts.iter_mut().chain(cp.video_parts.iter_mut().flatten()) {
+            for e in evs.iter_mut() {
+                if e.tag.voice == 0 {
+                    e.tag.voice = fallback;
+                }
+                let end = e.tag.env.map_or(e.end(), |v| v.end().min(e.end()));
+                let s = spans.entry(e.tag.voice).or_insert((e.onset, end));
+                s.0 = s.0.min(e.onset);
+                s.1 = s.1.max(end);
+            }
+        }
+    }
+    let mut order: Vec<(u64, f64, f64)> = spans.into_iter().map(|(v, (a, b))| (v, a, b)).collect();
+    order.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+    let mut tiles = crate::tile::TileAssigner::new();
+    let mut slot_of: BTreeMap<u64, (u8, f32, f32)> = BTreeMap::new();
+    for (voice, start, end) in order {
+        let slot = tiles.assign(voice, start);
+        tiles.release(voice, end);
+        let (cols, rows) = tiles.grid_at(start);
+        let (pan, gain) = crate::tile::layout_pan(slot as usize, cols, rows);
+        slot_of.insert(voice, (slot, pan, gain));
+    }
+    for cp in plans.iter_mut() {
+        for (_, evs) in cp.parts.iter_mut().chain(cp.video_parts.iter_mut().flatten()) {
+            for e in evs.iter_mut() {
+                if let Some(&(slot, pan, gain)) = slot_of.get(&e.tag.voice) {
+                    e.tag.tile = Some(slot);
+                    if layout_pan {
+                        e.pan = (pan + 0.2 * e.pan).clamp(-1.0, 1.0);
+                        e.gain *= gain;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Tile grid for each frame (layout `Tile`): from the tile slots of every
+/// grain visible in it, across all clips (see [`crate::tile::frame_grid`]).
+pub fn frame_tile_grids(plans: &[ClipPlan], t0: f64, fps: f32, n_frames: usize) -> Vec<(u32, u32)> {
+    let mut slots: Vec<Vec<u8>> = vec![Vec::new(); n_frames];
+    let fps = fps.max(1e-3) as f64;
+    for cp in plans {
+        let vparts = cp.video_parts.as_deref().unwrap_or(&cp.parts);
+        for (_, evs) in vparts {
+            for e in evs {
+                let Some(slot) = e.tag.tile else { continue };
+                let f0 = ((e.onset - t0) * fps).ceil().max(0.0) as usize;
+                let f1 = (((e.end() - t0) * fps).ceil().max(0.0) as usize).min(n_frames);
+                for (fi, list) in slots.iter_mut().enumerate().take(f1).skip(f0) {
+                    let ft = t0 + fi as f64 / fps;
+                    if ft >= e.onset && ft < e.end() && e.tag.picture_at(ft) > 0.0 && !list.contains(&slot) {
+                        list.push(slot);
+                    }
+                }
+            }
+        }
+    }
+    slots.into_iter().map(crate::tile::frame_grid).collect()
 }
 
 /// The clip transform's audio placement: x -> pan offset, scale ->
@@ -565,6 +662,8 @@ pub fn render_project(project: &Project, from_beat: f64, to_beat: f64) -> Render
     let plan = plan_project(project);
     let mut master_audio = StereoBuffer::new(len, project.sample_rate);
     let n_frames = (len * project.fps as f64).ceil() as usize;
+    let tile_grids: Option<Vec<(u32, u32)>> =
+        (project.layout == crate::tile::Layout::Tile).then(|| frame_tile_grids(&plan, t0, project.fps, n_frames));
     let mut frames: Vec<Frame> =
         (0..n_frames).map(|_| Frame::black(project.width, project.height)).collect();
 
@@ -773,7 +872,21 @@ pub fn render_project(project: &Project, from_beat: f64, to_beat: f64) -> Render
                         if let Some(video) =
                             project.sources.get(*sid).and_then(|s| s.video.as_ref())
                         {
-                            if is_stretched_snippet {
+                            if let Some(grids) = &tile_grids {
+                                composite_grains_frame_layout(
+                                    video,
+                                    evs,
+                                    &cp.style,
+                                    &clip.link,
+                                    &clip.transform,
+                                    clip.color_filter.as_ref(),
+                                    &mut clip_layer,
+                                    ft,
+                                    is_stretched_snippet,
+                                    hue_override,
+                                    Some(grids[fi]),
+                                );
+                            } else if is_stretched_snippet {
                                 composite_grains_frame_opts(
                                     video,
                                     evs,

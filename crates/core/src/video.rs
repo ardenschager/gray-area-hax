@@ -628,6 +628,9 @@ pub struct GrainDraw {
     pub src_time: f64,
     pub alpha: f32,
     pub hue_shift: f32,
+    /// Drawn as a tile (layout `Tile`): hard-edged, opaque normal blend,
+    /// no feather / shadow / additive.
+    pub tiled: bool,
 }
 
 /// Compute the draw list for all events active at `t`. `aspect` is the
@@ -658,6 +661,29 @@ pub fn grain_draws_opts(
     aspect: f32,
     parked: bool,
 ) -> Vec<GrainDraw> {
+    grain_draws_layout(events, style, link, transform, source_duration, t, aspect, parked, None)
+}
+
+/// [`grain_draws_opts`] with a layout: `tile_grid` = `Some((cols, rows))`
+/// for [`Layout::Tile`](crate::tile::Layout) (the frame's grid, from
+/// [`crate::tile::frame_grid`] over every visible grain's `tag.tile`).
+/// Tile-tagged grains then fill their tile rect ([`crate::tile::tile_rect`])
+/// with a centered cover crop of the source, at full opacity times the
+/// voice's picture weight (hard cut with ADSR `Cut`); untagged grains and
+/// `None` draw as before. In every mode a grain's opacity is multiplied by
+/// its voice's picture weight (`tag.picture_at(t)`).
+#[allow(clippy::too_many_arguments)]
+pub fn grain_draws_layout(
+    events: &[GrainEvent],
+    style: &VisualGrainStyle,
+    link: &AvLink,
+    transform: &crate::timeline::ClipTransform,
+    source_duration: f64,
+    t: f64,
+    aspect: f32,
+    parked: bool,
+    tile_grid: Option<(u32, u32)>,
+) -> Vec<GrainDraw> {
     let mut out = Vec::new();
     let rot = transform.rotation.to_radians();
     let (sin_r, cos_r) = rot.sin_cos();
@@ -671,6 +697,36 @@ pub fn grain_draws_opts(
             style.visual_duration(ev.duration)
         };
         if t < ev.onset || t >= ev.onset + vis_dur {
+            continue;
+        }
+        let picture = ev.tag.picture_at(t);
+        if picture <= 0.0 {
+            continue;
+        }
+        if let (Some((cols, rows)), Some(slot)) = (tile_grid, ev.tag.tile) {
+            if t >= ev.onset + ev.duration as f64 {
+                continue; // tiles cut with the sound, no visual tail
+            }
+            let r = crate::tile::tile_rect(slot as usize, cols, rows, aspect);
+            let visual_rate = 1.0 + (ev.pitch_ratio - 1.0) * link.pitch_to_rate;
+            let local = (t - ev.onset) * visual_rate as f64;
+            let src_time = if ev.reverse && link.reverse_video {
+                ev.source_pos + ev.duration as f64 * visual_rate as f64 - local
+            } else {
+                ev.source_pos + local
+            };
+            // Cover crop (the source is assumed to share the canvas aspect).
+            let tile_ar = r.w * aspect / r.h.max(1e-6);
+            let (pw, ph) = if tile_ar < aspect { (tile_ar / aspect, 1.0) } else { (1.0, aspect / tile_ar) };
+            out.push(GrainDraw {
+                dest: [r.x, r.y, r.w, r.h],
+                rotation: 0.0,
+                patch: [(1.0 - pw) * 0.5, (1.0 - ph) * 0.5, pw, ph],
+                src_time,
+                alpha: picture.clamp(0.0, 1.0),
+                hue_shift: ev.semitones() * link.pitch_to_hue,
+                tiled: true,
+            });
             continue;
         }
         let phase = ((t - ev.onset) / vis_dur) as f32;
@@ -697,7 +753,7 @@ pub fn grain_draws_opts(
         }
         let env_part = 1.0 + (env - 1.0) * link.envelope_to_opacity;
         let gain_part = 1.0 + (ev.gain.min(1.5) - 1.0) * link.gain_to_opacity;
-        let alpha = (env_part * gain_part).clamp(0.0, 1.0);
+        let alpha = (env_part * gain_part * picture).clamp(0.0, 1.0);
         if alpha <= 0.003 {
             continue;
         }
@@ -741,6 +797,7 @@ pub fn grain_draws_opts(
             src_time,
             alpha,
             hue_shift: ev.semitones() * link.pitch_to_hue,
+            tiled: false,
         });
     }
     out
@@ -794,15 +851,35 @@ pub fn composite_grains_frame_opts(
     blend_frames: bool,
     hue_override: Option<f32>,
 ) {
+    composite_grains_frame_layout(clip, events, style, link, transform, color_filter, out, t, blend_frames, hue_override, None);
+}
+
+/// [`composite_grains_frame_opts`] with a tile grid (layout `Tile`; see
+/// [`grain_draws_layout`]). Tiles are drawn hard-edged and opaque.
+#[allow(clippy::too_many_arguments)]
+pub fn composite_grains_frame_layout(
+    clip: &VideoClip,
+    events: &[GrainEvent],
+    style: &VisualGrainStyle,
+    link: &AvLink,
+    transform: &crate::timeline::ClipTransform,
+    color_filter: Option<&ColorFilter>,
+    out: &mut Frame,
+    t: f64,
+    blend_frames: bool,
+    hue_override: Option<f32>,
+    tile_grid: Option<(u32, u32)>,
+) {
     let ow = out.width as f32;
     let oh = out.height as f32;
     let aspect = ow / oh.max(1.0);
     let add = style.additive.clamp(0.0, 1.0);
     let feath = style.feather.clamp(0.0, 1.0);
     let shad = style.shadow.clamp(0.0, 1.0);
-    let draws = grain_draws(events, style, link, transform, clip.duration(), t, aspect);
+    let draws = grain_draws_layout(events, style, link, transform, clip.duration(), t, aspect, false, tile_grid);
 
     for d in draws {
+        let (add, feath, shad) = if d.tiled { (0.0, 0.0, 0.0) } else { (add, feath, shad) };
         let src_cow = if blend_frames {
             clip.frame_looped_at(d.src_time, 0.32)
         } else {

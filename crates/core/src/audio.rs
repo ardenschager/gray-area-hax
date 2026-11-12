@@ -379,9 +379,17 @@ pub fn render_grains_audio_spatial(
     for ev in events {
         // Rounded independently so block-wise rendering at t0 = k/sr is
         // sample-exact against a single full render at t0 = 0.
-        let start_sample = (ev.onset * out_sr).round() as i64 - (t0 * out_sr).round() as i64;
+        let abs_start = (ev.onset * out_sr).round() as i64;
+        let start_sample = abs_start - (t0 * out_sr).round() as i64;
         let n = (ev.duration as f64 * out_sr) as i64;
         if n <= 0 || start_sample + n < 0 || start_sample >= out_len {
+            continue;
+        }
+        // The voice's ADSR, evaluated at each output sample's absolute time
+        // (sample-exact for any block split). Grains past the voice's end
+        // are silent.
+        let venv = ev.tag.env;
+        if venv.is_some_and(|e| ev.onset >= e.end()) {
             continue;
         }
         // Equal-power pan (grain pan + clip placement offset).
@@ -399,7 +407,10 @@ pub fn render_grains_audio_spatial(
                 continue;
             }
             let phase = i as f32 / n as f32;
-            let env = grain_env_skewed(phase, ev.envelope, ev.env_skew);
+            let mut env = grain_env_skewed(phase, ev.envelope, ev.env_skew);
+            if let Some(e) = venv {
+                env *= e.level_at((abs_start + i) as f64 / out_sr);
+            }
             let src_off = if ev.reverse {
                 grain_src_len - i as f64 * ev.pitch_ratio as f64
             } else {

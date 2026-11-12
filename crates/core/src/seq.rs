@@ -162,6 +162,37 @@ impl StepPattern {
     }
 }
 
+/// Output length of a step hit: a chopped slice plays its whole slice (at
+/// the hit's pitch ratio) times `step.length`; otherwise the row's grain
+/// duration times `step.length`.
+pub fn hit_duration(g: &GrainSettings, step: &Step, chop: Option<crate::chop::Slice>, ratio: f32) -> f32 {
+    let len = step.length.max(0.05);
+    match chop {
+        Some(sl) => ((sl.len() / ratio.max(0.01) as f64) as f32 * len).clamp(0.01, 30.0),
+        None => (g.duration * len).clamp(0.01, 5.0),
+    }
+}
+
+/// Voice id of one step hit.
+pub fn hit_voice(row: usize, slot: u64, clip_start: f64) -> u64 {
+    let c = (clip_start * 1000.0).round() as u64;
+    0xA000_0000_0000_0000 | ((row as u64 & 0xFF) << 52) | ((c & 0xF_FFFF) << 32) | (slot & 0xFFFF_FFFF)
+}
+
+/// A row ADSR makes each hit a voice: gate = the hit length, then the
+/// release (the grain grows by it); the grain's own window goes flat so
+/// the envelope shapes sound and picture.
+pub fn apply_hit_adsr(ev: &mut GrainEvent, g: &GrainSettings, voice: u64) {
+    if let Some(adsr) = g.adsr {
+        let off = ev.onset + ev.duration as f64;
+        ev.duration += adsr.release;
+        ev.envelope = 0.01;
+        ev.env_skew = 0.0;
+        ev.tag.voice = voice;
+        ev.tag.env = Some(crate::envelope::VoiceEnv { adsr, on: ev.onset, off });
+    }
+}
+
 /// Expand a pattern into grain events for a clip window.
 ///
 /// * `clip_start_secs`/`clip_len_secs`: the pattern clip on the timeline.
@@ -249,8 +280,12 @@ pub fn pattern_events(
                         .clamp(0.0, (clip_len_secs - 1e-6).max(0.0));
                     let g = eff_at(t);
 
+                    let chop = step.slice_index.and_then(|i| source.slices.get(i as usize).copied());
                     let at = if step.slice >= 0.0 { step.slice.min(1.0) } else { g.position };
-                    let mut pos = at as f64 * source_len + g.spray as f64 * spray_j as f64;
+                    let mut pos = match chop {
+                        Some(sl) => sl.start,
+                        None => at as f64 * source_len + g.spray as f64 * spray_j as f64,
+                    };
                     pos = pos.rem_euclid(source_len.max(1e-6));
                     let step_base_hz = if key.is_some() && (step.slice >= 0.0 || g.position > 0.02) {
                         source.base_hz_at(pos)
@@ -266,10 +301,10 @@ pub fn pattern_events(
                         g.detune_cents,
                     );
 
-                    events.push(GrainEvent {
+                    let mut ev = GrainEvent {
                         onset: clip_start_secs + t,
                         source_pos: pos,
-                        duration: (g.duration * step.length.max(0.05)).clamp(0.01, 5.0),
+                        duration: hit_duration(&g, &step, chop, ratio),
                         pitch_ratio: ratio,
                         gain: g.gain * step.gain,
                         pan: (g.pan + g.pan_spread * pan_j).clamp(-1.0, 1.0),
@@ -278,7 +313,9 @@ pub fn pattern_events(
                         reverse: rev_j < g.reverse_prob,
                         id,
                         ..Default::default()
-                    });
+                    };
+                    apply_hit_adsr(&mut ev, &g, hit_voice(row_idx, slot as u64, clip_start_secs));
+                    events.push(ev);
                     id += 1;
                 }
             }
