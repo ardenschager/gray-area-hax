@@ -195,6 +195,29 @@ impl RealtimeAudio {
         self.live.push((bus, source, event));
     }
 
+    /// Release a live voice (its `GrainEvent::tag.voice`) at `off`, on the
+    /// live clock ([`RealtimeAudio::live_now_secs`]): queued and sounding
+    /// grains of the voice learn the note-off time, so their ADSR releases
+    /// sample-exactly; grains that would start after the release are
+    /// dropped. Grains without an envelope are left alone. Allocation-free.
+    pub fn release_voice(&mut self, voice: u64, off: f64) {
+        if voice == 0 {
+            return;
+        }
+        let mut end = f64::NEG_INFINITY;
+        for (_, _, e) in self.live.iter_mut() {
+            if e.tag.voice == voice {
+                if let Some(env) = e.tag.env.as_mut() {
+                    env.off = env.off.min(off);
+                    end = end.max(env.end());
+                }
+            }
+        }
+        if end.is_finite() {
+            self.live.retain(|(_, _, e)| !(e.tag.voice == voice && e.tag.env.is_some() && e.onset >= end));
+        }
+    }
+
     /// Set the effect chain of live bus `bus` (1-based). State is kept
     /// while the chain's shape (effect kinds) stays the same, so wet
     /// amounts can be swept without clicks; a new shape rebuilds it.
