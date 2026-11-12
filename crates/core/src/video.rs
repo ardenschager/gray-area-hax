@@ -159,6 +159,15 @@ pub struct VideoClip {
 }
 
 impl VideoClip {
+    /// `len` seconds of frames from `start` (clamped to the clip).
+    pub fn trimmed(&self, start: f64, len: f64) -> VideoClip {
+        let fps = self.fps.max(1e-3) as f64;
+        let n = self.frames.len();
+        let a = ((start.max(0.0) * fps).round() as usize).min(n);
+        let b = (((start.max(0.0) + len.max(0.0)) * fps).round() as usize).clamp(a, n);
+        VideoClip { frames: self.frames[a..b].to_vec(), fps: self.fps }
+    }
+
     pub fn duration(&self) -> f64 {
         if self.fps <= 0.0 {
             0.0
@@ -1245,6 +1254,7 @@ mod tests {
             env_skew: 0.0,
             reverse: false,
             id: 0,
+            ..Default::default()
         };
         let style = VisualGrainStyle { additive: 0.0, ..Default::default() };
 
@@ -1276,6 +1286,7 @@ mod tests {
             env_skew: 0.0,
             reverse: false,
             id: 0,
+            ..Default::default()
         };
         let style = VisualGrainStyle { additive: 0.0, ..Default::default() };
         let shifted = render_layer_at(
@@ -1345,6 +1356,7 @@ mod tests {
             env_skew: 0.0,
             reverse: false,
             id: 0,
+            ..Default::default()
         };
         let style = VisualGrainStyle { additive: 1.0, min_size: 1.0, max_size: 1.0, flicker: 1.0, ..Default::default() };
         let mut clip_layer = Frame::transparent(16, 16);
@@ -1368,6 +1380,7 @@ mod tests {
             env_skew: -0.95, // hard percussive audio transient
             reverse: false,
             id: 0,
+            ..Default::default()
         };
         let tform = crate::timeline::ClipTransform::default();
         let link = AvLink::default();

@@ -77,6 +77,10 @@ pub struct GrainSettings {
     /// single pristine grain with zero OLA time-stretch warble).
     #[serde(default)]
     pub varispeed: bool,
+    /// ADSR for the hits / voices these settings make (sound + picture).
+    /// None = the classic grain windows only.
+    #[serde(default)]
+    pub adsr: Option<crate::envelope::Adsr>,
 }
 
 fn default_swing() -> f32 {
@@ -148,12 +152,38 @@ impl Default for GrainSettings {
             texture: 0.0,
             swing: 0.5,
             varispeed: false,
+            adsr: None,
         }
     }
 }
 
+/// Which voice a grain belongs to, for ADSR and tiling. Default = no
+/// voice (classic behaviour).
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct VoiceTag {
+    /// Stable voice id (0 = none): a held note, a pad loop, a step hit,
+    /// a clip, an emitter gesture.
+    pub voice: u64,
+    /// The voice's envelope; scales audio per sample and picture opacity.
+    pub env: Option<crate::envelope::VoiceEnv>,
+    /// Tile slot in [`Layout::Tile`](crate::tile::Layout) (see [`crate::tile`]).
+    pub tile: Option<u8>,
+}
+
+impl VoiceTag {
+    /// Envelope gain at absolute time `t` (1 without an envelope).
+    pub fn level_at(&self, t: f64) -> f32 {
+        self.env.map_or(1.0, |e| e.level_at(t))
+    }
+
+    /// Picture weight at absolute time `t` (1 without an envelope).
+    pub fn picture_at(&self, t: f64) -> f32 {
+        self.env.map_or(1.0, |e| e.picture_at(t))
+    }
+}
+
 /// One scheduled grain, shared by the audio and video renderers.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct GrainEvent {
     /// Absolute onset on the timeline, seconds.
     pub onset: f64,
@@ -175,6 +205,9 @@ pub struct GrainEvent {
     pub reverse: bool,
     /// Stable per-grain id for deterministic visual scatter.
     pub id: u64,
+    /// Voice (ADSR envelope, tile slot).
+    #[serde(default)]
+    pub tag: VoiceTag,
 }
 
 impl GrainEvent {
@@ -289,6 +322,7 @@ pub fn schedule_grains_auto(
                 env_skew: s.env_skew,
                 reverse,
                 id: *id,
+                ..Default::default()
             });
             *id += 1;
         }
@@ -369,6 +403,7 @@ pub fn grain_from_note(
         env_skew: settings.env_skew,
         reverse: settings.reverse_prob >= 0.5,
         id,
+        ..Default::default()
     }
 }
 

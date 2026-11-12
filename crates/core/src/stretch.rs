@@ -270,6 +270,7 @@ pub fn paulstretch_source_opts(src: &Source, factor: f32, spread_cents: f32) -> 
             .as_ref()
             .map(|v| Arc::new(stretch_video(v, factor))),
         base_hz: src.base_hz,
+        ..Default::default()
     }
 }
 
@@ -372,6 +373,7 @@ mod tests {
             audio: Some(Arc::new(audio)),
             video: Some(Arc::new(VideoClip { frames, fps: 10.0 })),
             base_hz: 220.0,
+            ..Default::default()
         };
         let out = paulstretch_source(&src, 4.0);
         assert_eq!(out.base_hz, 220.0);

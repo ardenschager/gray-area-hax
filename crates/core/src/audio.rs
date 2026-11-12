@@ -21,6 +21,20 @@ impl AudioClip {
         AudioClip { samples, sample_rate, side: None }
     }
 
+    /// `len` seconds from `start` (clamped to the clip).
+    pub fn trimmed(&self, start: f64, len: f64) -> AudioClip {
+        let sr = self.sample_rate as f64;
+        let n = self.samples.len();
+        let a = ((start.max(0.0) * sr) as usize).min(n);
+        let b = ((start.max(0.0) + len.max(0.0)) * sr).ceil().min(n as f64) as usize;
+        let b = b.max(a);
+        AudioClip {
+            samples: self.samples[a..b].to_vec(),
+            sample_rate: self.sample_rate,
+            side: self.side.as_ref().map(|s| s[a.min(s.len())..b.min(s.len())].to_vec()),
+        }
+    }
+
     /// Build from left/right channels. Falls back to mono when the channels
     /// are (near) identical, so dual-mono files cost nothing extra.
     pub fn stereo(left: &[f32], right: &[f32], sample_rate: u32) -> AudioClip {
@@ -628,6 +642,7 @@ mod tests {
             env_skew: 0.0,
             reverse: false,
             id: 0,
+            ..Default::default()
         };
         let mut out = StereoBuffer::new(1.0, sr);
         render_grains_audio(&clip, &[ev], &mut out, 0.0);
@@ -738,6 +753,7 @@ mod tests {
             env_skew: 0.0,
             reverse: false,
             id: 0,
+            ..Default::default()
         };
         let mut out = StereoBuffer::new(0.6, sr);
         render_grains_audio(&clip, &[ev], &mut out, 0.0);

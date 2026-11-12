@@ -534,6 +534,7 @@ mod tests {
             audio: Some(std::sync::Arc::new(crate::audio::AudioClip::saw_stack(110.0, 3.0, p.sample_rate))),
             video: Some(std::sync::Arc::new(VideoClip::test_pattern(32, 24, 12.0, 2.0))),
             base_hz: 110.0,
+            ..Default::default()
         });
         // Granular clip with a clip-level delay.
         let t0 = p.add_track("grains");

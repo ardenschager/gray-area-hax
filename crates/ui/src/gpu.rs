@@ -1380,6 +1380,7 @@ mod tests {
             audio: None,
             video: Some(Arc::new(VideoClip::test_pattern(160, 96, 12.0, 2.0))),
             base_hz: 0.0,
+            ..Default::default()
         });
         // Additive glow is off: under glow the GPU's premultiplied blend
         // is a documented approximation of the CPU's straight-alpha mix

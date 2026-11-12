@@ -56,6 +56,29 @@ pub trait MediaBackend: Send + Sync {
     fn segment_masks(&self, _video_file: &Path, _prompt: &str, _mask_dir: &Path) -> MediaResult<()> {
         Err(format!("segmentation is not available with the {} media backend", self.name()))
     }
+    /// Search for videos (yt-dlp `ytsearchN:query`, metadata only).
+    fn search_videos(&self, _query: &str, _n: u32) -> MediaResult<Vec<crate::dig::VideoHit>> {
+        Err(format!("video search is not available with the {} media backend", self.name()))
+    }
+    /// Full metadata (license, upload date, ...) for one video URL.
+    fn video_info(&self, _url: &str) -> MediaResult<crate::dig::VideoHit> {
+        Err(format!("video lookup is not available with the {} media backend", self.name()))
+    }
+    /// Download `url` at ≤ `max_height` p into `dir`, reporting 0..1
+    /// progress; returns the file.
+    fn download_video(&self, _url: &str, _dir: &Path, _max_height: u32, _progress: &mut dyn FnMut(f32)) -> MediaResult<PathBuf> {
+        Err(format!("video download is not available with the {} media backend", self.name()))
+    }
+    /// Decode `len` seconds of a file's audio from `start`.
+    fn decode_audio_range(&self, path: &Path, sample_rate: u32, start: f64, len: f64) -> MediaResult<AudioClip> {
+        let a = self.decode_audio(path, sample_rate)?;
+        Ok(a.trimmed(start, len))
+    }
+    /// Decode `len` seconds of a file's video from `start`.
+    fn decode_video_range(&self, path: &Path, start: f64, len: f64) -> MediaResult<VideoClip> {
+        let v = self.decode_video(path)?;
+        Ok(v.trimmed(start, len))
+    }
     fn ffmpeg_available(&self) -> bool {
         false
     }
@@ -233,6 +256,7 @@ pub fn load_source(path: &Path, sample_rate: u32) -> MediaResult<Source> {
         audio: audio.map(std::sync::Arc::new),
         video: video.map(std::sync::Arc::new),
         base_hz,
+        ..Default::default()
     })
 }
 
@@ -959,6 +983,7 @@ pub fn segment_source(src: &Source, prompt: &str, work_dir: &Path) -> MediaResul
         audio: src.audio.clone(),
         video: Some(std::sync::Arc::new(masked)),
         base_hz: src.base_hz,
+        ..Default::default()
     })
 }
 
@@ -1075,6 +1100,7 @@ mod tests {
                     crate::video::VideoClip::test_pattern(160, 120, 12.0, 1.0),
                 )),
                 base_hz: 220.0,
+                ..Default::default()
             }
         };
         let n_in = src.video.as_ref().unwrap().frames.len();
@@ -1145,6 +1171,7 @@ print("ok 4")
                 crate::video::VideoClip::test_pattern(32, 24, 10.0, 0.5),
             )),
             base_hz: 220.0,
+            ..Default::default()
         };
         let out = segment_source(&src, "cat", &dir.join("work")).unwrap();
         std::env::remove_var("CHROMAGRAIN_SEGMENT_CMD");
@@ -1191,6 +1218,7 @@ print("ok 4")
         let ev = crate::grain::GrainEvent {
             onset: 0.0, source_pos: 0.0, duration: a.duration().min(5.0) as f32, pitch_ratio: 1.0,
             gain: 1.0, pan: 0.0, envelope: 0.05, env_skew: 0.0, reverse: false, id: 0,
+            ..Default::default()
         };
         let mut out = StereoBuffer::new(ev.duration as f64, 48000);
         crate::audio::render_grains_audio(&a, &[ev], &mut out, 0.0);

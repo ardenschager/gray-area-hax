@@ -265,6 +265,7 @@ pub fn grain_step(
         env_skew: 0.0,
         reverse,
         id,
+        ..Default::default()
     };
     (ev, hop)
 }
@@ -321,11 +322,23 @@ pub struct PadSlot {
     pub start: f32,
     pub len_beats: f32,
     pub gain: f32,
+    /// A chopped slice (source seconds): the pad is a one-shot that plays
+    /// this slice when hit (Koala pads) instead of looping `len_beats`.
+    pub slice: Option<crate::chop::Slice>,
+    /// Envelope of the pad's voice (sound + picture). None = classic.
+    pub adsr: Option<crate::envelope::Adsr>,
 }
 
 impl PadSlot {
     pub fn new(source: SourceId, len_beats: f32) -> PadSlot {
-        PadSlot { source, start: 0.0, len_beats, gain: 1.0 }
+        PadSlot { source, start: 0.0, len_beats, gain: 1.0, slice: None, adsr: None }
+    }
+
+    /// A one-shot pad playing `slice` of `source` (whose media is
+    /// `src_len` seconds long).
+    pub fn from_slice(source: SourceId, slice: crate::chop::Slice, src_len: f64) -> PadSlot {
+        let start = if src_len > 0.0 { (slice.start / src_len).clamp(0.0, 1.0) as f32 } else { 0.0 };
+        PadSlot { start, slice: Some(slice), ..PadSlot::new(source, 1.0) }
     }
 }
 
@@ -443,6 +456,12 @@ pub struct Instrument {
     pads: [Pad; PADS],
     /// Launch grid in beats (0 = now, 1 = beat, 4 = bar).
     launch_q: f64,
+    /// Envelope for held notes / slices (None = classic grain ring-out).
+    note_adsr: Option<crate::envelope::Adsr>,
+    layout: crate::tile::Layout,
+    layout_pan: bool,
+    #[allow(dead_code)] // tile assignment (next commits)
+    tiles: crate::tile::TileAssigner,
 }
 
 impl Instrument {
@@ -483,6 +502,10 @@ impl Instrument {
             pat_rng: Rng::new(0x5E9_0E9C),
             pads: [Pad::default(); PADS],
             launch_q: 1.0,
+            note_adsr: None,
+            layout: crate::tile::Layout::Stack,
+            layout_pan: true,
+            tiles: crate::tile::TileAssigner::new(),
         };
         inst.rebuild_fx();
         inst
@@ -728,6 +751,67 @@ impl Instrument {
         }
     }
 
+    /// Envelope for held notes and slices (sound + picture); None = the
+    /// classic grain ring-out on note-off.
+    pub fn set_note_adsr(&mut self, adsr: Option<crate::envelope::Adsr>) {
+        self.note_adsr = adsr;
+    }
+
+    pub fn note_adsr(&self) -> Option<crate::envelope::Adsr> {
+        self.note_adsr
+    }
+
+    /// Compositing layout (see [`crate::tile`]). In `Tile` every voice
+    /// gets a tile slot (`GrainEvent::tag.tile`), and with `layout_pan` its
+    /// column drives pan.
+    pub fn set_layout(&mut self, layout: crate::tile::Layout) {
+        self.layout = layout;
+    }
+
+    pub fn layout(&self) -> crate::tile::Layout {
+        self.layout
+    }
+
+    pub fn set_layout_pan(&mut self, on: bool) {
+        self.layout_pan = on;
+    }
+
+    pub fn layout_pan(&self) -> bool {
+        self.layout_pan
+    }
+
+    /// Set (or clear) the slices of source `id`. Allocates; call off the
+    /// audio thread (or swap the source).
+    pub fn set_slices(&mut self, id: SourceId, slices: Vec<crate::chop::Slice>) -> bool {
+        match self.sources.get_mut(id) {
+            Some(s) => {
+                s.slices = slices;
+                let len = s.duration();
+                crate::chop::normalize(&mut s.slices, len);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Fill pads `first..` with one-shot pads, one per slice of `source`
+    /// ("slices → pads"). Returns how many pads were set.
+    pub fn slices_to_pads(&mut self, source: SourceId, first: usize) -> usize {
+        let Some(src) = self.sources.get(source) else { return 0 };
+        let len = src.duration();
+        let slices: [Option<crate::chop::Slice>; PADS] = std::array::from_fn(|k| src.slices.get(k).copied());
+        let mut n = 0;
+        for (k, sl) in slices.iter().enumerate() {
+            let (Some(sl), pad) = (sl, first + k) else { break };
+            if pad >= PADS {
+                break;
+            }
+            self.set_pad(pad, Some(PadSlot::from_slice(source, *sl, len)));
+            n += 1;
+        }
+        n
+    }
+
     /// Stop every note (allocation- and free-free, so safe on the audio thread).
     pub fn all_notes_off(&mut self) {
         while let Some(v) = self.voices.pop() {
@@ -816,6 +900,7 @@ impl Instrument {
                     env_skew: g.env_skew,
                     reverse: g.reverse_prob >= 0.5,
                     id: (1u64 << 62) | ((ri as u64) << 40) | (k as u64 & 0xFF_FFFF_FFFF),
+                    ..Default::default()
                 };
                 let source = row.source;
                 self.grains.push(LiveGrain { source, voice: 0, ev, origin: GrainOrigin::Step, seen: false });
@@ -1063,6 +1148,7 @@ impl Instrument {
                     env_skew: 0.0,
                     reverse: false,
                     id: (3u64 << 61) | ((i as u64) << 48) | (k & 0xFFFF_FFFF_FFFF),
+                    ..Default::default()
                 };
                 self.grains.push(LiveGrain { source: slot.source, voice: p.serial, ev, origin: GrainOrigin::Pad(i), seen: false });
                 next_t += hop;
@@ -1163,7 +1249,7 @@ pub fn source_from_pcm_rgba(
             .collect();
         Arc::new(VideoClip { frames, fps })
     });
-    Source { name: name.into(), audio, video, base_hz }
+    Source { name: name.into(), audio, video, base_hz, ..Default::default() }
 }
 
 /// CPU rasterizer for [`FrameState`]s — the reference picture (thumbnails,
@@ -1221,6 +1307,7 @@ mod tests {
             audio: Some(Arc::new(AudioClip::sine(hz, secs, SR))),
             video: Some(Arc::new(VideoClip::test_pattern(32, 18, 12.0, secs))),
             base_hz: hz,
+            ..Default::default()
         }
     }
 
@@ -1313,6 +1400,7 @@ mod tests {
             env_skew: 0.0,
             reverse: false,
             id: 9,
+            ..Default::default()
         };
         i.trigger(0, ev.clone());
         i.trigger(7, ev); // unknown source: ignored
@@ -1443,7 +1531,7 @@ mod tests {
         // Clearing a playing pad stops it; triggered grains survive.
         i.toggle_pad(1);
         drained(&mut i, 0.05, 256);
-        i.trigger(0, GrainEvent { onset: 0.0, source_pos: 0.1, duration: 0.5, pitch_ratio: 1.0, gain: 0.5, pan: 0.0, envelope: 1.0, env_skew: 0.0, reverse: false, id: 1 });
+        i.trigger(0, GrainEvent { onset: 0.0, source_pos: 0.1, duration: 0.5, pitch_ratio: 1.0, gain: 0.5, pan: 0.0, envelope: 1.0, env_skew: 0.0, reverse: false, id: 1, ..Default::default() });
         i.set_pad(1, None);
         assert!(!i.pad(1).on && i.pad(1).slot.is_none());
         let (g, audio) = drained(&mut i, 0.2, 256);
@@ -1455,7 +1543,7 @@ mod tests {
     fn new_grains_are_reported_once_with_their_origin() {
         let mut i = inst_with_sine();
         i.note_on(60, 1.0);
-        i.trigger(0, GrainEvent { onset: 0.0, source_pos: 0.1, duration: 0.05, pitch_ratio: 1.0, gain: 0.5, pan: 0.0, envelope: 1.0, env_skew: 0.0, reverse: false, id: 1 });
+        i.trigger(0, GrainEvent { onset: 0.0, source_pos: 0.1, duration: 0.05, pitch_ratio: 1.0, gain: 0.5, pan: 0.0, envelope: 1.0, env_skew: 0.0, reverse: false, id: 1, ..Default::default() });
         let (g, _) = drained(&mut i, 1.0, 256);
         let ids: std::collections::HashSet<u64> = g.iter().map(|(e, _)| e.id).collect();
         assert_eq!(ids.len(), g.len(), "each grain once");

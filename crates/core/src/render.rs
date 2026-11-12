@@ -139,6 +139,7 @@ fn snippet_events(
                 env_skew: g.env_skew,
                 reverse: rev,
                 id: g.seed,
+                ..Default::default()
             }];
         }
         // Otherwise seamlessly crossfade-loop across `audio_len` using raised-cosine
@@ -168,6 +169,7 @@ fn snippet_events(
                 env_skew: 0.0,
                 reverse: rev,
                 id: g.seed.wrapping_add(pass_idx),
+                ..Default::default()
             });
             if t + dur >= clip_len - 1e-5 {
                 break;
@@ -225,6 +227,7 @@ fn snippet_events(
             env_skew: 0.0,
             reverse: rev,
             id: g.seed.wrapping_add(k),
+            ..Default::default()
         });
         head += HOP * speed.max(0.05) as f64;
         k += 1;
@@ -285,6 +288,7 @@ fn snippet_video_events(
         env_skew: g.env_skew,
         reverse: g.reverse_prob >= 0.5,
         id: g.seed,
+        ..Default::default()
     }])
 }
 
@@ -348,6 +352,7 @@ fn textured_events(
                 env_skew: tex * eff.env_skew,
                 reverse,
                 id: g.seed.wrapping_add(k),
+                ..Default::default()
             });
         }
         head += hop * eff.speed.max(0.05) as f64;
@@ -957,6 +962,7 @@ mod tests {
             audio: Some(std::sync::Arc::new(crate::audio::AudioClip::sine(220.0, 4.0, p.sample_rate))),
             video: Some(std::sync::Arc::new(VideoClip::test_pattern(96, 54, 12.0, 4.0))),
             base_hz: 220.0,
+            ..Default::default()
         };
         let sid = p.add_source(src);
         let tid = p.add_track("snip");
@@ -1207,12 +1213,14 @@ mod tests {
             audio: Some(std::sync::Arc::new(crate::audio::AudioClip::sine(220.0, 2.0, p.sample_rate))),
             video: Some(std::sync::Arc::new(solid_video(220, 30, 30))),
             base_hz: 220.0,
+            ..Default::default()
         });
         let blue = p.add_source(crate::timeline::Source {
             name: "blue".into(),
             audio: Some(std::sync::Arc::new(crate::audio::AudioClip::sine(330.0, 2.0, p.sample_rate))),
             video: Some(std::sync::Arc::new(solid_video(30, 30, 220))),
             base_hz: 330.0,
+            ..Default::default()
         });
         let order = if order_red_first { [red, blue] } else { [blue, red] };
         for sid in order {
@@ -1384,6 +1392,7 @@ mod tests {
                 fps: 12.0,
             })),
             base_hz: 220.0,
+            ..Default::default()
         });
         let t = p.add_track("t");
         p.tracks[t].clips.push(Clip::new_snippet(sid, 0.0, 4.0));
@@ -1515,6 +1524,7 @@ mod tests {
                 ))),
                 video: None,
                 base_hz: 110.0,
+                ..Default::default()
             });
             let t = p.add_track("t");
             let mut c = Clip::new_snippet(sid, 0.0, 4.0);
@@ -1584,6 +1594,7 @@ mod tests {
             audio: Some(std::sync::Arc::new(crate::audio::AudioClip::sine(440.0, 2.0, p.sample_rate))),
             video: Some(std::sync::Arc::new(VideoClip::test_pattern(64, 36, 12.0, 2.0))),
             base_hz: 440.0,
+            ..Default::default()
         });
         let mut pat = crate::seq::StepPattern::new("p");
         let r = pat.add_row(sid);
@@ -1655,12 +1666,14 @@ mod tests {
             audio: Some(std::sync::Arc::new(crate::audio::AudioClip::sine(220.0, 2.0, p.sample_rate))),
             video: Some(std::sync::Arc::new(solid_video(200, 200, 200))),
             base_hz: 220.0,
+            ..Default::default()
         });
         let kick_src = p.add_source(crate::timeline::Source {
             name: "kick".into(),
             audio: Some(std::sync::Arc::new(crate::audio::AudioClip::sine(60.0, 0.5, p.sample_rate))),
             video: None,
             base_hz: 60.0,
+            ..Default::default()
         });
         let t_pad = p.add_track("pad");
         let mut c_pad = Clip::new_snippet(pad_src, 0.0, 4.0);
@@ -1707,6 +1720,7 @@ mod tests {
             audio: Some(std::sync::Arc::new(crate::audio::AudioClip::sine(220.0, 1.0, p.sample_rate))),
             video: Some(std::sync::Arc::new(solid_video(200, 180, 140))),
             base_hz: 220.0,
+            ..Default::default()
         });
         let t = p.add_track("bed");
         let mut c = Clip::new_snippet(sid, 0.0, 8.0);
@@ -1736,12 +1750,14 @@ mod tests {
             audio: Some(std::sync::Arc::new(crate::audio::AudioClip::sine(55.0, 2.0, p.sample_rate))),
             video: None,
             base_hz: 55.0,
+            ..Default::default()
         });
         let hat_src = p.add_source(crate::timeline::Source {
             name: "hat".into(),
             audio: Some(std::sync::Arc::new(crate::audio::AudioClip::sine(6000.0, 2.0, p.sample_rate))),
             video: None,
             base_hz: 6000.0,
+            ..Default::default()
         });
         let t_sub = p.add_track("sub");
         let mut cs = Clip::new_snippet(sub_src, 0.0, 2.0);
@@ -1779,12 +1795,14 @@ mod tests {
             audio: None,
             video: Some(std::sync::Arc::new(solid_video(45, 50, 60))),
             base_hz: 220.0,
+            ..Default::default()
         });
         let hit_src = p.add_source(crate::timeline::Source {
             name: "hit".into(),
             audio: Some(std::sync::Arc::new(crate::audio::AudioClip::sine(110.0, 0.25, p.sample_rate))),
             video: None,
             base_hz: 110.0,
+            ..Default::default()
         });
         let t0 = p.add_track("bg");
         p.tracks[t0].clips.push(Clip::new_snippet(bed_src, 0.0, 6.0));

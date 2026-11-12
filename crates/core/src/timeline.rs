@@ -20,9 +20,41 @@ pub struct Source {
     /// Estimated fundamental (Hz) used for key quantization. 0 = unknown,
     /// in which case A440 relative quantization is used.
     pub base_hz: f32,
+    /// Chop points (Koala-style), source seconds; see [`crate::chop`].
+    pub slices: Vec<crate::chop::Slice>,
+    /// Where it came from (Dig / Link imports).
+    pub provenance: Option<Provenance>,
+}
+
+/// Where an imported source came from (Dig / Link), shown on its card.
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+pub struct Provenance {
+    pub title: String,
+    pub uploader: String,
+    /// YYYYMMDD.
+    pub upload_date: String,
+    pub views: Option<u64>,
+    pub url: String,
+    /// yt-dlp's license string ("Creative Commons Attribution license
+    /// (reuse allowed)"), empty when unknown.
+    pub license: String,
+    /// The Dig query that found it (empty for Link).
+    pub query: String,
+    /// The window cut from the original video, seconds (start, length).
+    pub window: (f64, f64),
 }
 
 impl Source {
+    /// Transient slices (at most `max`) from the audio.
+    pub fn auto_slices(&self, max: usize) -> Vec<crate::chop::Slice> {
+        self.audio.as_ref().map(|a| crate::chop::auto_slices(a, max)).unwrap_or_default()
+    }
+
+    /// `n` equal slices over the whole source.
+    pub fn equal_slices(&self, n: usize) -> Vec<crate::chop::Slice> {
+        crate::chop::equal_slices(self.duration(), n)
+    }
+
     /// Longest media duration available in this source, seconds.
     pub fn duration(&self) -> f64 {
         let a = self.audio.as_ref().map(|a| a.duration()).unwrap_or(0.0);
@@ -105,7 +137,7 @@ impl Source {
         } else {
             self.base_hz_at(start + len * 0.35)
         };
-        Source { name: self.name.clone(), audio, video, base_hz: sliced_base }
+        Source { name: self.name.clone(), audio, video, base_hz: sliced_base, ..Default::default() }
     }
 
     /// Combine `self`'s audio (and `base_hz`) with `video_src`'s video frames,
@@ -116,6 +148,7 @@ impl Source {
             audio: self.audio.clone(),
             video: video_src.video.clone(),
             base_hz: self.base_hz,
+            ..Default::default()
         }
     }
 }
@@ -523,6 +556,12 @@ pub struct Project {
     /// couples master broadband log-energy transients into subtle, non-strobing
     /// whole-frame light breathing (`corr(onset_flux, frame_diff) >= 0.30`).
     pub master_bloom: f32,
+    /// Compositing: layered (`Stack`) or one tile per sounding voice
+    /// (`Tile`); see [`crate::tile`].
+    pub layout: crate::tile::Layout,
+    /// In tile mode, a voice's tile column drives its pan and its row a
+    /// subtle elevation cue (on by default).
+    pub layout_pan: bool,
 }
 
 impl Default for Project {
@@ -542,6 +581,8 @@ impl Default for Project {
             master_tape: crate::audio::TapeSettings::default(),
             master_gain_db: 0.0,
             master_bloom: 0.0,
+            layout: crate::tile::Layout::Stack,
+            layout_pan: true,
         }
     }
 }
@@ -647,6 +688,7 @@ impl Project {
             audio: Some(std::sync::Arc::new(AudioClip::saw_stack(110.0, 4.0, p.sample_rate))),
             video: Some(std::sync::Arc::new(VideoClip::test_pattern(240, 136, 12.0, 4.0))),
             base_hz: 110.0,
+            ..Default::default()
         };
         let sid = p.add_source(tone);
 

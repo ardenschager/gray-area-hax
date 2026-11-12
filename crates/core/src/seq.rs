@@ -31,6 +31,10 @@ pub struct Step {
     pub every_n: u8,
     /// Which 0-based pass within `0..every_n` triggers this step.
     pub every_offset: u8,
+    /// Play this slice of the row's source (index into `Source::slices`):
+    /// position = slice start, length = the slice (`length` scales it).
+    /// Takes precedence over `slice` when the source has that slice.
+    pub slice_index: Option<u16>,
 }
 
 impl Default for Step {
@@ -45,6 +49,7 @@ impl Default for Step {
             offset: 0.0,
             every_n: 1,
             every_offset: 0,
+            slice_index: None,
         }
     }
 }
@@ -272,6 +277,7 @@ pub fn pattern_events(
                         env_skew: g.env_skew,
                         reverse: rev_j < g.reverse_prob,
                         id,
+                        ..Default::default()
                     });
                     id += 1;
                 }
@@ -307,6 +313,7 @@ pub fn pattern_events(
                         env_skew: g.env_skew,
                         reverse: g.reverse_prob >= 0.5,
                         id,
+                        ..Default::default()
                     });
                     id += 1;
                     t += dur_out;
@@ -332,6 +339,7 @@ mod tests {
             audio: Some(std::sync::Arc::new(AudioClip::sine(440.0, 2.0, 48000))),
             video: None,
             base_hz: 440.0,
+            ..Default::default()
         }]
     }
 

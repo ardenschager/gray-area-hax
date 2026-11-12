@@ -341,6 +341,7 @@ fn demo_sources(spec: &DemoSpec) -> &'static Vec<Source> {
                     audio: Some(Arc::new(chromagrain_core::audio::AudioClip::saw_stack(110.0 * (1.0 + i as f32 * 0.2), 4.0, 48000))),
                     video: Some(Arc::new(chromagrain_core::video::VideoClip::test_pattern(160, 90, 12.0, 4.0))),
                     base_hz: c.base_hz,
+                    ..Default::default()
                 })
                 .collect()
         })
