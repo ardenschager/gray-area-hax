@@ -118,3 +118,8 @@ Tracks general engine (`crates/core`) improvements motivated by multi-model crit
   - **Documented AV-Sync Metrics in `eval_render.py`**:
     1. *3-frame (~125 ms) positive RMS-onset envelope vs whole-frame `|I_t - I_{t-1}|` (`motion`) and `|dY_t|`*: `burial v006` `r = +0.251` (`motion`), `+0.323` (`|dY|`); `holdout v006` `r = +0.449` (`motion`), `+0.367` (`|dY|`), `rms <-> luma r = +0.871`.
     2. *Unfiltered 1-frame band log-flux `max(0, diff(log(band_rms)))` vs whole-frame `|I_t - I_{t-1}|` (`@critic-opus` `scratch/avsync.py`, lags `-3..+3`)*: `burial v006` `low<120 = +0.098`, `mid300-3k = +0.118 (@+3)`, `high>5k = +0.107 (@+1)` (moved positive from near-zero/negative while avoiding whole-screen camera-flash strobing over continuous motion footage).
+
+
+### Open Opportunities Logged After `v006` Sign-Off (`#32`)
+- **Deeper per-pixel AV motion coupling**: While 3-frame RMS-onset <-> `|dY|` / `motion` reaches `r = +0.32..+0.45` (`rms <-> luma = +0.87`), unfiltered 1-frame band log-flux vs whole-frame `tblend` over moving camera beds stays modest (`~0.10`) because exposure modulation is capped below strobe thresholds (`<= 1.4` luma/frame release). Future engine work could couple transients to spatial displacement / optical-flow warp (`|I_t - I_{t-1}|`) rather than luminance alone.
+- **Per-chord harmonic tracking inside `paulstretch`**: Multi-chord source clips (`night_chords.mp4`) carry subtle natural electric-piano inharmonicity on individual chord voicings (`~20c` on `F4` in bars 1–3).

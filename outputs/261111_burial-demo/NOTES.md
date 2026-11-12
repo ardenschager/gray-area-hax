@@ -93,3 +93,8 @@
      - **Breakdown (`0:36–0:50`) Air**: Unlinked `scale_to_gain` and `y_to_brightness` on off-canvas `vin_aud`, automated `t_vinyl` rain/crackle up in `80..111`, and opened Breakdown vocal LPF to `6.8 kHz` — lifting Breakdown `Air (>6 kHz)` by **`+20.7 dB` (`-70.0 -> -49.3 dB`)** and `Pres (2–6 kHz)` by **`+10.0 dB` (`-55.4 -> -45.4 dB`)**.
      - **Breakdown (`0:36–0:50`) Portraits**: Dedicated `t_portrait` layer + luminous emerald water reflections (`0:37–0:48`) make the rim-lit seated woman and overcoat commuter silhouettes the clearest, brightest human focal points of the piece.
      - **Web-ready `-14.6 LUFS / -0.8 dBTP` master**: `s.master_gain(2.4)` brings integrated loudness from `-17.3 LUFS` right into the `-14.6 LUFS` web target with clean true-peak headroom. **Whisper ASR = 0 segments**.
+
+- **Unanimous 3-model critic sign-off on `v006`**:
+  - `@critic-argon` (`#31`): **SHIP IT (`PASS` across all criteria)**
+  - `@critic-opus` (`#32`): **SIGN-OFF, ship it** (Taste verdict: `PASS`, Breakdown intonation/air/portraits verified, `-14.6 LUFS`, `0` reversals)
+  - `@critic` (`#33`): **`PASS` — Converged & Ready to Present (`v006` Sign-Off)**
