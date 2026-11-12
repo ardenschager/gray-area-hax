@@ -155,6 +155,10 @@ impl Studio {
     fn deep_links(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, target: DeepTarget) {
         match target {
             DeepTarget::Emitter(i) => {
+                let w = ui.available_width();
+                let (er, _) = ui.allocate_exact_size(egui::vec2(w, 250.0), Sense::hover());
+                let src = self.columns[self.emitters[i].col];
+                self.envelope_panel(host, ui, er, super::clip::EnvTarget::Emitter(i), src);
                 section(ui, &format!("Emitter {}", i + 1));
                 let id = ui.id().with(("em", i));
                 let e = &mut self.emitters[i];

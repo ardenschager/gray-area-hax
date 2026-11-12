@@ -6,7 +6,7 @@
 use crate::atlas;
 use crate::theme::*;
 use crate::widgets::*;
-use super::{DeepTab, DeepTarget, LANES, SCENES, STEPS};
+use super::{LANES, SCENES, STEPS};
 use super::Studio;
 use crate::host::Host;
 use chromagrain_core::music::Key;
@@ -301,11 +301,18 @@ impl Studio {
         let clip_start = playing_at.and_then(|(i, _)| lay.get(i)).map(|e| e.2).unwrap_or(0.0);
         let slot = ((host.playhead_beats() - clip_start).max(0.0) * 4.0).floor() as usize;
         let mut first_empty = true;
+        let pending = self.pending_slots(host);
+        let t_ui = ui.input(|i| i.time);
         for lane in 0..LANES {
             let y = area.top() + lane as f32 * (lh + g);
             let header = Rect::from_min_size(egui::pos2(area.left(), y), egui::vec2(hw, lh));
             let src = self.seq.lanes[lane];
             let Some(src) = src else {
+                if let Some((pd, _)) = pending.iter().find(|(_, t)| *t == crate::host::AddTarget::Lane(lane)) {
+                    super::add::placeholder_tile(&p, header, 8, pd, t_ui, true);
+                    ctx.request_repaint();
+                    continue;
+                }
                 // Empty lane: the first one is the "drop a video" slot.
                 p.rect_filled(header, r(8), G1);
                 p.rect_stroke(header, r(8), hair(LINE), StrokeKind::Inside);
@@ -314,7 +321,7 @@ impl Studio {
                     let resp = hit(ui, header, ui.id().with(("lane-add", lane)), Sense::click(), "add a lane");
                     draw_icon(&p, Icon::Plus, header.center(), 16.0, if resp.hovered() { INK2 } else { INK3 });
                     if resp.clicked() {
-                        host.import_media();
+                        self.open_add(host, crate::host::AddTarget::Lane(lane));
                     }
                 }
                 for s in 0..STEPS {
@@ -328,6 +335,10 @@ impl Studio {
             let steps: Vec<chromagrain_core::seq::Step> = (0..len).filter_map(|s| self.seq_step(host, scene, lane, s)).collect();
             let silent = steps.iter().all(|s| !s.on);
             let at = self.atlas(host, &ctx, src);
+            let chop_starts: Vec<f32> = {
+                let pp = host.project().lock().unwrap();
+                pp.sources.get(src).map(|so| so.slices.iter().map(|sl| (sl.start / so.duration().max(1e-6)) as f32).collect()).unwrap_or_default()
+            };
             // Header: the clip itself.
             if let Some((tex, a)) = at {
                 tile(&p, header, 8, tex, a.uv_cover(5, hw / lh), gray(if muted { 0.28 } else if silent { 0.5 } else { 0.86 }));
@@ -343,7 +354,7 @@ impl Studio {
             let hresp = hit(ui, header, ui.id().with(("lane-head", lane)), Sense::click(), &format!("lane {}", lane + 1));
             let h = hold(ui, &hresp, 0.45);
             if h.fired {
-                self.deep = Some((DeepTarget::Lane(lane), DeepTab::Links));
+                self.open_clip(super::ClipTarget::Lane(lane));
             } else if hresp.clicked() && !h.held_before {
                 self.toggle_lane_mute(host, lane);
             }
@@ -360,7 +371,11 @@ impl Studio {
                 let ghost = if muted { 0.35 } else { 1.0 };
                 if st.on {
                     if let Some((tex, a)) = at {
-                        let slice = if st.slice >= 0.0 { atlas::frame_at(st.slice) } else { s };
+                        let slice = match st.slice_index.and_then(|k| chop_starts.get(k as usize)) {
+                            Some(pos) => atlas::frame_at(*pos),
+                            None if st.slice >= 0.0 => atlas::frame_at(st.slice),
+                            None => s,
+                        };
                         tile(&p, c, 6, tex, a.uv_cover(slice, sw / lh), gray(0.9 * ghost));
                     }
                     if st.pitch.abs() > 0.01 {
@@ -560,20 +575,42 @@ impl Studio {
             p.rect_filled(rect, r(14), G2);
             p.rect_stroke(rect, r(14), hair(LINE2), StrokeKind::Inside);
             let inner = rect.shrink(10.0);
-            // Slices: 8×2.
+            // Slices: the source's own chops when it has them (up to 16),
+            // else 16 even positions. 8×2.
             let cw = (inner.width() - 7.0 * 4.0) / 8.0;
             let chh = 26.0;
-            let cur_slice = if st.slice >= 0.0 { atlas::frame_at(st.slice) } else { s };
-            for i in 0..16 {
+            let (chops, src_len) = {
+                let pp = host.project().lock().unwrap();
+                pp.sources.get(src).map(|so| (so.slices.clone(), so.duration())).unwrap_or_default()
+            };
+            let n = if chops.is_empty() { 16 } else { chops.len().min(16) };
+            let cur_slice = match st.slice_index {
+                Some(k) if !chops.is_empty() => k as usize,
+                _ if chops.is_empty() && st.slice >= 0.0 => atlas::frame_at(st.slice),
+                _ if chops.is_empty() => s,
+                _ => usize::MAX,
+            };
+            for i in 0..n {
                 let c = Rect::from_min_size(egui::pos2(inner.left() + (i % 8) as f32 * (cw + 4.0), inner.top() + (i / 8) as f32 * (chh + 4.0)), egui::vec2(cw, chh));
+                let frame = if chops.is_empty() { i } else { atlas::frame_at((chops[i].start / src_len.max(1e-6)) as f32) };
                 if let Some((tex, a)) = at {
-                    tile(&p, c, 4, tex, a.uv_cover(i, cw / chh), gray(if i == cur_slice { 1.0 } else { 0.6 }));
+                    tile(&p, c, 4, tex, a.uv_cover(frame, cw / chh), gray(if i == cur_slice { 1.0 } else { 0.6 }));
+                }
+                if !chops.is_empty() {
+                    p.text(c.left_top() + egui::vec2(4.0, 2.0), Align2::LEFT_TOP, (i + 1).to_string(), mono(9.0), INK);
                 }
                 if i == cur_slice {
                     p.rect_stroke(c, r(4), Stroke::new(1.5, HI), StrokeKind::Inside);
                 }
                 if hit(ui, c, id.with(("slice", i)), Sense::click(), &format!("slice {}", i + 1)).clicked() {
-                    self.seq_edit_step(host, scene, lane, s, |x| x.slice = (i as f32 + 0.5) / 16.0);
+                    if chops.is_empty() {
+                        self.seq_edit_step(host, scene, lane, s, |x| {
+                            x.slice = (i as f32 + 0.5) / 16.0;
+                            x.slice_index = None;
+                        });
+                    } else {
+                        self.seq_edit_step(host, scene, lane, s, |x| x.slice_index = Some(i as u16));
+                    }
                 }
             }
             // Params.

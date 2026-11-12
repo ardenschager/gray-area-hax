@@ -230,7 +230,32 @@ changes a value).
 | **Sequence** (2) | nanoloop-style lanes, one per clip, 16 steps. An active step is a thumbnail of the slice it plays. Tap = toggle, drag up/down = pitch in key degrees, hold = step sheet (slice, pitch, length, chance). Lanes can be shorter (polymeter, `↺`). Scenes 1–8 (tap = queue at the next bar; an empty scene copies the current one) and a song chain that becomes the arrangement. |
 | **Perform** (3) | 4×4 clip pads (one global bank), launch quantize Now / Beat / Bar, output to this screen or Display 2, Stop all, Fullscreen (F) with a minimal auto-hiding HUD. |
 
-**Deep** (top bar, an emitter's `⋯` / long-press, a lane header long-press)
+**Adding media — the Add sheet.** Every "+" (an empty grid column or its
+header, an empty pad, Sequence's empty lane) opens one sheet: **Files**
+(a picker), **Browse** (every video on this machine), **Link** (YouTube or
+anything yt-dlp fetches; a 20–60 s window is kept) and **Dig** — one tap
+fetches a random, rarely seen video (camera-default names like
+`IMG_4821`, under 500 views; *Creative Commons only* is on by default),
+hold digs 4. Adds stream in as placeholder tiles where they will land;
+what arrived shows as a card with its provenance (uploader · date ·
+views · CC) and a **Chop** button. The plugin offers Files only.
+
+**Chop, envelope, layout.** Long-press a grid column header, a lane
+header or a pad for its clip sheet: a full-width waveform + filmstrip
+with the slices as alternating bands — Auto (transients) / 4 / 8 / 16,
+**Tap** (the clip plays; every tap drops a chop point, like Koala),
+drag an edge, double-tap a slice to delete it, tap one to audition it,
+**Slices → pads** (pads 1–N; MIDI from C3 plays slices; a Sequence step
+sheet picks from them). Pads and lanes also get an **A / D / S / R**
+envelope drawn over the clip's own thumbnail, which shapes the sound *and*
+the picture: **Cut** (full picture, then a hard cut) or **Fade**
+(opacity = envelope); emitters have theirs on their Deep page. The stage
+in Play / Perform has a **stack | tile** switch: in tile every sounding
+voice gets its own tile (1 → 2 → 2×2 → 3×3, sharp cuts), and the tile
+column pans the sound. The panels are self-contained widgets
+(`Studio::add_panel`, `chop_panel`, `envelope_panel`, `layout_switch`).
+
+**Deep** (top bar, an emitter's `⋯` / long-press)
 holds everything that isn't playing: per-emitter grain settings and
 sound↔picture links, lane length/clip/sound, the master effects, the full
 arrangement with automation, the script console, and the library

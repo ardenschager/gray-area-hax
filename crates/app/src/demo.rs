@@ -13,7 +13,7 @@ use chromagrain_core::fx::{AvEffect, EffectKind};
 use chromagrain_core::music::{Key, ScaleKind};
 use chromagrain_core::seq::StepPattern;
 use chromagrain_core::timeline::{Clip, Source, Track};
-use chromagrain_ui::studio::{COLUMNS, EMITTERS, LANES, SCENES, STEPS};
+use chromagrain_ui::studio::{COLUMNS, EMITTERS, LANES, SCENES};
 use std::path::{Path, PathBuf};
 
 /// One clip of a demo: a file in the demo folder, its display name, and
@@ -466,7 +466,7 @@ mod tests {
         let n = spec.clips.len();
         assert!(spec.grid.iter().all(|c| *c < n) && spec.lanes.iter().all(|l| l.clip < n));
         for s in &spec.scenes {
-            assert!(s.hits.iter().all(|h| h.lane < spec.lanes.len() && h.step < STEPS), "hits land on real lanes and steps");
+            assert!(s.hits.iter().all(|h| h.lane < spec.lanes.len() && h.step < chromagrain_ui::studio::STEPS), "hits land on real lanes and steps");
         }
         assert!(spec.chain.iter().all(|(s, n)| *s < spec.scenes.len() && *n > 0));
         assert_eq!(spec.pads.len(), PADS);

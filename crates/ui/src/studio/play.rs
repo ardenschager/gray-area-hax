@@ -25,6 +25,7 @@ impl Studio {
         let stage_h = (side.width() * 9.0 / 16.0).min(side.height() * 0.5).floor();
         let stage = Rect::from_min_size(side.min, egui::vec2(side.width(), stage_h));
         self.stage(host, ui, stage, 14.0);
+        self.layout_switch(host, ui, stage);
         let brush = Rect::from_min_max(egui::pos2(side.left(), stage.bottom() + gap), side.max);
         self.brush_panel(host, ui, brush);
         let e = &self.emitters[self.sel_emitter];
@@ -36,9 +37,12 @@ impl Studio {
         ui.painter().text(tag.center(), Align2::CENTER_CENTER, look, tag_font, INK2);
     }
 
-    fn play_grid(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, grid: Rect) {
+    fn play_grid(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, area: Rect) {
         let ctx = ui.ctx().clone();
         let g = 4.0;
+        // Column headers: the clip's name (hold = chop), "+" on empty ones.
+        let head_h = 30.0;
+        let grid = Rect::from_min_max(egui::pos2(area.left(), area.top() + head_h + 6.0), area.max);
         let cw = (grid.width() - g * 7.0) / 8.0;
         let ch = (grid.height() - g * (ROWS as f32 - 1.0)) / ROWS as f32;
         let cell = |c: usize, r: usize| {
@@ -47,8 +51,46 @@ impl Studio {
         let p = ui.painter().clone();
         let now = host.clock();
         let sel_col = self.emitters[self.sel_emitter].col;
+        let pending = self.pending_slots(host);
+        let t_ui = ui.input(|i| i.time);
+        let mut open_add = None;
+        let mut open_clip = None;
         for c in 0..super::COLUMNS {
             let src = self.columns[c];
+            let head = Rect::from_min_size(egui::pos2(area.left() + c as f32 * (cw + g), area.top()), egui::vec2(cw, head_h));
+            let hresp = hit(ui, head, ui.id().with(("col-head", c)), Sense::click(), &format!("column {}", c + 1));
+            match src {
+                Some(s) => {
+                    let h = hold(ui, &hresp, 0.45);
+                    let n_slices = self.slices(host, s).len();
+                    let room = ((cw - 22.0) / 6.4).max(3.0) as usize;
+                    let col = if c == sel_col { INK } else { INK2 };
+                    p.text(egui::pos2(head.left() + 2.0, head.center().y), Align2::LEFT_CENTER, short(&self.source_name(host, s), room), font(11.0), col);
+                    if n_slices > 0 {
+                        draw_icon(&p, Icon::Chop, egui::pos2(head.right() - 8.0, head.center().y), 12.0, INK3);
+                    }
+                    if h.fired {
+                        open_clip = Some(c);
+                    } else if hresp.clicked() && !h.held_before {
+                        self.emitters[self.sel_emitter].col = c;
+                    }
+                }
+                None => {
+                    if hresp.clicked() {
+                        open_add = Some(c);
+                    }
+                    caps(&p, egui::pos2(head.left() + 2.0, head.center().y), Align2::LEFT_CENTER, &format!("{}", c + 1), 10.0);
+                }
+            }
+            // An add still arriving for this column: one tall placeholder.
+            if src.is_none() {
+                if let Some((pd, _)) = pending.iter().find(|(_, t)| *t == crate::host::AddTarget::Column(c)) {
+                    let col_rect = Rect::from_min_max(cell(c, 0).min, cell(c, ROWS - 1).max);
+                    super::add::placeholder_tile(&p, col_rect, 6, pd, t_ui, true);
+                    ctx.request_repaint();
+                    continue;
+                }
+            }
             let at = src.and_then(|s| self.atlas(host, &ctx, s));
             for row in 0..ROWS {
                 let rc = cell(c, row);
@@ -74,12 +116,19 @@ impl Studio {
                             let resp = hit(ui, rc, ui.id().with(("add-col", c)), Sense::click(), "add a clip");
                             draw_icon(&p, Icon::Plus, rc.center(), 16.0, if resp.hovered() { INK2 } else { INK3 });
                             if resp.clicked() {
-                                host.import_media();
+                                open_add = Some(c);
                             }
                         }
                     }
                 }
             }
+        }
+
+        if let Some(c) = open_add {
+            self.open_add(host, crate::host::AddTarget::Column(c));
+        }
+        if let Some(c) = open_clip {
+            self.open_clip(super::ClipTarget::Column(c));
         }
 
         // Touch / pointer: press = the selected emitter jumps there and
