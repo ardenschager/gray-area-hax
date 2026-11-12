@@ -84,6 +84,8 @@ fn sliced(app: &mut App, src: usize, n: usize) {
 fn v003_snapshots() {
     for size in SIZES {
         // Add sheet, every tab (Dig with things arriving and a dug card).
+        // Browse shows the design's media folder (the fixture library).
+        std::env::set_var(crate::browser::BROWSE_ROOT_ENV, std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../design/v001/media"));
         for route in [AddRoute::Files, AddRoute::Browse, AddRoute::Link, AddRoute::Dig] {
             let mut h = harness(size, View::Play, move |app| {
                 showcase(app);
@@ -99,6 +101,18 @@ fn v003_snapshots() {
                 app.studio.sheet = Some(Sheet::Add(AddTarget::Column(7)));
             });
             h.run_steps(10);
+            if route == AddRoute::Browse {
+                // Scan + ffmpeg thumbnails arrive in the background.
+                let t = std::time::Instant::now();
+                while t.elapsed().as_secs() < 15 && h.state().browse_last.is_empty() {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    h.run_steps(1);
+                }
+                for _ in 0..40 {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    h.run_steps(1);
+                }
+            }
             shot(&mut h, &name(&format!("add-{}", route.label().to_lowercase()), size));
         }
         // The grid with an add still arriving (placeholder column + tile).

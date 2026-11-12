@@ -63,6 +63,18 @@ pub fn placeholder_tile(p: &egui::Painter, rect: Rect, radius: u8, pend: &Pendin
         }
     }
     p.rect_stroke(rect, r(radius), Stroke::new(1.0, if pend.failed.is_some() { REC.gamma_multiply(0.6) } else { LINE3 }), StrokeKind::Inside);
+    // What's coming (a spade for digs, a link, a file) and three pulsing
+    // dots: unmistakably loading, still neutral.
+    if pend.failed.is_none() {
+        let icon = if pend.label.starts_with("digging") { Icon::Dig } else if pend.label.starts_with("loading") { Icon::Folder } else { Icon::Link };
+        let c = egui::pos2(rect.center().x, rect.center().y.min(rect.top() + 44.0).max(rect.top() + rect.height() * 0.4));
+        draw_icon(p, icon, c - egui::vec2(0.0, 8.0), if compact { 18.0 } else { 22.0 }, INK2);
+        for k in 0..3 {
+            let ph = ((t * 2.2 - k as f64 * 0.22).rem_euclid(1.0)) as f32;
+            let a = (1.0 - (ph * 2.0 - 1.0).abs()).clamp(0.15, 1.0);
+            p.circle_filled(c + egui::vec2((k as f32 - 1.0) * 8.0, 14.0), 2.2, Color32::from_white_alpha((a * 160.0) as u8));
+        }
+    }
     let label = match &pend.failed {
         Some(e) => super::play::short(e, if compact { 14 } else { 40 }),
         None => super::play::short(&pend.label, if compact { 14 } else { 40 }),

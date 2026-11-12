@@ -397,16 +397,23 @@ impl Studio {
         let p = ui.painter().clone();
         caps(&p, egui::pos2(area.left(), area.top() + 6.0), Align2::LEFT_CENTER, "Envelope — sound and picture", 10.5);
         let Some(mut adsr) = self.target_env(host, target) else { return };
-        let side_w = 230.0f32.min(area.width() * 0.36);
-        let ew = area.width() - side_w - 18.0;
-        let er = Rect::from_min_size(egui::pos2(area.left(), area.top() + 22.0), egui::vec2(ew, (area.height() - 26.0).clamp(80.0, 170.0)));
+        // Wide: editor | picture switch; narrow (a drawer): stacked.
+        let narrow = area.width() < 560.0;
+        let (er, side) = if narrow {
+            let eh = (area.height() - 26.0 - 96.0).clamp(80.0, 170.0);
+            let er = Rect::from_min_size(egui::pos2(area.left(), area.top() + 22.0), egui::vec2(area.width(), eh));
+            (er, Rect::from_min_max(egui::pos2(area.left(), er.bottom() + 8.0), egui::pos2(area.right(), er.bottom() + 96.0)))
+        } else {
+            let side_w = 230.0f32.min(area.width() * 0.36);
+            let er = Rect::from_min_size(egui::pos2(area.left(), area.top() + 22.0), egui::vec2(area.width() - side_w - 18.0, (area.height() - 26.0).clamp(80.0, 170.0)));
+            (er, Rect::from_min_max(egui::pos2(er.right() + 18.0, er.top()), egui::pos2(area.right(), er.bottom())))
+        };
         let frame = match target {
             EnvTarget::Emitter(i) => atlas::frame_at(self.emitters[i].pos()),
             _ => 5,
         };
         let thumb = thumb_src.and_then(|s| self.atlas(host, &ctx, s)).map(|(tex, _)| (tex, atlas::uv_cover(frame, er.width() / er.height())));
         let mut changed = adsr_editor(ui, er, ui.id().with(("env", target)), &mut adsr, thumb);
-        let side = Rect::from_min_max(egui::pos2(er.right() + 18.0, er.top()), egui::pos2(area.right(), er.bottom()));
         changed |= picture_switch(ui, side, ui.id().with(("cutfade", target)), &mut adsr);
         if changed {
             self.set_target_env(host, target, adsr);

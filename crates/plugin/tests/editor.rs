@@ -407,3 +407,73 @@ fn the_host_can_resize_the_editor_down_to_960x600() {
         assert!(pad.right() <= w + 0.5 && pad.bottom() <= hh + 0.5 && pad.width() >= 44.0, "{w}x{hh}: {pad:?}");
     }
 }
+
+/// v003 in the plugin editor: the clip sheet chops a source and sends the
+/// slices to the instrument's pads (one-shots), the layout switch flips
+/// stack / tile, and only Files is offered for adding (no Browse / Link /
+/// Dig inside a DAW).
+#[test]
+fn plugin_chop_slices_to_pads_layout_and_add_routes() {
+    use chromagrain_ui::studio::{ClipTarget, Sheet};
+    use chromagrain_ui::Host;
+    let version = std::env::var("CHROMAGRAIN_UI_VERSION").unwrap_or_else(|_| "v001".into());
+    let mut p = plugin_with(vec![sine()]);
+    let mut h = harness((1180.0, 820.0), editor_ui(&p));
+    h.run_steps(2);
+    assert_eq!(h.state().host.caps().add, vec![chromagrain_ui::AddRoute::Files]);
+    {
+        let ui = h.state_mut();
+        ui.studio.set_view(&mut ui.host, View::Perform);
+        ui.studio.open_clip(ClipTarget::Column(0));
+    }
+    h.run_steps(3);
+    h.get_by_label("slice 4").click();
+    h.run_steps(2);
+    assert_eq!(h.state().host.project.lock().unwrap().sources[0].slices.len(), 4);
+    h.get_by_label("slices to pads").click();
+    h.run_steps(2);
+    // The slices reach the instrument (loader swap) and the pads (live ring).
+    let t = Instant::now();
+    loop {
+        play(&mut p, 0.02, 0.0, &[]);
+        let inst = &p.audio().inst;
+        if inst.sources()[0].slices.len() == 4 && inst.pad(3).slot.is_some_and(|s| s.slice.is_some()) {
+            break;
+        }
+        assert!(t.elapsed() < Duration::from_secs(5), "slices never reached the instrument");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(p.params_ref().slices.lock().unwrap().len(), 1, "chops persist with the session");
+    assert_eq!(p.params_ref().pad_extra.lock().unwrap().len(), 4, "so do the slice pads");
+    h.state_mut().studio.sheet = None;
+    h.run_steps(2);
+    shot(&mut h, &format!("261112_plugin_editor_perform-slices_1180x820_{version}"));
+    h.get_by_label("layout tile").click();
+    h.run_steps(2);
+    assert_eq!(h.state().host.tile_layout(), Some(true));
+    assert_eq!(h.state().host.project.lock().unwrap().layout, chromagrain_core::tile::Layout::Tile);
+    // The pad sheet with its envelope.
+    h.state_mut().studio.open_clip(ClipTarget::Pad(0));
+    h.run_steps(3);
+    assert_eq!(h.state().studio.sheet, Some(Sheet::Clip(ClipTarget::Pad(0))));
+    let rh = h.get_by_label("adsr R").rect().center();
+    h.input_mut().events.push(egui::Event::PointerMoved(rh));
+    h.input_mut().events.push(egui::Event::PointerButton { pos: rh, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+    h.step();
+    for k in 1..=6 {
+        h.input_mut().events.push(egui::Event::PointerMoved(rh + egui::vec2(k as f32 * 10.0, 0.0)));
+        h.step();
+    }
+    h.input_mut().events.push(egui::Event::PointerButton { pos: rh + egui::vec2(60.0, 0.0), button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+    h.run_steps(2);
+    shot(&mut h, &format!("261112_plugin_editor_pad-sheet_1180x820_{version}"));
+    let t = Instant::now();
+    loop {
+        play(&mut p, 0.02, 0.0, &[]);
+        if p.audio().inst.pad(0).slot.and_then(|s| s.adsr).is_some_and(|a| a.release > 0.05) {
+            break;
+        }
+        assert!(t.elapsed() < Duration::from_secs(5), "the pad envelope never reached the instrument");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}

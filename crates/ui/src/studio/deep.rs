@@ -156,7 +156,7 @@ impl Studio {
         match target {
             DeepTarget::Emitter(i) => {
                 let w = ui.available_width();
-                let (er, _) = ui.allocate_exact_size(egui::vec2(w, 170.0), Sense::hover());
+                let (er, _) = ui.allocate_exact_size(egui::vec2(w, 250.0), Sense::hover());
                 let src = self.columns[self.emitters[i].col];
                 self.envelope_panel(host, ui, er, super::clip::EnvTarget::Emitter(i), src);
                 section(ui, &format!("Emitter {}", i + 1));
