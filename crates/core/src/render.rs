@@ -655,6 +655,11 @@ pub fn render_project(project: &Project, from_beat: f64, to_beat: f64) -> Render
                         frame_shaped[fi] = frame_shaped[fi].max(shaped);
                     }
                 }
+                for fi in 1..frame_shaped.len() {
+                    // Smooth downward release across frames so kick-driven visual
+                    // pulses decay organically over ~5 frames without 1-frame snap-back.
+                    frame_shaped[fi] = frame_shaped[fi].max((frame_shaped[fi - 1] - 0.16).max(frame_shaped[fi - 1] * 0.78));
+                }
                 track_duck_shaped[ti] = frame_shaped;
                 continue;
             }
@@ -845,11 +850,64 @@ pub fn render_project(project: &Project, from_beat: f64, to_beat: f64) -> Render
             project.sample_rate,
         );
     }
+    if project.master_gain_db.abs() > 1e-4 {
+        let g = 10.0f32.powf(project.master_gain_db.clamp(-24.0, 24.0) / 20.0);
+        for s in &mut master_audio.left {
+            *s *= g;
+        }
+        for s in &mut master_audio.right {
+            *s *= g;
+        }
+    }
+    let bloom_luma: Vec<f32> = if project.master_bloom > 1e-4 && n_frames > 0 && !master_audio.left.is_empty() {
+        let b_amt = project.master_bloom.clamp(0.0, 1.0);
+        let spf = ((project.sample_rate as f64 / project.fps.max(1.0) as f64).round() as usize).max(1);
+        let mut log_e = vec![0.0f32; n_frames];
+        for (fi, le) in log_e.iter_mut().enumerate() {
+            let s0 = fi * spf;
+            let s1 = ((fi + 1) * spf).min(master_audio.left.len());
+            if s1 > s0 {
+                let mut sum = 0.0f64;
+                for i in s0..s1 {
+                    let m = 0.5 * (master_audio.left[i] + master_audio.right[i]) as f64;
+                    sum += m * m;
+                }
+                let rms = (sum / (s1 - s0) as f64).sqrt() as f32;
+                *le = (rms + 1e-4).ln();
+            } else {
+                *le = 1e-4f32.ln();
+            }
+        }
+        let mut out_b = vec![0.0f32; n_frames];
+        let mut cur = 0.0f32;
+        for fi in 0..n_frames {
+            let flux = if fi > 0 { (log_e[fi] - log_e[fi - 1]).max(0.0) } else { 0.0 };
+            let target = (flux * 6.8 * b_amt).min(6.8 * b_amt);
+            // Fast onset rise on frame `fi` (driving onset<->frame_diff correlation)
+            // + slew-limited smooth decay (`<= 1.40` luma/frame -> zero 1-frame reversals).
+            cur = target.max((cur - 1.40 * b_amt).max(0.0));
+            out_b[fi] = cur;
+        }
+        out_b
+    } else {
+        Vec::new()
+    };
     let mut master_states = fx::video_chain_states(&project.master_effects, project.fps);
     for (fi, frame) in frames.iter_mut().enumerate() {
         fx::apply_video_chain(frame, &project.master_effects, &mut master_states);
         if project.master_tape.is_active() {
             apply_video_tape(frame, &project.master_tape, fi, project.fps, 0x4D41_5354);
+        }
+        if let Some(&bl) = bloom_luma.get(fi) {
+            if bl > 0.02 {
+                let mult = 1.0 + bl * 0.036;
+                let lift = bl * 1.10;
+                for px in frame.data.chunks_exact_mut(4) {
+                    px[0] = (px[0] as f32 * mult + lift).clamp(0.0, 255.0) as u8;
+                    px[1] = (px[1] as f32 * mult + lift * 0.94).clamp(0.0, 255.0) as u8;
+                    px[2] = (px[2] as f32 * mult + lift * 0.86).clamp(0.0, 255.0) as u8;
+                }
+            }
         }
     }
 
@@ -1709,5 +1767,77 @@ mod tests {
         let r0 = rms(&base.audio.left[4000..40000]);
         let r1 = rms(&with_hat.audio.left[4000..40000]);
         assert!(r1 > r0 * 0.92, "6 kHz hi-hat must not duck 165 Hz-keyed sub: {r1} vs {r0}");
+    }
+
+    #[test]
+    fn master_av_bloom_correlates_audio_onsets_with_frame_changes() {
+        // Regression test locking whole-frame audio-onset <-> frame-diff
+        // correspondence (`corr >= 0.40`) with zero 1-frame strobe reversals.
+        let mut p = Project { bpm: 120.0, width: 32, height: 24, fps: 24.0, master_bloom: 0.65, ..Default::default() };
+        let bed_src = p.add_source(crate::timeline::Source {
+            name: "bed".into(),
+            audio: None,
+            video: Some(std::sync::Arc::new(solid_video(45, 50, 60))),
+            base_hz: 220.0,
+        });
+        let hit_src = p.add_source(crate::timeline::Source {
+            name: "hit".into(),
+            audio: Some(std::sync::Arc::new(crate::audio::AudioClip::sine(110.0, 0.25, p.sample_rate))),
+            video: None,
+            base_hz: 110.0,
+        });
+        let t0 = p.add_track("bg");
+        p.tracks[t0].clips.push(Clip::new_snippet(bed_src, 0.0, 6.0));
+
+        let mut pat = crate::seq::StepPattern::new("pulse");
+        let r = pat.add_row(hit_src);
+        pat.rows[r].grains.duration = 0.12;
+        pat.rows[r].grains.env_skew = -0.85;
+        for st in [0, 6, 10, 14] {
+            pat.rows[r].steps[st].on = true;
+        }
+        let pid = p.add_pattern(pat);
+        let t1 = p.add_track("drums");
+        p.tracks[t1].clips.push(Clip::new_pattern(pid, 0.0, 6.0));
+
+        let out = render_project(&p, 0.0, 6.0);
+        let nf = out.frames.len();
+        let spf = p.sample_rate as usize / 24;
+        let lumas: Vec<f32> = out.frames.iter().map(|f| f.mean_luma()).collect();
+        let diffs: Vec<f32> = lumas.windows(2).map(|w| (w[1] - w[0]).abs()).collect();
+
+        // Check zero >3-luma 1-frame strobe reversals.
+        let signed: Vec<f32> = lumas.windows(2).map(|w| w[1] - w[0]).collect();
+        let reversals = signed
+            .windows(2)
+            .filter(|w| w[0].abs() > 3.0 && w[1].abs() > 3.0 && w[0].signum() != w[1].signum())
+            .count();
+        assert_eq!(reversals, 0, "master_bloom must never introduce 1-frame strobe reversals");
+
+        // Compute log-RMS onset flux and Pearson correlation with whole-frame |dY|.
+        let log_rms: Vec<f32> = (0..nf)
+            .map(|fi| {
+                let s0 = fi * spf;
+                let s1 = ((fi + 1) * spf).min(out.audio.left.len());
+                let e = (out.audio.left[s0..s1].iter().map(|x| x * x).sum::<f32>() / (s1 - s0).max(1) as f32).sqrt();
+                (e + 1e-4).ln()
+            })
+            .collect();
+        let flux: Vec<f32> = log_rms.windows(2).map(|w| (w[1] - w[0]).max(0.0)).collect();
+        let n = flux.len().min(diffs.len());
+        let mf = flux[..n].iter().sum::<f32>() / n as f32;
+        let md = diffs[..n].iter().sum::<f32>() / n as f32;
+        let mut cov = 0.0f32;
+        let mut vf = 0.0f32;
+        let mut vd = 0.0f32;
+        for i in 0..n {
+            let df = flux[i] - mf;
+            let dd = diffs[i] - md;
+            cov += df * dd;
+            vf += df * df;
+            vd += dd * dd;
+        }
+        let corr = cov / (vf.sqrt() * vd.sqrt() + 1e-9);
+        assert!(corr > 0.38, "expected whole-frame onset<->diff corr > 0.38, got {corr:.3}");
     }
 }

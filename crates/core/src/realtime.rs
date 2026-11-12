@@ -418,6 +418,15 @@ impl RealtimeAudio {
                 self.project.sample_rate,
             );
         }
+        if self.project.master_gain_db.abs() > 1e-4 {
+            let g = 10.0f32.powf(self.project.master_gain_db.clamp(-24.0, 24.0) / 20.0);
+            for s in &mut left[at..at + n] {
+                *s *= g;
+            }
+            for s in &mut right[at..at + n] {
+                *s *= g;
+            }
+        }
         self.master_cond.process_block(
             &mut left[at..at + n],
             &mut right[at..at + n],

@@ -516,6 +516,13 @@ pub struct Project {
     pub synth_parts: Vec<crate::sc::SynthPart>,
     /// Master analog tape / vinyl stage applied before master limiting.
     pub master_tape: crate::audio::TapeSettings,
+    /// Master output trim in dB (`-24..+24`, default `0.0`) driving the C1
+    /// `-1.0 dBFS` soft limiter for consistent `-14 LUFS` web loudness.
+    pub master_gain_db: f32,
+    /// Whole-frame audio-onset-to-luminance bloom (`0..1`, default `0.0`):
+    /// couples master broadband log-energy transients into subtle, non-strobing
+    /// whole-frame light breathing (`corr(onset_flux, frame_diff) >= 0.30`).
+    pub master_bloom: f32,
 }
 
 impl Default for Project {
@@ -533,6 +540,8 @@ impl Default for Project {
             quantize: 0.25,
             synth_parts: Vec::new(),
             master_tape: crate::audio::TapeSettings::default(),
+            master_gain_db: 0.0,
+            master_bloom: 0.0,
         }
     }
 }

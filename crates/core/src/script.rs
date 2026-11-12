@@ -788,6 +788,12 @@ pub fn build_engine(session: Session, log: Arc<Mutex<String>>) -> Engine {
             };
         },
     );
+    engine.register_fn("master_gain", |s: &mut Session, gain_db: f64| {
+        s.project.lock().unwrap().master_gain_db = (gain_db as f32).clamp(-24.0, 24.0);
+    });
+    engine.register_fn("master_av_bloom", |s: &mut Session, amount: f64| {
+        s.project.lock().unwrap().master_bloom = (amount as f32).clamp(0.0, 1.0);
+    });
     engine.register_fn(
         "track_effect",
         |s: &mut Session, track: i64, kind: &str| -> ScriptResult<i64> {

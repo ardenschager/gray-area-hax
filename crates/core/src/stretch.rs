@@ -103,27 +103,36 @@ fn paulstretch_channel(input: &[f32], factor: f32, sr: u32, spread_cents: f32) -
     let min_k = (20.0 / hz_per_bin).ceil() as usize;
     let rel_half = 2.0f32.powf(spread_cents / 1200.0) - 1.0;
 
-    // One energy-preserving proportional box pass over power spectrum `src -> dst`
-    // via prefix sums (`O(half)`). Running two passes yields a smooth triangular
-    // cents-proportional kernel that leaves flat broadband air at 0.0 dB change
-    // while spreading narrow tonal spikes across `±spread_cents`.
-    let blur_power_pass = |src: &[f64], dst: &mut [f64], pref: &mut [f64]| {
-        pref[0] = 0.0;
-        for k in 0..=half {
-            pref[k + 1] = pref[k] + src[k];
-        }
-        for k in 0..=half {
-            let freq = k as f32 * hz_per_bin;
-            let ramp = ((freq - 280.0) / 820.0).clamp(0.0, 1.0);
-            let dk = ((k as f32 * rel_half * ramp).round() as usize).min(half / 4);
-            if dk == 0 {
-                dst[k] = src[k];
-            } else {
-                let lo = k.saturating_sub(dk).max(min_k.min(k));
-                let hi = (k + dk).min(half - 1).max(lo);
-                let cnt = (hi - lo + 1) as f64;
-                dst[k] = (pref[hi + 1] - pref[lo]) / cnt;
+    // One energy-conserving symmetric SCATTER pass over power spectrum `src -> dst`
+    // via difference arrays (`O(half)`). Unlike a variable-width gather box (which
+    // pulls peak centroids upward where `dk(k)` grows), scattering each source bin
+    // `j` symmetrically across `[j - dj, j + dj]` keeps every harmonic's pitch
+    // centroid dead in tune (`0.0` cents shift) while melting `>1.1 kHz` whistles.
+    let scatter_power_pass = |src: &[f64], dst: &mut [f64], diff: &mut [f64]| {
+        diff.fill(0.0);
+        for j in 0..=half {
+            let p = src[j];
+            if p <= 0.0 {
+                continue;
             }
+            let freq = j as f32 * hz_per_bin;
+            let ramp = ((freq - 950.0) / 600.0).clamp(0.0, 1.0);
+            let dj = ((j as f32 * rel_half * ramp).round() as usize).min(half / 4);
+            if dj == 0 {
+                diff[j] += p;
+                diff[j + 1] -= p;
+            } else {
+                let lo = j.saturating_sub(dj).max(min_k.min(j));
+                let hi = (j + dj).min(half - 1).max(lo);
+                let share = p / (hi - lo + 1) as f64;
+                diff[lo] += share;
+                diff[hi + 1] -= share;
+            }
+        }
+        let mut acc = 0.0f64;
+        for k in 0..=half {
+            acc += diff[k];
+            dst[k] = acc.max(0.0);
         }
     };
 
@@ -144,8 +153,8 @@ fn paulstretch_channel(input: &[f32], factor: f32, sr: u32, spread_cents: f32) -
             };
         }
         if spread_cents > 0.5 {
-            blur_power_pass(&pow_a, &mut pow_b, &mut pref);
-            blur_power_pass(&pow_b, &mut pow_a, &mut pref);
+            scatter_power_pass(&pow_a, &mut pow_b, &mut pref);
+            scatter_power_pass(&pow_b, &mut pow_a, &mut pref);
         }
 
         let mut rng = Rng::new(0x9A75_57E7 ^ seg as u64);
@@ -430,6 +439,41 @@ mod tests {
         assert!(
             p_sp < p_raw * 0.25,
             "cents spread melts narrow whistle spike: {p_sp:.1} vs {p_raw:.1}"
+        );
+    }
+
+    #[test]
+    fn stretch_preserves_eb5_harmonic_tuning_within_3_cents() {
+        // Regression test for v004's 622.25 Hz -> 641 Hz (+51c) gather-box shift:
+        // symmetric scatter must keep Eb5 (622.254 Hz) dead in tune (<3 cents).
+        let sr = 48000u32;
+        let eb5 = sine(622.254, 0.8, sr);
+        let out = paulstretch(&eb5, 6.0);
+        let n = 65536usize;
+        let start = ((out.samples.len().saturating_sub(n)) / 2).max(0);
+        let mut re = vec![0.0f32; n];
+        let mut im = vec![0.0f32; n];
+        for i in 0..n.min(out.samples.len() - start) {
+            let h = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / n as f32).cos());
+            re[i] = out.samples[start + i] * h;
+        }
+        fft(&mut re, &mut im, false);
+        let k0 = (550.0 * n as f32 / sr as f32) as usize;
+        let k1 = (700.0 * n as f32 / sr as f32) as usize;
+        let mut best_k = k0;
+        let mut best_p = 0.0f64;
+        for k in k0..=k1 {
+            let p = (re[k] as f64).powi(2) + (im[k] as f64).powi(2);
+            if p > best_p {
+                best_p = p;
+                best_k = k;
+            }
+        }
+        let peak_hz = best_k as f32 * sr as f32 / n as f32;
+        let cents_err = 1200.0 * (peak_hz / 622.254).log2();
+        assert!(
+            cents_err.abs() < 3.0,
+            "paulstretch must keep Eb5 (622.25 Hz) in tune, got {peak_hz:.2} Hz ({cents_err:+.1}c)"
         );
     }
 }

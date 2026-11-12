@@ -874,10 +874,25 @@ pub fn composite_grains_frame_opts(
                 }
                 if shad > 0.002 {
                     let luma = (0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32) / 255.0;
-                    let keep = (1.0 - 0.84 * shad) * (0.65 + 0.35 * luma * luma);
-                    r = (r as f32 * keep).clamp(0.0, 255.0) as u8;
-                    g = (g as f32 * keep).clamp(0.0, 255.0) as u8;
-                    b = (b as f32 * keep).clamp(0.0, 255.0) as u8;
+                    // Detect 2-px silhouette alpha contour so dark shadow figures
+                    // carry a luminous rim highlight over dark nocturnal backgrounds.
+                    let sx_c = sx.min(src.width - 1);
+                    let sy_c = sy.min(src.height - 1);
+                    let a_l = src.get(sx_c.saturating_sub(2), sy_c)[3];
+                    let a_r = src.get((sx_c + 2).min(src.width - 1), sy_c)[3];
+                    let a_u = src.get(sx_c, sy_c.saturating_sub(2))[3];
+                    let a_d = src.get(sx_c, (sy_c + 2).min(src.height - 1))[3];
+                    let min_nb = a_l.min(a_r).min(a_u).min(a_d);
+                    let edge_grad = (ta.saturating_sub(min_nb)) as f32 / 255.0;
+                    let ta_n = ta as f32 / 255.0;
+                    let rim = (edge_grad * 1.4 + (ta_n * (1.0 - ta_n) * 2.8)).clamp(0.0, 1.0);
+
+                    let keep = (1.0 - 0.72 * shad) * (0.58 + 0.42 * luma);
+                    let floor_lift = 18.0 * shad * (0.35 + 0.65 * luma);
+                    let rim_boost = 92.0 * shad * rim;
+                    r = (r as f32 * keep + floor_lift + rim_boost * 1.08).clamp(0.0, 255.0) as u8;
+                    g = (g as f32 * keep + floor_lift + rim_boost * 0.90).clamp(0.0, 255.0) as u8;
+                    b = (b as f32 * keep + floor_lift + rim_boost * 0.68).clamp(0.0, 255.0) as u8;
                 }
 
                 // Straight-alpha accumulation into the layer, with an
