@@ -171,6 +171,8 @@ pub struct TileAssigner {
     /// Voice in each slot, when it started, and when it ends
     /// (`f64::INFINITY` while held).
     slots: [Option<(u64, f64, f64)>; MAX_TILES],
+    /// Affinity key of each slot's latest voice (see [`TileAssigner::assign_keyed`]).
+    keys: [Option<u64>; MAX_TILES],
 }
 
 impl TileAssigner {
@@ -198,6 +200,33 @@ impl TileAssigner {
         match self.slots.iter().position(|s| s.is_none()) {
             Some(i) => {
                 self.slots[i] = Some((voice, t, f64::INFINITY));
+                i as u8
+            }
+            None => (voice % MAX_TILES as u64) as u8,
+        }
+    }
+
+    /// Like [`TileAssigner::assign`], for voices with an affinity `key`
+    /// (a track, a pad, a lane) that holds one tile: a new voice takes
+    /// over the slot of a still-sounding voice with the same key (its tail
+    /// shares the tile), else takes back a free slot its key used last,
+    /// else the lowest free one. So a looping pad's next pass or a lane's
+    /// next hit stays in its tile instead of trading places.
+    pub fn assign_keyed(&mut self, voice: u64, key: u64, t: f64) -> u8 {
+        if let Some(i) = self.slot_of(voice) {
+            return i as u8;
+        }
+        self.expire(t);
+        let free = |i: &usize| self.slots[*i].is_none();
+        let i = (0..MAX_TILES)
+            .find(|&i| self.keys[i] == Some(key))
+            .filter(|&i| self.slots[i].is_some())
+            .or_else(|| (0..MAX_TILES).filter(free).find(|&i| self.keys[i] == Some(key)))
+            .or_else(|| (0..MAX_TILES).find(free));
+        match i {
+            Some(i) => {
+                self.slots[i] = Some((voice, t, f64::INFINITY));
+                self.keys[i] = Some(key);
                 i as u8
             }
             None => (voice % MAX_TILES as u64) as u8,
@@ -232,6 +261,7 @@ impl TileAssigner {
 
     pub fn clear(&mut self) {
         self.slots = [None; MAX_TILES];
+        self.keys = [None; MAX_TILES];
     }
 }
 
@@ -344,5 +374,25 @@ mod tests {
         assert_eq!(grid_in(&tl, 4.0), (1, 1));
         assert!(tl.windows(2).all(|w| w[0].0 < w[1].0 && w[0].1 != w[1].1));
         assert_eq!(grid_timeline(&[]), vec![(f64::NEG_INFINITY, (1, 1))]);
+    }
+
+    #[test]
+    fn keyed_voices_take_back_their_slot() {
+        let mut a = TileAssigner::new();
+        // Track 3 starts first (slot 0), track 1 joins (slot 1).
+        assert_eq!(a.assign_keyed(30, 3, 0.0), 0);
+        a.release(30, 1.0);
+        assert_eq!(a.assign_keyed(10, 1, 0.5), 1);
+        a.release(10, 1.0);
+        // Both loop at 1.0: each pass keeps its track's slot, even though
+        // track 1's voice comes first and slot 0 is lower.
+        assert_eq!(a.assign_keyed(11, 1, 1.0), 1);
+        assert_eq!(a.assign_keyed(31, 3, 1.0), 0);
+        // A new key takes the lowest free slot.
+        assert_eq!(a.assign_keyed(50, 5, 1.0), 2);
+        // An overlapping voice of the same key takes over its slot.
+        assert_eq!(a.assign_keyed(51, 5, 1.2), 2);
+        assert_eq!(a.slot_of(50), None);
+        assert_eq!(a.grid_at(1.2), (2, 2));
     }
 }

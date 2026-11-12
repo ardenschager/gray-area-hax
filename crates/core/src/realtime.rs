@@ -939,4 +939,57 @@ mod tests {
         let e: f32 = tail.iter().map(|s| s * s).sum::<f32>() / tail.len() as f32;
         assert!(e.sqrt() < 1e-4, "silent after the release: {}", e.sqrt());
     }
+
+    #[test]
+    fn muted_tracks_get_no_tiles_and_pads_keep_their_tile() {
+        // Six looping pad tracks (Perform: pad i = track i, ON = unmuted,
+        // the loop refilled with copies), three playing, entering at
+        // different times: they take slots 0, 1, 2 in a 2×2 grid, each
+        // pad keeps its slot on every pass, and muted pads get no tile.
+        let mut p = Project { bpm: 120.0, width: 32, height: 18, fps: 12.0, ..Default::default() };
+        p.layout = crate::tile::Layout::Tile;
+        let sid = p.add_source(Source {
+            name: "s".into(),
+            audio: Some(std::sync::Arc::new(crate::audio::AudioClip::saw_stack(110.0, 3.0, p.sample_rate))),
+            video: Some(std::sync::Arc::new(VideoClip::test_pattern(32, 18, 12.0, 3.0))),
+            base_hz: 110.0,
+            ..Default::default()
+        });
+        let entry = [None, Some(2.0), None, Some(0.0), Some(1.0), None]; // beats
+        for (k, e) in entry.iter().enumerate() {
+            let t = p.add_track(&format!("pad{k}"));
+            let from = e.unwrap_or(0.0);
+            let mut b = from;
+            while b < 8.0 {
+                let mut c = Clip::new_snippet(sid, b, 1.0);
+                c.grains.density = 10.0;
+                p.tracks[t].clips.push(c);
+                b += 1.0;
+            }
+            p.tracks[t].muted = e.is_none();
+        }
+        let plans = crate::render::plan_project(&p);
+        let slots = |track: usize| {
+            plans
+                .iter()
+                .filter(|cp| cp.track == track)
+                .flat_map(|cp| cp.parts.iter().chain(cp.video_parts.iter().flatten()).flat_map(|(_, e)| e.iter().map(|e| e.tag.tile)))
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_eq!(slots(3), [Some(0)].into(), "first in: slot 0, every pass");
+        assert_eq!(slots(4), [Some(1)].into());
+        assert_eq!(slots(1), [Some(2)].into());
+        for t in [0, 2, 5] {
+            assert!(slots(t).iter().all(|s| s.is_none()), "muted track {t} has no tile");
+        }
+        let grids = crate::render::frame_tile_grids(&plans, 0.0, 12.0, 48);
+        assert_eq!(grids[3], (1, 1), "0.25 s: pad 3 alone");
+        assert_eq!(grids[9], (2, 1), "0.75 s: pads 3 + 4");
+        for (f, g) in grids.iter().enumerate().skip(13) {
+            assert_eq!(*g, (2, 2), "frame {f}: three pads → 2×2 (no 3×3 with holes)");
+        }
+        let out = render_project(&p, 0.0, 4.0);
+        assert!(out.events.iter().flatten().all(|e| e.tag.tile.is_none_or(|s| s <= 2)));
+        assert!(out.frames[18].mean_luma() > 1.0, "the tiles draw");
+    }
 }

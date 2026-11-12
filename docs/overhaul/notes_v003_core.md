@@ -49,6 +49,9 @@ Core side of [spec_v003](spec_v003_dig-chop-tile-adsr.md), branch `feat-core-v00
   - Instrument: `TileAssigner::grid_at(onset)` counts voices with `start <= t < end`.
   - Render plans: `render::assign_tiles` uses `tile::grid_timeline(spans)` + `grid_in`.
 - **Offline per-frame grids:** `render::frame_tile_grids`.
+- **Render plans** (`render::plan_project`) differ from the Instrument in two ways:
+  - **Muted tracks get no tile.** Their grains keep `tag.tile == None`, so they don't count toward the grid.
+  - **Slots are keyed** (`TileAssigner::assign_keyed`): one tile per track, or per pattern lane for step hits. A pad's next loop pass, or a lane's next hit, takes back its slot (or takes over the slot from its own tail). When several voices start at the same instant, continuing keys claim their slots before new keys take the lowest free slot.
 
 ### GPU parity (crates/ui tile pass), mirrors `video::grain_draws_layout(.., tile_grid)`
 1. **Grid per frame:** `(cols, rows) = frame_grid(distinct tag.tile of grains with onset <= t < onset + duration and tag.picture_at(t) > 0)`.

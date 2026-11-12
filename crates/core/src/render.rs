@@ -538,7 +538,10 @@ pub fn plan_project(project: &Project) -> Vec<ClipPlan> {
         }
     }
     if project.layout == crate::tile::Layout::Tile {
-        assign_tiles(&mut plans, project.layout_pan);
+        // Muted tracks aren't heard or drawn, so they get no tile (no
+        // holes in the grid; their grains keep `tag.tile == None`).
+        let muted = |cp: &ClipPlan| project.tracks.get(cp.track).is_some_and(|t| t.muted);
+        assign_tiles_where(&mut plans, project.layout_pan, |cp| !muted(cp));
     }
     plans
 }
@@ -549,16 +552,25 @@ fn clip_voice(track: usize, clip: usize) -> u64 {
 }
 
 /// Layout `Tile`: give every voice in the plan a stable tile slot, in
-/// voice-start order (the same assignment the realtime engine replays,
+/// voice-start order, preferring the slot its track used last (the same assignment the realtime engine replays,
 /// since it plays this plan). Grains without a voice belong to their
 /// clip's voice. With `layout_pan`, the slot's column sets the grain pan
 /// (keeping a little of the grain's own spread) and its row a subtle gain
 /// cue, from the grid at each grain's onset (the grid the picture shows).
 pub fn assign_tiles(plans: &mut [ClipPlan], layout_pan: bool) {
+    assign_tiles_where(plans, layout_pan, |_| true);
+}
+
+/// [`assign_tiles`] over only the plans `include` accepts (e.g. clips on
+/// unmuted tracks); the others get no tile and don't count toward the grid.
+pub fn assign_tiles_where(plans: &mut [ClipPlan], layout_pan: bool, include: impl Fn(&ClipPlan) -> bool) {
     use std::collections::BTreeMap;
-    // voice -> (start, end)
-    let mut spans: BTreeMap<u64, (f64, f64)> = BTreeMap::new();
+    // voice -> (start, end, track)
+    let mut spans: BTreeMap<u64, (f64, f64, usize)> = BTreeMap::new();
     for cp in plans.iter_mut() {
+        if !include(cp) {
+            continue;
+        }
         let fallback = clip_voice(cp.track, cp.clip_index);
         for (_, evs) in cp.parts.iter_mut().chain(cp.video_parts.iter_mut().flatten()) {
             for e in evs.iter_mut() {
@@ -566,25 +578,54 @@ pub fn assign_tiles(plans: &mut [ClipPlan], layout_pan: bool) {
                     e.tag.voice = fallback;
                 }
                 let end = e.tag.env.map_or(e.end(), |v| v.end().min(e.end()));
-                let s = spans.entry(e.tag.voice).or_insert((e.onset, end));
+                let s = spans.entry(e.tag.voice).or_insert((e.onset, end, cp.track));
                 s.0 = s.0.min(e.onset);
                 s.1 = s.1.max(end);
             }
         }
     }
-    let mut order: Vec<(u64, f64, f64)> = spans.into_iter().map(|(v, (a, b))| (v, a, b)).collect();
+    let mut order: Vec<(u64, f64, f64, usize)> = spans.into_iter().map(|(v, (a, b, t))| (v, a, b, t)).collect();
     order.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
     let mut tiles = crate::tile::TileAssigner::new();
     let mut slot_of: BTreeMap<u64, u8> = BTreeMap::new();
     let mut spans: Vec<(u8, f64, f64)> = Vec::with_capacity(order.len());
-    for (voice, start, end) in order {
-        let slot = tiles.assign(voice, start);
-        tiles.release(voice, end);
-        slot_of.insert(voice, slot);
-        spans.push((slot, start, end));
+    // One tile per track (a pad's loop passes) or per pattern lane (step
+    // hits, `seq::hit_voice`): the next pass / hit keeps its tile.
+    let key_of = |voice: u64, track: usize| {
+        let lane = if voice >> 60 == 0xA { 1 + ((voice >> 52) & 0xFF) } else { 0 };
+        ((track as u64) << 9) | lane
+    };
+    // When the key's previous voice ends (continuations at a shared start
+    // claim their slots before new keys pick the lowest free one).
+    let mut key_end: BTreeMap<u64, f64> = BTreeMap::new();
+    let mut g = 0;
+    while g < order.len() {
+        let start = order[g].1;
+        let mut h = g;
+        while h < order.len() && order[h].1 <= start + 1e-9 {
+            h += 1;
+        }
+        let group = &mut order[g..h];
+        group.sort_by_key(|&(voice, s, _, track)| {
+            let cont = key_end.get(&key_of(voice, track)).is_some_and(|&e| e >= s - 1e-9);
+            (!cont, voice)
+        });
+        for &(voice, start, end, track) in group.iter() {
+            let key = key_of(voice, track);
+            let slot = tiles.assign_keyed(voice, key, start);
+            tiles.release(voice, end);
+            slot_of.insert(voice, slot);
+            spans.push((slot, start, end));
+            let e = key_end.entry(key).or_insert(end);
+            *e = e.max(end);
+        }
+        g = h;
     }
     let grids = crate::tile::grid_timeline(&spans);
     for cp in plans.iter_mut() {
+        if !include(cp) {
+            continue;
+        }
         for (_, evs) in cp.parts.iter_mut().chain(cp.video_parts.iter_mut().flatten()) {
             for e in evs.iter_mut() {
                 if let Some(&slot) = slot_of.get(&e.tag.voice) {
