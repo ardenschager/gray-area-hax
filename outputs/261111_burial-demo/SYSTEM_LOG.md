@@ -60,3 +60,34 @@ Tracks general engine (`crates/core`) improvements motivated by multi-model crit
 
 ### Candidate SYSTEM Improvement Queued for `v003` (Discovered Profiling `v002` Render)
 - **8x8 DCT `Compress` allocation bottleneck + single-threaded video render (`fx.rs`, `render.rs`)**: Stack-sampling `v002` showed >80% of wall-clock render time spent heap-allocating & sorting 64-element `Vec`s per 8x8 block in `fx::video_compress` (`6.2M` heap allocations per 72 s video!). Replacing `Vec` sort with a stack `[f32; 64]` `select_nth_unstable_by` makes `Compress` ~8–10× faster for every project.
+
+
+---
+
+## v004 — Chromatic Vibrato Pitch Lock, Vision Cutout Precision & `alpha_bounds`, Seamless Video Loop Crossfade, Peaking EQ, Audio-Reactive Opacity/Pulse & `step_every` (`commit 6049d26`)
+**Test suite**: `189` tests passing (`163` `chromagrain-core` unit + `4` integration + `22` `chromagrain` app/wgpu parity tests, `0` failures).
+
+### 1. Multi-Window Chromatic `detect_pitch` + `0.60 s` `Source::base_hz_at` + `Source::slice` Base Inheritance (`dsp.rs`, `timeline.rs`)
+- **Motivating critique**: `@critic-opus` (`#23` Item 1) & `@critic-argon` (`#25` Item 1.2): `base_hz_at` used a `0.26 s` window (`< 0.27 s` required by `detect_pitch`, making it a no-op), while single-window `detect_pitch` on vibrato/melismatic vocals landed ~45 cents off A=440, causing `Key` quantization (plus `quantize_amount < 1.0` partial-snap) to detune sustained vocals by `-45c / +23c`.
+- **System change**: Upgraded `detect_pitch` to evaluate up to 13 hopped `0.18 s` windows, preserving exact sub-cent frequency on stationary tones while stabilizing vibrato/melismatic sources (`spread > 12 cents`) to their nearest A=440 chromatic semitone; widened `Source::base_hz_at` to `0.60 s` locked to parent chromatic tuning; inherited `base_hz_at` in `Source::slice`.
+- **Before -> After evidence**:
+  - Verified by unit test `vibrato_pitch_detection_stabilizes_to_a440_semitone` (`< 3 cents` error on asymmetric vibrato/glide).
+  - 65k-point Welch intonation scan on `burial`: `v003` `Bb4 (-45c), Bb4 (+23c), F4 (+26c)` -> **`v004` `F5 (-1c), G5 (-2c), G4 (+9c), Ab5 (-3c)`**; `holdout`: `v003` `F4 (+26c)` -> **`v004` `F5 (+2c), Eb4 (+1c), Eb5 (-1c)`**.
+
+### 2. `PersonSegmenter` Background-Slab Rejection + `Frame::alpha_bounds` + Nocturnal `shadow` Crush (`tools/segment_vision.swift`, `media.rs`, `video.rs`)
+- **Motivating critique**: `@critic-argon` (`#25` Bug A) & `@critic` (`#24`): `VNGenerateForegroundInstanceMaskRequest` (`keepThreshold = 0.15`) unioned the `58.8%`-area subway bench/wall slab into `vbench_cut`, while `video.rs` sub-patch cropping guillotined cutouts into square boxes and bright daytime luminance looked like pasted stickers.
+- **System change**: Added instance precision (`>= 0.55`) and area (`<= 1.4x personPixels`, `< 35%` frame) guards in `PersonSegmenter.instancesOverlappingEvidence` (`v2` cache key); added `Frame::alpha_bounds` so cutout grains frame the entire padded silhouette intact; added alpha-preserving `VisualGrainStyle::shadow` (`0..1`).
+- **Before -> After evidence**: Verified by `alpha_bounds_frames_entire_segmented_cutout` and visual inspection of `burial v004` (`0:28, 0:37, 0:41, 0:54`): rectangular bench/wall halo completely eliminated, silhouettes grounded cleanly at bottom canvas.
+
+### 3. Seamless Cosine RGB Video Loop Crossfade + Snippet Entry Ramp (`video.rs`, `render.rs`)
+- **Motivating critique**: Unanimous `#23, #24, #25`: hard video wrap jump-cuts (`-51.7, -46.1` luma) and `8.79 s` (`+70.3 / -98.9` luma) doorway cut flash.
+- **System change**: Added `VideoClip::frame_looped_at` overlapping `[D - X .. D]` with `[0 .. X]` in RGB at full `alpha = 255`, wired `wraps_video` in `snippet_video_events`, and enforced `>= 3.5`-frame visual fade ramps on full-frame snippets.
+- **Before -> After evidence**: Verified by `video_loop_crossfade_wraps_without_jump_or_alpha_dip`; `burial` full-frame `max |dY|` dropped **`70.31 -> 10.63`** (center-ROI **`98.92 -> 14.77`**); `holdout v004` achieved **`0` full-frame AND `0` center-ROI reversals** (`max |dY| = 4.17`).
+
+### 4. Audio-Reactive `Track::rms_to_opacity` & Kick-Pulse `duck_to_opacity`, Parametric Peaking `EqBand`, and `Step::every_n` (`dsp.rs`, `seq.rs`, `timeline.rs`, `render.rs`, `realtime.rs`, `script.rs`)
+- **Motivating critique**: Unanimous `#23, #24, #25`: low onset<->visual sync (`0.08–0.14`), `220–500 Hz` boxiness tying `<90 Hz` sub, and mechanical 2-bar downbeat vocal repetition.
+- **System change**: Added per-frame smoothed audio-envelope opacity coupling (`s.track_rms_opacity`), signed `duck_to_opacity` / `s.track_visual_pulse` (`-1..1`), RBJ peaking bell EQ (`s.clip_eq`, `s.track_eq` with `RealtimeAudio` streaming parity), and pass-modulo `s.step_every(pat, row, step, every_n, offset)`.
+- **Before -> After evidence**:
+  - Verified by `peaking_eq_cuts_and_boosts_target_band`, `step_every_fires_only_on_matching_passes`, and `realtime_stream_matches_offline_render`.
+  - `burial` `Sub(<90 Hz)` vs `Box(220–500 Hz)`: `v003` `-22.9 vs -22.9 dB` (`0.0 dB` separation) -> **`v004` `-21.6 vs -29.6 dB` (`+8.0 dB` clean sub authority)**.
+  - AV correspondence: `burial` `onset <-> |dY|` **`+0.078 -> +0.261`** (`3.3x`), `onset <-> motion` **`+0.157 -> +0.246`**; `holdout` `onset <-> motion` **`+0.294 -> +0.415`**, `onset <-> |dY|` **`+0.077 -> +0.284`**, `rms <-> luma` **`+0.871`**.
