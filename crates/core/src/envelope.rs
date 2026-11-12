@@ -133,3 +133,82 @@ impl VoiceEnv {
         self.off + self.adsr.release_secs()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn adsr() -> Adsr {
+        Adsr { attack: 0.1, decay: 0.2, sustain: 0.5, release: 0.4, ..Adsr::default() }
+    }
+
+    #[test]
+    fn level_points() {
+        let a = adsr();
+        assert_eq!(a.level(-0.1, None), 0.0);
+        assert!((a.level(0.05, None) - 0.5).abs() < 1e-6);
+        assert!((a.level(0.1, None) - 1.0).abs() < 1e-6);
+        assert!((a.level(0.2, None) - 0.75).abs() < 1e-6);
+        assert!((a.level(0.3, None) - 0.5).abs() < 1e-6);
+        assert!((a.level(5.0, None) - 0.5).abs() < 1e-6);
+        // Release from sustain: linear to 0 over `release`.
+        assert!((a.level(5.0, Some(0.0)) - 0.5).abs() < 1e-6);
+        assert!((a.level(5.2, Some(0.2)) - 0.25).abs() < 1e-6);
+        assert!(a.level(5.4, Some(0.4)).abs() < 1e-6);
+        assert_eq!(a.level(9.0, Some(4.0)), 0.0);
+    }
+
+    #[test]
+    fn release_from_mid_attack_starts_where_the_envelope_was() {
+        let a = adsr();
+        // Note-off at 0.05 s (level 0.5, mid-attack).
+        assert!((a.level(0.05, Some(0.0)) - 0.5).abs() < 1e-6);
+        assert!((a.level(0.25, Some(0.2)) - 0.25).abs() < 1e-6);
+        // Zero release cuts instantly.
+        let z = Adsr { release: 0.0, ..a };
+        assert_eq!(z.level(1.0, Some(0.0)), 0.0);
+    }
+
+    #[test]
+    fn zero_attack_and_decay_are_instant() {
+        let a = Adsr { attack: 0.0, decay: 0.0, sustain: 0.7, release: 0.1, ..Adsr::default() };
+        assert!((a.level(0.0, None) - 0.7).abs() < 1e-6);
+    }
+
+    #[test]
+    fn picture_cut_vs_fade() {
+        let cut = adsr();
+        assert_eq!(cut.picture_weight(0.5), 1.0);
+        assert_eq!(cut.picture_weight(0.06), 1.0);
+        assert_eq!(cut.picture_weight(0.05), 0.0);
+        assert_eq!(cut.picture_weight(0.0), 0.0);
+        let fade = Adsr { picture: PictureCut::Fade, ..cut };
+        assert!((fade.picture_weight(0.3) - 0.3).abs() < 1e-6);
+        assert_eq!(fade.picture_weight(2.0), 1.0);
+    }
+
+    #[test]
+    fn voice_env_absolute_times_and_end() {
+        let mut e = VoiceEnv::held(adsr(), 10.0);
+        assert_eq!(e.end(), f64::INFINITY);
+        assert_eq!(e.level_at(9.0), 0.0);
+        assert!((e.level_at(11.0) - 0.5).abs() < 1e-6);
+        assert_eq!(e.picture_at(11.0), 1.0);
+        e.off = 12.0;
+        assert!((e.end() - 12.4).abs() < 1e-6);
+        assert!((e.level_at(12.2) - 0.25).abs() < 1e-6);
+        // Cut: the picture goes when the level drops below 0.05 (≈ 12.36 s).
+        assert_eq!(e.picture_at(12.3), 1.0);
+        assert_eq!(e.picture_at(12.38), 0.0);
+        assert_eq!(e.level_at(12.5), 0.0);
+    }
+
+    #[test]
+    fn serde_defaults_fill_picture_fields() {
+        let a: Adsr = serde_json::from_str(r#"{"attack":0.1,"decay":0.2,"sustain":0.5,"release":0.4}"#).unwrap();
+        assert_eq!(a.picture, PictureCut::Cut);
+        assert_eq!(a.cut_threshold, 0.05);
+        let back: Adsr = serde_json::from_str(&serde_json::to_string(&a).unwrap()).unwrap();
+        assert_eq!(a, back);
+    }
+}

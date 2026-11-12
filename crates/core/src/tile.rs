@@ -182,3 +182,87 @@ impl TileAssigner {
         self.slots = [None; MAX_TILES];
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grids() {
+        assert_eq!(grid_for(0), (1, 1));
+        assert_eq!(grid_for(1), (1, 1));
+        assert_eq!(grid_for(2), (2, 1));
+        assert_eq!(grid_for(3), (2, 2));
+        assert_eq!(grid_for(4), (2, 2));
+        assert_eq!(grid_for(5), (3, 3));
+        assert_eq!(grid_for(20), (3, 3));
+        assert_eq!(Layout::parse(" Tiles"), Some(Layout::Tile));
+        assert_eq!(Layout::parse(Layout::Stack.name()), Some(Layout::Stack));
+        assert_eq!(Layout::parse("x"), None);
+    }
+
+    #[test]
+    fn tile_rects_cover_the_canvas_with_hairline_gaps() {
+        let aspect = 16.0 / 9.0;
+        let one = tile_rect(0, 1, 1, aspect);
+        assert_eq!(one, TileRect { x: 0.0, y: 0.0, w: 1.0, h: 1.0 });
+        let (l, r) = (tile_rect(0, 2, 1, aspect), tile_rect(1, 2, 1, aspect));
+        assert_eq!(l.x, 0.0);
+        assert!((r.x + r.w - 1.0).abs() < 1e-6);
+        let gap_px_x = (r.x - (l.x + l.w)) * aspect; // in units of height
+        assert!((gap_px_x - TILE_GAP).abs() < 1e-6);
+        let (a, c) = (tile_rect(0, 3, 3, aspect), tile_rect(8, 3, 3, aspect));
+        assert!((c.y + c.h - 1.0).abs() < 1e-6 && (c.x + c.w - 1.0).abs() < 1e-6);
+        let b = tile_rect(3, 3, 3, aspect);
+        assert!((b.y - (a.y + a.h) - TILE_GAP).abs() < 1e-6);
+        // Out-of-range slots clamp to the last tile.
+        assert_eq!(tile_rect(42, 2, 2, aspect), tile_rect(3, 2, 2, aspect));
+        assert_eq!(tile_rect(0, 2, 2, f32::NAN), tile_rect(0, 2, 2, 1.0));
+    }
+
+    #[test]
+    fn frame_grid_counts_distinct_and_highest_slot() {
+        assert_eq!(frame_grid([]), (1, 1));
+        assert_eq!(frame_grid([0, 0, 0]), (1, 1));
+        assert_eq!(frame_grid([0, 1]), (2, 1));
+        // Slot 2 alone still needs a grid with 3 cells.
+        assert_eq!(frame_grid([2]), (2, 2));
+        assert_eq!(frame_grid([0, 1, 4]), (3, 3));
+        assert_eq!(frame_grid([200]), (3, 3));
+    }
+
+    #[test]
+    fn layout_pan_columns_and_rows() {
+        assert_eq!(layout_pan(0, 1, 1), (0.0, 1.0));
+        assert_eq!(layout_pan(0, 2, 1).0, -0.8);
+        assert_eq!(layout_pan(1, 2, 1).0, 0.8);
+        let (p, g) = layout_pan(4, 3, 3);
+        assert!(p.abs() < 1e-6);
+        assert!((g - 10f32.powf(-1.0 / 20.0)).abs() < 1e-6);
+        assert!(layout_pan(8, 3, 3).1 < g);
+    }
+
+    #[test]
+    fn assigner_is_stable_and_takes_the_lowest_free_slot() {
+        let mut a = TileAssigner::new();
+        assert_eq!(a.assign(10, 0.0), 0);
+        assert_eq!(a.assign(11, 0.1), 1);
+        assert_eq!(a.assign(10, 0.2), 0, "a voice keeps its slot");
+        assert_eq!(a.grid_at(0.2), (2, 1));
+        // Voice 10 ends at 1.0; until then its slot stays taken.
+        a.release(10, 1.0);
+        assert_eq!(a.assign(12, 0.5), 2);
+        assert_eq!(a.grid_at(0.5), (2, 2));
+        // After it ends the lowest free slot is reused; the grid never
+        // shrinks while slot 2 is live.
+        assert_eq!(a.assign(13, 1.5), 0);
+        assert_eq!(a.grid_at(1.5), (2, 2));
+        assert_eq!(a.slot_of(10), None);
+        for v in 0..20u64 {
+            a.assign(100 + v, 2.0);
+        }
+        assert_eq!(a.assign(999, 2.0), (999 % MAX_TILES as u64) as u8, "overflow shares");
+        a.clear();
+        assert_eq!(a.assign(5, 3.0), 0);
+    }
+}
