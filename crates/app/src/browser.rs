@@ -388,10 +388,37 @@ fn prettify(s: &str) -> String {
     s.replace(['_', '-'], " ")
 }
 
+/// `CHROMAGRAIN_BROWSE_ROOT=/dir` scans only that folder (tests, the
+/// showcase's fixture library) instead of the home folders.
+pub const BROWSE_ROOT_ENV: &str = "CHROMAGRAIN_BROWSE_ROOT";
+
 fn scan(tx: Sender<ScanMsg>) {
     let home = home();
     let projects = home.join("Documents/Projects");
     let mut covered: HashSet<PathBuf> = HashSet::new();
+    if let Some(root) = std::env::var_os(BROWSE_ROOT_ENV).map(PathBuf::from) {
+        let mut by_dir: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+        walk(&root, 0, &covered, &mut by_dir);
+        let mut dirs: Vec<(PathBuf, Vec<PathBuf>)> = by_dir.into_iter().collect();
+        dirs.sort();
+        for (dir, mut files) in dirs {
+            files.sort();
+            let name = dir.strip_prefix(&root).ok().filter(|r| !r.as_os_str().is_empty()).unwrap_or(&dir).display().to_string();
+            let clips = files
+                .into_iter()
+                .map(|p| {
+                    let stem = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                    let reel = prettify(&reel_of(&stem));
+                    let title = prettify(&stem);
+                    let hay = format!("{title} {reel} {name}").to_lowercase();
+                    BrowseClip { path: p, title, reel, desc: String::new(), dur: 0.0, hay }
+                })
+                .collect();
+            let _ = tx.send(ScanMsg::Collection(Collection { name, clips, semantic: None }));
+        }
+        let _ = tx.send(ScanMsg::Done);
+        return;
+    }
 
     // 1. Semantic corpora (video-grid style).
     if let Ok(rd) = std::fs::read_dir(&projects) {

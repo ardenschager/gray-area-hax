@@ -11,6 +11,69 @@ use std::sync::{Arc, Mutex};
 
 pub use crate::studio::{DeepTab, DeepTarget, View};
 
+/// Ways to add media (the Add sheet's tabs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddRoute {
+    /// Pick files (a dialog, or paths injected by tests / the showcase).
+    Files,
+    /// Every video on this machine (desktop).
+    Browse,
+    /// A YouTube / yt-dlp URL (desktop).
+    Link,
+    /// A random, rarely seen video (desktop).
+    Dig,
+}
+
+impl AddRoute {
+    pub fn label(self) -> &'static str {
+        match self {
+            AddRoute::Files => "Files",
+            AddRoute::Browse => "Browse",
+            AddRoute::Link => "Link",
+            AddRoute::Dig => "Dig",
+        }
+    }
+}
+
+/// Where added media should land.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddTarget {
+    /// The next empty grid column.
+    Any,
+    Column(usize),
+    Pad(usize),
+    Lane(usize),
+}
+
+/// One thing in the Browse tab.
+#[derive(Debug, Clone)]
+pub struct BrowseItem {
+    pub name: String,
+    /// e.g. "0:42 · Movies".
+    pub detail: String,
+    pub thumb: Option<egui::TextureId>,
+}
+
+/// An add still under way (a placeholder tile until it lands).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pending {
+    pub id: u64,
+    pub target: AddTarget,
+    /// "digging…", "downloading", "cutting", a file name.
+    pub label: String,
+    /// 0..1 when known.
+    pub progress: Option<f32>,
+    /// Failed: why (the tile shows it until dismissed or retried).
+    pub failed: Option<String>,
+}
+
+/// Media that finished arriving: the source index and where it should go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Added {
+    pub source: usize,
+    pub target: AddTarget,
+}
+
 /// Which parts of the UI the host supports.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Caps {
@@ -31,6 +94,8 @@ pub struct Caps {
     pub export: bool,
     /// Perform's output routing (a second window on another display).
     pub output: bool,
+    /// Add-sheet tabs (empty: the "+" buttons call `import_media`).
+    pub add: Vec<AddRoute>,
 }
 
 impl Default for Caps {
@@ -44,6 +109,7 @@ impl Default for Caps {
             deep_tabs: vec![DeepTab::Links, DeepTab::Effects, DeepTab::Automation, DeepTab::Script, DeepTab::Library],
             export: true,
             output: true,
+            add: vec![AddRoute::Files, AddRoute::Browse, AddRoute::Link, AddRoute::Dig],
         }
     }
 }
@@ -73,6 +139,15 @@ pub trait PerformHost {
     fn pads(&self) -> Vec<Pad>;
     fn toggle_pad(&mut self, i: usize);
     fn load_pad(&mut self, source: usize, i: usize);
+    /// Load seconds `t0..t1` of a source (a slice) onto pad `i`.
+    fn load_pad_slice(&mut self, source: usize, _t0: f64, _t1: f64, i: usize) {
+        self.load_pad(source, i);
+    }
+    /// A pad's A/D/S/R (None: the default envelope).
+    fn pad_env(&self, _i: usize) -> Option<chromagrain_core::envelope::Adsr> {
+        None
+    }
+    fn set_pad_env(&mut self, _i: usize, _adsr: chromagrain_core::envelope::Adsr) {}
     /// 0 = now, 1 = beat, 2 = bar.
     fn quantize(&self) -> usize;
     fn set_quantize(&mut self, q: usize);
@@ -132,6 +207,51 @@ pub trait Host {
 
     /// Pick media to add (file dialog).
     fn import_media(&mut self) {}
+    /// The Add sheet's Files tab (default: `import_media`).
+    fn add_files(&mut self, _target: AddTarget) {
+        self.import_media();
+    }
+    /// The Browse tab's items for `query` (thumbnails may fill in later).
+    fn browse(&mut self, _ctx: &egui::Context, _query: &str) -> Vec<BrowseItem> {
+        Vec::new()
+    }
+    /// Add Browse item `index` (of the last `browse` list).
+    fn browse_add(&mut self, _index: usize, _target: AddTarget) {}
+    fn add_link(&mut self, _url: &str, _target: AddTarget) {}
+    /// Dig `n` random, rarely seen videos (`cc_only`: Creative Commons).
+    fn dig(&mut self, _n: usize, _cc_only: bool, _target: AddTarget) {}
+    /// Adds under way (placeholder tiles).
+    fn pending(&self) -> Vec<Pending> {
+        Vec::new()
+    }
+    /// Forget a failed add.
+    fn dismiss_pending(&mut self, _id: u64) {}
+    /// Media that landed since the last call, with its target.
+    fn take_added(&mut self) -> Vec<Added> {
+        Vec::new()
+    }
+    /// Hear (and see) seconds `t0..t1` of a source once, now.
+    fn audition(&mut self, source: usize, t0: f64, t1: f64) {
+        let ev = GrainEvent {
+            onset: self.clock(),
+            source_pos: t0,
+            duration: (t1 - t0).max(0.01) as f32,
+            pitch_ratio: 1.0,
+            gain: 0.9,
+            pan: 0.0,
+            envelope: 0.04,
+            env_skew: 0.0,
+            reverse: false,
+            id: 0xA0D1_0000_0000 ^ (t0 * 1000.0) as u64,
+            tag: Default::default(),
+        };
+        self.fire(0, source, ev);
+    }
+    /// Stop an audition (where the host can).
+    fn stop_audition(&mut self) {}
+    /// A source's slices changed in the document (the plugin forwards
+    /// them to its instrument).
+    fn slices_changed(&mut self, _source: usize) {}
     fn export(&mut self) {}
     fn fullscreen(&self) -> bool {
         false
@@ -156,6 +276,12 @@ pub trait Host {
         None
     }
     fn set_shared_key(&mut self, _key: chromagrain_core::music::Key) {}
+    /// The canvas layout: `Some(false)` stack (layered), `Some(true)` tile
+    /// (every sounding voice its own tile); None = no layout switch.
+    fn tile_layout(&self) -> Option<bool> {
+        None
+    }
+    fn set_tile_layout(&mut self, _tile: bool) {}
     /// Busy line (e.g. "bouncing the take…").
     fn busy(&self) -> Option<String> {
         None

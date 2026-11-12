@@ -6,7 +6,7 @@
 use crate::atlas;
 use crate::theme::*;
 use crate::widgets::*;
-use super::{DeepTab, DeepTarget, LANES, SCENES, STEPS};
+use super::{LANES, SCENES, STEPS};
 use super::Studio;
 use crate::host::Host;
 use chromagrain_core::music::Key;
@@ -314,7 +314,7 @@ impl Studio {
                     let resp = hit(ui, header, ui.id().with(("lane-add", lane)), Sense::click(), "add a lane");
                     draw_icon(&p, Icon::Plus, header.center(), 16.0, if resp.hovered() { INK2 } else { INK3 });
                     if resp.clicked() {
-                        host.import_media();
+                        self.open_add(host, crate::host::AddTarget::Lane(lane));
                     }
                 }
                 for s in 0..STEPS {
@@ -343,7 +343,7 @@ impl Studio {
             let hresp = hit(ui, header, ui.id().with(("lane-head", lane)), Sense::click(), &format!("lane {}", lane + 1));
             let h = hold(ui, &hresp, 0.45);
             if h.fired {
-                self.deep = Some((DeepTarget::Lane(lane), DeepTab::Links));
+                self.open_clip(super::ClipTarget::Lane(lane));
             } else if hresp.clicked() && !h.held_before {
                 self.toggle_lane_mute(host, lane);
             }

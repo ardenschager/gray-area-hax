@@ -25,6 +25,7 @@ impl Studio {
         let top = area.top() + ((area.height() - block_h) / 2.0).max(0.0);
         let stage = Rect::from_min_size(egui::pos2(area.left(), top), egui::vec2(stage_w, stage_h));
         self.stage(host, ui, stage, 14.0);
+        self.layout_switch(host, ui, stage);
         if let Some(sub) = host.perform().and_then(|p| p.output()) {
             let p = ui.painter();
             p.rect_filled(stage, r(14), Color32::from_black_alpha(170));
@@ -53,10 +54,20 @@ impl Studio {
         };
         let mut toggle = None;
         let mut load = None;
+        let mut clip = None;
+        let pending = self.pending_slots(host);
+        let t_ui = ui.input(|i| i.time);
         for (i, pad) in pads.into_iter().enumerate().take(16) {
             let rc = Rect::from_min_size(egui::pos2(area.left() + (i % 4) as f32 * (pw + g), area.top() + (i / 4) as f32 * (ph + g)), egui::vec2(pw, ph));
             let resp = hit(ui, rc, ui.id().with(("pad", i)), Sense::click(), &format!("pad {}", i + 1));
             let on = pad.on;
+            if pad.source.is_none() {
+                if let Some((pd, _)) = pending.iter().find(|(_, t)| *t == crate::host::AddTarget::Pad(i)) {
+                    super::add::placeholder_tile(&p, rc, 10, pd, t_ui, true);
+                    ctx.request_repaint();
+                    continue;
+                }
+            }
             match pad.source {
                 Some(src) => {
                     if let Some((tex, a)) = self.atlas(host, &ctx, src) {
@@ -100,7 +111,10 @@ impl Studio {
                         }
                         ctx.request_repaint();
                     }
-                    if resp.clicked() {
+                    let h = hold(ui, &resp, 0.45);
+                    if h.fired {
+                        clip = Some(i);
+                    } else if resp.clicked() && !h.held_before {
                         toggle = Some(i);
                     }
                 }
@@ -109,9 +123,7 @@ impl Studio {
                     p.rect_stroke(rc, r(10), hair(LINE), StrokeKind::Inside);
                     draw_icon(&p, Icon::Plus, rc.center(), 16.0, INK4);
                     if resp.clicked() {
-                        if let Some(src) = self.columns[self.emitters[self.sel_emitter].col] {
-                            load = Some((src, i));
-                        }
+                        load = Some(i);
                     }
                 }
             }
@@ -120,9 +132,12 @@ impl Studio {
             if let Some(i) = toggle {
                 perf.toggle_pad(i);
             }
-            if let Some((src, i)) = load {
-                perf.load_pad(src, i);
-            }
+        }
+        if let Some(i) = load {
+            self.open_add(host, crate::host::AddTarget::Pad(i));
+        }
+        if let Some(i) = clip {
+            self.open_clip(super::ClipTarget::Pad(i));
         }
         if playing {
             ctx.request_repaint();

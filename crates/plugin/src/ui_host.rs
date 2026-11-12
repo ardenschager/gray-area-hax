@@ -248,6 +248,7 @@ impl Host for PluginHost {
             deep_tabs: vec![DeepTab::Links],
             export: false,
             output: false,
+            add: vec![chromagrain_ui::AddRoute::Files],
         }
     }
     fn perform(&mut self) -> Option<&mut dyn PerformHost> {
