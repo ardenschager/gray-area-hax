@@ -52,7 +52,7 @@ use crate::grain::GrainEvent;
 use crate::music::{semitones_to_ratio, Key};
 use crate::timeline::{ClipTransform, Source, SourceId};
 use crate::video::{
-    blend_layer, composite_grains_frame, AvLink, Frame, VideoClip, VisualGrainStyle,
+    blend_layer, AvLink, Frame, VideoClip, VisualGrainStyle,
 };
 use std::sync::Arc;
 
@@ -282,6 +282,59 @@ struct Voice {
     serial: u64,
     rng: Rng,
     k: u64,
+    /// MIDI note the grains are pitched from (60 = unity: slices, pads).
+    pitch_note: u8,
+    /// Envelope (sound + picture) and the note-off time once releasing.
+    adsr: Option<crate::envelope::Adsr>,
+    off: Option<f64>,
+    /// A slice: the voice stops (releases) when its head reaches this.
+    slice_end: Option<f64>,
+    /// Pad one-shots ignore note-off.
+    one_shot: bool,
+    origin: GrainOrigin,
+    gain: f32,
+    /// Tile slot + its (pan, gain) cue (layout `Tile`).
+    tile: Option<u8>,
+}
+
+impl Voice {
+    fn env(&self) -> Option<crate::envelope::VoiceEnv> {
+        self.adsr.map(|adsr| crate::envelope::VoiceEnv { adsr, on: self.start_t, off: self.off.unwrap_or(f64::INFINITY) })
+    }
+
+    /// When a releasing voice is silent for good.
+    fn release_end(&self) -> Option<f64> {
+        self.off.map(|o| o + self.adsr.map_or(0.0, |a| a.release_secs()))
+    }
+}
+
+/// Tag a grain with its voice: id, envelope, and (layout `Tile`) its tile
+/// slot with the column→pan / row→gain cue of the grid at the grain's
+/// onset (so a voice's pan follows its tile as the grid grows and shrinks).
+fn tag_grain(
+    ev: &mut GrainEvent,
+    voice: u64,
+    env: Option<crate::envelope::VoiceEnv>,
+    tile: Option<u8>,
+    layout_pan: bool,
+    tiles: &crate::tile::TileAssigner,
+) {
+    ev.tag.voice = voice;
+    ev.tag.env = env;
+    if let Some(slot) = tile {
+        ev.tag.tile = Some(slot);
+        if layout_pan {
+            let (cols, rows) = tiles.grid_at(ev.onset);
+            let (pan, gain) = crate::tile::layout_pan(slot as usize, cols, rows);
+            ev.pan = (pan + 0.2 * ev.pan).clamp(-1.0, 1.0);
+            ev.gain *= gain;
+        }
+    }
+}
+
+/// Assign a tile to a voice starting at `t` (layout `Tile`).
+fn start_tile(tiles: &mut crate::tile::TileAssigner, layout: crate::tile::Layout, voice: u64, t: f64) -> Option<u8> {
+    (layout == crate::tile::Layout::Tile).then(|| tiles.assign(voice, t))
 }
 
 #[derive(Clone)]
@@ -365,6 +418,10 @@ struct Pad {
     velocity: f32,
     serial: u64,
     k: u64,
+    /// Envelope on / off times of the current loop (off = INFINITY while on).
+    env_on: f64,
+    env_off: f64,
+    tile: Option<u8>,
 }
 
 /// What the picture is at one moment — plain data for a renderer.
@@ -385,6 +442,8 @@ pub struct FrameState {
     pub effects: Vec<AvEffect>,
     /// Index into [`LOOKS`].
     pub look: usize,
+    /// Compositing layout; in `Tile`, grains carry `tag.tile`.
+    pub layout: crate::tile::Layout,
 }
 
 /// Key-dependent look state (the tune look's resonators), built off the
@@ -460,7 +519,6 @@ pub struct Instrument {
     note_adsr: Option<crate::envelope::Adsr>,
     layout: crate::tile::Layout,
     layout_pan: bool,
-    #[allow(dead_code)] // tile assignment (next commits)
     tiles: crate::tile::TileAssigner,
 }
 
@@ -701,11 +759,19 @@ impl Instrument {
         self.anchor_t + (beat - self.transport.beat) * 60.0 / self.transport.bpm
     }
 
+    /// MIDI note on. Order: an assigned pad (36–51) plays its pad; else,
+    /// when the active source has slices, notes from C3 (48) up play slice
+    /// `note - 48` (at unity pitch, stopping at the slice end); else the
+    /// note plays the media pitched (C4 = unity).
     pub fn note_on(&mut self, note: u8, velocity: f32) {
         if let Some(i) = pad_of_note(note) {
-            if self.pads[i].slot.is_some() {
+            if let Some(slot) = self.pads[i].slot {
                 if velocity > 0.0 {
-                    self.toggle_pad_vel(i, velocity.min(1.0));
+                    if slot.slice.is_some() {
+                        self.hit_slice_pad(i, velocity.min(1.0));
+                    } else {
+                        self.toggle_pad_vel(i, velocity.min(1.0));
+                    }
                 }
                 return;
             }
@@ -719,35 +785,114 @@ impl Instrument {
             }
             return;
         }
+        let slice = crate::chop::slice_for_note(note, src.slices.len()).map(|i| src.slices[i]);
         self.note_off(note);
+        let now = self.now_secs();
+        let (head, pitch_note, slice_end) = match slice {
+            Some(sl) => (sl.start, 60, Some(sl.end)),
+            None => {
+                let mut head = self.position as f64 * len;
+                if self.follow_transport && self.transport.playing {
+                    head += self.beat_at(now) * 60.0 / self.transport.bpm;
+                }
+                (head.rem_euclid(len), note, None)
+            }
+        };
+        let adsr = self.note_adsr;
+        self.start_voice(note, velocity.min(1.0), source, head, pitch_note, slice_end, adsr, false, GrainOrigin::Note, 1.0);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_voice(
+        &mut self,
+        note: u8,
+        velocity: f32,
+        source: SourceId,
+        head: f64,
+        pitch_note: u8,
+        slice_end: Option<f64>,
+        adsr: Option<crate::envelope::Adsr>,
+        one_shot: bool,
+        origin: GrainOrigin,
+        gain: f32,
+    ) {
         if self.voices.len() >= MAX_VOICES {
             let oldest = self.voices.remove(0);
             self.cut_future(oldest.serial);
+            self.tiles.release(oldest.serial, self.now_secs());
         }
         let now = self.now_secs();
-        let mut head = self.position as f64 * len;
-        if self.follow_transport && self.transport.playing {
-            head += self.beat_at(now) * 60.0 / self.transport.bpm;
-        }
         self.serial += 1;
+        let tile = start_tile(&mut self.tiles, self.layout, self.serial, now);
         self.voices.push(Voice {
             note,
-            velocity: velocity.min(1.0),
+            velocity,
             source,
-            head: head.rem_euclid(len),
+            head,
             next_t: now,
             start_t: now,
             serial: self.serial,
             rng: Rng::new(0xC0FFEE ^ self.serial.wrapping_mul(0x9E37) ^ note as u64),
             k: 0,
+            pitch_note,
+            adsr,
+            off: None,
+            slice_end,
+            one_shot,
+            origin,
+            gain,
+            tile,
         });
     }
 
-    /// Stop a note: no new grains; sounding grains ring out (the release).
+    /// A slice pad: a one-shot of its slice, now (not launch-quantized).
+    fn hit_slice_pad(&mut self, i: usize, velocity: f32) {
+        let Some(slot) = self.pads.get(i).and_then(|p| p.slot) else { return };
+        let Some(sl) = slot.slice else { return };
+        if self.sources.get(slot.source).is_none_or(|s| s.duration() <= 0.0) {
+            return;
+        }
+        let note = PAD_NOTE + i as u8;
+        // Retrigger: the previous hit of this pad releases.
+        if let Some(vi) = self.voices.iter().position(|v| v.origin == GrainOrigin::Pad(i) && v.off.is_none()) {
+            self.release_voice_at(vi, self.now_secs());
+        }
+        let adsr = slot.adsr.or(self.note_adsr);
+        self.start_voice(note, velocity, slot.source, sl.start, 60, Some(sl.end), adsr, true, GrainOrigin::Pad(i), slot.gain);
+    }
+
+    /// Note-off for voice `vi` at time `t`: with an envelope it releases
+    /// (its grains learn the off time, it keeps sounding through the
+    /// release); without one it stops making grains and rings out.
+    fn release_voice_at(&mut self, vi: usize, t: f64) {
+        let v = &mut self.voices[vi];
+        if v.adsr.is_some() {
+            if v.off.is_some() {
+                return;
+            }
+            v.off = Some(t);
+            let serial = v.serial;
+            let end = v.release_end().unwrap_or(t);
+            for g in self.grains.iter_mut().filter(|g| g.voice == serial) {
+                if let Some(e) = g.ev.tag.env.as_mut() {
+                    e.off = e.off.min(t);
+                }
+            }
+            self.grains.retain(|g| !(g.voice == serial && g.ev.onset >= end));
+            self.tiles.release(serial, end);
+        } else {
+            let v = self.voices.remove(vi);
+            let end = self.grains.iter().filter(|g| g.voice == v.serial && g.ev.onset < t).map(|g| g.ev.end()).fold(t, f64::max);
+            self.grains.retain(|g| !(g.voice == v.serial && g.ev.onset >= t));
+            self.tiles.release(v.serial, end);
+        }
+    }
+
+    /// Stop a note: no new grains; sounding grains ring out (the release),
+    /// or, with an ADSR, the envelope releases.
     pub fn note_off(&mut self, note: u8) {
-        if let Some(i) = self.voices.iter().position(|v| v.note == note) {
-            let v = self.voices.remove(i);
-            self.cut_future(v.serial);
+        if let Some(vi) = self.voices.iter().position(|v| v.note == note && !v.one_shot && v.off.is_none()) {
+            self.release_voice_at(vi, self.now_secs());
         }
     }
 
@@ -814,13 +959,19 @@ impl Instrument {
 
     /// Stop every note (allocation- and free-free, so safe on the audio thread).
     pub fn all_notes_off(&mut self) {
-        while let Some(v) = self.voices.pop() {
-            self.cut_future(v.serial);
+        let now = self.now_secs();
+        let mut vi = self.voices.len();
+        while vi > 0 {
+            vi -= 1;
+            if vi < self.voices.len() && self.voices[vi].off.is_none() {
+                self.release_voice_at(vi, now);
+            }
         }
     }
 
+    /// Notes held down (not releasing, not pad one-shots).
     pub fn held_notes(&self) -> impl Iterator<Item = u8> + '_ {
-        self.voices.iter().map(|v| v.note)
+        self.voices.iter().filter(|v| v.off.is_none() && !v.one_shot && v.origin == GrainOrigin::Note).map(|v| v.note)
     }
 
     /// Drop a voice's look-ahead grains that have not started yet.
@@ -889,10 +1040,12 @@ impl Instrument {
                 let st = g.pitch + step.pitch + g.pitch_jitter * jit;
                 let ratio = crate::music::effective_ratio(st, key.as_ref(), src.effective_base_hz(), g.quantize_amount, g.detune_cents);
                 let at = if step.slice >= 0.0 { step.slice.min(1.0) } else { g.position };
-                let ev = GrainEvent {
+                let chop = step.slice_index.and_then(|i| src.slices.get(i as usize).copied());
+                let pos = chop.map_or(at as f64 * len, |sl| sl.start);
+                let mut ev = GrainEvent {
                     onset: t,
-                    source_pos: (at as f64 * len).rem_euclid(len.max(1e-6)),
-                    duration: (g.duration * step.length.max(0.05)).clamp(0.01, 5.0),
+                    source_pos: pos.rem_euclid(len.max(1e-6)),
+                    duration: crate::seq::hit_duration(g, &step, chop, ratio),
                     pitch_ratio: ratio,
                     gain: g.gain * step.gain,
                     pan: g.pan.clamp(-1.0, 1.0),
@@ -902,6 +1055,14 @@ impl Instrument {
                     id: (1u64 << 62) | ((ri as u64) << 40) | (k as u64 & 0xFF_FFFF_FFFF),
                     ..Default::default()
                 };
+                let voice = crate::seq::hit_voice(ri, k as u64, 0.0);
+                crate::seq::apply_hit_adsr(&mut ev, g, voice);
+                ev.tag.voice = voice;
+                if let Some(tile) = start_tile(&mut self.tiles, self.layout, voice, t) {
+                    self.tiles.release(voice, ev.end());
+                    let env = ev.tag.env;
+                    tag_grain(&mut ev, voice, env, Some(tile), self.layout_pan, &self.tiles);
+                }
                 let source = row.source;
                 self.grains.push(LiveGrain { source, voice: 0, ev, origin: GrainOrigin::Step, seen: false });
             }
@@ -975,23 +1136,58 @@ impl Instrument {
     /// position, pan and (in key) pitch. Loudness stays level.
     fn schedule(&mut self, until: f64, map: &MacroMap) {
         let sync = (self.sync_div > 0.0).then_some(self.sync_div as f64);
-        for vi in 0..self.voices.len() {
+        let layout_pan = self.layout_pan;
+        let mut vi = 0;
+        while vi < self.voices.len() {
             let src_len = self.sources.get(self.voices[vi].source).map(|s| s.duration()).unwrap_or(0.0);
             if src_len <= 0.0 {
+                vi += 1;
                 continue;
             }
+            let mut done = false;
             while self.voices[vi].next_t < until {
                 if self.grains.len() >= MAX_GRAINS {
                     return;
+                }
+                // A releasing voice stops making grains once silent; a slice
+                // voice releases (or stops) when its head reaches the end.
+                if let Some(end) = self.voices[vi].release_end() {
+                    if self.voices[vi].next_t >= end {
+                        done = true;
+                        break;
+                    }
+                }
+                if let Some(slice_end) = self.voices[vi].slice_end {
+                    if self.voices[vi].head >= slice_end - 1e-6 && self.voices[vi].off.is_none() {
+                        let t = self.voices[vi].next_t;
+                        if self.voices[vi].adsr.is_some() {
+                            self.voices[vi].off = Some(t);
+                            let end = self.voices[vi].release_end().unwrap_or(t);
+                            self.tiles.release(self.voices[vi].serial, end);
+                            continue;
+                        }
+                        let serial = self.voices[vi].serial;
+                        let end = self.grains.iter().filter(|g| g.voice == serial).map(|g| g.ev.end()).fold(t, f64::max);
+                        self.tiles.release(serial, end);
+                        done = true;
+                        break;
+                    }
                 }
                 let key = self.key;
                 let cloud = Cloud::default();
                 let v = &mut self.voices[vi];
                 let id = v.serial.wrapping_mul(1 << 20).wrapping_add(v.k);
                 let (mut ev, hop) =
-                    grain_step(map, &cloud, key.as_ref(), &mut v.rng, v.head, src_len, v.note, v.velocity, id);
+                    grain_step(map, &cloud, key.as_ref(), &mut v.rng, v.head, src_len, v.pitch_note, v.velocity, id);
                 ev.onset = (v.next_t + ev.onset).max(v.start_t);
-                let (source, serial) = (v.source, v.serial);
+                ev.gain *= v.gain;
+                if let Some(slice_end) = v.slice_end {
+                    // Don't read past the slice into the next one.
+                    let room = ((slice_end - ev.source_pos) / ev.pitch_ratio.max(0.01) as f64).max(0.005);
+                    ev.duration = ev.duration.min(room as f32);
+                }
+                tag_grain(&mut ev, v.serial, v.env(), v.tile, layout_pan, &self.tiles);
+                let (source, serial, origin) = (v.source, v.serial, v.origin);
                 v.head += hop * map.speed as f64;
                 v.k += 1;
                 let mut next = v.next_t + hop;
@@ -1001,7 +1197,12 @@ impl Instrument {
                     next = self.grid_time(b).max(self.voices[vi].next_t + 1e-4);
                 }
                 self.voices[vi].next_t = next;
-                self.grains.push(LiveGrain { source, voice: serial, ev, origin: GrainOrigin::Note, seen: false });
+                self.grains.push(LiveGrain { source, voice: serial, ev, origin, seen: false });
+            }
+            if done {
+                self.voices.remove(vi);
+            } else {
+                vi += 1;
             }
         }
     }
@@ -1050,7 +1251,11 @@ impl Instrument {
     /// grid (free-running at the host tempo while it is stopped). Pressing
     /// a pad whose launch is still queued cancels it. Empty pads ignore it.
     pub fn toggle_pad(&mut self, i: usize) {
-        self.toggle_pad_vel(i, 1.0);
+        if self.pads.get(i).and_then(|p| p.slot).is_some_and(|s| s.slice.is_some()) {
+            self.hit_slice_pad(i, 1.0);
+        } else {
+            self.toggle_pad_vel(i, 1.0);
+        }
     }
 
     fn toggle_pad_vel(&mut self, i: usize, velocity: f32) {
@@ -1104,15 +1309,28 @@ impl Instrument {
             let serial = self.serial;
             let p = &mut self.pads[i];
             p.queued = None;
+            let release = p.slot.and_then(|s| s.adsr).map_or(0.0, |a| a.release_secs());
             if start {
                 let old = p.serial;
                 (p.on, p.start_beat, p.next_t, p.serial, p.k) = (true, at, t, serial, 0);
+                (p.env_on, p.env_off) = (t, f64::INFINITY);
                 // A retrigger drops the old loop's pending grains.
                 self.grains.retain(|g| !(g.voice == old && g.origin == GrainOrigin::Pad(i) && g.ev.onset >= t));
+                self.tiles.release(old, t);
+                self.pads[i].tile = start_tile(&mut self.tiles, self.layout, serial, t);
             } else {
                 p.on = false;
+                p.env_off = t;
                 let old = p.serial;
-                self.grains.retain(|g| !(g.voice == old && g.origin == GrainOrigin::Pad(i) && g.ev.onset >= t));
+                // With an envelope the loop releases: its grains learn the
+                // off time and the pad keeps playing through the release.
+                for g in self.grains.iter_mut().filter(|g| g.voice == old && g.origin == GrainOrigin::Pad(i)) {
+                    if let Some(e) = g.ev.tag.env.as_mut() {
+                        e.off = e.off.min(t);
+                    }
+                }
+                self.grains.retain(|g| !(g.voice == old && g.origin == GrainOrigin::Pad(i) && g.ev.onset >= t + release));
+                self.tiles.release(old, t + release);
             }
         }
     }
@@ -1124,14 +1342,25 @@ impl Instrument {
         let hop = PAD_GRAIN / 2.0;
         for i in 0..PADS {
             let p = self.pads[i];
-            let Some(slot) = p.slot.filter(|_| p.on) else { continue };
+            let Some(slot) = p.slot else { continue };
+            if slot.slice.is_some() {
+                continue; // slice pads are one-shot voices
+            }
+            let env = slot.adsr.map(|adsr| crate::envelope::VoiceEnv { adsr, on: p.env_on, off: if p.on { f64::INFINITY } else { p.env_off } });
+            let releasing_until = env.filter(|_| !p.on).map(|e| e.end());
+            if !p.on && releasing_until.is_none_or(|end| p.next_t >= end) {
+                continue;
+            }
             let Some(len) = self.sources.get(slot.source).map(|s| s.duration()).filter(|l| *l > 0.0) else { continue };
             let spb = 60.0 / self.transport.bpm;
             let loop_secs = (slot.len_beats as f64 * spb).min(len);
             let mut next_t = p.next_t;
             let mut k = p.k;
             // Never look ahead past a queued stop.
-            let until = p.queued.filter(|q| !q.0).map_or(until, |q| until.min(self.grid_time(q.1)));
+            let until = match releasing_until {
+                Some(end) => until.min(end),
+                None => p.queued.filter(|q| !q.0).map_or(until, |q| until.min(self.grid_time(q.1) + slot.adsr.map_or(0.0, |a| a.release_secs()))),
+            };
             while next_t < until {
                 if self.grains.len() >= MAX_GRAINS {
                     break;
@@ -1150,6 +1379,8 @@ impl Instrument {
                     id: (3u64 << 61) | ((i as u64) << 48) | (k & 0xFFFF_FFFF_FFFF),
                     ..Default::default()
                 };
+                let mut ev = ev;
+                tag_grain(&mut ev, p.serial, env, p.tile, self.layout_pan, &self.tiles);
                 self.grains.push(LiveGrain { source: slot.source, voice: p.serial, ev, origin: GrainOrigin::Pad(i), seen: false });
                 next_t += hop;
                 k += 1;
@@ -1202,6 +1433,7 @@ impl Instrument {
         out.effects.extend(smear);
         out.effects.extend(self.looks[map.look]);
         out.look = map.look;
+        out.layout = self.layout;
     }
 
     /// Grains visible at instrument time `t` (a subset of the snapshot).
@@ -1275,9 +1507,14 @@ impl FrameRenderer {
         }
         let (w, h) = (out.width, out.height);
         let mut layer = Frame::transparent(w, h);
+        let grid = (frame.layout == crate::tile::Layout::Tile).then(|| {
+            crate::tile::frame_grid(
+                frame.grains.iter().filter(|(_, e)| t >= e.onset && t < e.end() && e.tag.picture_at(t) > 0.0).filter_map(|(_, e)| e.tag.tile),
+            )
+        });
         for (sid, ev) in &frame.grains {
             let Some(video) = sources.get(*sid).and_then(|s| s.video.as_deref()) else { continue };
-            composite_grains_frame(
+            crate::video::composite_grains_frame_layout(
                 video,
                 std::slice::from_ref(ev),
                 &frame.style,
@@ -1286,6 +1523,9 @@ impl FrameRenderer {
                 None,
                 &mut layer,
                 t,
+                false,
+                None,
+                grid,
             );
         }
         fx::apply_video_chain(&mut layer, &frame.effects, &mut self.states);
@@ -1856,5 +2096,190 @@ mod tests {
         assert!(l.iter().chain(&r).all(|s| s.is_finite() && s.abs() <= 1.0));
         i.all_notes_off();
         assert_eq!(i.held_notes().count(), 0);
+    }
+
+    // ---- v003: ADSR, slices, tiles ----
+
+    use crate::chop::{equal_slices, Slice};
+    use crate::envelope::Adsr;
+    use crate::tile::Layout;
+
+    fn run_n(i: &mut Instrument, samples: usize, block: usize) -> (Vec<f32>, Vec<f32>) {
+        let (mut l, mut r) = (vec![0.0; samples], vec![0.0; samples]);
+        let mut pos = 0;
+        while pos < samples {
+            let b = block.min(samples - pos);
+            i.process(&mut l[pos..pos + b], &mut r[pos..pos + b]);
+            pos += b;
+        }
+        (l, r)
+    }
+
+    fn quick_adsr() -> Adsr {
+        Adsr { attack: 0.002, decay: 0.0, sustain: 1.0, release: 0.02, ..Adsr::default() }
+    }
+
+    fn sliced() -> Instrument {
+        let mut i = inst_with_sine();
+        assert!(i.set_slices(0, equal_slices(3.0, 4)));
+        assert_eq!(i.sources()[0].slices.len(), 4);
+        i
+    }
+
+    #[test]
+    fn note_adsr_release_silences_after_note_off() {
+        let tail = |adsr: Option<Adsr>| {
+            let mut i = inst_with_sine();
+            i.set_macro(Macro::Smear, 0.0);
+            i.set_note_adsr(adsr);
+            assert_eq!(i.note_adsr(), adsr);
+            i.note_on(60, 1.0);
+            run(&mut i, 0.3, 256);
+            i.note_off(60);
+            assert_eq!(i.held_notes().count(), 0);
+            let (l, _) = run(&mut i, 0.3, 256);
+            // Past the release (+ the pipeline's latency).
+            let skip = ((0.02 + 0.01) * SR as f64) as usize + i.latency_samples();
+            rms(&l[skip..])
+        };
+        let classic = tail(None);
+        let enveloped = tail(Some(quick_adsr()));
+        assert!(classic > 0.01, "classic grains ring out: {classic}");
+        assert!(enveloped < classic * 0.05, "ADSR release cuts: {enveloped} vs {classic}");
+    }
+
+    #[test]
+    fn notes_from_c3_play_slices() {
+        let mut i = sliced();
+        i.note_on(49, 1.0); // slice 1 = 0.75..1.5 s
+        let grains = collect(&mut i, 1.5, 256);
+        assert!(!grains.is_empty());
+        for e in &grains {
+            assert!(e.source_pos >= 0.75 - 1e-9 && e.source_pos < 1.5, "inside slice 1: {}", e.source_pos);
+            assert!(e.source_pos + (e.duration * e.pitch_ratio) as f64 <= 1.5 + 1e-6, "clamped to the slice end");
+            assert!((e.pitch_ratio - 1.0).abs() < 1e-6, "slices play at unity");
+        }
+        // The voice stops at the slice end (0.75 s of media).
+        let first = grains.iter().map(|e| e.onset).fold(f64::INFINITY, f64::min);
+        let last = grains.iter().map(|e| e.onset).fold(0.0, f64::max);
+        assert!(last - first < 0.75 + 1e-6, "{first}..{last}");
+        // Past the slices: the melodic path.
+        let mut m = sliced();
+        m.note_on(60, 1.0);
+        let g = collect(&mut m, 0.2, 256);
+        assert!(!g.is_empty() && g.iter().all(|e| e.source_pos < 0.75 + 0.3));
+    }
+
+    #[test]
+    fn slices_to_pads_make_one_shot_pads() {
+        let mut i = sliced();
+        assert_eq!(i.slices_to_pads(0, 0), 4);
+        assert_eq!(i.slices_to_pads(9, 0), 0);
+        let p = i.pad(2);
+        assert_eq!(p.slot.and_then(|s| s.slice), Some(Slice::new(1.5, 2.25)));
+        i.note_on(PAD_NOTE + 2, 1.0);
+        i.note_off(PAD_NOTE + 2); // one-shot: note-off doesn't stop it
+        assert_eq!(i.held_notes().count(), 0);
+        let grains = collect(&mut i, 1.0, 256);
+        assert!(!grains.is_empty(), "the pad hit plays");
+        assert!(grains.iter().all(|e| e.source_pos >= 1.5 - 1e-9 && e.source_pos < 2.25));
+        // toggle_pad on a slice pad is also a one-shot.
+        let mut j = sliced();
+        j.slices_to_pads(0, 4);
+        j.toggle_pad(4);
+        let g = collect(&mut j, 0.3, 256);
+        assert!(!g.is_empty() && g.iter().all(|e| e.source_pos < 0.75));
+        assert!(!j.pad(4).on, "a slice pad doesn't latch");
+    }
+
+    #[test]
+    fn tile_layout_gives_voices_slots_and_pans() {
+        let mut i = inst_with_sine();
+        i.set_layout(Layout::Tile);
+        assert!(i.layout_pan());
+        i.note_on(60, 1.0);
+        i.note_on(67, 1.0);
+        let grains = collect(&mut i, 0.4, 256);
+        let pans = |slot: u8| grains.iter().filter(|e| e.tag.tile == Some(slot)).map(|e| e.pan).collect::<Vec<_>>();
+        let (a, b) = (pans(0), pans(1));
+        assert!(!a.is_empty() && !b.is_empty());
+        assert!(a.iter().all(|p| *p < -0.5), "slot 0 = left: {a:?}");
+        assert!(b.iter().all(|p| *p > 0.5), "slot 1 = right: {b:?}");
+        assert!(grains.iter().all(|e| e.tag.voice != 0));
+
+        // The picture: left and right halves both lit.
+        let f = i.frame();
+        assert_eq!(f.layout, Layout::Tile);
+        let mut out = Frame::black(32, 18);
+        FrameRenderer::new().render(&f, i.sources(), f.time, 24.0, &mut out);
+        let half = |x0: u32, x1: u32| {
+            let mut sum = 0.0;
+            for y in 0..18u32 {
+                for x in x0..x1 {
+                    let k = ((y * 32 + x) * 4) as usize;
+                    sum += out.data[k] as f32 + out.data[k + 1] as f32 + out.data[k + 2] as f32;
+                }
+            }
+            sum / ((x1 - x0) * 18 * 3) as f32
+        };
+        assert!(half(0, 15) > 10.0 && half(17, 32) > 10.0, "{} {}", half(0, 15), half(17, 32));
+
+        // Without layout pan, pans stay near center.
+        let mut c = inst_with_sine();
+        c.set_layout(Layout::Tile);
+        c.set_layout_pan(false);
+        c.note_on(60, 1.0);
+        c.note_on(67, 1.0);
+        let g = collect(&mut c, 0.3, 256);
+        assert!(g.iter().all(|e| e.pan.abs() < 0.5));
+        // Stack: no tiles.
+        let mut s = inst_with_sine();
+        s.note_on(60, 1.0);
+        assert!(collect(&mut s, 0.2, 256).iter().all(|e| e.tag.tile.is_none()));
+    }
+
+    #[test]
+    fn adsr_tiles_and_slices_are_block_size_independent() {
+        let render = |block: usize| {
+            let mut i = sliced();
+            i.set_layout(Layout::Tile);
+            i.set_note_adsr(Some(Adsr { attack: 0.01, decay: 0.05, sustain: 0.6, release: 0.1, ..Adsr::default() }));
+            i.slices_to_pads(0, 0);
+            let mut l = Vec::new();
+            let mut push = |i: &mut Instrument, n: usize| l.extend(run_n(i, n, block).0);
+            i.note_on(60, 0.9);
+            push(&mut i, 4096);
+            i.note_on(50, 0.7);
+            push(&mut i, 4096);
+            i.note_on(PAD_NOTE + 1, 1.0);
+            push(&mut i, 2048);
+            i.note_off(60);
+            push(&mut i, 8192);
+            i.note_off(50);
+            push(&mut i, 8192);
+            l
+        };
+        let a = render(64);
+        let b = render(512);
+        let c = render(2048);
+        assert!(rms(&a) > 0.01);
+        let diff = |x: &[f32], y: &[f32]| x.iter().zip(y).map(|(p, q)| (p - q).abs()).fold(0.0f32, f32::max);
+        assert!(diff(&a, &b) < 1e-5, "64 vs 512: {}", diff(&a, &b));
+        assert!(diff(&a, &c) < 1e-5, "64 vs 2048: {}", diff(&a, &c));
+    }
+
+    #[test]
+    fn a_voice_pan_follows_its_tile_as_the_grid_grows() {
+        let mut i = inst_with_sine();
+        i.set_layout(Layout::Tile);
+        i.note_on(60, 1.0);
+        let alone = collect(&mut i, 0.3, 256);
+        assert!(alone.iter().all(|e| e.tag.tile == Some(0) && e.pan.abs() <= 0.2 + 1e-6), "a lone voice is centered");
+        i.note_on(67, 1.0);
+        run(&mut i, 0.1, 256); // past the lookahead
+        let t = i.now_secs();
+        let both = collect(&mut i, 0.3, 256);
+        let first: Vec<f32> = both.iter().filter(|e| e.tag.tile == Some(0) && e.onset >= t).map(|e| e.pan).collect();
+        assert!(!first.is_empty() && first.iter().all(|p| *p < -0.5), "slot 0 moves left: {first:?}");
     }
 }

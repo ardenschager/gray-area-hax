@@ -194,12 +194,10 @@ impl Job {
         }
     }
 
-    #[allow(dead_code)] // used by the dig/link workers (next commits)
     fn set(&self, status: JobStatus) {
         self.with(|s| s.status = status);
     }
 
-    #[allow(dead_code)]
     fn set_title(&self, t: &str) {
         self.with(|s| s.title = Some(t.to_string()));
     }
@@ -277,12 +275,125 @@ pub fn random_query(rng: &mut crate::dsp::Rng) -> String {
     }
 }
 
-fn run_dig(_job: &Job, _opts: &DigOptions) -> MediaResult<Source> {
-    Err("dig: not available yet".into())
+fn cancelled(job: &Job) -> MediaResult<()> {
+    if job.is_cancelled() {
+        Err("cancelled".into())
+    } else {
+        Ok(())
+    }
 }
 
-fn run_link(_job: &Job, _url: &str, _opts: &DigOptions) -> MediaResult<Source> {
-    Err("link: not available yet".into())
+/// Fill in fields the flat search left out from a full lookup.
+fn merge(flat: &VideoHit, full: VideoHit) -> VideoHit {
+    let pick = |a: &String, b: String| if b.is_empty() { a.clone() } else { b };
+    VideoHit {
+        id: pick(&flat.id, full.id),
+        url: pick(&flat.url, full.url),
+        title: pick(&flat.title, full.title),
+        uploader: pick(&flat.uploader, full.uploader),
+        upload_date: pick(&flat.upload_date, full.upload_date),
+        views: full.views.or(flat.views),
+        duration: full.duration.or(flat.duration),
+        live: full.live || flat.live,
+        license: full.license.or_else(|| flat.license.clone()),
+    }
+}
+
+fn source_name(hit: &VideoHit, path: &std::path::Path) -> String {
+    let t = hit.title.trim();
+    if t.is_empty() {
+        path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "dig".into())
+    } else {
+        t.chars().take(80).collect()
+    }
+}
+
+fn run_dig(job: &Job, opts: &DigOptions) -> MediaResult<Source> {
+    let backend = crate::media::backend();
+    let mut rng = crate::dsp::Rng::new(opts.seed.unwrap_or_else(seed_now) | 1);
+    let mut last_err = String::from("nothing passed the filter");
+    for attempt in 1..=opts.attempts.max(1) {
+        cancelled(job)?;
+        let query = random_query(&mut rng);
+        job.set(JobStatus::Searching { query: query.clone(), attempt });
+        let hits = match backend.search_videos(&query, opts.results) {
+            Ok(h) => h,
+            Err(e) => {
+                last_err = e;
+                continue;
+            }
+        };
+        let mut candidates: Vec<VideoHit> = hits.into_iter().filter(|h| opts.accepts(h)).collect();
+        // Fisher-Yates with the job's rng: a random pick, then fallbacks.
+        for i in (1..candidates.len()).rev() {
+            let j = (rng.next_f32() * (i + 1) as f32) as usize % (i + 1);
+            candidates.swap(i, j);
+        }
+        for hit in candidates.into_iter().take(3) {
+            cancelled(job)?;
+            let hit = if opts.cc_only || hit.upload_date.is_empty() || hit.license.is_none() {
+                match backend.video_info(&hit.url) {
+                    Ok(full) => merge(&hit, full),
+                    Err(e) if opts.cc_only => {
+                        last_err = e;
+                        continue;
+                    }
+                    Err(_) => hit,
+                }
+            } else {
+                hit
+            };
+            if !opts.accepts(&hit) || (opts.cc_only && !hit.is_creative_commons()) {
+                continue;
+            }
+            job.set_title(&hit.title);
+            job.set(JobStatus::Downloading(0.0));
+            let path = match backend.download_video(&hit.url, &opts.cache_dir, 480, &mut |p| job.set(JobStatus::Downloading(p))) {
+                Ok(p) => p,
+                Err(e) => {
+                    last_err = e;
+                    continue;
+                }
+            };
+            cancelled(job)?;
+            job.set(JobStatus::Cutting);
+            let dur = hit.duration.unwrap_or(opts.window.1).max(0.0);
+            let (w0, w1) = (opts.window.0.min(opts.window.1).max(0.1), opts.window.0.max(opts.window.1).max(0.1));
+            let len = (w0 + (w1 - w0) * rng.next_f32() as f64).min(dur.max(0.1));
+            let start = (dur - len).max(0.0) * rng.next_f32() as f64;
+            match crate::media::load_source_window(&path, start, len, opts.sample_rate) {
+                Ok(mut src) => {
+                    src.name = source_name(&hit, &path);
+                    src.provenance = Some(provenance_of(&hit, &query, (start, len)));
+                    return Ok(src);
+                }
+                Err(e) => last_err = e,
+            }
+        }
+    }
+    Err(format!("dig: gave up after {} queries ({last_err})", opts.attempts.max(1)))
+}
+
+fn run_link(job: &Job, url: &str, opts: &DigOptions) -> MediaResult<Source> {
+    let backend = crate::media::backend();
+    job.set(JobStatus::Searching { query: url.to_string(), attempt: 1 });
+    let hit = match backend.video_info(url) {
+        Ok(h) => h,
+        Err(_) => VideoHit { url: url.to_string(), ..Default::default() },
+    };
+    if !hit.title.is_empty() {
+        job.set_title(&hit.title);
+    }
+    cancelled(job)?;
+    job.set(JobStatus::Downloading(0.0));
+    let path = backend.download_video(url, &opts.cache_dir, 480, &mut |p| job.set(JobStatus::Downloading(p)))?;
+    cancelled(job)?;
+    job.set(JobStatus::Cutting);
+    let mut src = crate::media::load_source(&path, opts.sample_rate)?;
+    src.name = source_name(&hit, &path);
+    let len = src.duration();
+    src.provenance = Some(provenance_of(&VideoHit { url: if hit.url.is_empty() { url.to_string() } else { hit.url.clone() }, ..hit }, "", (0.0, len)));
+    Ok(src)
 }
 
 /// Provenance for a hit (`window` = the cut, seconds into the video).
@@ -296,5 +407,198 @@ pub fn provenance_of(hit: &VideoHit, query: &str, window: (f64, f64)) -> Provena
         license: hit.license.clone().unwrap_or_default(),
         query: query.to_string(),
         window,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    /// The stub is selected through process-wide env vars: one dig test at a time.
+    static ENV: Mutex<()> = Mutex::new(());
+
+    fn stub() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/ytdlp-stub")
+    }
+
+    fn write_wav(path: &Path, secs: u32) {
+        let spec = hound::WavSpec { channels: 1, sample_rate: 8000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+        let mut w = hound::WavWriter::create(path, spec).unwrap();
+        for i in 0..secs * 8000 {
+            w.write_sample(((i as f32 * 0.07).sin() * 9000.0) as i16).unwrap();
+        }
+        w.finalize().unwrap();
+    }
+
+    fn flat(id: &str, views: u64, dur: f64, live: bool) -> String {
+        format!(r#"{{"id":"{id}","url":"https://www.youtube.com/watch?v={id}","title":"flat {id}","channel":"ch {id}","view_count":{views},"duration":{dur},"live_status":"{}"}}"#,
+            if live { "is_live" } else { "not_live" })
+    }
+
+    fn info(id: &str, views: u64, dur: f64, license: &str) -> String {
+        format!(r#"{{"id":"{id}","webpage_url":"https://www.youtube.com/watch?v={id}","title":"IMG_{id} at the lake","uploader":"someone {id}","upload_date":"20140612","view_count":{views},"duration":{dur},"license":"{license}"}}"#)
+    }
+
+    /// A finds folder: `hits` for search, plus metadata + media per good id.
+    fn finds(name: &str, hits: &[String], good: &[(&str, &str)]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("cg-dig-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("search.jsonl"), hits.join("\n") + "\n").unwrap();
+        for (id, lic) in good {
+            std::fs::write(dir.join(format!("{id}.json")), info(id, 42, 70.0, lic)).unwrap();
+            write_wav(&dir.join(format!("{id}.wav")), 70);
+        }
+        dir
+    }
+
+    fn with_stub<R>(dir: &Path, f: impl FnOnce() -> R) -> R {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var(YTDLP_ENV, stub());
+        std::env::set_var("CHROMAGRAIN_YTDLP_STUB_DIR", dir);
+        let r = f();
+        std::env::remove_var(YTDLP_ENV);
+        std::env::remove_var("CHROMAGRAIN_YTDLP_STUB_DIR");
+        r
+    }
+
+    fn opts(dir: &Path, seed: u64) -> DigOptions {
+        DigOptions { seed: Some(seed), sample_rate: 8000, cache_dir: dir.join("cache"), attempts: 4, ..Default::default() }
+    }
+
+    #[test]
+    fn queries_look_like_camera_files_or_words() {
+        let mut rng = crate::dsp::Rng::new(7);
+        let qs: Vec<String> = (0..200).map(|_| random_query(&mut rng)).collect();
+        let camera = qs.iter().filter(|q| CAMERA_PATTERNS.iter().any(|p| q.starts_with(p))).count();
+        assert!(camera > 120 && camera < 200, "mostly camera filenames: {camera}/200");
+        assert!(qs.iter().any(|q| WORDS.contains(&q.as_str())), "sometimes a word");
+        for q in qs.iter().filter(|q| q.starts_with("VID_")) {
+            assert_eq!(q.len(), 12, "VID_YYYYMMDD: {q}");
+        }
+    }
+
+    #[test]
+    fn match_filter() {
+        let o = DigOptions::default();
+        let hit = |views, dur, live| VideoHit { views: Some(views), duration: Some(dur), live, ..Default::default() };
+        assert!(o.accepts(&hit(10, 90.0, false)));
+        assert!(!o.accepts(&hit(10_000, 90.0, false)), "too popular");
+        assert!(!o.accepts(&hit(10, 4.0, false)), "too short");
+        assert!(!o.accepts(&hit(10, 3600.0, false)), "too long");
+        assert!(!o.accepts(&hit(10, 90.0, true)), "live");
+        assert!(!o.accepts(&VideoHit { duration: None, ..hit(10, 90.0, false) }), "unknown duration");
+        let cc = DigOptions { cc_only: true, ..o };
+        let lic = |l: &str| VideoHit { license: Some(l.into()), ..hit(10, 90.0, false) };
+        assert!(cc.accepts(&lic("Creative Commons Attribution license (reuse allowed)")));
+        assert!(!cc.accepts(&lic("Standard YouTube License")));
+    }
+
+    #[test]
+    fn dig_picks_an_unseen_video_and_cuts_a_window() {
+        let hits = [flat("popular", 90_000, 70.0, false), flat("livecam", 3, 70.0, true), flat("short1", 2, 3.0, false), flat("good1", 42, 70.0, false)];
+        let dir = finds("pick", &hits, &[("good1", "")]);
+        let src = with_stub(&dir, || {
+            let job = dig(opts(&dir, 11));
+            assert_eq!(job.wait(), JobStatus::Done);
+            assert_eq!(job.progress(), 1.0);
+            assert_eq!(job.title().as_deref(), Some("IMG_good1 at the lake"));
+            job.take_source().expect("source")
+        });
+        let p = src.provenance.clone().expect("provenance");
+        assert_eq!(p.url, "https://www.youtube.com/watch?v=good1");
+        assert_eq!((p.views, p.uploader.as_str(), p.upload_date.as_str()), (Some(42), "someone good1", "20140612"));
+        assert!(!p.query.is_empty());
+        let (start, len) = p.window;
+        assert!((20.0..=60.0).contains(&len) && start >= 0.0 && start + len <= 70.0 + 1e-9, "window {start}+{len}");
+        assert!((src.duration() - len).abs() < 0.01, "source is the window: {} vs {len}", src.duration());
+        assert_eq!(src.name, "IMG_good1 at the lake");
+        assert!(dir.join("cache/good1.wav").exists(), "downloaded into the cache dir");
+    }
+
+    #[test]
+    fn dig_retries_when_searches_come_back_empty() {
+        let dir = finds("retry", &[flat("good1", 42, 70.0, false)], &[("good1", "")]);
+        std::fs::write(dir.join("empty_searches"), "2").unwrap();
+        let st = with_stub(&dir, || dig(opts(&dir, 3)).wait());
+        assert_eq!(st, JobStatus::Done);
+        assert_eq!(std::fs::read_to_string(dir.join(".calls")).unwrap().trim(), "3", "two empty searches, then a hit");
+    }
+
+    #[test]
+    fn dig_gives_up_when_nothing_passes() {
+        let dir = finds("none", &[flat("popular", 90_000, 70.0, false)], &[]);
+        let st = with_stub(&dir, || dig(DigOptions { attempts: 2, ..opts(&dir, 5) }).wait());
+        match st {
+            JobStatus::Failed(e) => assert!(e.contains("gave up after 2"), "{e}"),
+            other => panic!("expected failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cc_only_keeps_creative_commons_finds() {
+        let hits = [flat("plain", 10, 70.0, false), flat("ccfind", 12, 70.0, false)];
+        let dir = finds("cc", &hits, &[("plain", "Standard YouTube License"), ("ccfind", "Creative Commons Attribution license (reuse allowed)")]);
+        for seed in 1..5 {
+            let src = with_stub(&dir, || {
+                let job = dig(DigOptions { cc_only: true, ..opts(&dir, seed) });
+                assert_eq!(job.wait(), JobStatus::Done);
+                job.take_source().unwrap()
+            });
+            let p = src.provenance.unwrap();
+            assert!(p.url.ends_with("ccfind"), "seed {seed}: {}", p.url);
+            assert!(p.license.contains("Creative Commons"));
+        }
+    }
+
+    #[test]
+    fn dig_many_runs_jobs_with_distinct_seeds() {
+        let hits = [flat("good1", 42, 70.0, false), flat("good2", 7, 70.0, false)];
+        let dir = finds("many", &hits, &[("good1", ""), ("good2", "")]);
+        let windows: Vec<(f64, f64)> = with_stub(&dir, || {
+            let jobs = dig_many(3, opts(&dir, 99));
+            jobs.iter().map(|j| {
+                assert_eq!(j.wait(), JobStatus::Done);
+                j.take_source().unwrap().provenance.unwrap().window
+            }).collect()
+        });
+        assert_eq!(windows.len(), 3);
+        assert!(windows[0] != windows[1] || windows[1] != windows[2], "different random windows: {windows:?}");
+    }
+
+    #[test]
+    fn link_downloads_and_loads_with_provenance() {
+        let dir = finds("link", &[], &[("good1", "")]);
+        let src = with_stub(&dir, || {
+            let job = fetch_link("https://www.youtube.com/watch?v=good1", opts(&dir, 1));
+            assert_eq!(job.wait(), JobStatus::Done);
+            job.take_source().unwrap()
+        });
+        let p = src.provenance.clone().unwrap();
+        assert_eq!((p.title.as_str(), p.query.as_str()), ("IMG_good1 at the lake", ""));
+        assert!((p.window.1 - 70.0).abs() < 0.01 && (src.duration() - 70.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn link_failure_is_reported() {
+        let dir = finds("linkfail", &[], &[]);
+        let st = with_stub(&dir, || fetch_link("https://www.youtube.com/watch?v=missing", opts(&dir, 1)).wait());
+        assert!(matches!(st, JobStatus::Failed(ref e) if e.contains("no media")), "{st:?}");
+    }
+
+    /// Real network dig (yt-dlp + ffmpeg on PATH):
+    /// `cargo test -p chromagrain-core dig::tests::real_dig -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn real_dig() {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let job = dig(DigOptions { attempts: 8, ..Default::default() });
+        let st = job.wait();
+        eprintln!("{st:?}");
+        let src = job.take_source().expect("a real find");
+        eprintln!("{} {:.1}s {:?}", src.name, src.duration(), src.provenance);
+        assert!(src.duration() >= 1.0);
     }
 }

@@ -379,9 +379,17 @@ pub fn render_grains_audio_spatial(
     for ev in events {
         // Rounded independently so block-wise rendering at t0 = k/sr is
         // sample-exact against a single full render at t0 = 0.
-        let start_sample = (ev.onset * out_sr).round() as i64 - (t0 * out_sr).round() as i64;
+        let abs_start = (ev.onset * out_sr).round() as i64;
+        let start_sample = abs_start - (t0 * out_sr).round() as i64;
         let n = (ev.duration as f64 * out_sr) as i64;
         if n <= 0 || start_sample + n < 0 || start_sample >= out_len {
+            continue;
+        }
+        // The voice's ADSR, evaluated at each output sample's absolute time
+        // (sample-exact for any block split). Grains past the voice's end
+        // are silent.
+        let venv = ev.tag.env;
+        if venv.is_some_and(|e| ev.onset >= e.end()) {
             continue;
         }
         // Equal-power pan (grain pan + clip placement offset).
@@ -399,7 +407,10 @@ pub fn render_grains_audio_spatial(
                 continue;
             }
             let phase = i as f32 / n as f32;
-            let env = grain_env_skewed(phase, ev.envelope, ev.env_skew);
+            let mut env = grain_env_skewed(phase, ev.envelope, ev.env_skew);
+            if let Some(e) = venv {
+                env *= e.level_at((abs_start + i) as f64 / out_sr);
+            }
             let src_off = if ev.reverse {
                 grain_src_len - i as f64 * ev.pitch_ratio as f64
             } else {
@@ -771,5 +782,48 @@ mod tests {
         let clip = AudioClip::stereo(&a, &a, 48000);
         assert!(!clip.is_stereo());
         assert_eq!(clip.samples.len(), 1000);
+    }
+
+    #[test]
+    fn grain_envelope_is_sample_exact_across_blocks_and_releases_to_zero() {
+        let sr = 48000u32;
+        let clip = AudioClip::sine(220.0, 2.0, sr);
+        let adsr = crate::envelope::Adsr { attack: 0.05, decay: 0.1, sustain: 0.5, release: 0.1, ..Default::default() };
+        let env = crate::envelope::VoiceEnv { adsr, on: 0.1, off: 0.6 };
+        let ev = GrainEvent {
+            onset: 0.1,
+            source_pos: 0.2,
+            duration: 1.0,
+            pitch_ratio: 1.0,
+            gain: 1.0,
+            envelope: 0.01,
+            id: 1,
+            tag: crate::grain::VoiceTag { voice: 5, env: Some(env), tile: None },
+            ..Default::default()
+        };
+        let mut whole = StereoBuffer::new(1.2, sr);
+        render_grains_audio(&clip, std::slice::from_ref(&ev), &mut whole, 0.0);
+        let n = whole.left.len();
+        let mut blocks = vec![0.0f32; n];
+        let mut pos = 0;
+        while pos < n {
+            let b = 64.min(n - pos);
+            let mut buf = StereoBuffer { left: vec![0.0; b], right: vec![0.0; b], sample_rate: sr };
+            render_grains_audio(&clip, std::slice::from_ref(&ev), &mut buf, pos as f64 / sr as f64);
+            blocks[pos..pos + b].copy_from_slice(&buf.left);
+            pos += b;
+        }
+        let diff = whole.left.iter().zip(&blocks).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(diff < 1e-6, "one pass == 64-sample blocks: {diff}");
+        let peak = |a: f64, b: f64| whole.left[(a * sr as f64) as usize..(b * sr as f64) as usize].iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        let (attack, sustain) = (peak(0.1, 0.12), peak(0.4, 0.6));
+        assert!(attack < sustain, "attack ramps: {attack} < {sustain}");
+        assert!(peak(0.55, 0.6) > 0.1, "sustain holds");
+        assert!(peak(0.701, 1.2) < 1e-9, "silent after off + release");
+        // A grain starting after the voice ended is skipped.
+        let late = GrainEvent { onset: 0.8, ..ev };
+        let mut buf = StereoBuffer::new(1.2, sr);
+        render_grains_audio(&clip, std::slice::from_ref(&late), &mut buf, 0.0);
+        assert_eq!(buf.rms(), 0.0);
     }
 }
