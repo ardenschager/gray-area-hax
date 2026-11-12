@@ -25,6 +25,28 @@ pub enum ClipTarget {
     Pad(usize),
 }
 
+/// Height the chop panel is laid out for (waveform, filmstrip, bar).
+pub const CHOP_PANEL_H: f32 = 296.0;
+
+/// Whose envelope the envelope panel edits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EnvTarget {
+    Pad(usize),
+    Lane(usize),
+    Emitter(usize),
+}
+
+impl ClipTarget {
+    /// The envelope this clip target carries (pads and lanes).
+    pub fn env_target(self) -> Option<EnvTarget> {
+        match self {
+            ClipTarget::Pad(i) => Some(EnvTarget::Pad(i)),
+            ClipTarget::Lane(l) => Some(EnvTarget::Lane(l)),
+            _ => None,
+        }
+    }
+}
+
 /// Live tap-chop: the clip plays from the start; each tap drops a chop
 /// point straight into the source's slices.
 #[derive(Debug, Clone)]
@@ -91,7 +113,7 @@ impl Studio {
             self.sheet = None;
             return;
         };
-        let env_target = matches!(target, ClipTarget::Pad(_) | ClipTarget::Lane(_));
+        let env_target = target.env_target().is_some();
         let screen = ctx.screen_rect();
         let size = egui::vec2((screen.width() - 40.0).min(980.0), (screen.height() - 48.0).min(if env_target { 640.0 } else { 470.0 }));
         let now = host.clock();
@@ -102,6 +124,7 @@ impl Studio {
             let name = self.source_name(host, src);
             let len = host.project().lock().unwrap().sources.get(src).map(|s| s.duration()).unwrap_or(0.0);
             let slices = self.slices(host, src);
+            let _ = now;
             let prov = self.provenance_line(host, src);
             let sub = format!(
                 "{} · {}:{:02}{}",
@@ -117,33 +140,51 @@ impl Studio {
             if sheet_header(ui, inner, &name, &sub, id) {
                 close = true;
             }
-            let top = inner.top() + 60.0;
-            let wave = Rect::from_min_size(egui::pos2(inner.left(), top), egui::vec2(inner.width(), 150.0));
-            let film = Rect::from_min_size(egui::pos2(inner.left(), wave.bottom() + 6.0), egui::vec2(inner.width(), 62.0));
-            self.chop_area(host, ui, src, len, &slices, wave, film, now);
-            let bar = Rect::from_min_size(egui::pos2(inner.left(), film.bottom() + 16.0), egui::vec2(inner.width(), 44.0));
-            self.chop_bar(host, ui, src, len, bar, now);
-            if env_target {
-                let env = Rect::from_min_max(egui::pos2(inner.left(), bar.bottom() + 22.0), inner.max);
-                self.envelope_section(host, ui, target, src, env);
+            let chop = Rect::from_min_size(egui::pos2(inner.left(), inner.top() + 60.0), egui::vec2(inner.width(), CHOP_PANEL_H));
+            self.chop_panel(host, ui, chop, src);
+            if let Some(et) = target.env_target() {
+                let env = Rect::from_min_max(egui::pos2(inner.left(), chop.bottom() + 22.0), inner.max);
+                self.envelope_panel(host, ui, env, et, Some(src));
+                if let EnvTarget::Lane(l) = et {
+                    let more = Rect::from_min_size(egui::pos2(env.right() - 200.0, env.bottom() - 40.0), egui::vec2(200.0, 40.0));
+                    if button(ui, more, ui.id().with(("lane-more", l)), "Lane settings", false, Some(Icon::Deep), None).clicked() {
+                        self.sheet = None;
+                        self.deep = Some((super::DeepTarget::Lane(l), super::DeepTab::Links));
+                    }
+                }
             }
         });
-        // Tap chop ends with the clip.
-        if let Some(tc) = self.chop.tap.as_ref() {
-            if now - tc.t0 >= tc.len {
-                self.finish_tap(host);
-            }
-            ctx.request_repaint();
-        }
-        if self.chop.playing.is_some_and(|(_, _, t)| now - t < 4.0) {
-            ctx.request_repaint();
-        }
         if (close || scrim) && matches!(self.sheet, Some(Sheet::Clip(_))) {
             if self.chop.tap.is_some() {
                 self.finish_tap(host);
             }
             host.stop_audition();
             self.sheet = None;
+        }
+    }
+
+    /// The chop panel, self-contained (any host rect, `CHOP_PANEL_H` tall
+    /// looks best): waveform + filmstrip with slices, then auto / 4 / 8 /
+    /// 16, Tap, Clear, Slices → pads.
+    pub fn chop_panel(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, rect: Rect, src: usize) {
+        let now = host.clock();
+        let len = host.project().lock().unwrap().sources.get(src).map(|s| s.duration()).unwrap_or(0.0);
+        let slices = self.slices(host, src);
+        let bar_h = 44.0;
+        let film_h = (rect.height() * 0.24).clamp(36.0, 62.0);
+        let wave = Rect::from_min_max(rect.min, egui::pos2(rect.right(), rect.bottom() - bar_h - 16.0 - film_h - 6.0));
+        let film = Rect::from_min_size(egui::pos2(rect.left(), wave.bottom() + 6.0), egui::vec2(rect.width(), film_h));
+        self.chop_area(host, ui, src, len, &slices, wave, film, now);
+        let bar = Rect::from_min_size(egui::pos2(rect.left(), rect.bottom() - bar_h), egui::vec2(rect.width(), bar_h));
+        self.chop_bar(host, ui, src, len, bar, now);
+        if let Some(tc) = self.chop.tap.as_ref() {
+            if now - tc.t0 >= tc.len {
+                self.finish_tap(host);
+            }
+            ui.ctx().request_repaint();
+        }
+        if self.chop.playing.is_some_and(|(_, _, t)| now - t < 4.0) {
+            ui.ctx().request_repaint();
         }
     }
 
@@ -295,7 +336,7 @@ impl Studio {
         let p = ui.painter().clone();
         // Slice by: auto / 4 / 8 / 16.
         let seg = Rect::from_min_size(bar.min, egui::vec2(268.0, bar.height()));
-        if let Some(i) = segmented(ui, seg, ui.id().with(("slice-by", src)), &["Auto", "4", "8", "16"], &[], usize::MAX, font(13.0), false) {
+        if let Some(i) = segmented_named(ui, seg, ui.id().with(("slice-by", src)), &["Auto", "4", "8", "16"], &["slice auto", "slice 4", "slice 8", "slice 16"], &[], usize::MAX, font(13.0), false) {
             let v = match i {
                 0 => host.project().lock().unwrap().sources.get(src).map(|s| s.auto_slices(16)).unwrap_or_default(),
                 1 => chop::equal_slices(len, 4),
@@ -310,7 +351,7 @@ impl Studio {
         let tapping = self.chop.tap.as_ref().is_some_and(|t| t.source == src);
         let tb = Rect::from_min_size(egui::pos2(seg.right() + 10.0, bar.top()), egui::vec2(if tapping { 150.0 } else { 104.0 }, bar.height()));
         let label = if tapping { "Chop here" } else { "Tap" };
-        if button(ui, tb, ui.id().with(("chop-tap", src)), label, tapping, Some(Icon::Chop), None).clicked() {
+        if button_named(ui, tb, ui.id().with(("chop-tap", src)), label, "chop tap", tapping, Some(Icon::Chop), None).clicked() {
             if tapping {
                 self.tap_chop(host, now);
             } else {
@@ -323,7 +364,7 @@ impl Studio {
         }
         if tapping {
             let sb = Rect::from_min_size(egui::pos2(tb.right() + 8.0, bar.top()), egui::vec2(80.0, bar.height()));
-            if button(ui, sb, ui.id().with(("chop-tap-done", src)), "Done", false, None, None).clicked() {
+            if button_named(ui, sb, ui.id().with(("chop-tap-done", src)), "Done", "chop tap done", false, None, None).clicked() {
                 self.finish_tap(host);
             }
         }
@@ -335,65 +376,70 @@ impl Studio {
             let pb = Rect::from_min_size(egui::pos2(rx - 160.0, bar.top()), egui::vec2(160.0, bar.height()));
             rx = pb.left() - 8.0;
             let primary = n > 0;
-            if button(ui, pb, ui.id().with(("to-pads", src)), "Slices → pads", primary, Some(Icon::Grid), None).clicked() && n > 0 {
+            if button_named(ui, pb, ui.id().with(("to-pads", src)), "Slices → pads", "slices to pads", primary, Some(Icon::Grid), None).clicked() && n > 0 {
                 let k = self.slices_to_pads(host, src);
                 host.status(format!("{k} slices on pads 1–{k}"));
             }
         }
         if n > 0 {
             let cb = Rect::from_min_size(egui::pos2(rx - 84.0, bar.top()), egui::vec2(84.0, bar.height()));
-            if button(ui, cb, ui.id().with(("chop-clear", src)), "Clear", false, None, None).clicked() {
+            if button_named(ui, cb, ui.id().with(("chop-clear", src)), "Clear", "clear slices", false, None, None).clicked() {
                 self.set_slices(host, src, Vec::new());
             }
         }
         let _ = p;
     }
 
-    fn envelope_section(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, target: ClipTarget, src: usize, area: Rect) {
+    /// The envelope panel, self-contained: the 4-handle A/D/S/R editor over
+    /// the clip's thumbnail (`thumb_src`) and the picture's Cut | Fade.
+    pub fn envelope_panel(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, area: Rect, target: EnvTarget, thumb_src: Option<usize>) {
         let ctx = ui.ctx().clone();
         let p = ui.painter().clone();
         caps(&p, egui::pos2(area.left(), area.top() + 6.0), Align2::LEFT_CENTER, "Envelope — sound and picture", 10.5);
         let Some(mut adsr) = self.target_env(host, target) else { return };
-        let ew = (area.width() * 0.62).max(280.0);
-        let er = Rect::from_min_size(egui::pos2(area.left(), area.top() + 22.0), egui::vec2(ew, (area.height() - 26.0).clamp(90.0, 170.0)));
-        let thumb = self.atlas(host, &ctx, src).map(|(tex, _)| (tex, atlas::uv_cover(5, er.width() / er.height())));
-        let mut changed = adsr_editor(ui, er, ui.id().with(("env", target_key(target))), &mut adsr, thumb);
+        let side_w = 230.0f32.min(area.width() * 0.36);
+        let ew = area.width() - side_w - 18.0;
+        let er = Rect::from_min_size(egui::pos2(area.left(), area.top() + 22.0), egui::vec2(ew, (area.height() - 26.0).clamp(80.0, 170.0)));
+        let frame = match target {
+            EnvTarget::Emitter(i) => atlas::frame_at(self.emitters[i].pos()),
+            _ => 5,
+        };
+        let thumb = thumb_src.and_then(|s| self.atlas(host, &ctx, s)).map(|(tex, _)| (tex, atlas::uv_cover(frame, er.width() / er.height())));
+        let mut changed = adsr_editor(ui, er, ui.id().with(("env", target)), &mut adsr, thumb);
         let side = Rect::from_min_max(egui::pos2(er.right() + 18.0, er.top()), egui::pos2(area.right(), er.bottom()));
-        changed |= picture_switch(ui, side, ui.id().with(("cutfade", target_key(target))), &mut adsr);
-        if let ClipTarget::Lane(l) = target {
-            let more = Rect::from_min_size(egui::pos2(side.left(), side.bottom() - 40.0), egui::vec2(side.width().min(220.0), 40.0));
-            if button(ui, more, ui.id().with(("lane-more", l)), "Lane settings", false, Some(Icon::Deep), None).clicked() {
-                self.sheet = None;
-                self.deep = Some((super::DeepTarget::Lane(l), super::DeepTab::Links));
-            }
-        }
+        changed |= picture_switch(ui, side, ui.id().with(("cutfade", target)), &mut adsr);
         if changed {
             self.set_target_env(host, target, adsr);
         }
     }
 
     /// The envelope of a pad / lane / emitter.
-    pub fn target_env(&self, host: &mut dyn Host, target: ClipTarget) -> Option<Adsr> {
+    pub fn target_env(&self, host: &mut dyn Host, target: EnvTarget) -> Option<Adsr> {
         match target {
-            ClipTarget::Pad(i) => host.perform().map(|p| p.pad_env(i).unwrap_or_default()),
-            ClipTarget::Lane(l) => {
+            EnvTarget::Emitter(i) => self.emitters.get(i).map(|e| e.adsr),
+            EnvTarget::Pad(i) => host.perform().map(|p| p.pad_env(i).unwrap_or_default()),
+            EnvTarget::Lane(l) => {
                 let (scene, _) = self.seq_current(host);
                 let pid = self.seq_pattern(scene)?;
                 let pp = host.project().lock().unwrap();
                 Some(pp.patterns.get(pid).and_then(|pat| pat.rows.get(l)).and_then(|r| r.grains.adsr).unwrap_or_default())
             }
-            _ => None,
         }
     }
 
-    pub fn set_target_env(&mut self, host: &mut dyn Host, target: ClipTarget, adsr: Adsr) {
+    pub fn set_target_env(&mut self, host: &mut dyn Host, target: EnvTarget, adsr: Adsr) {
         match target {
-            ClipTarget::Pad(i) => {
+            EnvTarget::Emitter(i) => {
+                if let Some(e) = self.emitters.get_mut(i) {
+                    e.adsr = adsr;
+                }
+            }
+            EnvTarget::Pad(i) => {
                 if let Some(p) = host.perform() {
                     p.set_pad_env(i, adsr);
                 }
             }
-            ClipTarget::Lane(l) => {
+            EnvTarget::Lane(l) => {
                 {
                     let mut pp = host.project().lock().unwrap();
                     for pid in self.seq.scene_pats.iter().flatten() {
@@ -404,7 +450,6 @@ impl Studio {
                 }
                 host.mark();
             }
-            _ => {}
         }
     }
 }
@@ -416,7 +461,7 @@ pub fn picture_switch(ui: &mut egui::Ui, side: Rect, id: egui::Id, adsr: &mut Ad
     let seg = Rect::from_min_size(egui::pos2(side.left(), side.top() + 22.0), egui::vec2(side.width().min(220.0), 44.0));
     let fade = adsr.picture == PictureCut::Fade;
     let mut changed = false;
-    if let Some(i) = segmented(ui, seg, id, &["Cut", "Fade"], &[], fade as usize, font(13.0), false) {
+    if let Some(i) = segmented_named(ui, seg, id, &["Cut", "Fade"], &["picture cut", "picture fade"], &[], fade as usize, font(13.0), false) {
         adsr.picture = if i == 1 { PictureCut::Fade } else { PictureCut::Cut };
         changed = true;
     }
@@ -424,13 +469,3 @@ pub fn picture_switch(ui: &mut egui::Ui, side: Rect, id: egui::Id, adsr: &mut Ad
     p.text(egui::pos2(side.left(), seg.bottom() + 16.0), Align2::LEFT_CENTER, note, font(11.5), INK3);
     changed
 }
-
-fn target_key(t: ClipTarget) -> (u8, usize) {
-    match t {
-        ClipTarget::Source(s) => (0, s),
-        ClipTarget::Column(c) => (1, c),
-        ClipTarget::Lane(l) => (2, l),
-        ClipTarget::Pad(i) => (3, i),
-    }
-}
-

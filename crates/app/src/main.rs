@@ -34,6 +34,8 @@ mod showcase;
 mod studio_host;
 #[cfg(test)]
 mod studio_tests;
+#[cfg(test)]
+mod studio_tests_v003;
 mod theme;
 mod ui_browse;
 mod ui_inspector;

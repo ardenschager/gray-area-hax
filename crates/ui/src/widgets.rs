@@ -114,6 +114,22 @@ pub fn segmented(
     font: FontId,
     thumb_hi: bool,
 ) -> Option<usize> {
+    segmented_named(ui, rect, id, labels, labels, hints, selected, font, thumb_hi)
+}
+
+/// [`segmented`] with separate accessibility names per segment.
+#[allow(clippy::too_many_arguments)]
+pub fn segmented_named(
+    ui: &mut Ui,
+    rect: Rect,
+    id: egui::Id,
+    labels: &[&str],
+    names: &[&str],
+    hints: &[&str],
+    selected: usize,
+    font: FontId,
+    thumb_hi: bool,
+) -> Option<usize> {
     let painter = ui.painter().clone();
     painter.rect_filled(rect, r(12), G1);
     painter.rect_stroke(rect, r(12), hair(LINE), StrokeKind::Inside);
@@ -131,7 +147,7 @@ pub fn segmented(
     let mut picked = None;
     for (i, label) in labels.iter().enumerate() {
         let cell = Rect::from_min_size(egui::pos2(inner.left() + i as f32 * w, inner.top()), egui::vec2(w, inner.height()));
-        let resp = hit(ui, cell, id.with(i), Sense::click(), label);
+        let resp = hit(ui, cell, id.with(i), Sense::click(), names.get(i).copied().unwrap_or(label));
         if resp.clicked() {
             picked = Some(i);
         }
@@ -175,7 +191,13 @@ pub fn chip(ui: &mut Ui, rect: Rect, id: egui::Id, label: &str, ghost: bool, on:
 
 /// Primary / secondary button with an icon painter and a label.
 pub fn button(ui: &mut Ui, rect: Rect, id: egui::Id, label: &str, primary: bool, icon: Option<Icon>, kbd: Option<&str>) -> Response {
-    let resp = hit(ui, rect, id, Sense::click(), label);
+    button_named(ui, rect, id, label, label, primary, icon, kbd)
+}
+
+/// [`button`] with an accessibility name other than its label.
+#[allow(clippy::too_many_arguments)]
+pub fn button_named(ui: &mut Ui, rect: Rect, id: egui::Id, label: &str, name: &str, primary: bool, icon: Option<Icon>, kbd: Option<&str>) -> Response {
+    let resp = hit(ui, rect, id, Sense::click(), name);
     let p = ui.painter().clone();
     let pressed = resp.is_pointer_button_down_on();
     if primary {

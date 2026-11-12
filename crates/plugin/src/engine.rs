@@ -46,6 +46,8 @@ pub enum ToAudio {
     Key(KeyFx),
     /// New step lanes from the editor's Sequence view.
     Pattern(Box<StepPattern>),
+    /// The same media with new slices (the old one goes to the trash).
+    Replace(usize, Source),
 }
 
 /// Editor -> audio, direct (no loader hop). Plain values: pushing and
@@ -78,6 +80,8 @@ pub enum Job {
     /// Editor -> audio (via this thread: patterns allocate, and what they
     /// replace is freed here).
     Pattern(Box<StepPattern>),
+    /// A source's chops changed in the editor.
+    Slices(usize, Vec<chromagrain_core::chop::Slice>),
     Stop,
 }
 
@@ -249,10 +253,17 @@ impl AudioSide {
         // Restore the pads (a session load: the sources reload in the
         // same order, so the indices hold).
         let saved = params.pads.lock().map(|p| p.clone()).unwrap_or_default();
+        let extra = params.pad_extra.lock().map(|p| p.clone()).unwrap_or_default();
         let mut slots = [None; PADS];
         for (pad, source, start, len) in saved {
             if pad < PADS {
-                slots[pad] = Some(PadSlot { start, ..PadSlot::new(source, len) });
+                let (slice, adsr) = extra.iter().find(|e| e.0 == pad).map(|e| (e.1, e.2)).unwrap_or((None, None));
+                slots[pad] = Some(PadSlot {
+                    start,
+                    slice: slice.map(|(a, b)| chromagrain_core::chop::Slice::new(a, b)),
+                    adsr,
+                    ..PadSlot::new(source, len)
+                });
             }
         }
         for (i, s) in slots.iter().enumerate() {
@@ -273,6 +284,8 @@ impl AudioSide {
         inst.set_sync(params.sync.value().beats());
         inst.set_follow_transport(params.follow.value());
         inst.set_launch_quantize(params.launch.value().beats());
+        inst.set_layout(params.layout.value().layout());
+        inst.set_layout_pan(params.layout_pan.value());
     }
 
     /// Latency the instrument reports right now (the current LOOK).
@@ -372,6 +385,7 @@ impl AudioSide {
                     let old = self.inst.swap_pattern(Some(*p));
                     old.map(|o| Trash::Pattern(Box::new(o)))
                 }
+                ToAudio::Replace(id, src) => Some(Trash::Source(self.inst.swap_source(id, src).unwrap_or_else(|s| s))),
             };
             if let Some(t) = old {
                 // The trash ring only fills if the loader is stuck; then
@@ -419,9 +433,12 @@ impl Loader {
                 Ok(Job::Stop) | Err(RecvTimeoutError::Disconnected) => break,
                 Ok(Job::Load(path)) => self.load(path),
                 Ok(Job::Decoded(src)) => {
+                    let mut src = *src;
+                    self.restore_slices(&mut src);
                     self.shared.mirror_source(&src);
-                    self.pending.push(ToAudio::Add(*src));
+                    self.pending.push(ToAudio::Add(src));
                 }
+                Ok(Job::Slices(id, v)) => self.slices(id, v),
                 Ok(Job::Pattern(p)) => {
                     // Only the newest pattern matters.
                     self.pending.retain(|m| !matches!(m, ToAudio::Pattern(_)));
@@ -445,7 +462,8 @@ impl Loader {
         self.shared.set_status(format!("loading {name}…"));
         let sr = self.shared.sample_rate.load(Ordering::Relaxed);
         match chromagrain_core::media::load_source(&path, sr) {
-            Ok(src) => {
+            Ok(mut src) => {
+                self.restore_slices(&mut src);
                 let p = path.to_string_lossy().into_owned();
                 if let Ok(mut l) = self.shared.loaded.lock() {
                     l.push(p.clone());
@@ -461,6 +479,41 @@ impl Loader {
             }
             Err(e) => self.shared.set_status(format!("{name}: {e}")),
         }
+    }
+
+    /// Index the next mirrored source gets.
+    fn next_index(&self) -> usize {
+        self.shared.ui_sources.lock().map(|u| u.len()).unwrap_or(0)
+    }
+
+    /// Chops saved with the session for the source about to be added.
+    fn restore_slices(&self, src: &mut Source) {
+        let k = self.next_index();
+        let saved = self.params.slices.lock().ok().and_then(|s| s.iter().find(|e| e.0 == k).map(|e| e.1.clone()));
+        if let Some(v) = saved {
+            src.slices = v.into_iter().map(|(a, b)| chromagrain_core::chop::Slice::new(a, b)).collect();
+            let len = src.duration();
+            chromagrain_core::chop::normalize(&mut src.slices, len);
+        }
+    }
+
+    /// New chops from the editor: swap in the same media with them, and
+    /// keep them in the plugin state.
+    fn slices(&mut self, id: usize, v: Vec<chromagrain_core::chop::Slice>) {
+        let src = self.shared.ui_sources.lock().ok().and_then(|mut u| {
+            let s = u.get_mut(id)?;
+            s.slices = v.clone();
+            Some(s.clone())
+        });
+        let Some(src) = src else { return };
+        if let Ok(mut saved) = self.params.slices.lock() {
+            saved.retain(|e| e.0 != id);
+            if !v.is_empty() {
+                saved.push((id, v.iter().map(|s| (s.start, s.end)).collect()));
+            }
+        }
+        self.pending.retain(|m| !matches!(m, ToAudio::Replace(k, _) if *k == id));
+        self.pending.push(ToAudio::Replace(id, src));
     }
 
     /// Prepare look state when the key/scale params or the rate change.

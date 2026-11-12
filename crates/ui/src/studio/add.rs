@@ -105,7 +105,7 @@ pub fn sheet_header(ui: &mut egui::Ui, inner: Rect, title: &str, sub: &str, id: 
     p.text(egui::pos2(inner.left(), inner.top() + 16.0), Align2::LEFT_CENTER, title, font_semibold(18.0), INK);
     p.text(egui::pos2(inner.left(), inner.top() + 38.0), Align2::LEFT_CENTER, sub, font(12.0), INK3);
     let done = Rect::from_min_size(egui::pos2(inner.right() - 72.0, inner.top() + 4.0), egui::vec2(72.0, 40.0));
-    let c = chip(ui, done, id.with("done"), "Done", true, false).clicked();
+    let c = chip(ui, done, id.with("done"), "close sheet", true, false).clicked();
     p.text(done.center(), Align2::CENTER_CENTER, "Done", font(13.0), INK2);
     c
 }
@@ -215,10 +215,28 @@ impl Studio {
             if sheet_header(ui, inner, "Add a clip", &target_label(target), id) {
                 close = true;
             }
+            let panel = Rect::from_min_max(egui::pos2(inner.left(), inner.top() + 58.0), inner.max);
+            self.add_panel(host, ui, panel, target, &routes, t);
+        });
+        if !host.pending().is_empty() {
+            ctx.request_repaint();
+        }
+        if (close || scrim) && matches!(self.sheet, Some(Sheet::Add(_))) {
+            self.sheet = None;
+        }
+    }
+
+    /// The Add panel, self-contained (any host rect): route tabs, the
+    /// route's body, then what's arriving / arrived.
+    pub fn add_panel(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, inner: Rect, target: AddTarget, routes: &[AddRoute], t: f64) {
+        {
+            let id = egui::Id::new("cg-add");
             let labels: Vec<&str> = routes.iter().map(|r| r.label()).collect();
-            let tabs = Rect::from_min_size(egui::pos2(inner.left(), inner.top() + 58.0), egui::vec2(inner.width(), 44.0));
+            let names: Vec<String> = labels.iter().map(|l| format!("add {l}")).collect();
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            let tabs = Rect::from_min_size(inner.min, egui::vec2(inner.width(), 44.0));
             let cur = routes.iter().position(|r| *r == self.add.tab).unwrap_or(0);
-            if let Some(i) = segmented(ui, tabs, id.with("tabs"), &labels, &[], cur, font_medium(13.0), false) {
+            if let Some(i) = segmented_named(ui, tabs, id.with("tabs"), &labels, &names, &[], cur, font_medium(13.0), false) {
                 self.add.tab = routes[i];
             }
             // What's arriving / arrived (bottom strip).
@@ -234,15 +252,12 @@ impl Studio {
             if strip_h > 0.0 {
                 let strip = Rect::from_min_max(egui::pos2(inner.left(), inner.bottom() - strip_h + 12.0), inner.max);
                 if let Some(chop) = self.arrivals(host, ui, strip, &pend, t) {
-                    self.sheet = Some(Sheet::Clip(ClipTarget::Source(chop)));
+                    self.open_clip(ClipTarget::Source(chop));
                 }
             }
-        });
-        if !host.pending().is_empty() {
-            ctx.request_repaint();
-        }
-        if (close || scrim) && matches!(self.sheet, Some(Sheet::Add(_))) {
-            self.sheet = None;
+            if !pend.is_empty() {
+                ui.ctx().request_repaint();
+            }
         }
     }
 
@@ -252,7 +267,7 @@ impl Studio {
         p.rect_stroke(zone, r(14), Stroke::new(1.0, LINE3), StrokeKind::Inside);
         draw_icon(&p, Icon::Folder, zone.center() - egui::vec2(0.0, 52.0), 30.0, INK2);
         let b = Rect::from_center_size(zone.center() + egui::vec2(0.0, 4.0), egui::vec2(220.0, 48.0));
-        if button(ui, b, ui.id().with("add-files"), "Choose files…", true, None, None).clicked() {
+        if button_named(ui, b, ui.id().with("add-files"), "Choose files…", "choose files", true, None, None).clicked() {
             host.add_files(target);
         }
         p.text(zone.center() + egui::vec2(0.0, 54.0), Align2::CENTER_CENTER, "video or audio · or drop files anywhere", font(12.0), INK3);
@@ -318,7 +333,7 @@ impl Studio {
         let (_, enter) = field(ui, f, egui::Id::new("cg-link"), &mut link, "Paste a YouTube or any video link", "link url");
         self.add.link = link;
         let b = Rect::from_min_size(egui::pos2(f.right() + 12.0, f.top()), egui::vec2(120.0, 48.0));
-        let go = button(ui, b, ui.id().with("link-fetch"), "Fetch", true, None, None).clicked();
+        let go = button_named(ui, b, ui.id().with("link-fetch"), "Fetch", "fetch link", true, None, None).clicked();
         if (go || enter) && !self.add.link.trim().is_empty() {
             host.add_link(self.add.link.trim(), target);
             self.add.link.clear();
@@ -330,7 +345,7 @@ impl Studio {
         let p = ui.painter().clone();
         let c = egui::pos2(body.center().x, body.top() + 96.0);
         let b = Rect::from_center_size(c, egui::vec2(200.0, 112.0));
-        let resp = hit(ui, b, ui.id().with("dig"), Sense::click(), "Dig");
+        let resp = hit(ui, b, ui.id().with("dig"), Sense::click(), "dig");
         let h = hold(ui, &resp, 0.6);
         let down = resp.is_pointer_button_down_on();
         p.add(egui::epaint::Shadow { offset: [0, 6], blur: 18, spread: 0, color: Color32::from_black_alpha(90) }.as_shape(b, r(22)));

@@ -335,23 +335,26 @@ impl PerformHost for App {
         if i >= PADS {
             return;
         }
-        App::load_pad(self, source, i, PlayMode::Snippet);
+        // Pads are the perform tracks: live in Perform, stashed otherwise.
+        self.studio_seed_pads();
+        let perform = self.mode == AppMode::Perform;
         let mut p = self.project.lock().unwrap();
-        let src_len = p.sources.get(source).map(|s| s.duration()).unwrap_or(0.0);
+        let Some(src) = p.sources.get(source) else { return };
+        let (src_len, name) = (src.duration(), src.name.clone());
+        let n = src.slices.iter().position(|sl| (sl.start - t0).abs() < 1e-6).map_or(0, |k| k + 1);
         let slice_beats = p.secs_to_beats((t1 - t0).max(0.0));
-        let n = p.sources.get(source).map(|s| s.slices.iter().position(|sl| (sl.start - t0).abs() < 1e-6).map_or(0, |k| k + 1)).unwrap_or(0);
-        let name = p.sources.get(source).map(|s| s.name.clone()).unwrap_or_default();
-        if let Some(t) = p.tracks.get_mut(i) {
-            // The slice, looping at its own length (quarter beats, at least one).
-            if let Some(c) = t.clips.first_mut() {
-                c.grains.position = if src_len > 0.0 { (t0 / src_len) as f32 } else { 0.0 };
-                c.length_beats = ((slice_beats * 4.0).floor() / 4.0).max(0.25);
-            }
-            t.clips.truncate(1);
-            if n > 0 {
-                t.name = format!("{name} · {n}");
-            }
+        let mut clip = build_clip(&mut p, source, 0.0, PlayMode::Snippet);
+        // The slice, looping at its own length (quarter beats, at least one).
+        clip.grains.position = if src_len > 0.0 { (t0 / src_len) as f32 } else { 0.0 };
+        clip.length_beats = ((slice_beats * 4.0).floor() / 4.0).max(0.25);
+        let tracks = if perform { &mut p.tracks } else { &mut self.other_tracks };
+        while tracks.len() < PADS {
+            let k = tracks.len();
+            tracks.push(Track { name: format!("pad {}", k + 1), muted: true, ..Default::default() });
         }
+        let t = &mut tracks[i];
+        t.clips = vec![clip];
+        t.name = if n > 0 { format!("{name} · {n}") } else { format!("pad {}", i + 1) };
         drop(p);
         self.mark_now();
     }

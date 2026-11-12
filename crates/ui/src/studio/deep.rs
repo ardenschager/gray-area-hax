@@ -155,19 +155,10 @@ impl Studio {
     fn deep_links(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, target: DeepTarget) {
         match target {
             DeepTarget::Emitter(i) => {
-                section(ui, "Envelope — sound and picture, press to release");
                 let w = ui.available_width();
-                let (er, _) = ui.allocate_exact_size(egui::vec2(w, 132.0), Sense::hover());
-                let ctx = ui.ctx().clone();
-                let thumb = self.columns[self.emitters[i].col]
-                    .and_then(|s| self.atlas(host, &ctx, s))
-                    .map(|(tex, _)| (tex, crate::atlas::uv_cover(crate::atlas::frame_at(self.emitters[i].pos()), er.width() / er.height())));
-                let mut adsr = self.emitters[i].adsr;
-                crate::envelope::adsr_editor(ui, er, ui.id().with(("em-env", i)), &mut adsr, thumb);
-                ui.add_space(8.0);
-                let (sr, _) = ui.allocate_exact_size(egui::vec2(w, 92.0), Sense::hover());
-                super::clip::picture_switch(ui, sr, ui.id().with(("em-cut", i)), &mut adsr);
-                self.emitters[i].adsr = adsr;
+                let (er, _) = ui.allocate_exact_size(egui::vec2(w, 170.0), Sense::hover());
+                let src = self.columns[self.emitters[i].col];
+                self.envelope_panel(host, ui, er, super::clip::EnvTarget::Emitter(i), src);
                 section(ui, &format!("Emitter {}", i + 1));
                 let id = ui.id().with(("em", i));
                 let e = &mut self.emitters[i];

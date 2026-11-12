@@ -54,6 +54,7 @@ pub struct PluginHost {
     macro_override: [Option<f32>; 4],
     key_override: Option<Key>,
     launch_override: Option<Launch>,
+    layout_override: Option<bool>,
     /// The canvas fills the editor window (Perform's Fullscreen).
     pub fullscreen: bool,
     pub scene: Arc<Mutex<Option<Scene>>>,
@@ -78,6 +79,7 @@ impl PluginHost {
             macro_override: [None; 4],
             key_override: None,
             launch_override: None,
+            layout_override: None,
             fullscreen: false,
             scene: Arc::new(Mutex::new(None)),
             gpu: true,
@@ -112,6 +114,13 @@ impl PluginHost {
                 p.bpm = bpm;
                 self.doc_rev += 1;
             }
+            let tile = self.layout_override.unwrap_or_else(|| self.params.layout.value() == crate::params::LayoutParam::Tile);
+            let layout = if tile { chromagrain_core::tile::Layout::Tile } else { chromagrain_core::tile::Layout::Stack };
+            if p.layout != layout || p.layout_pan != self.params.layout_pan.value() {
+                p.layout = layout;
+                p.layout_pan = self.params.layout_pan.value();
+                self.doc_rev += 1;
+            }
         }
         if self.doc_rev != self.sent_rev {
             if let Some(pat) = self.seq_pid.and_then(|pid| self.project.lock().unwrap().patterns.get(pid).cloned()) {
@@ -142,6 +151,24 @@ impl PluginHost {
         if let Ok(mut p) = self.params.pads.lock() {
             *p = slots.iter().enumerate().filter_map(|(i, s)| s.map(|s| (i, s.source, s.start, s.len_beats))).collect();
         }
+        if let Ok(mut p) = self.params.pad_extra.lock() {
+            *p = slots
+                .iter()
+                .enumerate()
+                .filter_map(|(i, s)| s.filter(|s| s.slice.is_some() || s.adsr.is_some()).map(|s| (i, s.slice.map(|x| (x.start, x.end)), s.adsr)))
+                .collect();
+        }
+    }
+
+    /// Set pad `i` (mirror, session, audio thread).
+    fn put_pad(&mut self, i: usize, slot: PadSlot) {
+        let slots = {
+            let mut s = self.shared.pad_slots.lock().unwrap();
+            s[i] = Some(slot);
+            *s
+        };
+        self.persist_pads(&slots);
+        self.shared.live(Live::Pad(i, Some(slot)));
     }
 
     /// Hand the GPU this frame's picture.
@@ -260,6 +287,35 @@ impl Host for PluginHost {
     fn toggle_fullscreen(&mut self, _ctx: &egui::Context) {
         self.fullscreen = !self.fullscreen;
     }
+    fn tile_layout(&self) -> Option<bool> {
+        Some(self.layout_override.unwrap_or_else(|| self.params.layout.value() == crate::params::LayoutParam::Tile))
+    }
+    fn set_tile_layout(&mut self, tile: bool) {
+        let v = if tile { crate::params::LayoutParam::Tile } else { crate::params::LayoutParam::Stack };
+        if self.gui.is_some() {
+            let params = self.params.clone();
+            self.with_setter(|s| {
+                s.begin_set_parameter(&params.layout);
+                s.set_parameter(&params.layout, v);
+                s.end_set_parameter(&params.layout);
+            });
+        } else {
+            self.layout_override = Some(tile);
+        }
+        self.project.lock().unwrap().layout = v.layout();
+        self.doc_rev += 1;
+    }
+    fn slices_changed(&mut self, source: usize) {
+        let v = self.project.lock().unwrap().sources.get(source).map(|s| s.slices.clone());
+        if let Some(v) = v {
+            if let Ok(mut u) = self.shared.ui_sources.lock() {
+                if let Some(s) = u.get_mut(source) {
+                    s.slices = v.clone();
+                }
+            }
+            self.shared.send(Job::Slices(source, v));
+        }
+    }
     fn sequence_changed(&mut self, layout: &[(usize, f64, f64)]) -> bool {
         // One looping scene: the picture of the lanes, and what the
         // instrument plays.
@@ -347,7 +403,7 @@ impl PerformHost for PluginHost {
                 Pad {
                     name: None,
                     source: s.map(|s| s.source),
-                    kind: PadKind::Loop,
+                    kind: if s.is_some_and(|s| s.slice.is_some()) { PadKind::Chop } else { PadKind::Loop },
                     len_beats: s.map_or(4.0, |s| s.len_beats as f64),
                     on: on && s.is_some(),
                     queued: queued.filter(|_| s.is_some()),
@@ -384,6 +440,27 @@ impl PerformHost for PluginHost {
         self.persist_pads(&slots);
         self.shared.live(Live::Pad(i, Some(slot)));
         self.shared.set_status(format!("'{name}' is on pad {} (MIDI note {})", i + 1, chromagrain_core::instrument::PAD_NOTE as usize + i));
+    }
+    fn load_pad_slice(&mut self, source: usize, t0: f64, t1: f64, i: usize) {
+        if i >= PADS {
+            return;
+        }
+        let len = match self.project.lock().unwrap().sources.get(source) {
+            Some(s) => s.duration(),
+            None => return,
+        };
+        let adsr = self.shared.pad_slots.lock().ok().and_then(|s| s[i].and_then(|x| x.adsr));
+        let slot = PadSlot { adsr, ..PadSlot::from_slice(source, chromagrain_core::chop::Slice::new(t0, t1), len) };
+        self.put_pad(i, slot);
+    }
+    fn pad_env(&self, i: usize) -> Option<chromagrain_core::envelope::Adsr> {
+        self.shared.pad_slots.lock().ok().and_then(|s| s.get(i).copied().flatten().and_then(|x| x.adsr))
+    }
+    fn set_pad_env(&mut self, i: usize, adsr: chromagrain_core::envelope::Adsr) {
+        let slot = self.shared.pad_slots.lock().ok().and_then(|s| s.get(i).copied().flatten());
+        if let Some(slot) = slot {
+            self.put_pad(i, PadSlot { adsr: Some(adsr), ..slot });
+        }
     }
     fn quantize(&self) -> usize {
         self.launch() as usize

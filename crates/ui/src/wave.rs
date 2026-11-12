@@ -57,7 +57,8 @@ impl Peaks {
             let a = t0 + (t1 - t0) * x as f64 / cols as f64;
             let b = t0 + (t1 - t0) * (x + 1) as f64 / cols as f64;
             let (ia, ib) = (((a / self.secs) * n as f64) as usize, ((b / self.secs) * n as f64).ceil() as usize);
-            let (ia, ib) = (ia.min(n - 1), ib.clamp(ia + 1, n));
+            let ia = ia.min(n - 1);
+            let ib = ib.clamp(ia + 1, n);
             let mn = self.lo[ia..ib].iter().copied().fold(f32::MAX, f32::min);
             let mx = self.hi[ia..ib].iter().copied().fold(f32::MIN, f32::max);
             let px = rect.left() + x as f32 + 0.5;
