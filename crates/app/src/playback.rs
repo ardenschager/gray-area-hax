@@ -527,7 +527,13 @@ mod tests {
             env_skew: 0.0,
             reverse: false,
             id: 1,
-            tag: VoiceTag { voice: 0xE000_0000_0001, env: Some(VoiceEnv::held(adsr, app_t)), tile: None },
+            tag: VoiceTag {
+                voice: 0xE000_0000_0001,
+                env: Some(VoiceEnv::held(adsr, app_t)),
+                tile: None,
+                ..Default::default()
+            },
+            ..Default::default()
         };
         pb.trigger_bus(0, 0, ev);
         let (l, _) = pb.render_offline(4800);

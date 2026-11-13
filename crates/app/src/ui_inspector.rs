@@ -1167,6 +1167,10 @@ fn effects_chain_ui(ui: &mut egui::Ui, effects: &mut Vec<AvEffect>, salt: &str, 
                             changed |= param("mirror", 0.0, 1.0).tip("past half: alternate tiles flip — kaleidoscope").show(ui, mirror);
                             changed |= param("turn", -0.5, 0.5).tip("rotate the whole grid (turns)").show(ui, spin);
                         }
+                        EffectKind::Kaleido { folds, spin } => {
+                            changed |= param("folds", 2.0, 12.0).tip("radial mirror wedges (2..12)").show(ui, folds);
+                            changed |= param("spin", -1.0, 1.0).tip("angular rotation rate").show(ui, spin);
+                        }
                     }
                     changed |= param("on sound", 0.0, 1.0).show(ui, &mut fx.audio);
                     changed |= param("on picture", 0.0, 1.0).show(ui, &mut fx.video);

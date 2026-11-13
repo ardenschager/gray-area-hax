@@ -638,7 +638,14 @@ impl Studio {
     fn fire_emitters(&mut self, host: &mut dyn Host, ctx: &egui::Context) {
         let now = host.clock();
         let key = self.key;
-        let sources: Vec<f64> = host.project().lock().unwrap().sources.iter().map(|s| s.duration()).collect();
+        let sources: Vec<(f64, f32)> = host
+            .project()
+            .lock()
+            .unwrap()
+            .sources
+            .iter()
+            .map(|s| (s.duration(), s.base_hz))
+            .collect();
         for (i, b) in self.buses().into_iter().enumerate() {
             host.set_bus(i as u8 + 1, b.effects);
         }
@@ -667,7 +674,7 @@ impl Studio {
             }
             let sounding = e.held || e.gesture.is_some_and(|(_, _, off)| off.is_some());
             let Some(src) = self.columns.get(e.col).copied().flatten() else { continue };
-            let len = sources.get(src).copied().unwrap_or(0.0);
+            let (len, src_hz) = sources.get(src).copied().unwrap_or((0.0, 0.0));
             if !sounding || len <= 0.0 {
                 e.next_t = now;
                 e.head = e.pos() as f64 * len;
@@ -688,12 +695,26 @@ impl Studio {
             };
             let stretch_mul = (1.0 - 0.75 * e.stretch.clamp(0.0, 1.0)).max(0.15) as f64;
             let cap = (!e.caption.trim().is_empty()).then(|| e.caption.trim().to_string());
+            let core_sculpt = e.sculpt.to_core();
+            let core_chord = e.sculpt.chord.to_core();
+            let hard_burst = e.adsr.picture == chromagrain_core::envelope::PictureCut::Cut && e.cloud.spray <= 0.08;
+            let cap_inline = chromagrain_core::chop::Caption::new(&e.caption);
             while e.next_t <= now && n < 64 {
                 let id = ((i as u64 + 1) << 48) | e.k;
                 let (mut ev, hop) = grain_step(&map, &e.cloud, Some(&key), &mut e.rng, e.head, len, base_note, vel, id);
                 ev.pitch_ratio *= fine_ratio * tape_spin_mul;
                 ev.onset = (e.next_t + ev.onset).max(now - 0.02);
-                ev.tag = VoiceTag { voice, env: Some(env), tile: slot, ..Default::default() };
+                ev.sculpt = core_sculpt;
+                ev.tag = VoiceTag {
+                    voice,
+                    env: Some(env),
+                    tile: slot,
+                    focus: e.focus,
+                    choke_group: e.sculpt.choke,
+                    caption: cap_inline,
+                    hard_burst,
+                    ..Default::default()
+                };
                 if let (Some(sl), true) = (slot, pan_by_tile) {
                     let (pan, gain) = layout_pan(sl as usize, cols, rows);
                     ev.pan = pan;
@@ -712,7 +733,16 @@ impl Studio {
                 e.k += 1;
                 n += 1;
                 let cell_row = ((ev.source_pos / len) * ROWS as f64) as usize;
-                fired.push((src, i as u8 + 1, ev, (e.col, cell_row.min(ROWS - 1)), cap.clone()));
+                let (chord_evs, chord_n) = chromagrain_core::grain::expand_chord_grain_inline(&ev, core_chord, src_hz, Some(&key));
+                for (ci, cev) in chord_evs.into_iter().take(chord_n).enumerate() {
+                    fired.push((
+                        src,
+                        i as u8 + 1,
+                        cev,
+                        (e.col, cell_row.min(ROWS - 1)),
+                        if ci == 0 { cap.clone() } else { None },
+                    ));
+                }
                 e.last_fire = now;
             }
             if e.next_t < now - 0.5 {

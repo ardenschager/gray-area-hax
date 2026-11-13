@@ -262,6 +262,7 @@ impl Studio {
     }
 
     pub fn set_owner_sculpt(&mut self, host: &mut dyn Host, owner: EnvTarget, sp: SculptParams) {
+        let core_sc = sp.to_core();
         match owner {
             EnvTarget::Emitter(i) => {
                 let e = &mut self.emitters[i.min(EMITTERS - 1)];
@@ -273,12 +274,10 @@ impl Studio {
                 let mut pp = host.project().lock().unwrap();
                 for pid in self.seq.scene_pats.iter().flatten() {
                     if let Some(r) = pp.patterns.get_mut(*pid).and_then(|pat| pat.rows.get_mut(l)) {
-                        if sp.stamp == SculptStamp::Kick && sp.sub > 0.4 {
-                            r.grains.pitch = -12.0;
-                        } else if sp.stamp == SculptStamp::Hat {
-                            r.grains.pitch = 10.0;
-                        }
-                        r.grains.pitch_jitter = (sp.wow * 2.4).clamp(0.0, 12.0);
+                        r.sculpt = core_sc;
+                        r.choke_group = sp.choke.min(4);
+                        r.grains.sculpt = core_sc;
+                        r.grains.choke_group = sp.choke.min(4);
                     }
                 }
                 if let Some(t) = pp.tracks.iter_mut().find(|t| t.name == "sequence") {
@@ -286,6 +285,7 @@ impl Studio {
                     t.tape.age = sp.wear * 0.75;
                 }
                 drop(pp);
+                self.rev += 1;
                 host.mark();
             }
             EnvTarget::Pad(pi) => {
@@ -294,19 +294,17 @@ impl Studio {
                 let mut pp = host.project().lock().unwrap();
                 let bpm = pp.bpm.max(20.0);
                 if let Some(t) = pp.tracks.get_mut(pi) {
+                    t.sculpt = core_sc;
+                    t.choke_group = sp.choke.min(4);
                     t.tape.wow = sp.wow;
                     t.tape.age = sp.wear * 0.8;
                     for c in &mut t.clips {
+                        c.grains.sculpt = core_sc;
+                        c.grains.choke_group = sp.choke.min(4);
                         if let Some(free_s) = sp.free_loop_secs {
                             let beats = (free_s.max(0.5) as f64 * bpm / 60.0).clamp(0.5, 64.0);
                             c.length_beats = beats;
                         }
-                        if sp.stamp == SculptStamp::Kick && sp.sub > 0.4 {
-                            c.grains.pitch = -12.0;
-                        } else if sp.stamp == SculptStamp::Hat {
-                            c.grains.pitch = 10.0;
-                        }
-                        c.grains.pitch_jitter = (sp.wow * 2.4).clamp(0.0, 12.0);
                     }
                 }
                 drop(pp);
@@ -789,6 +787,12 @@ impl Studio {
                     } else {
                         self.slice_captions.insert((src, si), cap_txt.clone());
                     }
+                    if let Some(so) = host.project().lock().unwrap().sources.get_mut(src) {
+                        if let Some(sl) = so.slices.get_mut(si) {
+                            sl.caption = chromagrain_core::chop::Caption::new(&cap_txt);
+                        }
+                    }
+                    host.slices_changed(src);
                 }
                 match owner {
                     EnvTarget::Emitter(i) => self.emitters[i].caption = cap_txt,
@@ -1690,11 +1694,21 @@ impl Studio {
         p.rect_filled(wave, r(9), G0);
         let playing = self.chop.playing.filter(|(s, _, t)| *s == src && now - t < 3.0).map(|(_, i, _)| i);
         let selected = self.chop.selected_slice.filter(|(s, _)| *s == src).map(|(_, i)| i);
-        let badges: Vec<&'static str> = {
+        let badges: Vec<String> = {
             let pp = host.project().lock().unwrap();
             match pp.sources.get(src) {
-                Some(so) => slices.iter().map(|sl| acoustic_slice_badge(so, sl)).collect(),
-                None => vec![""; slices.len()],
+                Some(so) => slices
+                    .iter()
+                    .map(|sl| {
+                        let b = sl.badge();
+                        if !b.is_empty() {
+                            b
+                        } else {
+                            acoustic_slice_badge(so, sl).to_string()
+                        }
+                    })
+                    .collect(),
+                None => vec![String::new(); slices.len()],
             }
         };
         for (i, sl) in slices.iter().enumerate() {
@@ -1718,7 +1732,7 @@ impl Studio {
                 mono(9.5),
                 if is_play || is_sel { INK } else { INK3 },
             );
-            let badge = badges.get(i).copied().unwrap_or("");
+            let badge = badges.get(i).map(String::as_str).unwrap_or("");
             if !badge.is_empty() && band.width() >= 42.0 {
                 p.text(
                     egui::pos2(num_r.right() + 5.0, band.top() + 4.5),
@@ -1728,7 +1742,13 @@ impl Studio {
                     if is_play || is_sel { INK2 } else { INK4 },
                 );
             }
-            if let Some(cap) = self.slice_captions.get(&(src, i)).filter(|c| !c.trim().is_empty()) {
+            let cap_s = self
+                .slice_captions
+                .get(&(src, i))
+                .map(|c| c.as_str())
+                .filter(|c| !c.trim().is_empty())
+                .or_else(|| (!sl.caption.is_empty()).then(|| sl.caption.as_str()));
+            if let Some(cap) = cap_s {
                 if band.width() >= 52.0 {
                     p.text(
                         band.left_bottom() + egui::vec2(5.0, -4.0),
@@ -1858,7 +1878,14 @@ impl Studio {
             false,
         ) {
             let v = match i {
-                0 => host.project().lock().unwrap().sources.get(src).map(|s| s.auto_slices(16)).unwrap_or_default(),
+                0 => host
+                    .project()
+                    .lock()
+                    .unwrap()
+                    .sources
+                    .get(src)
+                    .map(|s| chromagrain_core::chop::analyze_source_slices(s, 16))
+                    .unwrap_or_default(),
                 1 => chop::equal_slices(len, 4),
                 2 => chop::equal_slices(len, 8),
                 _ => chop::equal_slices(len, 16),

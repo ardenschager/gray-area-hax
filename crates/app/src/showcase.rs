@@ -404,7 +404,13 @@ fn film2_hold_left_pad5(app: &mut App) {
             env_skew: 0.0,
             reverse: false,
             id: v_left,
-            tag: chromagrain_core::grain::VoiceTag { voice: v_left, env, tile: Some(0) },
+            tag: chromagrain_core::grain::VoiceTag {
+                voice: v_left,
+                env,
+                tile: Some(0),
+                ..Default::default()
+            },
+            ..Default::default()
         },
     );
 }

@@ -394,32 +394,39 @@ fn fs_present(i: VOut) -> @location(0) vec4f {
     return vec4f(c.rgb, 1.0);
 }
 
-// True Polar Kaleidoscope (`EffectKind::Kaleido`):
-// d.x = folds (2..12), d.y = spin (rad), d.z = cx, d.w = cy, c.w = video wet (0..1).
+// True Polar Kaleidoscope (`EffectKind::Kaleido` — 1:1 with `fx::kaleido_source_uv`):
+// d.x = folds (2..12), d.y = angle_rad, d.z = cx, d.w = cy, c.w = video wet (0..1).
+fn mirror_wrap1(t: f32) -> f32 {
+    let m = gmod(t, 2.0);
+    if (m > 1.0) { return 2.0 - m; }
+    return m;
+}
+
 @fragment
 fn fs_kaleido(i: VOut) -> @location(0) vec4f {
-    let orig = tex0(i.uv);
+    let px0 = min(vec2i(i.uv * u.res.xy), vec2i(u.res.xy) - 1);
+    let orig = textureLoad(t0, px0, 0);
     let w = clamp(u.c.w, 0.0, 1.0);
     if (w <= 0.001) { return orig; }
-    let aspect = u.res.x / max(u.res.y, 1.0);
+    let aspect = max(u.res.x / max(u.res.y, 1.0), 1e-4);
     let center = vec2f(u.d.z, u.d.w);
-    let delta = vec2f((i.uv.x - center.x) * aspect, i.uv.y - center.y);
-    let rad = length(delta);
-    let folds = clamp(floor(u.d.x + 0.5), 2.0, 16.0);
-    let sector = 6.283185307 / folds;
-    let half_s = sector * 0.5;
-    let theta = atan2(delta.y, delta.x) + u.d.y;
-    var local = gmod(theta, sector);
-    if (local > half_s) {
-        local = sector - local;
-    }
-    let sample_ang = local - u.d.y * 0.35;
-    let suv = clamp(
-        vec2f(center.x + (rad * cos(sample_ang)) / aspect, center.y + rad * sin(sample_ang)),
-        vec2f(0.002),
-        vec2f(0.998)
-    );
-    let kal = tex0(suv);
+    let dx = (i.uv.x - center.x) * aspect;
+    let dy = i.uv.y - center.y;
+    let r = sqrt(dx * dx + dy * dy);
+    let folds = clamp(u.d.x, 2.0, 12.0);
+    let wedge = 3.14159265359 / folds;
+    let theta = atan2(dy, dx) - u.d.y;
+    let q = gmod(theta, 6.28318530718) / wedge;
+    let fold_idx = i32(floor(q));
+    let f = q - f32(fold_idx);
+    let odd = ((fold_idx % 2) + 2) % 2;
+    let folded = select(f, 1.0 - f, odd == 1);
+    let src_theta = folded * wedge + u.d.y * 0.35;
+    let raw_u = center.x + (r * cos(src_theta)) / aspect;
+    let raw_v = center.y + r * sin(src_theta);
+    let suv = clamp(vec2f(mirror_wrap1(raw_u), mirror_wrap1(raw_v)), vec2f(0.0), vec2f(1.0));
+    let spx = min(vec2i(suv * u.res.xy), vec2i(u.res.xy) - 1);
+    let kal = textureLoad(t0, spx, 0);
     return mix(orig, kal, w);
 }
 
@@ -726,6 +733,7 @@ struct FxInst {
     filled: usize,
     accum: Option<[usize; 2]>,
     accum_idx: usize,
+    kaleido_angle: f32,
 }
 
 struct DrawOp {
@@ -1073,13 +1081,18 @@ impl GpuPreview {
 
     /// Record an effect chain over `cur` (slab index), returning the slab
     /// index holding the result.
-    fn apply_chain(&mut self, chain: &[AvEffect], scope: u64, mut cur: usize, fps: f32, t_sec: f64) -> usize {
+    fn apply_chain(&mut self, chain: &[AvEffect], scope: u64, mut cur: usize, fps: f32, _t_sec: f64) -> usize {
         for (fi, fx) in chain.iter().enumerate() {
             let key = scope ^ ((fi as u64 + 1) << 40);
             if fx.video <= 0.001 {
                 if let EffectKind::Delay { time, .. } = fx.kind {
                     let frames = ((time * fps).round() as usize).clamp(1, MAX_HISTORY);
                     self.push_history(key, frames, cur, 1.0);
+                } else if let EffectKind::Kaleido { spin, .. } = fx.kind {
+                    let inst = self.fx.entry(key).or_default();
+                    inst.kaleido_angle = (inst.kaleido_angle
+                        + spin.clamp(-1.0, 1.0) * std::f32::consts::TAU / fps.max(1.0))
+                    .rem_euclid(std::f32::consts::TAU);
                 }
                 continue;
             }
@@ -1165,14 +1178,23 @@ impl GpuPreview {
                     self.full(out, Pipe::IdctRow, FPONG, None, u);
                     cur = out;
                 }
-                _ => {
-                    // Ready for `EffectKind::Kaleido { folds, spin }` on `vgs-core` merge!
+                EffectKind::Kaleido { folds, spin } => {
+                    let angle = {
+                        let inst = self.fx.entry(key).or_default();
+                        let cur_ang = inst.kaleido_angle;
+                        inst.kaleido_angle = (inst.kaleido_angle
+                            + spin.clamp(-1.0, 1.0) * std::f32::consts::TAU / fps.max(1.0))
+                        .rem_euclid(std::f32::consts::TAU);
+                        cur_ang
+                    };
                     let mut u = self.res_uni();
-                    u.d = [6.0, t_sec as f32 * 0.45, 0.5, 0.5];
+                    u.d = [folds.clamp(2.0, 12.0), angle, 0.5, 0.5];
                     u.c[3] = fx.video.clamp(0.0, 1.0);
                     self.full(out, Pipe::Kaleido, cur, None, u);
                     cur = out;
                 }
+                #[allow(unreachable_patterns)]
+                _ => {}
             }
         }
         cur
@@ -1291,6 +1313,8 @@ impl GpuPreview {
             pitch_ratio: f32,
             zoom_punch: f32,
             oxide: f32,
+            flip_x: bool,
+            tag_focus: (f32, f32),
             slot_key: u32,
             effects: Vec<AvEffect>,
             fx_scope: u64,
@@ -1332,7 +1356,12 @@ impl GpuPreview {
                     } else {
                         ev.source_pos + dt * rate as f64
                     };
-                    let punch = if dt < 0.09 { ((1.0 - dt as f32 / 0.09).powi(2)) * 0.085 } else { 0.0 };
+                    let punch = if dt < 0.09 {
+                        ((1.0 - dt as f32 / 0.09).powi(2)) * 0.085
+                    } else {
+                        0.0
+                    }
+                    .max(ev.tag.zoom_punch);
                     let mut fx = clip.effects.clone();
                     fx.extend(track.effects.iter().cloned());
                     let sv = SplitVoice {
@@ -1342,12 +1371,14 @@ impl GpuPreview {
                         hue_shift: ev.semitones() * clip.link.pitch_to_hue,
                         pitch_ratio: ev.pitch_ratio,
                         zoom_punch: punch,
-                        oxide,
+                        oxide: oxide.max(ev.tag.oxide_dropout),
+                        flip_x: ev.tag.ratchet_odd,
+                        tag_focus: ev.tag.focus,
                         slot_key: ev.tag.tile.map(|x| x as u32).unwrap_or(ti as u32),
                         effects: fx,
                         fx_scope: ((ti as u64 + 1) << 28) | (*sid as u64 + 1),
                     };
-                    if is_wash {
+                    if is_wash || ev.tag.is_wash {
                         wash_voices.push(sv);
                     } else {
                         fg_voices.push(sv);
@@ -1385,7 +1416,12 @@ impl GpuPreview {
             } else {
                 ev.source_pos + dt * rate as f64
             };
-            let punch = if dt < 0.09 { ((1.0 - dt as f32 / 0.09).powi(2)) * 0.09 } else { 0.0 };
+            let punch = if dt < 0.09 {
+                ((1.0 - dt as f32 / 0.09).powi(2)) * 0.09
+            } else {
+                0.0
+            }
+            .max(ev.tag.zoom_punch);
             let sv = SplitVoice {
                 sid,
                 src_time,
@@ -1393,12 +1429,14 @@ impl GpuPreview {
                 hue_shift: ev.semitones() * link.pitch_to_hue,
                 pitch_ratio: ev.pitch_ratio,
                 zoom_punch: punch,
-                oxide: 0.0,
+                oxide: ev.tag.oxide_dropout,
+                flip_x: ev.tag.ratchet_odd,
+                tag_focus: ev.tag.focus,
                 slot_key: ev.tag.tile.map(|x| x as u32).unwrap_or(100 + bus as u32),
                 effects: fx,
                 fx_scope: 0xB500_0000_0000 | (bus as u64) << 16 | (sid as u64),
             };
-            if is_wash {
+            if is_wash || ev.tag.is_wash {
                 wash_voices.push(sv);
             } else {
                 fg_voices.push(sv);
@@ -1428,7 +1466,7 @@ impl GpuPreview {
             let src_ar = gsrc.src_aspect;
             let (dest, edge_mask) = split_panel_rect(idx, count, aspect);
             let cell_ar = (dest[2] * aspect) / dest[3].max(1e-4);
-            let focus = scene.focus_overrides.get(&v.sid).copied().unwrap_or((0.5, 0.5));
+            let focus = scene.focus_overrides.get(&v.sid).copied().unwrap_or(v.tag_focus);
             let patch = cover_patch_focus(src_ar, cell_ar, focus, v.zoom_punch);
             let gd = GrainDraw {
                 dest,
@@ -1438,13 +1476,22 @@ impl GpuPreview {
                 alpha: v.alpha,
                 hue_shift: v.hue_shift,
                 tiled: false,
+                flip_x: v.flip_x,
+                oxide_dropout: v.oxide,
+                is_wash: false,
+                feather_edges: [
+                    (edge_mask & 1) != 0,
+                    (edge_mask & 2) != 0,
+                    (edge_mask & 4) != 0,
+                    (edge_mask & 8) != 0,
+                ],
             };
             if v.effects.is_empty() {
                 self.pass(MASTER, None);
-                self.record_grains_ext(v.sid, vec![(gd, false, edge_mask, v.oxide)], None, 0.0, 0.0, idx > 0);
+                self.record_grains_ext(v.sid, vec![(gd, v.flip_x, edge_mask, v.oxide)], None, 0.0, 0.0, idx > 0);
             } else {
                 self.pass(CLIP, Some([0.0; 4]));
-                self.record_grains_ext(v.sid, vec![(gd, false, edge_mask, v.oxide)], None, 0.0, 0.0, false);
+                self.record_grains_ext(v.sid, vec![(gd, v.flip_x, edge_mask, v.oxide)], None, 0.0, 0.0, false);
                 let fx_out = self.apply_chain(&v.effects, v.fx_scope, CLIP, fps, scene.t);
                 if idx == 0 {
                     self.blend_onto(MASTER, fx_out, 1.0, 0.0);
@@ -1458,7 +1505,7 @@ impl GpuPreview {
         for wv in wash_voices.iter().take(3) {
             let Some(gsrc) = self.sources.get(&wv.sid) else { continue };
             let src_ar = gsrc.src_aspect;
-            let focus = scene.focus_overrides.get(&wv.sid).copied().unwrap_or((0.5, 0.5));
+            let focus = scene.focus_overrides.get(&wv.sid).copied().unwrap_or(wv.tag_focus);
             let patch = cover_patch_focus(src_ar, aspect, focus, 0.0);
             let gd = GrainDraw {
                 dest: [0.0, 0.0, 1.0, 1.0],
@@ -1468,9 +1515,13 @@ impl GpuPreview {
                 alpha: (0.26 + 0.14 * wv.alpha).clamp(0.24, 0.40),
                 hue_shift: wv.hue_shift,
                 tiled: false,
+                flip_x: wv.flip_x,
+                oxide_dropout: wv.oxide,
+                is_wash: true,
+                feather_edges: [false; 4],
             };
             self.pass(CLIP, Some([0.0; 4]));
-            self.record_grains_ext(wv.sid, vec![(gd, false, 0, wv.oxide)], None, 0.0, 0.0, false);
+            self.record_grains_ext(wv.sid, vec![(gd, wv.flip_x, 0, wv.oxide)], None, 0.0, 0.0, false);
             let fx_out = self.apply_chain(&wv.effects, wv.fx_scope ^ 0x7777, CLIP, fps, scene.t);
             self.bleed_onto(MASTER, fx_out, 1.0);
         }
@@ -1587,7 +1638,9 @@ impl GpuPreview {
                                             gd.patch = cover_patch_focus(src_ar, aspect, fc, 0.0);
                                         }
                                     }
-                                    (gd, false, 0u32, oxide)
+                                    let flip = gd.flip_x;
+                                    let ox = gd.oxide_dropout.max(oxide);
+                                    (gd, flip, 0u32, ox)
                                 })
                                 .collect();
                             if !ext_draws.is_empty() {
@@ -1675,7 +1728,9 @@ impl GpuPreview {
                                 gd.dest = [0.0, 0.0, 1.0, 1.0];
                                 gd.patch = cover_patch_focus(src_ar, aspect, focus_opt.unwrap_or((0.5, 0.5)), punch);
                             }
-                            (gd, false, 0u32, 0.0)
+                            let flip = gd.flip_x;
+                            let ox = gd.oxide_dropout;
+                            (gd, flip, 0u32, ox)
                         })
                         .collect();
                     if !ext_draws.is_empty() {

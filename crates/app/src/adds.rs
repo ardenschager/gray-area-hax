@@ -8,7 +8,6 @@ use chromagrain_core::timeline::{Project, Source};
 use chromagrain_ui::{AddTarget, Added, Pending, YoutubeHit};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Mutex;
 
@@ -91,54 +90,18 @@ pub fn picked_from_env() -> Option<Vec<PathBuf>> {
 }
 
 fn run_yt_search_cli(query: &str, under_500_views: bool) -> Result<Vec<YoutubeHit>, String> {
-    let q = query.trim();
-    if q.is_empty() {
-        return Ok(Vec::new());
-    }
-    let count = if under_500_views { 24 } else { 12 };
-    let spec = format!("ytsearch{count}:{q}");
-    let out = Command::new("yt-dlp")
-        .args(["--dump-json", "--flat-playlist", "--no-warnings", "--ignore-errors", &spec])
-        .output()
-        .map_err(|e| format!("yt-dlp unavailable: {e}"))?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut hits = Vec::new();
-    for line in text.lines() {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-        let title = v.get("title").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
-        if title.is_empty() {
-            continue;
-        }
-        let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("");
-        let url = v
-            .get("webpage_url")
-            .or_else(|| v.get("url"))
-            .and_then(|x| x.as_str())
-            .map(|u| {
-                if u.starts_with("http") {
-                    u.to_string()
-                } else {
-                    format!("https://www.youtube.com/watch?v={u}")
-                }
-            })
-            .unwrap_or_else(|| format!("https://www.youtube.com/watch?v={id}"));
-        let views = v.get("view_count").and_then(|x| x.as_u64());
-        if under_500_views && views.is_some_and(|vw| vw >= 500) {
-            continue;
-        }
-        let duration_secs = v.get("duration").and_then(|x| x.as_f64()).filter(|d| *d > 0.0);
-        let uploader = v
-            .get("channel")
-            .or_else(|| v.get("uploader"))
-            .and_then(|x| x.as_str())
-            .unwrap_or("YouTube")
-            .to_string();
-        hits.push(YoutubeHit { title, url, views, duration_secs, uploader });
-        if hits.len() >= 12 {
-            break;
-        }
-    }
-    Ok(hits)
+    let cards = dig::search_youtube(query, 12, under_500_views)?;
+    Ok(cards
+        .into_iter()
+        .filter(|h| !under_500_views || h.views.is_none_or(|v| v < 500))
+        .map(|h| YoutubeHit {
+            title: h.title,
+            url: h.url,
+            views: h.views,
+            duration_secs: h.duration.filter(|d| *d > 0.0),
+            uploader: if h.uploader.is_empty() { "YouTube".into() } else { h.uploader },
+        })
+        .collect())
 }
 
 impl Adds {

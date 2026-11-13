@@ -330,7 +330,7 @@ pub fn drive_roots() -> Vec<PathBuf> {
             return vec![override_root];
         }
     }
-    let mut out = Vec::new();
+    let mut out = chromagrain_core::dig::discover_google_drive_roots();
     let cloud = home().join("Library/CloudStorage");
     if let Ok(rd) = std::fs::read_dir(&cloud) {
         for e in rd.flatten() {

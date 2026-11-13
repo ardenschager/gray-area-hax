@@ -59,6 +59,24 @@ impl StageMode {
             StageMode::Bleed => "bleed",
         }
     }
+
+    pub fn to_layout(self) -> chromagrain_core::tile::Layout {
+        match self {
+            StageMode::Stack => chromagrain_core::tile::Layout::Stack,
+            StageMode::Split => chromagrain_core::tile::Layout::Split,
+            StageMode::Grid => chromagrain_core::tile::Layout::Tile,
+            StageMode::Bleed => chromagrain_core::tile::Layout::Bleed,
+        }
+    }
+
+    pub fn from_layout(l: chromagrain_core::tile::Layout) -> Self {
+        match l {
+            chromagrain_core::tile::Layout::Stack => StageMode::Stack,
+            chromagrain_core::tile::Layout::Split => StageMode::Split,
+            chromagrain_core::tile::Layout::Tile => StageMode::Grid,
+            chromagrain_core::tile::Layout::Bleed => StageMode::Bleed,
+        }
+    }
 }
 
 /// Canvas aspect ratio (`16:9 · 1:1 · 9:16`).
@@ -115,6 +133,22 @@ impl StageAspect {
             StageAspect::Wide16x9
         }
     }
+
+    pub fn to_core(self) -> chromagrain_core::tile::AspectRatio {
+        match self {
+            StageAspect::Wide16x9 => chromagrain_core::tile::AspectRatio::Wide16x9,
+            StageAspect::Square1x1 => chromagrain_core::tile::AspectRatio::Square1x1,
+            StageAspect::Vertical9x16 => chromagrain_core::tile::AspectRatio::Vertical9x16,
+        }
+    }
+
+    pub fn from_core(a: chromagrain_core::tile::AspectRatio) -> Self {
+        match a {
+            chromagrain_core::tile::AspectRatio::Wide16x9 => StageAspect::Wide16x9,
+            chromagrain_core::tile::AspectRatio::Square1x1 => StageAspect::Square1x1,
+            chromagrain_core::tile::AspectRatio::Vertical9x16 => StageAspect::Vertical9x16,
+        }
+    }
 }
 
 /// 1-tap musical stamps for the `Sculpt & tape` card (only populates the
@@ -167,6 +201,36 @@ impl SculptStamp {
             other => other.label(),
         }
     }
+
+    pub fn to_core(self) -> chromagrain_core::grain::Stamp {
+        use chromagrain_core::grain::Stamp;
+        match self {
+            SculptStamp::Raw => Stamp::Raw,
+            SculptStamp::Kick => Stamp::Kick,
+            SculptStamp::Snare => Stamp::Snare,
+            SculptStamp::Hat => Stamp::Hat,
+            SculptStamp::Pluck => Stamp::Pluck,
+            SculptStamp::Chord => Stamp::Chord,
+            SculptStamp::Phrase => Stamp::Phrase,
+            SculptStamp::TapeLoop => Stamp::TapeLoop,
+            SculptStamp::Disintegrate => Stamp::Disintegrate,
+        }
+    }
+
+    pub fn from_core(s: chromagrain_core::grain::Stamp) -> Self {
+        use chromagrain_core::grain::Stamp;
+        match s {
+            Stamp::Raw => SculptStamp::Raw,
+            Stamp::Kick => SculptStamp::Kick,
+            Stamp::Snare => SculptStamp::Snare,
+            Stamp::Hat => SculptStamp::Hat,
+            Stamp::Pluck => SculptStamp::Pluck,
+            Stamp::Chord => SculptStamp::Chord,
+            Stamp::Phrase => SculptStamp::Phrase,
+            Stamp::Wash | Stamp::TapeLoop => SculptStamp::TapeLoop,
+            Stamp::Disintegrate => SculptStamp::Disintegrate,
+        }
+    }
 }
 
 /// Chord voicing selector for `Sculpt & tape` and `Sequence` steps.
@@ -216,6 +280,32 @@ impl ChordChoice {
     pub fn step_by(self, delta: i32) -> Self {
         let n = Self::ALL.len() as i32;
         Self::ALL[(self.index() as i32 + delta).rem_euclid(n) as usize]
+    }
+
+    pub fn to_core(self) -> chromagrain_core::grain::ChordVoicing {
+        use chromagrain_core::grain::ChordVoicing;
+        match self {
+            ChordChoice::Off => ChordVoicing::Off,
+            ChordChoice::Octaves => ChordVoicing::Octaves,
+            ChordChoice::Fifths => ChordVoicing::Fifths,
+            ChordChoice::Min7 => ChordVoicing::Min7,
+            ChordChoice::Min9 => ChordVoicing::Min9,
+            ChordChoice::Maj7 => ChordVoicing::Maj7,
+            ChordChoice::Sus4 => ChordVoicing::Sus4,
+        }
+    }
+
+    pub fn from_core(c: chromagrain_core::grain::ChordVoicing) -> Self {
+        use chromagrain_core::grain::ChordVoicing;
+        match c {
+            ChordVoicing::Off => ChordChoice::Off,
+            ChordVoicing::Octaves => ChordChoice::Octaves,
+            ChordVoicing::Fifths => ChordChoice::Fifths,
+            ChordVoicing::Min7 => ChordChoice::Min7,
+            ChordVoicing::Min9 | ChordVoicing::Cluster => ChordChoice::Min9,
+            ChordVoicing::Maj7 => ChordChoice::Maj7,
+            ChordVoicing::Sus4 => ChordChoice::Sus4,
+        }
     }
 }
 
@@ -321,6 +411,42 @@ impl SculptParams {
             }
         }
         p
+    }
+
+    /// Convert UI sculptor dials into a core [`chromagrain_core::grain::VoiceSculpt`]
+    /// (preserving stamp-specific filter/shimmer/ebb_flow shaping from `VoiceSculpt::preset`).
+    pub fn to_core(self) -> chromagrain_core::grain::VoiceSculpt {
+        let mut v = chromagrain_core::grain::VoiceSculpt::preset(self.stamp.to_core());
+        v.pitch_env_semitones = self.pitch_drop_st.clamp(-24.0, 24.0);
+        v.pitch_env_ms = self.pitch_drop_ms.clamp(10.0, 250.0);
+        v.sub_exciter = self.sub.clamp(0.0, 1.0);
+        v.snare_snap = self.snap.clamp(0.0, 1.0);
+        v.drive_db = self.drive_db.clamp(0.0, 18.0);
+        v.comb_mix = self.comb.clamp(0.0, 1.0);
+        v.comb_feedback = self.comb_feedback.clamp(0.60, 0.96);
+        v.chord = self.chord.to_core();
+        v.free_loop_secs = self.free_loop_secs;
+        v.wow_flutter = self.wow.clamp(0.0, 1.0);
+        v.disintegrate = self.wear.clamp(0.0, 1.0);
+        v
+    }
+
+    pub fn from_core(stamp: chromagrain_core::grain::Stamp, v: chromagrain_core::grain::VoiceSculpt, choke: u8) -> Self {
+        SculptParams {
+            stamp: SculptStamp::from_core(stamp),
+            pitch_drop_st: v.pitch_env_semitones,
+            pitch_drop_ms: v.pitch_env_ms,
+            sub: v.sub_exciter,
+            snap: v.snare_snap,
+            drive_db: v.drive_db,
+            comb: v.comb_mix,
+            comb_feedback: v.comb_feedback,
+            chord: ChordChoice::from_core(v.chord),
+            choke: choke.min(4),
+            free_loop_secs: v.free_loop_secs,
+            wow: v.wow_flutter,
+            wear: v.disintegrate,
+        }
     }
 }
 
@@ -622,6 +748,7 @@ pub trait Host {
                 tile: None,
                 ..Default::default()
             },
+            ..Default::default()
         };
         self.fire(0, source, ev);
     }

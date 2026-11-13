@@ -330,50 +330,43 @@ impl Host for PluginHost {
     fn set_stage_mode(&mut self, mode: StageMode) {
         self.set_tile_layout(mode == StageMode::Grid);
         self.stage_mode_override = Some(mode);
+        self.project.lock().unwrap().layout = mode.to_layout();
+        self.doc_rev += 1;
     }
     fn build_kit_to_pads(&mut self) -> usize {
-        let sources: Vec<(usize, f64, Vec<chromagrain_core::chop::Slice>)> = {
+        let key = self.shared_key();
+        let (specs, lens): (Vec<chromagrain_core::chop::KitPadSpec>, Vec<f64>) = {
             let mut p = self.project.lock().unwrap();
-            let mut out = Vec::new();
-            for (sid, s) in p.sources.iter_mut().enumerate() {
+            for s in p.sources.iter_mut() {
                 if s.slices.is_empty() {
-                    if let Some(a) = &s.audio {
-                        s.slices = chromagrain_core::chop::auto_slices(a, 16);
-                    }
-                    if s.slices.is_empty() {
-                        s.slices = chromagrain_core::chop::equal_slices(s.duration(), 8);
-                    }
+                    s.slices = chromagrain_core::chop::analyze_source_slices(s, 16);
                 }
-                out.push((sid, s.duration(), s.slices.clone()));
             }
-            out
+            let lens = p.sources.iter().map(|s| s.duration()).collect();
+            let specs = chromagrain_core::chop::build_kit_across_sources_opt(&p.sources, key);
+            (specs, lens)
         };
-        let mut count = 0usize;
-        for pad in 0..PADS {
-            if sources.is_empty() {
-                break;
-            }
-            let (sid, _dur, ref slices) = sources[pad % sources.len()];
-            if slices.is_empty() {
-                continue;
-            }
-            let sl = slices[(pad / sources.len()) % slices.len()];
-            self.load_pad_slice(sid, sl.start, sl.end, pad);
-            count += 1;
+        for spec in &specs {
+            let pad = spec.pad_index.min(PADS - 1);
+            let src_len = lens.get(spec.source).copied().unwrap_or(0.0);
+            self.put_pad(pad, spec.to_pad_slot(src_len));
         }
-        count
+        specs.len()
     }
     fn build_loops_to_pads(&mut self) -> usize {
-        let n_src = self.project.lock().unwrap().sources.len();
-        if n_src == 0 {
-            return 0;
+        let key = self.shared_key();
+        let (specs, lens): (Vec<chromagrain_core::chop::KitPadSpec>, Vec<f64>) = {
+            let p = self.project.lock().unwrap();
+            let lens = p.sources.iter().map(|s| s.duration()).collect();
+            let specs = chromagrain_core::chop::build_tape_loops_across_sources(&p.sources, key);
+            (specs, lens)
+        };
+        for spec in &specs {
+            let pad = spec.pad_index.min(PADS - 1);
+            let src_len = lens.get(spec.source).copied().unwrap_or(0.0);
+            self.put_pad(pad, spec.to_pad_slot(src_len));
         }
-        let n = PADS.min(n_src * 4).min(PADS);
-        for pad in 0..n {
-            let sid = pad % n_src;
-            self.load_pad(sid, pad);
-        }
-        n
+        specs.len()
     }
     fn slices_changed(&mut self, source: usize) {
         let v = self.project.lock().unwrap().sources.get(source).map(|s| s.slices.clone());

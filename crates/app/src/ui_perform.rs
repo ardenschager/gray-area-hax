@@ -294,17 +294,48 @@ impl App {
         } else {
             None
         };
+        let (sculpt, choke_group, pitch_st, pad_pan, pad_gain, base_hz) = {
+            let p = self.project.lock().unwrap();
+            let hz = p.sources.get(source).map(|s| s.base_hz).unwrap_or(0.0);
+            match p.tracks.get(pad) {
+                Some(t) => {
+                    let c = t.clips.first();
+                    let sc = c.filter(|x| x.grains.sculpt.is_active()).map(|x| x.grains.sculpt).unwrap_or(t.sculpt);
+                    let ch = c.filter(|x| x.grains.choke_group > 0).map(|x| x.grains.choke_group).unwrap_or(t.choke_group);
+                    let pt = c.map(|x| x.grains.pitch).unwrap_or(0.0);
+                    let pn = c.map(|x| x.grains.pan).unwrap_or(0.0);
+                    let gn = c.map(|x| x.grains.gain).unwrap_or(0.90);
+                    (sc, ch, pt, pn, gn, hz)
+                }
+                None => (chromagrain_core::grain::VoiceSculpt::default(), 0, 0.0, 0.0, 0.90, hz),
+            }
+        };
+        if (1..=4).contains(&choke_group) {
+            let mut to_release = Vec::new();
+            for (_, _, prev) in &mut self.live_events {
+                if prev.tag.choke_group == choke_group && prev.onset < now - 0.002 {
+                    prev.tag.choke_at = Some(now);
+                    if prev.tag.voice != 0 {
+                        to_release.push(prev.tag.voice);
+                    }
+                }
+            }
+            for v in to_release {
+                self.playback.release_voice(v);
+            }
+        }
         let (cols, rows) = self.pad_tiles.grid_at(now);
         let (pan, gain_mul) = match (slot, pan_by_tile) {
             (Some(sl), true) => chromagrain_core::tile::layout_pan(sl as usize, cols, rows),
-            _ => (0.0, 1.0),
+            _ => (pad_pan, 1.0),
         };
+        let pitch_ratio = chromagrain_core::music::semitones_to_ratio(pitch_st + sculpt.pitch_semitones);
         let ev = chromagrain_core::grain::GrainEvent {
             onset: now,
             source_pos: t0,
             duration: (end_t - now).max(0.05) as f32,
-            pitch_ratio: 1.0,
-            gain: 0.90 * gain_mul,
+            pitch_ratio,
+            gain: pad_gain * gain_mul,
             pan,
             envelope: 0.01,
             env_skew: 0.0,
@@ -314,9 +345,18 @@ impl App {
                 voice,
                 env: Some(chromagrain_core::envelope::VoiceEnv { adsr, on: now, off }),
                 tile: slot,
+                choke_group,
+                zoom_punch: 0.08,
+                ..Default::default()
             },
+            sculpt,
+            ..Default::default()
         };
-        chromagrain_ui::Host::fire(self, 0, source, ev);
+        let key = self.studio.key;
+        let (chord_evs, chord_n) = chromagrain_core::grain::expand_chord_grain_inline(&ev, sculpt.chord, base_hz, Some(&key));
+        for cev in chord_evs.into_iter().take(chord_n) {
+            chromagrain_ui::Host::fire(self, 0, source, cev);
+        }
     }
 
     /// Load media onto a pad (replacing what was there). A pad that was

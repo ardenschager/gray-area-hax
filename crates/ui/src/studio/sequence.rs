@@ -373,6 +373,13 @@ impl Studio {
         } else {
             self.seq.step_ext.insert((scene, lane, step), (r, sl, chord));
         }
+        let core_chord = chord.to_core();
+        self.seq_edit_step(host, scene, lane, step, |st| {
+            st.ratchet = r;
+            st.ratchet_pitch = sl;
+            st.chord = core_chord;
+        });
+        self.rev += 1;
         host.mark();
     }
 
