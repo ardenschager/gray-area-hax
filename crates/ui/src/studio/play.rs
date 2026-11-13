@@ -202,21 +202,25 @@ impl Studio {
         let down = !fingers && (resp.is_pointer_button_down_on() || resp.clicked());
         if down {
             if let Some(pos) = resp.interact_pointer_pos() {
-                let grabbing = ui.data(|d| d.get_temp::<Option<usize>>(resp.id)).flatten();
-                let who = match grabbing {
-                    Some(i) => i,
-                    None => {
-                        let i = pick(&self, pos, &[]);
-                        ui.data_mut(|d| d.insert_temp(resp.id, Some(i)));
-                        i
-                    }
-                };
-                self.sel_emitter = who;
                 let (c, row) = to_grid(pos);
-                let e = &mut self.emitters[who];
-                e.col = c;
-                e.row = row;
-                e.held = !resp.clicked() || resp.is_pointer_button_down_on();
+                if self.columns[c].is_none() && resp.clicked() {
+                    self.open_add(host, crate::host::AddTarget::Column(c));
+                } else {
+                    let grabbing = ui.data(|d| d.get_temp::<Option<usize>>(resp.id)).flatten();
+                    let who = match grabbing {
+                        Some(i) => i,
+                        None => {
+                            let i = pick(&self, pos, &[]);
+                            ui.data_mut(|d| d.insert_temp(resp.id, Some(i)));
+                            i
+                        }
+                    };
+                    self.sel_emitter = who;
+                    let e = &mut self.emitters[who];
+                    e.col = c;
+                    e.row = row;
+                    e.held = !resp.clicked() || resp.is_pointer_button_down_on();
+                }
             }
         }
         if !resp.is_pointer_button_down_on() || fingers {
@@ -231,6 +235,9 @@ impl Studio {
 
         for i in 0..EMITTERS {
             let e = &self.emitters[i];
+            if self.columns.get(e.col).copied().flatten().is_none() {
+                continue;
+            }
             let active = e.held || now - e.last_fire < 0.3;
             emitter_ring(&p, ring_pos(e.col, e.row), if grid.width() < 600.0 { 13.0 } else { 15.0 }, i + 1, i == self.sel_emitter, active, now);
         }

@@ -1166,7 +1166,7 @@ impl GpuPreview {
         let n_buses = scene.buses.len().min(250) as u8;
         for bus in 0..=n_buses {
             let (style, effects, link, add_in, add_out) = if bus == 0 {
-                (VisualGrainStyle::default(), &[][..], chromagrain_core::video::AvLink::default(), 0.4, 0.3)
+                (VisualGrainStyle::morph(0.0, &VisualGrainStyle::default(), 0.0), &[][..], chromagrain_core::video::AvLink::default(), 0.0, 0.0)
             } else {
                 let b = &scene.buses[bus as usize - 1];
                 (b.style, &b.effects[..], b.link, b.style.additive, b.style.additive * 0.5)

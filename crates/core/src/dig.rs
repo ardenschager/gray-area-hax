@@ -243,8 +243,15 @@ pub fn fetch_link(url: &str, opts: DigOptions) -> Job {
 }
 
 fn seed_now() -> u64 {
-    if let Some(s) = std::env::var(DIG_SEED_ENV).ok().and_then(|v| v.parse().ok()) {
-        return s;
+    static LAST: std::sync::Mutex<(u64, u64)> = std::sync::Mutex::new((0, 0));
+    if let Some(s) = std::env::var(DIG_SEED_ENV).ok().and_then(|v| v.parse::<u64>().ok()) {
+        let mut g = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if g.0 != s {
+            *g = (s, 0);
+        }
+        let k = g.1;
+        g.1 = k + 1;
+        return s.wrapping_add(k.wrapping_mul(0xD1B5_4A32_D192_ED03));
     }
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1)
 }

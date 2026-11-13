@@ -379,6 +379,10 @@ impl Studio {
             if button_named(ui, pb, ui.id().with(("to-pads", src)), "Slices → pads", "slices to pads", primary, Some(Icon::Grid), None).clicked() && n > 0 {
                 let k = self.slices_to_pads(host, src);
                 host.status(format!("{k} slices on pads 1–{k}"));
+                self.finish_tap(host);
+                host.stop_audition();
+                self.sheet = None;
+                self.set_view(host, super::View::Perform);
             }
         }
         if n > 0 {
@@ -417,6 +421,17 @@ impl Studio {
         changed |= picture_switch(ui, side, ui.id().with(("cutfade", target)), &mut adsr);
         if changed {
             self.set_target_env(host, target, adsr);
+        }
+        if let EnvTarget::Pad(i) = target {
+            let released_in_env = ui.input(|inp| {
+                inp.pointer.button_released(egui::PointerButton::Primary)
+                    && inp.pointer.latest_pos().is_some_and(|p| er.expand(28.0).contains(p))
+            });
+            if released_in_env {
+                if let Some(p) = host.perform() {
+                    p.toggle_pad(i);
+                }
+            }
         }
     }
 

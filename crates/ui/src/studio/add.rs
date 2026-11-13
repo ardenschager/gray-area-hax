@@ -161,7 +161,13 @@ impl Studio {
     pub fn place_added(&mut self, host: &mut dyn Host) {
         for a in host.take_added() {
             match a.target {
-                AddTarget::Any => {}
+                AddTarget::Any => {
+                    if !self.columns.contains(&Some(a.source)) {
+                        if let Some(slot) = self.columns.iter_mut().find(|c| c.is_none()) {
+                            *slot = Some(a.source);
+                        }
+                    }
+                }
                 AddTarget::Column(c) if c < super::COLUMNS => {
                     for col in self.columns.iter_mut() {
                         if *col == Some(a.source) {
@@ -169,6 +175,9 @@ impl Studio {
                         }
                     }
                     self.columns[c] = Some(a.source);
+                    if self.sheet == Some(Sheet::Add(AddTarget::Column(c))) {
+                        self.sheet = Some(Sheet::Add(AddTarget::Any));
+                    }
                 }
                 AddTarget::Lane(l) if l < super::LANES => {
                     self.seq.lanes[l] = Some(a.source);
@@ -184,6 +193,22 @@ impl Studio {
             if matches!(self.sheet, Some(Sheet::Add(_))) {
                 self.add.recent.push(a.source);
             }
+        }
+    }
+
+    /// If `target` names a column that already has a clip or a pending job,
+    /// spill subsequent adds while the sheet stays open onto the next free
+    /// grid column (`AddTarget::Any`).
+    fn next_add_target(&self, host: &dyn Host, target: AddTarget) -> AddTarget {
+        match target {
+            AddTarget::Column(c)
+                if c < super::COLUMNS
+                    && (self.columns[c].is_some()
+                        || host.pending().iter().any(|p| p.target == AddTarget::Column(c))) =>
+            {
+                AddTarget::Any
+            }
+            t => t,
         }
     }
 
@@ -255,6 +280,7 @@ impl Studio {
             let pend: Vec<Pending> = host.pending();
             let strip_h = if pend.is_empty() && self.add.recent.is_empty() { 0.0 } else { 128.0 };
             let body = Rect::from_min_max(egui::pos2(inner.left(), tabs.bottom() + 16.0), egui::pos2(inner.right(), inner.bottom() - strip_h));
+            let target = self.next_add_target(host, target);
             match self.add.tab {
                 AddRoute::Files => self.add_files_tab(host, ui, body, target),
                 AddRoute::Browse => self.add_browse_tab(host, ui, body, target),
@@ -422,11 +448,11 @@ impl Studio {
             } else {
                 p.rect_filled(rc, r(10), G2);
             }
-            let scrim = Rect::from_min_max(egui::pos2(rc.left(), rc.bottom() - 40.0), rc.max);
-            p.rect_filled(scrim, egui::CornerRadius { nw: 0, ne: 0, sw: 10, se: 10 }, Color32::from_black_alpha(150));
+            let scrim = Rect::from_min_max(egui::pos2(rc.left(), rc.bottom() - 42.0), rc.max);
+            p.rect_filled(scrim, egui::CornerRadius { nw: 0, ne: 0, sw: 10, se: 10 }, Color32::from_black_alpha(205));
             let name = self.source_name(host, src);
-            p.text(egui::pos2(rc.left() + 9.0, rc.bottom() - 25.0), Align2::LEFT_CENTER, super::play::short(&name, 22), font_medium(11.5), INK);
-            p.text(egui::pos2(rc.left() + 9.0, rc.bottom() - 10.0), Align2::LEFT_CENTER, super::play::short(&self.provenance_line(host, src), 30), font(10.0), INK3);
+            p.text(egui::pos2(rc.left() + 9.0, rc.bottom() - 26.0), Align2::LEFT_CENTER, super::play::short(&name, 22), font_medium(11.5), INK);
+            p.text(egui::pos2(rc.left() + 9.0, rc.bottom() - 10.0), Align2::LEFT_CENTER, super::play::short(&self.provenance_line(host, src), 32), font(10.0), INK2);
             let cb = Rect::from_min_size(egui::pos2(rc.right() - 66.0, rc.top() + 6.0), egui::vec2(60.0, 30.0));
             p.rect_filled(cb, r(8), Color32::from_black_alpha(160));
             draw_icon(&p, Icon::Chop, egui::pos2(cb.left() + 15.0, cb.center().y), 13.0, INK);

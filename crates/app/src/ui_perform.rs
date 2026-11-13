@@ -109,7 +109,9 @@ impl App {
         self.perform_fill();
         self.playback.set_loop(self.loop_region());
         self.mark_now();
-        self.seek(if self.loop_on { self.loop_start } else { 0.0 });
+        if !self.playback.is_playing() {
+            self.seek(if self.loop_on { self.loop_start } else { 0.0 });
+        }
         self.status = match (m, first_time) {
             (AppMode::Perform, true) => "perform: your clips are on the pads — click one (or press its key) to start it".into(),
             (AppMode::Perform, false) => "perform mode".into(),
@@ -211,6 +213,29 @@ impl App {
     /// again cancels. With the transport stopped, starting a pad starts
     /// everything from the top.
     pub(crate) fn toggle_pad(&mut self, i: usize) {
+        let slice_hit = {
+            let p = self.project.lock().unwrap();
+            p.tracks.get(i).filter(|t| t.name.contains(" · ")).and_then(|t| {
+                let c = t.clips.first()?;
+                let src = p.sources.get(c.source)?;
+                let len = src.duration();
+                let t0 = c.grains.position as f64 * len;
+                let dur = c.grains.duration.max(0.08) as f64;
+                let adsr = c.grains.adsr.unwrap_or(chromagrain_core::envelope::Adsr {
+                    attack: 0.005,
+                    decay: 0.08,
+                    sustain: 0.9,
+                    release: 0.14,
+                    picture: chromagrain_core::envelope::PictureCut::Cut,
+                    ..Default::default()
+                });
+                Some((c.source, t0, dur, adsr, p.layout == chromagrain_core::tile::Layout::Tile, p.layout_pan))
+            })
+        };
+        if let Some((source, t0, dur, adsr, is_tile, pan_by_tile)) = slice_hit {
+            self.fire_pad_slice(i, source, t0, dur, adsr, is_tile, pan_by_tile);
+            return;
+        }
         let (has, on) = {
             let p = self.project.lock().unwrap();
             p.tracks.get(i).map(|t| (!t.clips.is_empty(), !t.muted)).unwrap_or((false, false))
@@ -242,6 +267,56 @@ impl App {
             self.playhead_beats = 0.0;
             self.start_play();
         }
+    }
+
+    /// Fire a one-shot slice pad (`PadKind::Chop` from `Slices → pads`),
+    /// shaped by the pad's ADSR envelope and claiming a tile in `Layout::Tile`.
+    pub(crate) fn fire_pad_slice(
+        &mut self,
+        pad: usize,
+        source: usize,
+        t0: f64,
+        dur: f64,
+        adsr: chromagrain_core::envelope::Adsr,
+        is_tile: bool,
+        pan_by_tile: bool,
+    ) {
+        let now = self.app_clock.secs();
+        self.live_id += 1;
+        let voice = (0x50AD_0000_0000 | ((pad as u64) << 32)) | (self.live_id & 0xFFFF_FFFF);
+        let hold_len = (dur - adsr.release_secs() * 0.5).clamp(0.18, dur.max(0.18));
+        let off = now + hold_len;
+        let end_t = off + adsr.release_secs();
+        let slot = if is_tile {
+            let s = self.pad_tiles.assign_keyed(voice, pad as u64 + 1, now);
+            self.pad_tiles.release(voice, end_t);
+            Some(s as u8)
+        } else {
+            None
+        };
+        let (cols, rows) = self.pad_tiles.grid_at(now);
+        let (pan, gain_mul) = match (slot, pan_by_tile) {
+            (Some(sl), true) => chromagrain_core::tile::layout_pan(sl as usize, cols, rows),
+            _ => (0.0, 1.0),
+        };
+        let ev = chromagrain_core::grain::GrainEvent {
+            onset: now,
+            source_pos: t0,
+            duration: (end_t - now).max(0.05) as f32,
+            pitch_ratio: 1.0,
+            gain: 0.90 * gain_mul,
+            pan,
+            envelope: 0.01,
+            env_skew: 0.0,
+            reverse: false,
+            id: voice,
+            tag: chromagrain_core::grain::VoiceTag {
+                voice,
+                env: Some(chromagrain_core::envelope::VoiceEnv { adsr, on: now, off }),
+                tile: slot,
+            },
+        };
+        chromagrain_ui::Host::fire(self, 0, source, ev);
     }
 
     /// Load media onto a pad (replacing what was there). A pad that was

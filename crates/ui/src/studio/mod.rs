@@ -174,8 +174,8 @@ pub struct Studio {
     pub add: add::AddState,
     pub chop: clip::ChopState,
     pub(crate) waves: crate::wave::WaveCache,
-    /// Tile slots for emitter gestures (tile layout).
-    tiles: TileAssigner,
+    /// Tile slots for emitter gestures and live one-shot pad hits (tile layout).
+    pub tiles: TileAssigner,
     gestures: u64,
 }
 
@@ -321,6 +321,21 @@ impl Studio {
     /// What the canvas shows under the grains: in Play the selected
     /// emitter's tile of footage, playing; in Sequence the latest hit.
     pub fn backdrop(&self, host: &dyn Host) -> Option<(usize, f64)> {
+        let now = host.clock();
+        if let Some(tc) = self.chop.tap.as_ref() {
+            if now - tc.t0 < tc.len {
+                return Some((tc.source, (now - tc.t0).clamp(0.0, tc.len)));
+            }
+        }
+        if let Some((src, i, t0)) = self.chop.playing {
+            let slices = self.slices(host, src);
+            if let Some(sl) = slices.get(i) {
+                let at = sl.start + (now - t0);
+                if at < sl.end {
+                    return Some((src, at));
+                }
+            }
+        }
         if self.view == View::Sequence {
             return self.seq_last_hit(host);
         }
@@ -335,7 +350,7 @@ impl Studio {
         }
         let seg = len / ROWS as f64;
         let start = (e.row.floor() as f64 / ROWS as f64) * len;
-        Some((src, start + host.clock() % seg))
+        Some((src, start + now % seg))
     }
 
     fn fire_emitters(&mut self, host: &mut dyn Host, ctx: &egui::Context) {
@@ -804,17 +819,17 @@ impl Studio {
         let p = host.project().lock().unwrap();
         let Some(pv) = p.sources.get(src).and_then(|s| s.provenance.as_ref()) else { return String::new() };
         let mut parts: Vec<String> = Vec::new();
-        if !pv.uploader.is_empty() {
-            parts.push(pv.uploader.clone());
-        }
-        if pv.upload_date.len() == 8 {
-            parts.push(format!("{}-{}-{}", &pv.upload_date[..4], &pv.upload_date[4..6], &pv.upload_date[6..]));
-        }
         if let Some(v) = pv.views {
             parts.push(if v == 1 { "1 view".into() } else { format!("{v} views") });
         }
         if pv.license.to_lowercase().contains("creative commons") {
             parts.push("CC".into());
+        }
+        if pv.upload_date.len() == 8 {
+            parts.push(pv.upload_date[..4].to_string());
+        }
+        if !pv.uploader.is_empty() {
+            parts.push(pv.uploader.clone());
         }
         parts.join(" · ")
     }
@@ -880,4 +895,14 @@ pub fn emitter_effects(map: &MacroMap, key: &Key) -> Vec<AvEffect> {
 
 pub fn note_name(pc: i32) -> &'static str {
     NOTE_NAMES[pc.rem_euclid(12) as usize]
+}
+
+/// Strip common media file extensions (`.mp4`, `.MOV`, etc.) from display titles.
+pub fn strip_media_ext(s: &str) -> &str {
+    for ext in [".mp4", ".mov", ".m4v", ".webm", ".mkv", ".wav", ".mp3", ".aif", ".aiff", ".flac"] {
+        if s.len() > ext.len() && s[s.len() - ext.len()..].eq_ignore_ascii_case(ext) {
+            return &s[..s.len() - ext.len()];
+        }
+    }
+    s
 }
