@@ -1,6 +1,7 @@
 //! Audio side: clips, granular rendering into a stereo buffer.
 
 use crate::dsp::{apply_filter_chain, grain_env, grain_env_skewed, FilterSpec};
+pub use crate::dsp::{BandIsolator, IsolatorChannelMode, IsolatorMonitor, IsolatorState};
 use crate::grain::GrainEvent;
 use serde::{Deserialize, Serialize};
 
@@ -597,12 +598,15 @@ fn render_sculpted_grain(
     };
     let grain_src_len = n_nom as f64 * base_rate;
 
-    // Pre-compute filter stages (with Basinski per-pass progressive LPF darkening).
-    let base_wear = (sc.disintegrate.clamp(0.0, 1.0) * (0.14 + 0.22 * ev.loop_pass as f32)).clamp(0.0, 0.96);
-    let eff_lpf_hz = (sc.lpf_hz * (0.14f32).powf(base_wear)).clamp(90.0, 20_000.0);
+    // Pre-compute filter stages (with smooth non-saturating Basinski per-pass LPF darkening).
+    let d_amt = sc.disintegrate.clamp(0.0, 1.0);
+    let pass_wear = 1.0 - (-0.115 * (ev.loop_pass as f32 + 0.35)).exp();
+    let base_wear = (d_amt * pass_wear).clamp(0.0, 0.96);
+    let eff_lpf_hz = (sc.lpf_hz * (0.08f32).powf(base_wear)).clamp(90.0, 20_000.0);
     let eff_hpf_hz = sc.hpf_hz.clamp(20.0, 16_000.0);
     let res_q = sc.resonance_q.clamp(0.4, 8.0);
     let steep_kick_lpf = sc.lpf_hz <= 200.0;
+    let steep_wear_lpf = base_wear > 0.02 && !steep_kick_lpf;
     let steep_hpf = eff_hpf_hz >= 200.0;
 
     let mut hp1 = (eff_hpf_hz > 22.0).then(|| {
@@ -614,14 +618,20 @@ fn render_sculpted_grain(
         [bq.clone(), bq]
     });
     let mut lp1 = (eff_lpf_hz < 19_800.0).then(|| {
-        let bq = crate::dsp::Biquad::new(crate::dsp::FilterKind::LowPass, sr_f, eff_lpf_hz, if steep_kick_lpf { 0.707 } else { res_q });
+        let bq = crate::dsp::Biquad::new(
+            crate::dsp::FilterKind::LowPass,
+            sr_f,
+            eff_lpf_hz,
+            if steep_kick_lpf || steep_wear_lpf { 0.707 } else { res_q },
+        );
         [bq.clone(), bq]
     });
-    let mut lp2 = steep_kick_lpf.then(|| {
-        let bq = crate::dsp::Biquad::new(crate::dsp::FilterKind::LowPass, sr_f, eff_lpf_hz, res_q.max(0.85));
+    let mut lp2 = (steep_kick_lpf || steep_wear_lpf).then(|| {
+        let q2 = if steep_kick_lpf { res_q.max(0.85) } else { 0.707 };
+        let bq = crate::dsp::Biquad::new(crate::dsp::FilterKind::LowPass, sr_f, eff_lpf_hz, q2);
         [bq.clone(), bq]
     });
-    let kick_sub_makeup = if steep_kick_lpf { 1.48f32 } else { 1.0 };
+    let kick_sub_makeup = if steep_kick_lpf { 1.38f32 } else { 1.0 };
 
     let snap = sc.snare_snap.clamp(0.0, 1.0);
     let mut snare_body = (snap > 1e-3).then(|| {
@@ -646,8 +656,12 @@ fn render_sculpted_grain(
     let sub_mix = sc.sub_exciter.clamp(0.0, 1.0);
     let mut svf_ic1 = 0.0f32;
     let mut svf_ic2 = 0.0f32;
-    let mut sub_env_dc = 0.0f32;
-    let sub_dc_a = 1.0 - (-2.0 * std::f32::consts::PI * 34.0 / sr_f).exp();
+    let mut sub_env_fast = 0.0f32;
+    let mut sub_env_slow = 0.0f32;
+    let sub_fast_atk = 1.0 - (-1.0 / (0.0005 * sr_f)).exp();
+    let sub_fast_rel = 1.0 - (-1.0 / (0.0060 * sr_f)).exp();
+    let sub_slow_atk = 1.0 - (-1.0 / (0.0032 * sr_f)).exp();
+    let sub_slow_rel = 1.0 - (-1.0 / (0.0450 * sr_f)).exp();
 
     // Karplus-Strong fractional-delay comb resonator (stack buffer, 0 heap allocs).
     const COMB_LEN: usize = 1024;
@@ -684,12 +698,16 @@ fn render_sculpted_grain(
     const ROOM_WEIGHTS: [f32; 5] = [1.0, -0.85, 0.72, -0.60, 0.50];
 
     let shimmer_amt = sc.shimmer.clamp(0.0, 1.0);
+    let shim_cut = (11_500.0 * (0.05f32).powf(base_wear))
+        .min(eff_lpf_hz * 1.25)
+        .clamp(420.0, sr_f * 0.46);
+    let shim_gain = 0.36 * shimmer_amt * (1.0 - 0.92 * base_wear).max(0.04);
     let mut shim_hp = (shimmer_amt > 1e-3).then(|| {
         let bq = crate::dsp::Biquad::new(crate::dsp::FilterKind::HighPass, sr_f, 380.0, 0.707);
         [bq.clone(), bq]
     });
     let mut shim_lp = (shimmer_amt > 1e-3).then(|| {
-        let bq = crate::dsp::Biquad::new(crate::dsp::FilterKind::LowPass, sr_f, 11_500.0f32.min(sr_f * 0.46), 0.707);
+        let bq = crate::dsp::Biquad::new(crate::dsp::FilterKind::LowPass, sr_f, shim_cut, 0.707);
         [bq.clone(), bq]
     });
     // Ghost reverb tank (2 dark cross-coupled combs on stack) for Basinski disintegrate & shimmer.
@@ -704,7 +722,8 @@ fn render_sculpted_grain(
         (i_warm as usize) % ghost_lens[1],
     ];
     let mut ghost_lp = [0.0f32; 2];
-    let ghost_lp_a = 1.0 - (-2.0 * std::f32::consts::PI * 1850.0 / sr_f).exp();
+    let ghost_cut = (1850.0 * (0.28f32).powf(base_wear)).clamp(320.0, 4000.0);
+    let ghost_lp_a = 1.0 - (-2.0 * std::f32::consts::PI * ghost_cut / sr_f).exp();
 
     let src_len_samps = clip.samples.len() as f64;
     let read_stereo = |src_idx: f64, ratio: f32| -> (f32, f32) {
@@ -737,9 +756,15 @@ fn render_sculpted_grain(
         let inst_ratio = (ev.pitch_ratio * pitch_mult as f32).clamp(0.05, 8.0);
 
         // 1. Sample read (with 0.82 Hz wow + 4.25 Hz flutter + subtle R Haas chorus).
+        let perc_hit = (sub_mix > 0.1 || snap > 0.1 || comb_mix > 0.2) && sc.free_loop_secs.is_none();
         let (mut sig_l, mut sig_r) = if i < n_nom {
             let phase = (i as f32 / n_nom as f32).clamp(0.0, 1.0);
-            let mut w_env = grain_env_skewed(phase, ev.envelope, ev.env_skew);
+            let eff_env = if perc_hit && phase < 0.5 {
+                ev.envelope.min(0.04)
+            } else {
+                ev.envelope
+            };
+            let mut w_env = grain_env_skewed(phase, eff_env, ev.env_skew);
             if (i as f32) < anti_click_samps {
                 let u = (i as f32) / anti_click_samps;
                 w_env *= 0.5 * (1.0 - (std::f32::consts::PI * u).cos());
@@ -801,15 +826,18 @@ fn render_sculpted_grain(
         read_off += base_rate * pitch_mult;
 
         // 3. `sub_exciter`: 68ms-transient-gated Cytomic ZDF swept SVF (`155 -> 50 Hz`, `Q = 8.2`, 0 oscillators!).
-        // Uses both direct waveform AND DC-blocked transient envelope rectification so even high-pitched
-        // taps/snaps/consonants excite natural sub weight while digital silence produces exact 0.0!
+        // Half-cycle-matched dual-envelope positive onset flux (`0.5ms` vs `3.2ms`) pings the ZDF SVF
+        // with maximum resonant momentum from ANY real sample transient while digital silence produces exact `0.0`!
         if sub_mix > 1e-3 && t_rel < 0.48 {
             let ex_in = if t_rel < 0.068 {
                 let mono = 0.5 * (sig_l + sig_r);
                 let rect = mono.abs();
-                let env_imp = rect - sub_env_dc;
-                sub_env_dc += sub_dc_a * env_imp;
-                (mono * 0.45 + env_imp * 1.55) * ((-t_rel / 0.024).exp() as f32)
+                let a_f = if rect > sub_env_fast { sub_fast_atk } else { sub_fast_rel };
+                let a_s = if rect > sub_env_slow { sub_slow_atk } else { sub_slow_rel };
+                sub_env_fast += a_f * (rect - sub_env_fast);
+                sub_env_slow += a_s * (rect - sub_env_slow);
+                let onset_ping = (sub_env_fast - sub_env_slow).max(0.0);
+                (mono * 0.45 + onset_ping * 4.1) * ((-t_rel / 0.032).exp() as f32)
             } else {
                 0.0
             };
@@ -825,9 +853,9 @@ fn render_sculpted_grain(
             svf_ic1 = 2.0 * v1 - svf_ic1;
             svf_ic2 = 2.0 * v2 - svf_ic2;
             let body_env = (-t_rel / 0.165).exp() as f32;
-            let shaped_sub = ((v1 * 1.45 + v2 * 0.78) * body_env * 2.2).tanh() * 0.72;
-            sig_l = sig_l * (1.0 - sub_mix * 0.28) + shaped_sub * sub_mix;
-            sig_r = sig_r * (1.0 - sub_mix * 0.28) + shaped_sub * sub_mix;
+            let shaped_sub = ((v1 * 1.40 + v2 * 0.95) * body_env * 2.1).tanh() * 0.86;
+            sig_l = sig_l * (1.0 - sub_mix * 0.26) + shaped_sub * sub_mix;
+            sig_r = sig_r * (1.0 - sub_mix * 0.26) + shaped_sub * sub_mix;
         }
 
         // 4. PRE-FILTER loudness-compensated `tanh` saturation (`drive_db`).
@@ -945,26 +973,27 @@ fn render_sculpted_grain(
                 sh_l = f[0].process(sh_l);
                 sh_r = f[1].process(sh_r);
             }
-            wet_tail_l += sh_l * 0.36 * shimmer_amt;
-            wet_tail_r += sh_r * 0.36 * shimmer_amt;
+            wet_tail_l += sh_l * shim_gain;
+            wet_tail_r += sh_r * shim_gain;
         }
 
         let oxide = crate::grain::oxide_dropout_at(sc.disintegrate, ev.loop_pass, t_rel, ev.id);
         if sc.disintegrate > 1e-3 || shimmer_amt > 1e-3 {
-            let feed_g = 0.25 * shimmer_amt + 0.42 * base_wear;
+            let feed_g = 0.25 * shimmer_amt + 0.34 * base_wear * (1.0 - 0.55 * base_wear);
             let gl = ghost_ring[0][ghost_pos[0]];
             let gr = ghost_ring[1][ghost_pos[1]];
             ghost_lp[0] += ghost_lp_a * (gl - ghost_lp[0]);
             ghost_lp[1] += ghost_lp_a * (gr - ghost_lp[1]);
-            ghost_ring[0][ghost_pos[0]] = (sig_l * feed_g + wet_tail_l) + ghost_lp[1] * 0.78;
-            ghost_ring[1][ghost_pos[1]] = (sig_r * feed_g + wet_tail_r) + ghost_lp[0] * 0.78;
+            ghost_ring[0][ghost_pos[0]] = (sig_l * feed_g + wet_tail_l) + ghost_lp[1] * 0.76;
+            ghost_ring[1][ghost_pos[1]] = (sig_r * feed_g + wet_tail_r) + ghost_lp[0] * 0.76;
             ghost_pos[0] = (ghost_pos[0] + 1) % ghost_lens[0];
             ghost_pos[1] = (ghost_pos[1] + 1) % ghost_lens[1];
-            wet_tail_l += ghost_lp[0] * 0.52;
-            wet_tail_r += ghost_lp[1] * 0.52;
+            let ghost_wet = 0.50 * (1.0 - 0.42 * base_wear);
+            wet_tail_l += ghost_lp[0] * ghost_wet;
+            wet_tail_r += ghost_lp[1] * ghost_wet;
         }
 
-        let dry_keep = (1.0 - 0.88 * oxide).clamp(0.02, 1.0);
+        let dry_keep = ((1.0 - 0.85 * oxide) * (1.0 - 0.35 * base_wear)).clamp(0.02, 1.0);
         let ebb = crate::grain::ebb_flow_gain_at(sc.ebb_flow, ev.loop_pass, t_rel, ev.id);
         sig_l = (sig_l * dry_keep + wet_tail_l) * ebb;
         sig_r = (sig_r * dry_keep + wet_tail_r) * ebb;
@@ -1509,9 +1538,11 @@ mod tests {
             .sqrt();
         assert!(tail_rms > 1e-4, "comb rings out into +140ms tail: {tail_rms}");
 
-        // Basinski disintegrate: progressive HF darkening across pass 0 -> pass 14.
+        // Basinski disintegrate: strictly monotonic HF darkening AND body decay across passes 0, 4, 8, 12, 16!
         let rich = AudioClip::saw_stack(220.0, 1.0, sr);
-        let hf_ratio = |pass: u32| -> f32 {
+        let mut dis_sculpt = crate::grain::VoiceSculpt::preset(crate::grain::Stamp::Disintegrate);
+        dis_sculpt.ebb_flow = 0.0; // isolate pure tape wear from slow LFO breathing
+        let pass_metrics = |pass: u32| -> (f32, f32) {
             let ev = GrainEvent {
                 onset: 0.0,
                 source_pos: 0.0,
@@ -1520,21 +1551,33 @@ mod tests {
                 gain: 1.0,
                 envelope: 0.1,
                 id: 99,
-                sculpt: crate::grain::VoiceSculpt::preset(crate::grain::Stamp::Disintegrate),
+                sculpt: dis_sculpt,
                 loop_pass: pass,
                 ..Default::default()
             };
             let mut b = StereoBuffer::new(0.7, sr);
             render_grains_audio(&rich, std::slice::from_ref(&ev), &mut b, 0.0);
             let total: f32 = b.left.iter().map(|x| x * x).sum::<f32>().max(1e-9);
-            let mut hp = crate::dsp::Biquad::new(crate::dsp::FilterKind::HighPass, sr as f32, 2400.0, 0.707);
+            let rms = (total / b.left.len() as f32).sqrt();
+            let mut hp = crate::dsp::Biquad::new(crate::dsp::FilterKind::HighPass, sr as f32, 2000.0, 0.707);
             let mut hi = b.left.clone();
             hp.process_buffer(&mut hi);
-            hi.iter().map(|x| x * x).sum::<f32>() / total
+            let hf_r = hi.iter().map(|x| x * x).sum::<f32>() / total;
+            (hf_r, rms)
         };
-        let r0 = hf_ratio(0);
-        let r6 = hf_ratio(6);
-        let r16 = hf_ratio(16);
-        assert!(r16 < r6 && r6 < r0, "progressive Basinski HF loss: pass0={r0:.4} > pass6={r6:.4} > pass16={r16:.4}");
+        let passes = [0u32, 4, 8, 12, 16];
+        let vals: Vec<(u32, f32, f32)> = passes.iter().map(|&p| { let (h, r) = pass_metrics(p); (p, h, r) }).collect();
+        for w in vals.windows(2) {
+            let (p_prev, hf_prev, rms_prev) = w[0];
+            let (p_next, hf_next, rms_next) = w[1];
+            assert!(
+                hf_next < hf_prev,
+                "Disintegrate >2kHz HF ratio must darken monotonically: pass {p_prev} ({hf_prev:.5}) -> pass {p_next} ({hf_next:.5})"
+            );
+            assert!(
+                rms_next < rms_prev,
+                "Disintegrate RMS must wear monotonically: pass {p_prev} ({rms_prev:.5}) -> pass {p_next} ({rms_next:.5})"
+            );
+        }
     }
 }

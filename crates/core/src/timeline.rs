@@ -585,6 +585,8 @@ pub struct Project {
     pub captions_on: bool,
     /// Prefer *MODELL 5* vertical portrait columns (`2×1` / `3×1` / `4×1`) on wide `16:9` canvases in `Layout::Tile`.
     pub portrait_columns: bool,
+    /// Master 5-band `24 dB/Oct` Linkwitz-Riley frequency isolator (`ISOL8`).
+    pub isolator: crate::dsp::BandIsolator,
 }
 
 impl Default for Project {
@@ -610,6 +612,7 @@ impl Default for Project {
             studio_bus: true,
             captions_on: true,
             portrait_columns: false,
+            isolator: crate::dsp::BandIsolator::default(),
         }
     }
 }

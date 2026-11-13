@@ -23,6 +23,7 @@
 //! sides fully apply; video=0 makes an effect audio-only, and vice versa.
 
 use crate::audio::StereoBuffer;
+pub use crate::dsp::{BandIsolator, IsolatorChannelMode, IsolatorMonitor, IsolatorState};
 use crate::video::Frame;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -67,6 +68,12 @@ pub enum EffectKind {
     /// and odd (mirrored) taps are windowed time-reflected reverse / fifth
     /// reflections, with stereo pan & allpass phaser notches phase-locked to `spin`.
     Kaleido { folds: f32, spin: f32 },
+    /// 5-Band `24 dB/Oct` Linkwitz-Riley studio frequency isolator (`ISOL8`).
+    /// Audio: phase-coherent 5-band (`LF · LMF · MF · HMF · HF`) Mute/Solo + `Stereo/Mid/Side`
+    /// + `L/R/M/S` monitor + `-18 dB` Dim. Video: 1:1 5-band spatial-frequency & Bernstein
+    /// tonal decomposition (`LF` deep shadow/low-spatial mass, `MF` mid-tone body,
+    /// `HF` crisp edge detail, `Mid/Side` center subject vs peripheral frame).
+    Isolator(BandIsolator),
 }
 
 impl EffectKind {
@@ -94,6 +101,7 @@ impl EffectKind {
             },
             "tile" | "tiles" | "grid" => EffectKind::Tile { count: 2.0, mirror: 0.0, spin: 0.0 },
             "kaleido" | "kaleidoscope" | "prism" => EffectKind::Kaleido { folds: 6.0, spin: 0.12 },
+            "isolator" | "isol8" | "crossover" => EffectKind::Isolator(BandIsolator::default()),
             _ => return None,
         })
     }
@@ -108,13 +116,14 @@ impl EffectKind {
             EffectKind::Tune { .. } => "tune",
             EffectKind::Tile { .. } => "tile",
             EffectKind::Kaleido { .. } => "kaleido",
+            EffectKind::Isolator(_) => "isolator",
         }
     }
 
     /// Canonical parse names of every effect kind, in UI order (each one
     /// round-trips through [`EffectKind::parse`] to its default).
-    pub const KINDS: [&'static str; 8] = [
-        "tune", "crush", "delay", "reverb", "compress", "tint", "tile", "kaleido",
+    pub const KINDS: [&'static str; 9] = [
+        "tune", "crush", "delay", "reverb", "compress", "tint", "tile", "kaleido", "isolator",
     ];
 
     /// One-line "audio ↔ video" description for UIs.
@@ -128,6 +137,7 @@ impl EffectKind {
             EffectKind::Tune { .. } => "frequencies → key ↔ hues → key colors",
             EffectKind::Tile { .. } => "multi-tap echoes ↔ tiled / kaleidoscope picture",
             EffectKind::Kaleido { .. } => "radial reverse-mirror prism ↔ polar kaleidoscope",
+            EffectKind::Isolator(_) => "5-band 24dB/oct isolator ↔ spatial/tonal band isolator",
         }
     }
 }
@@ -227,6 +237,43 @@ impl AvEffect {
                 "spin" | "turn" | "rotate" | "rotation" | "omega" => *spin = value.clamp(-1.0, 1.0),
                 _ => return Err(format!("kaleido has no parameter '{name}'")),
             },
+            EffectKind::Isolator(iso) => match key.as_str() {
+                "x1" => iso.crossovers[0] = value.clamp(25.0, 1200.0),
+                "x2" => iso.crossovers[1] = value.clamp(80.0, 4500.0),
+                "x3" => iso.crossovers[2] = value.clamp(250.0, 12_000.0),
+                "x4" => iso.crossovers[3] = value.clamp(800.0, 19_500.0),
+                "mute_lf" | "mute_0" => iso.mute[0] = value >= 0.5,
+                "mute_lmf" | "mute_1" => iso.mute[1] = value >= 0.5,
+                "mute_mf" | "mute_2" => iso.mute[2] = value >= 0.5,
+                "mute_hmf" | "mute_3" => iso.mute[3] = value >= 0.5,
+                "mute_hf" | "mute_4" => iso.mute[4] = value >= 0.5,
+                "solo_lf" | "solo_0" => iso.solo[0] = value >= 0.5,
+                "solo_lmf" | "solo_1" => iso.solo[1] = value >= 0.5,
+                "solo_mf" | "solo_2" => iso.solo[2] = value >= 0.5,
+                "solo_hmf" | "solo_3" => iso.solo[3] = value >= 0.5,
+                "solo_hf" | "solo_4" => iso.solo[4] = value >= 0.5,
+                "bypass" => iso.bypass = value >= 0.5,
+                "dim" => iso.dim = value >= 0.5,
+                "dim_db" | "atten" => iso.dim_db = value.clamp(-48.0, 0.0),
+                "output_db" | "output" => iso.output_db = value.clamp(-24.0, 12.0),
+                "ch_mode" => {
+                    iso.ch_mode = match value.round() as i32 {
+                        1 => IsolatorChannelMode::Mid,
+                        2 => IsolatorChannelMode::Side,
+                        _ => IsolatorChannelMode::Stereo,
+                    };
+                }
+                "monitor" => {
+                    iso.monitor = match value.round() as i32 {
+                        1 => IsolatorMonitor::Left,
+                        2 => IsolatorMonitor::Right,
+                        3 => IsolatorMonitor::Mid,
+                        4 => IsolatorMonitor::Side,
+                        _ => IsolatorMonitor::Off,
+                    };
+                }
+                _ => return Err(format!("isolator has no parameter '{name}'")),
+            },
         }
         Ok(())
     }
@@ -262,6 +309,11 @@ pub enum AudioFxState {
         sample_idx: u64,
         ap: [[f32; 2]; 2],
         sr: f32,
+    },
+    /// 5-Band `24 dB/Oct` Linkwitz-Riley frequency isolator (`ISOL8`).
+    Isolator {
+        state: Box<IsolatorState>,
+        sr: u32,
     },
 }
 
@@ -376,6 +428,10 @@ pub fn audio_chain_states(chain: &[AvEffect], sample_rate: u32) -> Vec<AudioFxSt
                     sr,
                 }
             }
+            EffectKind::Isolator(_) => AudioFxState::Isolator {
+                state: Box::new(IsolatorState::new(sample_rate.max(8000))),
+                sr: sample_rate.max(8000),
+            },
         })
         .collect()
 }
@@ -503,6 +559,20 @@ pub fn process_audio_chain_opts(
                 AudioFxState::Kaleido { ring, pos, sample_idx, ap, sr },
             ) => {
                 process_kaleido(left, right, ring, pos, sample_idx, ap, *sr, folds, spin, fx.audio);
+            }
+            (EffectKind::Isolator(iso), AudioFxState::Isolator { state, sr }) => {
+                let mix = fx.audio.clamp(0.0, 1.0);
+                if mix >= 0.999 {
+                    state.process_block(left, right, &iso, *sr);
+                } else {
+                    let mut wl = left.to_vec();
+                    let mut wr = right.to_vec();
+                    state.process_block(&mut wl, &mut wr, &iso, *sr);
+                    for i in 0..left.len().min(right.len()) {
+                        left[i] = left[i] * (1.0 - mix) + wl[i] * mix;
+                        right[i] = right[i] * (1.0 - mix) + wr[i] * mix;
+                    }
+                }
             }
             _ => debug_assert!(false, "chain/state mismatch — rebuild states"),
         }
@@ -997,7 +1067,8 @@ pub fn video_chain_states(chain: &[AvEffect], fps: f32) -> Vec<VideoFxState> {
             | EffectKind::Compress { .. }
             | EffectKind::Tint { .. }
             | EffectKind::Tune { .. }
-            | EffectKind::Tile { .. } => VideoFxState::Stateless,
+            | EffectKind::Tile { .. }
+            | EffectKind::Isolator(_) => VideoFxState::Stateless,
         })
         .collect()
 }
@@ -1078,6 +1149,9 @@ pub fn apply_video_chain(
                     _ => 0.0,
                 };
                 video_kaleido(frame, folds, angle, (0.5, 0.5), fx.video);
+            }
+            EffectKind::Isolator(iso) => {
+                apply_video_isolator(frame, &iso, fx.video);
             }
         }
     }
@@ -1575,6 +1649,204 @@ fn video_compress(frame: &mut Frame, quality: f32) {
                     }
                 }
             }
+        }
+    }
+}
+
+/// Packed `(band_gains[5], ch_mode_u32, monitor_u32, out_exposure)` uniforms for GPU
+/// `Isolator` shader parity with [`apply_video_isolator`].
+pub fn isolator_video_uniforms(iso: &BandIsolator, amount: f32) -> ([f32; 5], u32, u32, f32) {
+    let amt = amount.clamp(0.0, 1.0);
+    let raw = iso.band_audibility();
+    let gains = std::array::from_fn(|b| 1.0 + (raw[b] - 1.0) * amt);
+    let ch = match iso.ch_mode {
+        IsolatorChannelMode::Stereo => 0,
+        IsolatorChannelMode::Mid => 1,
+        IsolatorChannelMode::Side => 2,
+    };
+    let mon = match iso.monitor {
+        IsolatorMonitor::Off => 0,
+        IsolatorMonitor::Left => 1,
+        IsolatorMonitor::Right => 2,
+        IsolatorMonitor::Mid => 3,
+        IsolatorMonitor::Side => 4,
+    };
+    let mut exp_gain = 10.0f32.powf(iso.output_db.clamp(-24.0, 12.0) / 40.0).clamp(0.20, 1.80);
+    if iso.dim {
+        exp_gain *= 10.0f32.powf(iso.dim_db.clamp(-48.0, 0.0) / 36.0).clamp(0.08, 1.0);
+    }
+    let eff_exp = 1.0 + (exp_gain - 1.0) * amt;
+    (gains, ch, mon, eff_exp)
+}
+
+fn box_blur_rgb(src: &[u8], w: usize, h: usize, radius: usize) -> Vec<[f32; 3]> {
+    let n = w * h;
+    let mut tmp = vec![[0.0f32; 3]; n];
+    let mut out = vec![[0.0f32; 3]; n];
+    if n == 0 || radius == 0 {
+        for i in 0..n {
+            let p = i * 4;
+            out[i] = [
+                src[p] as f32 / 255.0,
+                src[p + 1] as f32 / 255.0,
+                src[p + 2] as f32 / 255.0,
+            ];
+        }
+        return out;
+    }
+    let r = radius as isize;
+    for y in 0..h {
+        let row = y * w;
+        for x in 0..w {
+            let x0 = (x as isize - r).max(0) as usize;
+            let x1 = (x as isize + r).min(w as isize - 1) as usize;
+            let inv = 1.0 / (x1 - x0 + 1) as f32;
+            let mut acc = [0.0f32; 3];
+            for xx in x0..=x1 {
+                let p = (row + xx) * 4;
+                acc[0] += src[p] as f32;
+                acc[1] += src[p + 1] as f32;
+                acc[2] += src[p + 2] as f32;
+            }
+            let scale = inv / 255.0;
+            tmp[row + x] = [acc[0] * scale, acc[1] * scale, acc[2] * scale];
+        }
+    }
+    for y in 0..h {
+        let y0 = (y as isize - r).max(0) as usize;
+        let y1 = (y as isize + r).min(h as isize - 1) as usize;
+        let inv = 1.0 / (y1 - y0 + 1) as f32;
+        for x in 0..w {
+            let mut acc = [0.0f32; 3];
+            for yy in y0..=y1 {
+                let c = tmp[yy * w + x];
+                acc[0] += c[0];
+                acc[1] += c[1];
+                acc[2] += c[2];
+            }
+            out[y * w + x] = [acc[0] * inv, acc[1] * inv, acc[2] * inv];
+        }
+    }
+    out
+}
+
+/// 1:1 visual counterpart of [`BandIsolator`] (`ISOL8`):
+/// Exact 5-band partition of unity (`orig === LF + LMF + MF + HMF + HF`):
+/// - `HF` (`> X4`): fine high-spatial-frequency edge detail (`orig - blur_med`)
+/// - `HMF` (`X3..X4`): medium-high spatial structure (`blur_med - blur_coarse`) + bright highlights
+/// - `MF` (`X2..X3`): midrange Bernstein tonal body (`3 Y^2 (1 - Y)`)
+/// - `LMF` (`X1..X2`): warm low-mid tonal body (`3 Y (1 - Y)^2`)
+/// - `LF` (`< X1`): deep shadow & low-spatial DC mass (`0.35 + 0.65 (1 - Y)^3` of `blur_coarse`)
+/// Plus `Mid / Side` radial center-subject vs peripheral-frame isolation and `L / R / M / S` monitor!
+pub fn apply_video_isolator(frame: &mut Frame, iso: &BandIsolator, amount: f32) {
+    let amt = amount.clamp(0.0, 1.0);
+    if amt <= 1e-4 || !iso.is_active() || frame.width == 0 || frame.height == 0 {
+        return;
+    }
+    let w = frame.width as usize;
+    let h = frame.height as usize;
+    let (g, ch_mode, mon_mode, eff_exp) = isolator_video_uniforms(iso, amt);
+    let filter_on = g.iter().any(|&v| (v - 1.0).abs() > 1e-4);
+
+    let (blur_med, blur_coarse) = if filter_on {
+        let min_dim = w.min(h).max(1);
+        let r_med = (min_dim / 42).clamp(2, 10);
+        let r_coarse = (min_dim / 12).clamp(6, 28);
+        (
+            box_blur_rgb(&frame.data, w, h, r_med),
+            box_blur_rgb(&frame.data, w, h, r_coarse),
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
+    let only_high_solo = filter_on && g[0] < 0.05 && g[1] < 0.05 && g[2] < 0.05 && (g[3] > 0.5 || g[4] > 0.5);
+
+    for y in 0..h {
+        let v = (y as f32 + 0.5) / h as f32;
+        for x in 0..w {
+            let u = (x as f32 + 0.5) / w as f32;
+            let idx = y * w + x;
+            let p = idx * 4;
+            if frame.data[p + 3] == 0 {
+                continue;
+            }
+            let orig = [
+                frame.data[p] as f32 / 255.0,
+                frame.data[p + 1] as f32 / 255.0,
+                frame.data[p + 2] as f32 / 255.0,
+            ];
+
+            // Radial center-subject (`w_mid`) vs peripheral-frame (`w_side`) mask.
+            let dist = (((u - 0.5) * 1.15).powi(2) + (v - 0.5).powi(2)).sqrt();
+            let t_rad = ((0.70 - dist) / (0.70 - 0.16)).clamp(0.0, 1.0);
+            let w_mid = t_rad * t_rad * (3.0 - 2.0 * t_rad);
+            let w_side = 1.0 - w_mid;
+
+            let mut rgb = if filter_on {
+                let bm = blur_med[idx];
+                let bc = blur_coarse[idx];
+                let y_luma = (0.2126 * bc[0] + 0.7152 * bc[1] + 0.0722 * bc[2]).clamp(0.0, 1.0);
+                let inv_y = 1.0 - y_luma;
+                // Exact partition of unity: c0 + c1 + c2 + c3 == 1.0!
+                let c0 = 0.35 + 0.65 * inv_y * inv_y * inv_y;
+                let c1 = 0.65 * 3.0 * y_luma * inv_y * inv_y;
+                let c2 = 0.65 * 3.0 * y_luma * y_luma * inv_y;
+                let c3 = 0.65 * y_luma * y_luma * y_luma;
+
+                let mut band_sum = [0.0f32; 3];
+                for c in 0..3 {
+                    let d_hf = orig[c] - bm[c];
+                    let d_hmf = bm[c] - bc[c];
+                    let mut val = g[0] * (c0 * bc[c])
+                        + g[1] * (c1 * bc[c])
+                        + g[2] * (c2 * bc[c])
+                        + g[3] * (c3 * bc[c] + d_hmf)
+                        + g[4] * d_hf;
+                    if only_high_solo && g[3] < 0.05 {
+                        // Pure HF SOLO: render bipolar edge energy as crisp luminous contours!
+                        val = (d_hf.abs() * 2.4 * g[4]).min(1.0);
+                    }
+                    band_sum[c] = val;
+                }
+                match ch_mode {
+                    1 => [
+                        band_sum[0] * w_mid + orig[0] * w_side,
+                        band_sum[1] * w_mid + orig[1] * w_side,
+                        band_sum[2] * w_mid + orig[2] * w_side,
+                    ],
+                    2 => [
+                        orig[0] * w_mid + band_sum[0] * w_side,
+                        orig[1] * w_mid + band_sum[1] * w_side,
+                        orig[2] * w_mid + band_sum[2] * w_side,
+                    ],
+                    _ => band_sum,
+                }
+            } else {
+                orig
+            };
+
+            let mon_mask = match mon_mode {
+                1 => {
+                    let s = ((0.54 - u) / 0.08).clamp(0.0, 1.0);
+                    0.18 + 0.82 * s
+                }
+                2 => {
+                    let s = ((u - 0.46) / 0.08).clamp(0.0, 1.0);
+                    0.18 + 0.82 * s
+                }
+                3 => 0.16 + 0.84 * w_mid,
+                4 => 0.14 + 0.86 * w_side,
+                _ => 1.0,
+            };
+            let mon_blend = 1.0 + (mon_mask - 1.0) * amt;
+            for c in 0..3 {
+                let v_out = (rgb[c] * mon_blend * eff_exp).clamp(0.0, 1.0);
+                rgb[c] = v_out;
+            }
+            frame.data[p] = (rgb[0] * 255.0).round() as u8;
+            frame.data[p + 1] = (rgb[1] * 255.0).round() as u8;
+            frame.data[p + 2] = (rgb[2] * 255.0).round() as u8;
         }
     }
 }
@@ -2301,6 +2573,82 @@ mod tests {
             assert!((l1[i] - l2[i]).abs() < 1e-6);
             assert!((r1[i] - r2[i]).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn isolator_effect_audio_and_video_band_correspondence() {
+        let mut fx = AvEffect::new(EffectKind::parse("isol8").expect("parse isol8"));
+        assert_eq!(fx.kind.name(), "isolator");
+
+        // Unmuted default isolator is an exact passthrough on video.
+        let clip = VideoClip::test_pattern(64, 64, 24.0, 0.1);
+        let mut orig = clip.frames[0].clone();
+        // Stamp fine 2px high-frequency detail onto the test frame so HF edge detail is present.
+        for y in 16..48 {
+            for x in 16..48 {
+                if ((x / 2) + (y / 2)) % 2 == 0 {
+                    let p = (y * 64 + x) * 4;
+                    orig.data[p] = orig.data[p].saturating_add(90);
+                    orig.data[p + 1] = orig.data[p + 1].saturating_add(90);
+                    orig.data[p + 2] = orig.data[p + 2].saturating_add(90);
+                }
+            }
+        }
+        let mut f_pass = orig.clone();
+        if let EffectKind::Isolator(iso) = fx.kind {
+            apply_video_isolator(&mut f_pass, &iso, 1.0);
+        }
+        assert_eq!(orig.data, f_pass.data, "unmuted default isolator leaves frame bit-identical");
+
+        // Muting LF cuts low-spatial shadow mass (luma drops); muting HF softens sharp edges!
+        fx.set_param("mute_lf", 1.0).unwrap();
+        let mut f_no_lf = orig.clone();
+        let mut vstates = video_chain_states(std::slice::from_ref(&fx), 24.0);
+        apply_video_chain(&mut f_no_lf, std::slice::from_ref(&fx), &mut vstates);
+        assert!(f_no_lf.mean_luma() < orig.mean_luma() * 0.85, "muting LF cuts low-spatial mass");
+
+        let mut fx_no_hf = AvEffect::new(EffectKind::parse("isolator").unwrap());
+        fx_no_hf.set_param("mute_hf", 1.0).unwrap();
+        let mut f_no_hf = orig.clone();
+        apply_video_chain(&mut f_no_hf, std::slice::from_ref(&fx_no_hf), &mut vstates);
+        let edge_energy = |fr: &Frame| -> f32 {
+            let w = fr.width as usize;
+            let mut sum = 0.0f32;
+            for y in 1..fr.height as usize {
+                for x in 1..w {
+                    let p = (y * w + x) * 4;
+                    let px = (y * w + x - 1) * 4;
+                    sum += (fr.data[p] as f32 - fr.data[px] as f32).abs();
+                }
+            }
+            sum
+        };
+        assert!(edge_energy(&f_no_hf) < edge_energy(&orig) * 0.85, "muting HF softens crisp edges");
+
+        // Mid vs Side monitor isolates center subject vs peripheral frame!
+        let mut white = Frame::black(64, 64);
+        for px in white.data.chunks_exact_mut(4) {
+            px[0] = 220;
+            px[1] = 220;
+            px[2] = 220;
+            px[3] = 255;
+        }
+        let mut f_mid = white.clone();
+        let mut f_side = white.clone();
+        apply_video_isolator(
+            &mut f_mid,
+            &BandIsolator { monitor: IsolatorMonitor::Mid, ..Default::default() },
+            1.0,
+        );
+        apply_video_isolator(
+            &mut f_side,
+            &BandIsolator { monitor: IsolatorMonitor::Side, ..Default::default() },
+            1.0,
+        );
+        let center_idx = (32 * 64 + 32) * 4;
+        let corner_idx = (2 * 64 + 2) * 4;
+        assert!(f_mid.data[center_idx] > f_mid.data[corner_idx] + 100, "Mid isolates center subject");
+        assert!(f_side.data[corner_idx] > f_side.data[center_idx] + 100, "Side isolates peripheral frame");
     }
 }
 

@@ -544,6 +544,8 @@ pub struct Instrument {
     layout: crate::tile::Layout,
     layout_pan: bool,
     tiles: crate::tile::TileAssigner,
+    isolator: crate::dsp::BandIsolator,
+    isolator_state: crate::dsp::IsolatorState,
 }
 
 impl Instrument {
@@ -588,6 +590,8 @@ impl Instrument {
             layout: crate::tile::Layout::Stack,
             layout_pan: true,
             tiles: crate::tile::TileAssigner::new(),
+            isolator: crate::dsp::BandIsolator::default(),
+            isolator_state: crate::dsp::IsolatorState::new(sample_rate),
         };
         inst.rebuild_fx();
         inst
@@ -597,6 +601,7 @@ impl Instrument {
     pub fn reset(&mut self, sample_rate: u32) {
         self.sample_rate = sample_rate.max(1);
         self.scratch.sample_rate = self.sample_rate;
+        self.isolator_state = crate::dsp::IsolatorState::new(self.sample_rate);
         self.voices.clear();
         self.grains.clear();
         for p in &mut self.pads {
@@ -960,7 +965,7 @@ impl Instrument {
                 return;
             }
             let map = self.macro_map();
-            let ratio = semitones_to_ratio(map.pitch_st);
+            let ratio = semitones_to_ratio(map.pitch_st + slot.sculpt.pitch_semitones);
             let dur = ((sl.len() / ratio.max(0.01) as f64) as f32).clamp(0.015, 30.0);
             let comb_hz = if slot.sculpt.comb_mix > 1e-3 {
                 crate::grain::quantize_comb_hz(base_hz.max(40.0) * ratio, self.key.as_ref())
@@ -1030,12 +1035,13 @@ impl Instrument {
             return;
         }
         let note = PAD_NOTE + i as u8;
+        let pitch_note = (60.0 + slot.sculpt.pitch_semitones).round().clamp(12.0, 115.0) as u8;
         self.start_voice(
             note,
             velocity,
             slot.source,
             sl.start,
-            60,
+            pitch_note,
             Some(sl.end),
             adsr,
             true,
@@ -1290,7 +1296,11 @@ impl Instrument {
                     if choke_group > 0 {
                         self.choke_group_at(choke_group, sub_t);
                     }
-                    let st = g.pitch + step.pitch + g.pitch_jitter * jit + sub as f32 * step.ratchet_pitch;
+                    let st = g.pitch
+                        + sculpt.pitch_semitones
+                        + step.pitch
+                        + g.pitch_jitter * jit
+                        + sub as f32 * step.ratchet_pitch;
                     let ratio = crate::music::effective_ratio(st, key.as_ref(), base_hz, g.quantize_amount, g.detune_cents);
                     let mut dur = crate::seq::hit_duration(&g, &step, chop, ratio);
                     if r_count > 1 {
@@ -1303,6 +1313,14 @@ impl Instrument {
                         0.0
                     };
                     let slot_u = if r_count == 1 { k as u64 } else { (k as u64).wrapping_mul(8).wrapping_add(sub as u64) };
+                    let hit_env = if sculpt.sub_exciter > 0.1
+                        || sculpt.snare_snap > 0.1
+                        || sculpt.comb_mix > 0.2
+                    {
+                        g.envelope.min(0.04)
+                    } else {
+                        g.envelope
+                    };
                     let mut ev = GrainEvent {
                         onset: sub_t,
                         source_pos: pos,
@@ -1310,7 +1328,7 @@ impl Instrument {
                         pitch_ratio: ratio,
                         gain: g.gain * step.gain * sub_gain,
                         pan: g.pan.clamp(-1.0, 1.0),
-                        envelope: g.envelope,
+                        envelope: hit_env,
                         env_skew: g.env_skew,
                         reverse: g.reverse_prob >= 0.5,
                         id: (1u64 << 62) | ((ri as u64) << 40) | (slot_u & 0xFF_FFFF_FFFF),
@@ -1404,6 +1422,11 @@ impl Instrument {
         // LOOK.
         if let Some(fx) = &self.looks[map.look] {
             fx::process_audio_chain(left, right, std::slice::from_ref(fx), &mut self.look_states[map.look]);
+        }
+        // ISOL8 5-band frequency isolator (allocation-free).
+        if self.isolator.is_active() {
+            self.isolator_state
+                .process_block(left, right, &self.isolator, self.sample_rate);
         }
         // Same soft clip as the master bus.
         for s in left.iter_mut().chain(right.iter_mut()) {
@@ -1536,6 +1559,15 @@ impl Instrument {
         self.launch_q
     }
 
+    /// Set the master 5-band `24 dB/Oct` `ISOL8` frequency isolator live (`0` heap allocations).
+    pub fn set_isolator(&mut self, isolator: crate::dsp::BandIsolator) {
+        self.isolator = isolator;
+    }
+
+    pub fn isolator(&self) -> crate::dsp::BandIsolator {
+        self.isolator
+    }
+
     /// Start / stop a pad on the next launch-grid line of the host's beat
     /// grid (free-running at the host tempo while it is stopped). Pressing
     /// a pad whose launch is still queued cancels it. Empty pads ignore it.
@@ -1650,7 +1682,19 @@ impl Instrument {
             if !p.on && releasing_until.is_none_or(|end| p.next_t >= end) {
                 continue;
             }
-            let Some(len) = self.sources.get(slot.source).map(|s| s.duration()).filter(|l| *l > 0.0) else { continue };
+            let Some((len, base_hz)) = self
+                .sources
+                .get(slot.source)
+                .and_then(|s| (s.duration() > 0.0).then_some((s.duration(), s.effective_base_hz())))
+            else {
+                continue;
+            };
+            let pad_ratio = semitones_to_ratio(slot.sculpt.pitch_semitones);
+            let pad_comb_hz = if slot.sculpt.comb_mix > 1e-3 {
+                crate::grain::quantize_comb_hz(base_hz.max(40.0) * pad_ratio, self.key.as_ref())
+            } else {
+                0.0
+            };
             let mut next_t = p.next_t;
             let mut k = p.k;
             // Never look ahead past a queued stop.
@@ -1675,7 +1719,7 @@ impl Instrument {
                         onset: next_t,
                         source_pos: (slot.start as f64 * len).rem_euclid(len),
                         duration: dur_out as f32,
-                        pitch_ratio: 1.0,
+                        pitch_ratio: pad_ratio,
                         gain: slot.gain * p.velocity * ebb,
                         pan: 0.0,
                         envelope: env_taper,
@@ -1683,7 +1727,7 @@ impl Instrument {
                         reverse: false,
                         id,
                         sculpt: slot.sculpt,
-                        comb_hz: 0.0,
+                        comb_hz: pad_comb_hz,
                         loop_pass: pass_k,
                         ..Default::default()
                     };
@@ -1719,7 +1763,7 @@ impl Instrument {
                         onset: next_t,
                         source_pos: (slot.start as f64 * len + phase).rem_euclid(len),
                         duration: PAD_GRAIN as f32,
-                        pitch_ratio: 1.0,
+                        pitch_ratio: pad_ratio,
                         gain: slot.gain * p.velocity * ebb,
                         pan: 0.0,
                         envelope: 1.0,
@@ -1727,7 +1771,7 @@ impl Instrument {
                         reverse: false,
                         id,
                         sculpt: slot.sculpt,
-                        comb_hz: 0.0,
+                        comb_hz: pad_comb_hz,
                         loop_pass: pass_k,
                         ..Default::default()
                     };
@@ -1777,6 +1821,9 @@ impl Instrument {
         out.style = VisualGrainStyle::morph(0.35, &VisualGrainStyle::default(), map.texture);
         out.link = AvLink::default();
         out.effects.clear();
+        if out.effects.capacity() < 4 {
+            out.effects.reserve(4);
+        }
         let mut smear = self.smear_chain;
         if let EffectKind::Delay { feedback, mix, .. } = &mut smear[0].kind {
             *feedback = map.echo_feedback;
@@ -1787,6 +1834,9 @@ impl Instrument {
         }
         out.effects.extend(smear);
         out.effects.extend(self.looks[map.look]);
+        if self.isolator.is_active() {
+            out.effects.push(AvEffect::new(EffectKind::Isolator(self.isolator)));
+        }
         out.look = map.look;
         out.layout = self.layout;
     }

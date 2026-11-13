@@ -114,7 +114,7 @@ fn snippet_events(
         )
     };
 
-    let base_ratio = quantized(g.pitch, g);
+    let base_ratio = quantized(g.pitch + eff_sculpt.pitch_semitones, g);
     let eff_speed0 = if g.varispeed { base_ratio } else { g.speed };
 
     // Asynchronous real-seconds Basinski tape loop (`free_loop_secs`) independent
@@ -224,6 +224,7 @@ fn snippet_events(
             clip_t0,
             clip_len,
             secs_per_beat,
+            eff_sculpt.pitch_semitones,
             &quantized,
         ));
     }
@@ -311,7 +312,7 @@ fn snippet_events(
         } else {
             crate::auto::settings_at(g, &clip.automation, t / secs_per_beat.max(1e-9))
         };
-        let ratio = quantized(eff.pitch, &eff);
+        let ratio = quantized(eff.pitch + eff_sculpt.pitch_semitones, &eff);
         let speed = if eff.varispeed { ratio } else { eff.speed };
         let nom_pos = head.rem_euclid(source_len.max(1e-6));
         let rev = eff.reverse_prob >= 0.5;
@@ -374,7 +375,7 @@ fn snippet_video_events(
         source.effective_base_hz()
     };
     let base_ratio = crate::music::effective_ratio(
-        g.pitch,
+        g.pitch + eff_sculpt.pitch_semitones,
         clip.key.as_ref(),
         bh,
         g.quantize_amount,
@@ -424,6 +425,7 @@ fn textured_events(
     clip_t0: f64,
     clip_len: f64,
     secs_per_beat: f64,
+    sculpt_pitch: f32,
     quantized: &dyn Fn(f32, &crate::grain::GrainSettings) -> f32,
 ) -> Vec<GrainEvent> {
     let g = &clip.grains;
@@ -450,7 +452,7 @@ fn textured_events(
         let jitter = tex as f64 * hop * 0.5 * rng.bipolar() as f64;
         let onset_t = (t + jitter).max(0.0);
         let pos = head + tex as f64 * eff.spray as f64 * rng.bipolar() as f64;
-        let st = eff.pitch + tex * eff.pitch_jitter * rng.bipolar();
+        let st = eff.pitch + sculpt_pitch + tex * eff.pitch_jitter * rng.bipolar();
         let pan = eff.pan + tex * eff.pan_spread.clamp(0.0, 1.0) * rng.bipolar();
         let reverse = if tex < 0.5 {
             eff.reverse_prob >= 0.5
@@ -694,11 +696,26 @@ pub fn plan_project(project: &Project) -> Vec<ClipPlan> {
                         &clip.automation,
                     );
                     if track.sculpt.is_active() || track.choke_group > 0 {
-                        for (_, evs) in &mut parts {
+                        for (sid, evs) in &mut parts {
+                            let bh = project
+                                .sources
+                                .get(*sid)
+                                .map_or(440.0, |s| s.effective_base_hz());
                             for e in evs {
                                 if !e.sculpt.is_active() && track.sculpt.is_active() {
                                     e.sculpt = track.sculpt;
                                     e.tag.is_wash = track.sculpt.is_wash();
+                                    if track.sculpt.pitch_semitones.abs() > 1e-4 {
+                                        e.pitch_ratio *= crate::music::semitones_to_ratio(
+                                            track.sculpt.pitch_semitones,
+                                        );
+                                    }
+                                    if track.sculpt.comb_mix > 1e-3 && e.comb_hz <= 0.0 {
+                                        e.comb_hz = crate::grain::quantize_comb_hz(
+                                            bh.max(40.0) * e.pitch_ratio,
+                                            clip.key.as_ref(),
+                                        );
+                                    }
                                 }
                                 if e.tag.choke_group == 0 && track.choke_group > 0 {
                                     e.tag.choke_group = track.choke_group.min(4);
@@ -720,7 +737,7 @@ pub fn plan_project(project: &Project) -> Vec<ClipPlan> {
                                 .map(|s| s.effective_base_hz())
                                 .unwrap_or(440.0);
                             crate::music::effective_ratio(
-                                clip.grains.pitch,
+                                clip.grains.pitch + eff_sculpt.pitch_semitones,
                                 clip.key.as_ref(),
                                 bh,
                                 clip.grains.quantize_amount,
@@ -1379,6 +1396,15 @@ pub fn render_project(project: &Project, from_beat: f64, to_beat: f64) -> Render
             *s *= g;
         }
     }
+    if project.isolator.is_active() {
+        let mut iso_state = crate::dsp::IsolatorState::new(project.sample_rate);
+        iso_state.process_block(
+            &mut master_audio.left,
+            &mut master_audio.right,
+            &project.isolator,
+            project.sample_rate,
+        );
+    }
     let bloom_luma: Vec<f32> = if project.master_bloom > 1e-4 && n_frames > 0 && !master_audio.left.is_empty() {
         let b_amt = project.master_bloom.clamp(0.0, 1.0);
         let spf = ((project.sample_rate as f64 / project.fps.max(1.0) as f64).round() as usize).max(1);
@@ -1418,6 +1444,9 @@ pub fn render_project(project: &Project, from_beat: f64, to_beat: f64) -> Render
         fx::apply_video_chain(frame, &project.master_effects, &mut master_states);
         if project.master_tape.is_active() {
             apply_video_tape(frame, &project.master_tape, fi, project.fps, 0x4D41_5354);
+        }
+        if project.isolator.is_active() {
+            fx::apply_video_isolator(frame, &project.isolator, 1.0);
         }
         if let Some(&bl) = bloom_luma.get(fi) {
             if bl > 0.02 {
@@ -2688,5 +2717,61 @@ mod tests {
         assert!(!draws.is_empty());
         assert_eq!(draws[0].dest, [0.0, 0.0, 1.0, 1.0], "MODELL 5 micro-burst fills full frame in Stack");
         assert!(draws[0].tiled, "hard-edged zero-feather cut");
+    }
+
+    #[test]
+    fn snippet_sculpt_pitch_and_master_isolator_stream_sample_exact() {
+        let mut p = Project {
+            bpm: 120.0,
+            sample_rate: 48_000,
+            width: 64,
+            height: 64,
+            fps: 24.0,
+            ..Default::default()
+        };
+        let sid = p.add_source(crate::timeline::Source {
+            name: "s".into(),
+            audio: Some(std::sync::Arc::new(crate::audio::AudioClip::saw_stack(220.0, 2.0, 48_000))),
+            video: Some(std::sync::Arc::new(VideoClip::test_pattern(64, 64, 24.0, 2.0))),
+            base_hz: 220.0,
+            ..Default::default()
+        });
+        let tid = p.add_track("hat_snip");
+        let mut c = Clip::new_snippet(sid, 0.0, 1.0);
+        c.grains.sculpt = crate::grain::VoiceSculpt::preset(crate::grain::Stamp::Hat); // +10 st
+        p.tracks[tid].clips.push(c);
+
+        // Snippet event honors Stamp::Hat +10st pitch transposition!
+        let plan = plan_project(&p);
+        let ratio = plan[0].parts[0].1[0].pitch_ratio;
+        assert!(
+            (ratio - crate::music::semitones_to_ratio(10.0)).abs() < 1e-4,
+            "Snippet applies Stamp::Hat +10st: {ratio}"
+        );
+
+        // Engage master ISOL8 (LMF+MF+HMF SOLO + -3 dB output) and verify sample-exact
+        // parity between offline `render_project` and chunked `RealtimeAudio`!
+        p.isolator.solo = [false, true, true, true, false];
+        p.isolator.output_db = -3.0;
+        let offline = render_project(&p, 0.0, 1.0);
+
+        let mut rt = crate::realtime::RealtimeAudio::new(p, 0.0, None);
+        let n = offline.audio.len();
+        let mut l = vec![0.0f32; n];
+        let mut r = vec![0.0f32; n];
+        let mut pos = 0;
+        while pos < n {
+            let blk = 256.min(n - pos);
+            rt.next_block(&mut l[pos..pos + blk], &mut r[pos..pos + blk]);
+            pos += blk;
+        }
+        let max_diff = offline
+            .audio
+            .left
+            .iter()
+            .zip(&l)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_diff < 1e-6, "RealtimeAudio + ISOL8 matches render_project sample-exactly: {max_diff}");
     }
 }
