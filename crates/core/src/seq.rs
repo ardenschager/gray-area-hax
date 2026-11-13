@@ -365,6 +365,7 @@ pub fn pattern_events(
                             break;
                         }
                         let st = g.pitch
+                            + sculpt.pitch_semitones
                             + step.pitch
                             + g.pitch_jitter * pitch_j
                             + sub as f32 * step.ratchet_pitch;
@@ -394,6 +395,14 @@ pub fn pattern_events(
                         } else {
                             (slot as u64).wrapping_mul(8).wrapping_add(sub as u64)
                         };
+                        let hit_env = if sculpt.sub_exciter > 0.1
+                            || sculpt.snare_snap > 0.1
+                            || sculpt.comb_mix > 0.2
+                        {
+                            g.envelope.min(0.04)
+                        } else {
+                            g.envelope
+                        };
                         let mut ev = GrainEvent {
                             onset: clip_start_secs + sub_t,
                             source_pos: pos,
@@ -401,7 +410,7 @@ pub fn pattern_events(
                             pitch_ratio: ratio,
                             gain: g.gain * step.gain * sub_gain,
                             pan: (g.pan + g.pan_spread * pan_j).clamp(-1.0, 1.0),
-                            envelope: g.envelope,
+                            envelope: hit_env,
                             env_skew: g.env_skew,
                             reverse: rev_j < g.reverse_prob,
                             id,
@@ -470,7 +479,7 @@ pub fn pattern_events(
                         let sculpt = eff_sculpt_for(&g);
                         let choke_group = eff_choke_for(&g);
                         let ratio = crate::music::effective_ratio(
-                            g.pitch,
+                            g.pitch + sculpt.pitch_semitones,
                             key,
                             base_hz,
                             g.quantize_amount,
@@ -545,7 +554,7 @@ pub fn pattern_events(
                         let sculpt = eff_sculpt_for(&g);
                         let choke_group = eff_choke_for(&g);
                         let ratio = crate::music::effective_ratio(
-                            g.pitch,
+                            g.pitch + sculpt.pitch_semitones,
                             key,
                             base_hz,
                             g.quantize_amount,
@@ -935,5 +944,62 @@ mod tests {
             .map(|w| (w[1] - w[0]).abs())
             .fold(0.0f32, f32::max);
         assert!(max_jump < 0.12, "80ms crossfaded seam is click-free: max_jump={max_jump}");
+    }
+
+    #[test]
+    fn step_pattern_kick_and_hat_apply_sculpt_pitch_and_studio_weight_sub() {
+        let sr = 48_000u32;
+        // 0.75-peak 380 Hz exponentially decaying desk tap (`tau = 25ms`).
+        let mut tap = vec![0.0f32; (0.5 * sr as f64) as usize];
+        for (i, s) in tap.iter_mut().enumerate() {
+            let t = i as f64 / sr as f64;
+            *s = 0.75 * (std::f64::consts::TAU * 380.0 * t).sin() as f32 * (-t / 0.025).exp() as f32;
+        }
+        let sources = vec![Source {
+            name: "desk_tap".into(),
+            audio: Some(std::sync::Arc::new(crate::audio::AudioClip::new(tap, sr))),
+            base_hz: 380.0,
+            ..Default::default()
+        }];
+        let mut pat = StepPattern::new("tap_kit");
+        let r_kick = pat.add_row(0);
+        pat.rows[r_kick].sculpt = VoiceSculpt::preset(crate::grain::Stamp::Kick);
+        pat.rows[r_kick].steps[0].on = true;
+
+        let r_hat = pat.add_row(0);
+        pat.rows[r_hat].sculpt = VoiceSculpt::preset(crate::grain::Stamp::Hat);
+        pat.rows[r_hat].steps[4].on = true;
+
+        let parts = pattern_events(&pat, &sources, 0.0, 1.0, 0.5, None, &[]);
+        let kick_ev = &parts[0].1[0];
+        let hat_ev = &parts[1].1[0];
+        assert!(
+            (kick_ev.pitch_ratio - crate::music::semitones_to_ratio(-14.0)).abs() < 1e-4,
+            "Stamp::Kick -14st applied in StepPattern: {}",
+            kick_ev.pitch_ratio
+        );
+        assert!(
+            (hat_ev.pitch_ratio - crate::music::semitones_to_ratio(10.0)).abs() < 1e-4,
+            "Stamp::Hat +10st applied in StepPattern: {}",
+            hat_ev.pitch_ratio
+        );
+
+        let mut buf = crate::audio::StereoBuffer::new(0.45, sr);
+        crate::audio::render_grains_audio(
+            sources[0].audio.as_deref().unwrap(),
+            std::slice::from_ref(kick_ev),
+            &mut buf,
+            0.0,
+        );
+        let peak = buf.left.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        assert!(
+            (0.24..=0.72).contains(&peak),
+            "StepPattern Stamp::Kick on 0.75-peak 380Hz tap hits healthy drum level (-12..-3 dBFS), got peak={peak:.4}"
+        );
+        let mut lp = crate::dsp::Biquad::new(crate::dsp::FilterKind::LowPass, sr as f32, 95.0, 0.707);
+        let mut sub_only = buf.left[..(0.25 * sr as f64) as usize].to_vec();
+        lp.process_buffer(&mut sub_only);
+        let sub_rms = (sub_only.iter().map(|x| x * x).sum::<f32>() / sub_only.len() as f32).sqrt();
+        assert!(sub_rms >= 0.04, "Kick sub_exciter delivers solid <95Hz RMS >= 0.04, got {sub_rms:.4}");
     }
 }

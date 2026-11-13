@@ -506,7 +506,10 @@ pub fn oxide_dropout_at(disintegrate: f32, pass_index: u32, elapsed_secs: f64, s
     if d <= 1e-4 {
         return 0.0;
     }
-    let wear = (d * (0.12 + 0.22 * pass_index as f32 + 0.018 * elapsed_secs.max(0.0) as f32)).clamp(0.0, 0.96);
+    // Smooth, non-saturating exponential oxide wear across 0..24+ passes.
+    let pass_wear =
+        1.0 - (-0.115 * (pass_index as f32 + 0.35) - 0.010 * elapsed_secs.max(0.0) as f32).exp();
+    let wear = (d * pass_wear).clamp(0.0, 0.95);
     let p0 = ((seed & 0xFFFF) as f64) * 0.000_095;
     let p1 = (((seed >> 16) & 0xFFFF) as f64) * 0.000_095;
     let p2 = (((seed >> 32) & 0xFFFF) as f64) * 0.000_095;
@@ -515,10 +518,10 @@ pub fn oxide_dropout_at(disintegrate: f32, pass_index: u32, elapsed_secs: f64, s
     let w = 0.45 * (0.5 + 0.5 * (t * 1.73 + p0).sin())
         + 0.35 * (0.5 + 0.5 * (t * 4.31 + p1).sin())
         + 0.20 * (0.5 + 0.5 * (t * 11.17 + p2).sin());
-    let thresh = (1.02 - 0.88 * wear as f64).clamp(0.08, 1.0);
+    let thresh = (1.02 - 0.82 * wear as f64).clamp(0.10, 1.0);
     let flake = ((w - thresh) / (1.0 - thresh).max(0.08)).clamp(0.0, 1.0) as f32;
-    // Combine baseline progressive oxide loss + localized tape-flake dropouts.
-    (wear * 0.38 + flake * (0.35 + 0.60 * wear)).clamp(0.0, 0.96)
+    // Monotonic progressive baseline oxide loss + localized tape-flake dropouts.
+    (wear * 0.58 + flake * (0.20 + 0.36 * wear)).clamp(0.0, 0.95)
 }
 
 /// Slow asynchronous Caretaker/Eno breathing swell multiplier (`0.35..1.0`).

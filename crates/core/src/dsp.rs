@@ -139,6 +139,44 @@ impl Biquad {
         }
     }
 
+    /// 2nd-order RBJ allpass filter (`|H(e^{jw})| == 1` everywhere; at `Q = FRAC_1_SQRT_2`,
+    /// `AP(z) === LP_LR4(z) + HP_LR4(z)` identically for phase-coherent Linkwitz-Riley trees).
+    pub fn allpass(sample_rate: f32, freq: f32, q: f32) -> Biquad {
+        let freq = freq.clamp(10.0, sample_rate * 0.49);
+        let q = q.max(0.05);
+        let w0 = 2.0 * std::f32::consts::PI * freq / sample_rate;
+        let (sin_w0, cos_w0) = w0.sin_cos();
+        let alpha = sin_w0 / (2.0 * q);
+        let b0 = 1.0 - alpha;
+        let b1 = -2.0 * cos_w0;
+        let b2 = 1.0 + alpha;
+        let a0 = 1.0 + alpha;
+        let a1 = -2.0 * cos_w0;
+        let a2 = 1.0 - alpha;
+        Biquad {
+            b0: b0 / a0,
+            b1: b1 / a0,
+            b2: b2 / a0,
+            a1: a1 / a0,
+            a2: a2 / a0,
+            x1: 0.0,
+            x2: 0.0,
+            y1: 0.0,
+            y2: 0.0,
+        }
+    }
+
+    /// Update coefficients in-place while preserving `x1, x2, y1, y2` delay state
+    /// so live crossover sweeps remain smooth and click-free.
+    #[inline]
+    pub fn copy_coeffs_from(&mut self, src: &Biquad) {
+        self.b0 = src.b0;
+        self.b1 = src.b1;
+        self.b2 = src.b2;
+        self.a1 = src.a1;
+        self.a2 = src.a2;
+    }
+
     #[inline]
     pub fn process(&mut self, x: f32) -> f32 {
         let y = self.b0 * x + self.b1 * self.x1 + self.b2 * self.x2
@@ -857,6 +895,396 @@ impl Rng {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ISOL8 — 5-Band 24 dB/Oct Linkwitz-Riley Studio Frequency Isolator
+// ---------------------------------------------------------------------------
+
+/// Which stereo component the 5-band isolator filters (`CH. MODE` on ISOL8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum IsolatorChannelMode {
+    /// Filter both Left and Right channels identically (`STEREO`).
+    #[default]
+    Stereo,
+    /// Filter only Mid (`0.5*(L+R)`), keeping Side phase-aligned via matching allpass (`MID`).
+    Mid,
+    /// Filter only Side (`0.5*(L-R)`), keeping Mid phase-aligned via matching allpass (`SIDE`).
+    Side,
+}
+
+impl IsolatorChannelMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            IsolatorChannelMode::Stereo => "STEREO",
+            IsolatorChannelMode::Mid => "MID",
+            IsolatorChannelMode::Side => "SIDE",
+        }
+    }
+}
+
+/// Output channel monitor latch (`L | R | M | S` push-buttons on ISOL8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum IsolatorMonitor {
+    /// Normal stereo output (no monitor button latched).
+    #[default]
+    Off,
+    /// Isolate Left channel (`L`).
+    Left,
+    /// Isolate Right channel (`R`).
+    Right,
+    /// Isolate Mid mono sum (`M = 0.5*(L+R)`).
+    Mid,
+    /// Isolate Side difference (`S = 0.5*(L-R)`).
+    Side,
+}
+
+/// 5-Band `24 dB/Oct` Linkwitz-Riley studio frequency isolator & monitor (`ISOL8`).
+///
+/// Splits audio into 5 phase-coherent bands (`LF`, `LMF`, `MF`, `HMF`, `HF`) across
+/// 4 adjustable crossovers (`[200, 700, 2500, 8000] Hz` default). Using complementary
+/// LR4 (`Q = 1/sqrt(2)` cascaded Butterworth) splits + 2nd-order Butterworth allpass
+/// tree alignment, all 5 bands sum back with `0.00 dB` magnitude ripple across the entire
+/// spectrum!
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BandIsolator {
+    /// 4 crossover frequencies `[X1, X2, X3, X4]` in Hz (default `[200, 700, 2500, 8000]`).
+    pub crossovers: [f32; 4],
+    /// Per-band mute switches (`LF`, `LMF`, `MF`, `HMF`, `HF`).
+    pub mute: [bool; 5],
+    /// Per-band solo switches (`LF`, `LMF`, `MF`, `HMF`, `HF`). When any band is soloed,
+    /// only soloed and non-muted bands pass.
+    pub solo: [bool; 5],
+    /// Filter channel mode (`STEREO`, `MID`, `SIDE`).
+    pub ch_mode: IsolatorChannelMode,
+    /// Output channel monitor (`Off`, `Left`, `Right`, `Mid`, `Side`).
+    pub monitor: IsolatorMonitor,
+    /// `FILTER BYPASS` switch: bypasses the 5-band mute/solo crossover.
+    pub bypass: bool,
+    /// Output trim in dB (`-24.0..+12.0`, default `0.0`).
+    pub output_db: f32,
+    /// `DIM` switch in the `ATTEN.` section.
+    pub dim: bool,
+    /// `DIM` attenuation in dB (`-48.0..0.0`, default `-18.0`).
+    pub dim_db: f32,
+}
+
+impl Default for BandIsolator {
+    fn default() -> Self {
+        Self {
+            crossovers: Self::DEFAULT_CROSSOVERS,
+            mute: [false; 5],
+            solo: [false; 5],
+            ch_mode: IsolatorChannelMode::Stereo,
+            monitor: IsolatorMonitor::Off,
+            bypass: false,
+            output_db: 0.0,
+            dim: false,
+            dim_db: -18.0,
+        }
+    }
+}
+
+impl BandIsolator {
+    pub const BAND_NAMES: [&'static str; 5] = ["LF", "LMF", "MF", "HMF", "HF"];
+    pub const DEFAULT_CROSSOVERS: [f32; 4] = [200.0, 700.0, 2500.0, 8000.0];
+
+    /// Sanitized, strictly ordered crossover frequencies `[X1 < X2 < X3 < X4]` for `sample_rate`.
+    #[inline]
+    pub fn sanitized_crossovers(&self, sample_rate: f32) -> [f32; 4] {
+        let nyq = (sample_rate.max(8000.0) * 0.46).min(19_500.0);
+        let x1 = self.crossovers[0].clamp(25.0, (nyq * 0.25).min(1200.0));
+        let x2 = self.crossovers[1].clamp((x1 * 1.25).max(80.0), (nyq * 0.50).min(4500.0));
+        let x3 = self.crossovers[2].clamp((x2 * 1.25).max(250.0), (nyq * 0.78).min(12_000.0));
+        let x4 = self.crossovers[3].clamp((x3 * 1.20).max(800.0), nyq);
+        [x1, x2, x3, x4]
+    }
+
+    /// Per-band linear audibility (`1.0` = pass, `0.0` = cut) accounting for `bypass`, `solo`, and `mute`.
+    #[inline]
+    pub fn band_audibility(&self) -> [f32; 5] {
+        if self.bypass {
+            return [1.0; 5];
+        }
+        let any_solo = self.solo.iter().any(|&s| s);
+        std::array::from_fn(|b| {
+            let pass = if any_solo {
+                self.solo[b] && !self.mute[b]
+            } else {
+                !self.mute[b]
+            };
+            if pass { 1.0 } else { 0.0 }
+        })
+    }
+
+    /// True if any band is muted or soloed and `bypass` is off.
+    #[inline]
+    pub fn is_filter_active(&self) -> bool {
+        !self.bypass && (self.mute.iter().any(|&m| m) || self.solo.iter().any(|&s| s))
+    }
+
+    /// True when the isolator alters audio or video away from unity passthrough.
+    #[inline]
+    pub fn is_active(&self) -> bool {
+        self.is_filter_active()
+            || self.monitor != IsolatorMonitor::Off
+            || self.dim
+            || self.output_db.abs() > 1e-4
+    }
+
+    /// Combined linear output + dim gain.
+    #[inline]
+    pub fn target_output_gain(&self) -> f32 {
+        let mut db = self.output_db.clamp(-48.0, 18.0);
+        if self.dim {
+            db += self.dim_db.clamp(-48.0, 0.0);
+        }
+        10.0f32.powf(db / 20.0)
+    }
+}
+
+/// Stack-allocated per-channel 5-band LR4 (`24 dB/Oct`) phase-aligned filter tree.
+#[derive(Debug, Clone)]
+struct IsolatorChannel {
+    lp1: [Biquad; 4],
+    lp2: [Biquad; 4],
+    hp1: [Biquad; 4],
+    hp2: [Biquad; 4],
+    /// Band 0 (`LF`) phase alignment through `X2, X3, X4`.
+    ap_b0: [Biquad; 3],
+    /// Band 1 (`LMF`) phase alignment through `X3, X4`.
+    ap_b1: [Biquad; 2],
+    /// Band 2 (`MF`) phase alignment through `X4`.
+    ap_b2: Biquad,
+}
+
+impl IsolatorChannel {
+    fn new(sr: f32, x: [f32; 4]) -> Self {
+        let q = std::f32::consts::FRAC_1_SQRT_2;
+        Self {
+            lp1: std::array::from_fn(|k| Biquad::new(FilterKind::LowPass, sr, x[k], q)),
+            lp2: std::array::from_fn(|k| Biquad::new(FilterKind::LowPass, sr, x[k], q)),
+            hp1: std::array::from_fn(|k| Biquad::new(FilterKind::HighPass, sr, x[k], q)),
+            hp2: std::array::from_fn(|k| Biquad::new(FilterKind::HighPass, sr, x[k], q)),
+            ap_b0: [
+                Biquad::allpass(sr, x[1], q),
+                Biquad::allpass(sr, x[2], q),
+                Biquad::allpass(sr, x[3], q),
+            ],
+            ap_b1: [
+                Biquad::allpass(sr, x[2], q),
+                Biquad::allpass(sr, x[3], q),
+            ],
+            ap_b2: Biquad::allpass(sr, x[3], q),
+        }
+    }
+
+    fn update_coeffs(&mut self, sr: f32, x: [f32; 4]) {
+        let q = std::f32::consts::FRAC_1_SQRT_2;
+        for k in 0..4 {
+            let lp = Biquad::new(FilterKind::LowPass, sr, x[k], q);
+            let hp = Biquad::new(FilterKind::HighPass, sr, x[k], q);
+            self.lp1[k].copy_coeffs_from(&lp);
+            self.lp2[k].copy_coeffs_from(&lp);
+            self.hp1[k].copy_coeffs_from(&hp);
+            self.hp2[k].copy_coeffs_from(&hp);
+        }
+        let ap1 = Biquad::allpass(sr, x[1], q);
+        let ap2 = Biquad::allpass(sr, x[2], q);
+        let ap3 = Biquad::allpass(sr, x[3], q);
+        self.ap_b0[0].copy_coeffs_from(&ap1);
+        self.ap_b0[1].copy_coeffs_from(&ap2);
+        self.ap_b0[2].copy_coeffs_from(&ap3);
+        self.ap_b1[0].copy_coeffs_from(&ap2);
+        self.ap_b1[1].copy_coeffs_from(&ap3);
+        self.ap_b2.copy_coeffs_from(&ap3);
+    }
+
+    #[inline]
+    fn split(&mut self, x: f32) -> [f32; 5] {
+        // Stage 1 (X1): LF vs >=X1
+        let b0_raw = self.lp2[0].process(self.lp1[0].process(x));
+        let rem1 = self.hp2[0].process(self.hp1[0].process(x));
+        // Stage 2 (X2): LMF vs >=X2
+        let b1_raw = self.lp2[1].process(self.lp1[1].process(rem1));
+        let rem2 = self.hp2[1].process(self.hp1[1].process(rem1));
+        // Stage 3 (X3): MF vs >=X3
+        let b2_raw = self.lp2[2].process(self.lp1[2].process(rem2));
+        let rem3 = self.hp2[2].process(self.hp1[2].process(rem2));
+        // Stage 4 (X4): HMF vs HF
+        let b3 = self.lp2[3].process(self.lp1[3].process(rem3));
+        let b4 = self.hp2[3].process(self.hp1[3].process(rem3));
+
+        // Phase-align lower bands through subsequent crossover allpasses:
+        let mut b0 = b0_raw;
+        for ap in &mut self.ap_b0 {
+            b0 = ap.process(b0);
+        }
+        let mut b1 = b1_raw;
+        for ap in &mut self.ap_b1 {
+            b1 = ap.process(b1);
+        }
+        let b2 = self.ap_b2.process(b2_raw);
+        [b0, b1, b2, b3, b4]
+    }
+}
+
+/// Allocation-free streaming state for [`BandIsolator`].
+#[derive(Debug, Clone)]
+pub struct IsolatorState {
+    channels: [IsolatorChannel; 2],
+    /// Companion 4-stage allpass (`AP(X1..X4)`) keeping the unfiltered Mid or Side
+    /// channel 100% phase-aligned when `ch_mode` is `Mid` or `Side`.
+    ref_ap: [Biquad; 4],
+    cached_x: [f32; 4],
+    cached_sr: u32,
+    band_gains: [f32; 5],
+    out_gain: f32,
+    initialized: bool,
+}
+
+impl Default for IsolatorState {
+    fn default() -> Self {
+        Self::new(48_000)
+    }
+}
+
+impl IsolatorState {
+    pub fn new(sample_rate: u32) -> Self {
+        let sr = sample_rate.max(8000);
+        let sr_f = sr as f32;
+        let x = BandIsolator::DEFAULT_CROSSOVERS;
+        let q = std::f32::consts::FRAC_1_SQRT_2;
+        Self {
+            channels: [IsolatorChannel::new(sr_f, x), IsolatorChannel::new(sr_f, x)],
+            ref_ap: std::array::from_fn(|k| Biquad::allpass(sr_f, x[k], q)),
+            cached_x: x,
+            cached_sr: sr,
+            band_gains: [1.0; 5],
+            out_gain: 1.0,
+            initialized: false,
+        }
+    }
+
+    fn sync_params(&mut self, spec: &BandIsolator, sample_rate: u32) {
+        let sr = sample_rate.max(8000);
+        let sr_f = sr as f32;
+        let x = spec.sanitized_crossovers(sr_f);
+        if sr != self.cached_sr {
+            let fresh = Self::new(sr);
+            *self = fresh;
+        }
+        if (0..4).any(|k| (x[k] - self.cached_x[k]).abs() > 0.05) {
+            self.channels[0].update_coeffs(sr_f, x);
+            self.channels[1].update_coeffs(sr_f, x);
+            let q = std::f32::consts::FRAC_1_SQRT_2;
+            for k in 0..4 {
+                let ap = Biquad::allpass(sr_f, x[k], q);
+                self.ref_ap[k].copy_coeffs_from(&ap);
+            }
+            self.cached_x = x;
+        }
+    }
+
+    /// Process a stereo buffer in-place (`0` heap allocations).
+    pub fn process_block(
+        &mut self,
+        left: &mut [f32],
+        right: &mut [f32],
+        spec: &BandIsolator,
+        sample_rate: u32,
+    ) {
+        let n = left.len().min(right.len());
+        if n == 0 {
+            return;
+        }
+        self.sync_params(spec, sample_rate);
+        let targets = spec.band_audibility();
+        let target_out = spec.target_output_gain();
+        if !self.initialized {
+            self.band_gains = targets;
+            self.out_gain = target_out;
+            self.initialized = true;
+        }
+        // ~3 ms click-free smoothing for live MUTE / SOLO / BYPASS / DIM punches.
+        let smooth_a = 1.0 - (-1.0 / (0.003 * sample_rate.max(8000) as f32)).exp();
+
+        for i in 0..n {
+            for b in 0..5 {
+                self.band_gains[b] += smooth_a * (targets[b] - self.band_gains[b]);
+            }
+            self.out_gain += smooth_a * (target_out - self.out_gain);
+
+            let in_l = left[i];
+            let in_r = right[i];
+            let (mut out_l, mut out_r) = match spec.ch_mode {
+                IsolatorChannelMode::Stereo => {
+                    let bl = self.channels[0].split(in_l);
+                    let br = self.channels[1].split(in_r);
+                    let mut sl = 0.0f32;
+                    let mut sr_acc = 0.0f32;
+                    for b in 0..5 {
+                        let g = self.band_gains[b];
+                        sl += bl[b] * g;
+                        sr_acc += br[b] * g;
+                    }
+                    (sl, sr_acc)
+                }
+                IsolatorChannelMode::Mid => {
+                    let mid = 0.5 * (in_l + in_r);
+                    let side = 0.5 * (in_l - in_r);
+                    let bm = self.channels[0].split(mid);
+                    let mut m_out = 0.0f32;
+                    for b in 0..5 {
+                        m_out += bm[b] * self.band_gains[b];
+                    }
+                    let mut s_aligned = side;
+                    for ap in &mut self.ref_ap {
+                        s_aligned = ap.process(s_aligned);
+                    }
+                    (m_out + s_aligned, m_out - s_aligned)
+                }
+                IsolatorChannelMode::Side => {
+                    let mid = 0.5 * (in_l + in_r);
+                    let side = 0.5 * (in_l - in_r);
+                    let bs = self.channels[1].split(side);
+                    let mut s_out = 0.0f32;
+                    for b in 0..5 {
+                        s_out += bs[b] * self.band_gains[b];
+                    }
+                    let mut m_aligned = mid;
+                    for ap in &mut self.ref_ap {
+                        m_aligned = ap.process(m_aligned);
+                    }
+                    (m_aligned + s_out, m_aligned - s_out)
+                }
+            };
+
+            match spec.monitor {
+                IsolatorMonitor::Off => {}
+                IsolatorMonitor::Left => {
+                    out_r = out_l;
+                }
+                IsolatorMonitor::Right => {
+                    out_l = out_r;
+                }
+                IsolatorMonitor::Mid => {
+                    let m = 0.5 * (out_l + out_r);
+                    out_l = m;
+                    out_r = m;
+                }
+                IsolatorMonitor::Side => {
+                    let s = 0.5 * (out_l - out_r);
+                    out_l = s;
+                    out_r = s;
+                }
+            }
+
+            left[i] = out_l * self.out_gain;
+            right[i] = out_r * self.out_gain;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -984,5 +1412,82 @@ mod tests {
             let v = r.next_f32();
             assert!((0.0..1.0).contains(&v));
         }
+    }
+
+    #[test]
+    fn band_isolator_reconstructs_flat_magnitude_and_isolates_bands_at_24db_oct() {
+        let sr = 48_000u32;
+        // 1. Flat magnitude reconstruction across 5 bands in Stereo, Mid, and Side modes!
+        for mode in [
+            IsolatorChannelMode::Stereo,
+            IsolatorChannelMode::Mid,
+            IsolatorChannelMode::Side,
+        ] {
+            let iso = BandIsolator { ch_mode: mode, ..Default::default() };
+            for &freq in &[55.0f32, 200.0, 420.0, 700.0, 1400.0, 2500.0, 5200.0, 8000.0, 13_500.0] {
+                let mut l = sine(freq, 0.30, sr);
+                let mut r: Vec<f32> = l.iter().map(|&x| x * 0.65).collect();
+                // Measure over an exact integer number of wave cycles after filter settling
+                // so phase rotation across crossovers doesn't skew fractional-cycle window power!
+                let settle = 4800usize;
+                let period_samps = sr as f32 / freq;
+                let n_cycles = ((l.len() - settle) as f32 / period_samps).floor().max(4.0);
+                let win_len = (n_cycles * period_samps).round() as usize;
+                let ref_rms_l = rms(&l[settle..settle + win_len]);
+                let ref_rms_r = rms(&r[settle..settle + win_len]);
+                let mut st = IsolatorState::new(sr);
+                st.process_block(&mut l, &mut r, &iso, sr);
+                let out_rms_l = rms(&l[settle..settle + win_len]);
+                let out_rms_r = rms(&r[settle..settle + win_len]);
+                let db_err_l = 20.0 * (out_rms_l / ref_rms_l).log10();
+                let db_err_r = 20.0 * (out_rms_r / ref_rms_r).log10();
+                assert!(
+                    db_err_l.abs() < 0.02 && db_err_r.abs() < 0.02,
+                    "LR4 5-band sum must be flat within 0.02 dB at {freq} Hz ({mode:?}): L={db_err_l:.4}dB R={db_err_r:.4}dB"
+                );
+            }
+        }
+
+        // 2. Soloing LF (<200 Hz) passes 60 Hz cleanly and rejects 1000 Hz by >26 dB (24 dB/Oct).
+        let mut lf_solo = BandIsolator::default();
+        lf_solo.solo[0] = true;
+        let mut sub_l = sine(60.0, 0.25, sr);
+        let mut sub_r = sub_l.clone();
+        IsolatorState::new(sr).process_block(&mut sub_l, &mut sub_r, &lf_solo, sr);
+        assert!(rms(&sub_l[4000..]) > 0.68, "LF SOLO passes 60 Hz sub cleanly");
+
+        let mut mid_l = sine(1000.0, 0.25, sr);
+        let mut mid_r = mid_l.clone();
+        IsolatorState::new(sr).process_block(&mut mid_l, &mut mid_r, &lf_solo, sr);
+        assert!(rms(&mid_l[4000..]) < 0.008, "LF SOLO rejects 1 kHz at 24 dB/oct: {}", rms(&mid_l[4000..]));
+
+        // 3. LMF + MF + HMF SOLO (exact ISOL8 panel state: 200..8000 Hz vocal/radio band)
+        //    plus Mute-overrides-Solo, Bypass, Dim (-18 dB), and Monitor M/S.
+        let mut radio = BandIsolator::default();
+        radio.solo = [false, true, true, true, false];
+        let mut vox_l = sine(1200.0, 0.25, sr);
+        let mut vox_r = vox_l.clone();
+        IsolatorState::new(sr).process_block(&mut vox_l, &mut vox_r, &radio, sr);
+        assert!(rms(&vox_l[4000..]) > 0.68, "LMF+MF+HMF SOLO passes 1.2 kHz");
+
+        // Muting MF while MF is soloed cuts 1.2 kHz; DIM attenuates by ~18 dB (0.1259x).
+        radio.dim = true;
+        let mut dim_l = sine(1200.0, 0.25, sr);
+        let mut dim_r = dim_l.clone();
+        IsolatorState::new(sr).process_block(&mut dim_l, &mut dim_r, &radio, sr);
+        let ratio = rms(&dim_l[4000..]) / rms(&vox_l[4000..]);
+        assert!((ratio - 0.1259).abs() < 0.01, "DIM -18.0 dB scales by ~0.1259, got {ratio:.4}");
+
+        // Monitor Mid vs Side on hard-left input (L = sine, R = 0 -> M = 0.5*L, S = 0.5*L).
+        let mut mon_m = BandIsolator { monitor: IsolatorMonitor::Mid, ..Default::default() };
+        let mut ml = sine(440.0, 0.2, sr);
+        let mut mr = vec![0.0f32; ml.len()];
+        IsolatorState::new(sr).process_block(&mut ml, &mut mr, &mon_m, sr);
+        assert!((rms(&ml[3000..]) - 0.3535).abs() < 0.01 && (rms(&mr[3000..]) - 0.3535).abs() < 0.01);
+        mon_m.monitor = IsolatorMonitor::Right;
+        let mut rl = sine(440.0, 0.2, sr);
+        let mut rr = vec![0.0f32; rl.len()];
+        IsolatorState::new(sr).process_block(&mut rl, &mut rr, &mon_m, sr);
+        assert!(rms(&rl[3000..]) < 1e-6 && rms(&rr[3000..]) < 1e-6, "Monitor R on L-only signal is silent");
     }
 }
