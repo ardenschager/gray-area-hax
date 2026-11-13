@@ -19,7 +19,7 @@ pub mod wave;
 pub mod widgets;
 
 pub use host::{AddRoute, AddTarget, Added, BrowseItem, Caps, Host, Pad, PadKind, Pending, PerformHost};
-pub use studio::{DeepTab, DeepTarget, Studio, View};
+pub use studio::{ClipTarget, DeepTab, DeepTarget, Sheet, Studio, View};
 
 /// Largest rect of `aspect` (w/h) centered inside `outer` (letterbox /
 /// pillarbox): the picture is never cropped or stretched.

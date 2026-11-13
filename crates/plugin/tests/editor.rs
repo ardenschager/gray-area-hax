@@ -477,3 +477,35 @@ fn plugin_chop_slices_to_pads_layout_and_add_routes() {
         std::thread::sleep(Duration::from_millis(5));
     }
 }
+
+#[test]
+fn plugin_ui_hybrid_snapshots() {
+    use chromagrain_ui::studio::{ClipTarget, Sheet};
+    let version = std::env::var("CHROMAGRAIN_UI_VERSION").unwrap_or_else(|_| "v001".into());
+    let p = plugin_with(clips());
+    for size in [(1180.0f32, 820.0f32), (960.0, 600.0)] {
+        let mut h = harness(size, editor_ui(&p));
+        h.run_steps(2);
+        {
+            let ui = h.state_mut();
+            lanes(ui);
+            ui.studio.set_view(&mut ui.host, View::Play);
+            ui.studio.emitters[0].held = true;
+            ui.studio.emitters[1].macros[0] = 0.55;
+        }
+        h.run_steps(8);
+        shot(&mut h, &format!("261112_chromagrain_ui-hybrid_plugin-play_{}x{}_{version}", size.0, size.1));
+
+        h.get_by_label("Project").click();
+        h.run_steps(3);
+        assert_eq!(h.state().studio.sheet, Some(Sheet::Project));
+        h.get_by_label("close sheet").click();
+        h.run_steps(2);
+        assert_eq!(h.state().studio.sheet, None);
+
+        h.get_by_label("open clip").click();
+        h.run_steps(3);
+        assert_eq!(h.state().studio.sheet, Some(Sheet::Clip(ClipTarget::Emitter(0))));
+        shot(&mut h, &format!("261112_chromagrain_ui-hybrid_plugin-clip-sheet_{}x{}_{version}", size.0, size.1));
+    }
+}

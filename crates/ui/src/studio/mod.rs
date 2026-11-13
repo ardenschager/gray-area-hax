@@ -44,6 +44,7 @@ pub use deep::{DeepTab, DeepTarget};
 pub enum Sheet {
     Add(crate::host::AddTarget),
     Clip(ClipTarget),
+    Project,
 }
 
 pub const COLUMNS: usize = 8;
@@ -74,6 +75,20 @@ pub struct Emitter {
     pub row: f32,
     /// GRAIN, PITCH, SMEAR, LOOK (0..1 each).
     pub macros: [f32; 4],
+    /// Voice output level (0..1; 0.8 = unity).
+    pub level: f32,
+    /// Center stereo pan (-1..1).
+    pub pan: f32,
+    /// Fine detune in cents (-50..50).
+    pub fine_cents: f32,
+    /// Octave shift (-2..2).
+    pub octave: i32,
+    /// Additional per-emitter AV effects configured in the Clip sheet.
+    pub effects: Vec<AvEffect>,
+    /// Extra stretch / filter amounts (0..1) from the Clip sheet FX pills.
+    pub stretch: f32,
+    pub lowpass: f32,
+    pub highpass: f32,
     pub cloud: Cloud,
     pub link: AvLink,
     /// Held by a finger / the pointer: spraying.
@@ -95,10 +110,24 @@ impl Emitter {
             col,
             row,
             macros: [0.18, 0.5, 0.25, 0.0],
+            level: 0.8,
+            pan: 0.0,
+            fine_cents: 0.0,
+            octave: 0,
+            effects: Vec::new(),
+            stretch: 0.0,
+            lowpass: 0.0,
+            highpass: 0.0,
             cloud: Cloud::default(),
             link: AvLink::default(),
             held: false,
-            adsr: Adsr::default(),
+            adsr: Adsr {
+                attack: 0.02,
+                decay: 0.26,
+                sustain: 0.78,
+                release: [0.35, 0.85, 0.22, 0.10][i % 4],
+                ..Adsr::default()
+            },
             gesture: None,
             head: 0.0,
             next_t: 0.0,
@@ -152,11 +181,18 @@ pub struct Studio {
     pub columns: [Option<usize>; COLUMNS],
     pub emitters: [Emitter; EMITTERS],
     pub sel_emitter: usize,
+    pub sel_lane: usize,
+    pub sel_pad: usize,
     pub key: Key,
     pub seq: SeqState,
     pub deep: Option<(DeepTarget, DeepTab)>,
     pub rec: Option<Rec>,
     pub hud_until: f64,
+    /// On-object gesture bubble: `(emitter_index, text, show_until_ui_time)`.
+    pub gesture_hud: Option<(usize, String, f64)>,
+    pub(crate) lane_links: [AvLink; LANES],
+    pub(crate) lane_fx: [Vec<AvEffect>; LANES],
+    pub(crate) pad_links: [AvLink; 16],
     atlases: atlas::Atlases,
     grain_tex: Option<egui::TextureHandle>,
     /// Grid cells lit by sprays: (col, row) -> time.
@@ -186,6 +222,8 @@ impl Default for Studio {
             columns: [None; COLUMNS],
             emitters: [Emitter::new(0, 0, 6.5), Emitter::new(1, 2, 5.5), Emitter::new(2, 5, 1.5), Emitter::new(3, 4, 6.4)],
             sel_emitter: 0,
+            sel_lane: 0,
+            sel_pad: 0,
             key: Key::new(9, ScaleKind::Minor),
             seq: SeqState {
                 scene_pats: [None; SCENES],
@@ -199,6 +237,10 @@ impl Default for Studio {
             deep: None,
             rec: None,
             hud_until: 0.0,
+            gesture_hud: None,
+            lane_links: [AvLink::default(); LANES],
+            lane_fx: std::array::from_fn(|_| Vec::new()),
+            pad_links: [AvLink::default(); 16],
             atlases: atlas::Atlases::default(),
             grain_tex: None,
             lit: Vec::new(),
@@ -271,8 +313,19 @@ impl Studio {
         }
     }
 
+    pub fn route_deep(&mut self) {
+        if let Some((target, _tab)) = self.deep.take() {
+            match target {
+                DeepTarget::Global => self.sheet = Some(Sheet::Project),
+                DeepTarget::Emitter(i) => self.open_clip(ClipTarget::Emitter(i)),
+                DeepTarget::Lane(l) => self.open_clip(ClipTarget::Lane(l)),
+            }
+        }
+    }
+
     /// Per-frame engine work: emitters, buses, rec, sequence arrangement.
     pub fn update(&mut self, host: &mut dyn Host, ctx: &egui::Context) {
+        self.route_deep();
         if !self.fonts_installed {
             self.install_theme(ctx);
             ctx.request_repaint();
@@ -300,18 +353,29 @@ impl Studio {
         self.lit.retain(|(_, t)| now - *t < 0.4);
     }
 
-    /// The four emitter buses: grain style + SMEAR + LOOK, sound and picture.
+    /// The four emitter buses: grain style + SMEAR + LOOK + Clip-sheet FX, sound and picture.
     pub fn buses(&self) -> Vec<crate::gpu::LiveBus> {
         self.emitters
             .iter()
             .map(|e| {
                 let map = MacroMap::resolve(&e.macros, Some(&self.key));
+                let mut effects = emitter_effects(&map, &self.key);
+                for extra in &e.effects {
+                    if extra.audio > 0.005 || extra.video > 0.005 {
+                        if let Some(existing) = effects.iter_mut().find(|f| f.kind.name() == extra.kind.name()) {
+                            existing.audio = existing.audio.max(extra.audio);
+                            existing.video = existing.video.max(extra.video);
+                        } else {
+                            effects.push(*extra);
+                        }
+                    }
+                }
                 crate::gpu::LiveBus {
                     // Sample end: the footage itself (over, not glow); the
                     // cloud end glows like classic grain clouds.
                     // grain end: soft-edged patches that glow, never hard blocks.
                     style: VisualGrainStyle::morph(0.0, &VisualGrainStyle { additive: 0.3, feather: 0.7, ..Default::default() }, map.texture),
-                    effects: emitter_effects(&map, &self.key),
+                    effects,
                     link: e.link,
                 }
             })
@@ -398,17 +462,28 @@ impl Studio {
             let (cols, rows) = self.tiles.grid_at(now);
             let map = MacroMap::resolve(&e.macros, Some(&key));
             let mut n = 0;
+            let base_note = (60 + e.octave * 12).clamp(24, 96) as u8;
+            let vel = (e.level / 0.8 * 0.9).clamp(0.0, 1.2);
+            let fine_ratio = if e.fine_cents.abs() > 0.01 {
+                chromagrain_core::music::semitones_to_ratio(e.fine_cents / 100.0)
+            } else {
+                1.0
+            };
+            let stretch_mul = (1.0 - 0.75 * e.stretch.clamp(0.0, 1.0)).max(0.15) as f64;
             while e.next_t <= now && n < 64 {
                 let id = ((i as u64 + 1) << 48) | e.k;
-                let (mut ev, hop) = grain_step(&map, &e.cloud, Some(&key), &mut e.rng, e.head, len, 60, 0.9, id);
+                let (mut ev, hop) = grain_step(&map, &e.cloud, Some(&key), &mut e.rng, e.head, len, base_note, vel, id);
+                ev.pitch_ratio *= fine_ratio;
                 ev.onset = (e.next_t + ev.onset).max(now - 0.02);
                 ev.tag = VoiceTag { voice, env: Some(env), tile: slot };
                 if let (Some(sl), true) = (slot, pan_by_tile) {
                     let (pan, gain) = layout_pan(sl as usize, cols, rows);
                     ev.pan = pan;
                     ev.gain *= gain;
+                } else if e.pan.abs() > 1e-4 {
+                    ev.pan = (ev.pan + e.pan).clamp(-1.0, 1.0);
                 }
-                e.head += hop * map.speed as f64;
+                e.head += hop * map.speed as f64 * stretch_mul;
                 e.next_t += hop;
                 e.k += 1;
                 n += 1;
@@ -469,6 +544,7 @@ impl Studio {
 
     /// The whole studio, every frame.
     pub fn ui(&mut self, host: &mut dyn Host, ctx: &egui::Context) {
+        self.route_deep();
         if !self.fonts_ready {
             egui::CentralPanel::default().frame(egui::Frame::new().fill(G0)).show(ctx, |_| {});
             return;
@@ -501,7 +577,7 @@ impl Studio {
                 View::Perform => self.perform_view(host, ui, area),
             }
         });
-        self.deep_drawer(host, ctx);
+        self.project_sheet(host, ctx);
         self.add_sheet(host, ctx);
         self.clip_sheet(host, ctx);
         self.grain_overlay(ctx);
@@ -690,30 +766,29 @@ impl Studio {
             self.set_view(host, caps.views[i]);
         }
 
-        // Right: tempo, key, Deep, Export.
+        // Right: tempo, key, Project, Export.
         let mut rx = rect.right() - if small { 14.0 } else { 18.0 };
-        let ghost = |ui: &mut egui::Ui, rx: &mut f32, label: &str, icon: Icon, id: &str| -> egui::Response {
+        let ghost = |ui: &mut egui::Ui, rx: &mut f32, label: &str, icon: Icon, id: &str, active: bool| -> egui::Response {
             let w = if small { 40.0 } else { 26.0 + ui.painter().layout_no_wrap(label.into(), font(13.0), INK).size().x + 14.0 };
             let r = Rect::from_min_size(egui::pos2(*rx - w, cy - 18.0), egui::vec2(w, 36.0));
             *rx -= w + 6.0;
-            let resp = chip(ui, r, ui.id().with(id), label, true, false);
+            let resp = chip(ui, r, ui.id().with(id), label, !active, false);
             let p = ui.painter();
+            let fg = if active { INK } else { INK2 };
             if small {
-                draw_icon(p, icon, r.center(), 16.0, INK2);
+                draw_icon(p, icon, r.center(), 16.0, fg);
             } else {
-                draw_icon(p, icon, egui::pos2(r.left() + 16.0, r.center().y), 15.0, INK2);
-                p.text(egui::pos2(r.left() + 28.0, r.center().y), Align2::LEFT_CENTER, label, font(13.0), INK2);
+                draw_icon(p, icon, egui::pos2(r.left() + 16.0, r.center().y), 15.0, fg);
+                p.text(egui::pos2(r.left() + 28.0, r.center().y), Align2::LEFT_CENTER, label, font(13.0), fg);
             }
             resp
         };
-        if caps.export && ghost(ui, &mut rx, "Export", Icon::Export, "export").clicked() {
+        if caps.export && ghost(ui, &mut rx, "Export", Icon::Export, "export", false).clicked() {
             host.export();
         }
-        if ghost(ui, &mut rx, "Deep", Icon::Deep, "deep").clicked() {
-            self.deep = match self.deep {
-                Some(_) => None,
-                None => Some((DeepTarget::Global, DeepTab::Links)),
-            };
+        let proj_open = self.sheet == Some(Sheet::Project);
+        if ghost(ui, &mut rx, "Project", Icon::Grid, "project", proj_open).clicked() {
+            self.sheet = if proj_open { None } else { Some(Sheet::Project) };
         }
         rx -= 6.0;
         p.line_segment([egui::pos2(rx, cy - 11.0), egui::pos2(rx, cy + 11.0)], hair(LINE2));
@@ -849,25 +924,43 @@ impl Studio {
         p.rect_stroke(rect, r(radius as u8), hair(LINE), egui::StrokeKind::Inside);
     }
 
-    /// The small `stack | tile` switch in a stage's bottom-left corner.
+    /// The small `stack | tile` switch in a stage's top-left corner.
     pub fn layout_switch(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, stage: Rect) {
+        self.layout_switch_named(
+            host,
+            ui,
+            egui::pos2(stage.left() + 10.0, stage.top() + 10.0),
+            "layout",
+            ("layout stack", "layout tile"),
+        );
+    }
+
+    /// `stack | tile` switch at `pos` with explicit id salt and accessibility names.
+    pub fn layout_switch_named(
+        &mut self,
+        host: &mut dyn Host,
+        ui: &mut egui::Ui,
+        pos: egui::Pos2,
+        id_salt: &str,
+        names: (&str, &str),
+    ) {
         let Some(tile) = host.tile_layout() else { return };
-        let r0 = Rect::from_min_size(egui::pos2(stage.left() + 10.0, stage.bottom() - 10.0 - 36.0), egui::vec2(132.0, 36.0));
+        let r0 = Rect::from_min_size(pos, egui::vec2(118.0, 34.0));
         let p = ui.painter().clone();
-        p.rect_filled(r0, r(10), Color32::from_black_alpha(150));
+        p.rect_filled(r0, r(10), Color32::from_black_alpha(165));
+        p.rect_stroke(r0, r(10), hair(LINE2), egui::StrokeKind::Inside);
         let half = r0.width() / 2.0;
-        for (k, (icon, name)) in [(Icon::Stack, "stack"), (Icon::Tile, "tile")].into_iter().enumerate() {
+        let a11y = [names.0, names.1];
+        for (k, name) in ["stack", "tile"].into_iter().enumerate() {
             let rc = Rect::from_min_size(egui::pos2(r0.left() + k as f32 * half, r0.top()), egui::vec2(half, r0.height())).shrink(3.0);
             let on = tile == (k == 1);
             if on {
-                p.rect_filled(rc, r(8), Color32::from_white_alpha(28));
+                p.rect_filled(rc, r(7), HI);
             }
-            let col = if on { INK } else { INK3 };
-            draw_icon(&p, icon, egui::pos2(rc.left() + 15.0, rc.center().y), 13.0, col);
-            p.text(egui::pos2(rc.left() + 26.0, rc.center().y), Align2::LEFT_CENTER, name, font(11.5), col);
-            // 44 px tall hit areas (they reach past the pill).
+            let col = if on { ON_HI } else { INK2 };
+            p.text(rc.center(), Align2::CENTER_CENTER, name, font_medium(11.5), col);
             let hr = Rect::from_min_max(egui::pos2(rc.left(), rc.top() - 4.0), egui::pos2(rc.right(), rc.bottom() + 4.0));
-            if hit(ui, hr, ui.id().with(("layout", k)), egui::Sense::click(), &format!("layout {name}")).clicked() && !on {
+            if hit(ui, hr, ui.id().with((id_salt, k)), egui::Sense::click(), a11y[k]).clicked() && !on {
                 host.set_tile_layout(k == 1);
             }
         }
@@ -900,7 +993,7 @@ pub fn note_name(pc: i32) -> &'static str {
 /// Strip common media file extensions (`.mp4`, `.MOV`, etc.) from display titles.
 pub fn strip_media_ext(s: &str) -> &str {
     for ext in [".mp4", ".mov", ".m4v", ".webm", ".mkv", ".wav", ".mp3", ".aif", ".aiff", ".flac"] {
-        if s.len() > ext.len() && s[s.len() - ext.len()..].eq_ignore_ascii_case(ext) {
+        if s.len() > ext.len() && s.as_bytes()[s.len() - ext.len()..].eq_ignore_ascii_case(ext.as_bytes()) {
             return &s[..s.len() - ext.len()];
         }
     }

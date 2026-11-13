@@ -339,23 +339,55 @@ impl Studio {
                 let pp = host.project().lock().unwrap();
                 pp.sources.get(src).map(|so| so.slices.iter().map(|sl| (sl.start / so.duration().max(1e-6)) as f32).collect()).unwrap_or_default()
             };
-            // Header: the clip itself.
+            // Header: the clip itself + mini ADSR + `›` button (`D · Hybrid`).
+            let is_sel = lane == self.sel_lane;
+            let lane_adsr = self.target_env(host, super::clip::EnvTarget::Lane(lane)).unwrap_or_default();
             if let Some((tex, a)) = at {
-                tile(&p, header, 8, tex, a.uv_cover(5, hw / lh), gray(if muted { 0.28 } else if silent { 0.5 } else { 0.86 }));
+                tile(&p, header, 8, tex, a.uv_cover(5, hw / lh), gray(if muted { 0.28 } else if silent { 0.48 } else { 0.78 }));
                 p.rect_filled(Rect::from_min_size(header.min, egui::vec2(3.0, lh)), r(2), a.swatch);
             }
-            p.rect_stroke(header, r(8), hair(LINE), StrokeKind::Inside);
-            if len != STEPS {
-                p.text(header.right_bottom() + egui::vec2(-8.0, -6.0), Align2::RIGHT_BOTTOM, len.to_string(), mono(10.0), INK2);
+            let bot_scrim = Rect::from_min_max(egui::pos2(header.left(), (header.bottom() - 22.0).max(header.top())), header.max);
+            p.rect_filled(bot_scrim, egui::CornerRadius { nw: 0, ne: 0, sw: 8, se: 8 }, Color32::from_black_alpha(105));
+            if lh >= 42.0 && hw >= 88.0 {
+                let raw_name = self.source_name(host, src);
+                let clean = super::strip_media_ext(&raw_name);
+                let room = ((hw - 36.0) / 6.0).max(4.0) as usize;
+                p.text(
+                    egui::pos2(header.left() + 9.0, header.top() + 7.0),
+                    Align2::LEFT_TOP,
+                    super::play::short(clean, room.min(16)),
+                    font_medium(10.5),
+                    if muted { INK3 } else if is_sel { INK } else { INK2 },
+                );
             }
-            if muted {
-                p.text(header.left_bottom() + egui::vec2(10.0, -6.0), Align2::LEFT_BOTTOM, "muted", font(10.0), INK2);
+            if !muted {
+                let env_w = (hw * 0.36).clamp(18.0, 48.0);
+                let env_r = Rect::from_min_size(egui::pos2(header.left() + 9.0, header.bottom() - 16.5), egui::vec2(env_w, 10.5));
+                mini_adsr(&p, env_r, &lane_adsr, if is_sel { 0.9 } else { 0.68 });
+            } else {
+                p.text(header.left_bottom() + egui::vec2(10.0, -5.0), Align2::LEFT_BOTTOM, "muted", font(10.0), INK2);
+            }
+            if len != STEPS {
+                p.text(header.right_bottom() + egui::vec2(-8.0, -5.0), Align2::RIGHT_BOTTOM, len.to_string(), mono(10.0), INK2);
+            }
+            if is_sel {
+                p.rect_stroke(header, r(8), Stroke::new(1.5, Color32::from_white_alpha(150)), StrokeKind::Inside);
+            } else {
+                p.rect_stroke(header, r(8), hair(LINE), StrokeKind::Inside);
             }
             let hresp = hit(ui, header, ui.id().with(("lane-head", lane)), Sense::click(), &format!("lane {}", lane + 1));
+            let chev_vis = Rect::from_min_size(egui::pos2(header.right() - 24.0, header.top() + 4.0), egui::vec2(20.0, 20.0));
+            let chev_hit = Rect::from_center_size(chev_vis.center(), egui::vec2(24.0, 24.0));
+            let chev_resp = chev_button(ui, chev_vis, chev_hit, ui.id().with(("lane-clip", lane)), &format!("clip lane {}", lane + 1));
             let h = hold(ui, &hresp, 0.45);
-            if h.fired {
+            if chev_resp.clicked() {
+                self.sel_lane = lane;
                 self.open_clip(super::ClipTarget::Lane(lane));
-            } else if hresp.clicked() && !h.held_before {
+            } else if h.fired {
+                self.sel_lane = lane;
+                self.open_clip(super::ClipTarget::Lane(lane));
+            } else if hresp.clicked() && !h.held_before && !chev_resp.hovered() {
+                self.sel_lane = lane;
                 self.toggle_lane_mute(host, lane);
             }
             let cur = if playing || host.playhead_beats() > 0.0 { Some(slot % len.max(1)) } else { None };
@@ -401,13 +433,16 @@ impl Studio {
                 let resp = hit(ui, c, ui.id().with(("step", lane, s)), Sense::click_and_drag(), &format!("lane {} step {}", lane + 1, s + 1));
                 let h = hold(ui, &resp, 0.45);
                 if h.fired {
+                    self.sel_lane = lane;
                     self.seq.hold = Some((lane, s));
                     if !st.on {
                         self.seq_toggle(host, scene, lane, s);
                     }
                 } else if resp.clicked() && !h.held_before {
+                    self.sel_lane = lane;
                     self.seq_toggle(host, scene, lane, s);
                 } else if resp.dragged() && st.on {
+                    self.sel_lane = lane;
                     let acc = ui.data(|d| d.get_temp::<f32>(resp.id).unwrap_or(0.0)) - resp.drag_delta().y;
                     let steps_moved = (acc / 14.0).trunc();
                     if steps_moved != 0.0 {
@@ -510,19 +545,48 @@ impl Studio {
         let stage = Rect::from_min_size(col.min, egui::vec2(col.width(), (col.width() * 9.0 / 16.0).floor()));
         self.stage(host, ui, stage, 12.0);
         self.layout_switch(host, ui, stage);
-        if !host.caps().scenes {
-            return; // one looping scene; the host arranges
+        let mut y_after = stage.bottom() + 14.0;
+        if host.caps().scenes {
+            let (cur, _) = self.seq_current(host);
+            let g = 8.0;
+            let sw = (col.width() - g * 3.0) / 4.0;
+            let sh = 64.0;
+            for s in 0..SCENES {
+                let rc = Rect::from_min_size(egui::pos2(col.left() + (s % 4) as f32 * (sw + g), stage.bottom() + 14.0 + (s / 4) as f32 * (sh + g)), egui::vec2(sw, sh));
+                self.scene_cell(host, ui, rc, s, cur);
+            }
+            let chain = Rect::from_min_size(egui::pos2(col.left(), stage.bottom() + 14.0 + 2.0 * (sh + g) + 8.0), egui::vec2(col.width(), 36.0));
+            self.chain_row(host, ui, chain);
+            y_after = chain.bottom() + 14.0;
         }
-        let (cur, _) = self.seq_current(host);
-        let g = 8.0;
-        let sw = (col.width() - g * 3.0) / 4.0;
-        let sh = 64.0;
-        for s in 0..SCENES {
-            let rc = Rect::from_min_size(egui::pos2(col.left() + (s % 4) as f32 * (sw + g), stage.bottom() + 14.0 + (s / 4) as f32 * (sh + g)), egui::vec2(sw, sh));
-            self.scene_cell(host, ui, rc, s, cur);
+        if col.bottom() - y_after >= 34.0 {
+            if self.seq.lanes.get(self.sel_lane).copied().flatten().is_none() {
+                if let Some(first) = self.seq.lanes.iter().position(|l| l.is_some()) {
+                    self.sel_lane = first;
+                }
+            }
+            let l = self.sel_lane.min(LANES - 1);
+            if let Some(src) = self.seq.lanes[l] {
+                let ob = Rect::from_min_size(egui::pos2(col.left(), y_after), egui::vec2(col.width(), 34.0));
+                let p = ui.painter();
+                p.rect_filled(ob, r(10), G1);
+                p.rect_stroke(ob, r(10), hair(LINE), StrokeKind::Inside);
+                let raw = self.source_name(host, src);
+                let clean = super::strip_media_ext(&raw);
+                let room = ((ob.width() - 122.0) / 6.2).max(5.0) as usize;
+                p.text(
+                    egui::pos2(ob.left() + 12.0, ob.center().y),
+                    Align2::LEFT_CENTER,
+                    format!("Lane {} · {}", l + 1, super::play::short(clean, room.min(18))),
+                    font_medium(12.0),
+                    INK2,
+                );
+                let pill = Rect::from_min_size(egui::pos2(ob.right() - 100.0, ob.center().y - 13.0), egui::vec2(92.0, 26.0));
+                if open_clip_pill(ui, pill, ui.id().with("seq-open-clip"), "open clip").clicked() {
+                    self.open_clip(super::ClipTarget::Lane(l));
+                }
+            }
         }
-        let chain = Rect::from_min_size(egui::pos2(col.left(), stage.bottom() + 14.0 + 2.0 * (sh + g) + 8.0), egui::vec2(col.width(), 36.0));
-        self.chain_row(host, ui, chain);
     }
 
     fn song_strip(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, strip: Rect) {

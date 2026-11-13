@@ -155,11 +155,11 @@ pub fn tour() -> Tour {
     // LOOK: slip quickly past crush and jpeg, settle on tint, then kaleido.
     say(19.8, 22.4, "look · picture and sound together");
     at(20.0, Knob("Look", vec![(0.0, 0.0), (0.25, -26.0), (0.42, -132.0), (1.3, -140.0), (1.9, -205.0)]));
-    // Deep: the emitter's own page, one tap away.
+    // Clip sheet: the emitter's own page, one tap away.
     at(23.0, Tap(lab("emitter settings")));
-    say(23.4, 26.8, "deep · every sound ↔ picture link is a dial");
+    say(23.4, 26.8, "open clip · every sound ↔ picture link is a dial");
     at(24.4, Drag(vec![lab("pitch → hue"), lab("pitch → hue").off(150.0, 0.0)], 1.4));
-    at(26.6, Tap(lab("Done")));
+    at(26.6, Tap(lab("close sheet")));
     // Rec: what you play becomes a take, and plays back hands-free.
     say(27.8, 31.2, "rec turns a phrase into a take");
     at(28.0, Tap(lab("rec")));

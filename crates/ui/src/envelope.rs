@@ -94,7 +94,16 @@ pub fn adsr_editor(ui: &mut Ui, rect: Rect, id: egui::Id, env: &mut Adsr, thumb:
             p.image(tex, sr, suv, Color32::from_rgb(v, v, v));
         }
     }
-    // The curve.
+    // The curve + cut threshold line (when picture is in hard-cut mode).
+    if !fade {
+        let ty = inner.bottom() - cut_level.clamp(0.0, 1.0) * inner.height();
+        let mut x = inner.left();
+        while x < inner.right() {
+            let x1 = (x + 3.0).min(inner.right());
+            p.line_segment([egui::pos2(x, ty), egui::pos2(x1, ty)], Stroke::new(1.0, Color32::from_white_alpha(95)));
+            x += 6.0;
+        }
+    }
     p.add(egui::Shape::line(pts.to_vec(), Stroke::new(1.6, HI)));
     p.line_segment([egui::pos2(inner.left(), inner.bottom()), egui::pos2(inner.right(), inner.bottom())], hair(LINE2));
     p.rect_stroke(rect, r(10), hair(LINE2), StrokeKind::Inside);

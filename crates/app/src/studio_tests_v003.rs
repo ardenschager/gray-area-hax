@@ -389,3 +389,181 @@ fn emitter_gestures_carry_their_envelope_and_tile() {
     assert!(rel.iter().all(|t| t.voice == voice));
     let _ = Slice::new(0.0, 1.0);
 }
+
+#[test]
+fn d_hybrid_open_clip_buttons_pad_chevrons_project_sheet_and_owner_tabs() {
+    // 1. Play: `Open clip ›` in the object bar and `Clip ›` on emitter cards open `Sheet::Clip(ClipTarget::Emitter(_))`.
+    let mut h = harness(SIZES[0], View::Play, |_| {});
+    h.run_steps(3);
+    assert_eq!(h.state().studio.sheet, None);
+    h.get_by_label("open clip").click();
+    h.run_steps(2);
+    assert_eq!(h.state().studio.sheet, Some(Sheet::Clip(ClipTarget::Emitter(0))));
+    h.get_by_label("close sheet").click();
+    h.run_steps(2);
+    assert_eq!(h.state().studio.sheet, None);
+
+    h.get_by_label("clip emitter 2").click();
+    h.run_steps(2);
+    assert_eq!(h.state().studio.sel_emitter, 1);
+    assert_eq!(h.state().studio.sheet, Some(Sheet::Clip(ClipTarget::Emitter(1))));
+
+    // 2. Editing Grain / Links / Shape cards inside `Sheet::Clip` mutates engine parameters.
+    let dens0 = h.state().studio.emitters[1].cloud.density;
+    let dk = h.get_by_label("grain density").rect().center();
+    drag(&mut h, dk, dk - egui::vec2(0.0, 70.0));
+    assert!(
+        h.state().studio.emitters[1].cloud.density > dens0 + 8.0,
+        "grain density knob mutated emitter cloud: {dens0} -> {}",
+        h.state().studio.emitters[1].cloud.density
+    );
+
+    let hue0 = h.state().studio.emitters[1].link.pitch_to_hue;
+    let hk = h.get_by_label("pitch → hue").rect().center();
+    drag(&mut h, hk, hk + egui::vec2(80.0, 0.0));
+    assert!(
+        h.state().studio.emitters[1].link.pitch_to_hue > hue0 + 2.0,
+        "pitch → hue pill mutated AvLink: {hue0} -> {}",
+        h.state().studio.emitters[1].link.pitch_to_hue
+    );
+
+    assert_eq!(h.state().studio.emitters[1].adsr.picture, PictureCut::Cut);
+    h.get_by_label("picture fade").click();
+    h.run_steps(2);
+    assert_eq!(h.state().studio.emitters[1].adsr.picture, PictureCut::Fade);
+
+    // 3. Owner Switcher tabs inside `Sheet::Clip` switch cleanly between `Clip`, `Emitter`, `Lane`, and `Pad`.
+    h.get_by_label("close sheet").click();
+    h.run_steps(2);
+    // Seed Perform pads so source 0 has Emitter 1, Lane 1, and Pad 1 owners.
+    h.get_by_label("Perform").click();
+    h.run_steps(2);
+    h.get_by_label("Play").click();
+    h.run_steps(2);
+    h.get_by_label("emitter 1").click();
+    h.run_steps(2);
+    h.get_by_label("open clip").click();
+    h.run_steps(2);
+    assert_eq!(h.state().studio.sheet, Some(Sheet::Clip(ClipTarget::Emitter(0))));
+
+    h.get_by_label("owner Clip").click();
+    h.run_steps(2);
+    assert_eq!(h.state().studio.sheet, Some(Sheet::Clip(ClipTarget::Column(0))));
+
+    h.get_by_label("owner Lane 1").click();
+    h.run_steps(2);
+    assert_eq!(h.state().studio.sheet, Some(Sheet::Clip(ClipTarget::Lane(0))));
+
+    h.get_by_label("owner Pad 1").click();
+    h.run_steps(2);
+    assert_eq!(h.state().studio.sheet, Some(Sheet::Clip(ClipTarget::Pad(0))));
+
+    h.get_by_label("owner Emitter 1").click();
+    h.run_steps(2);
+    assert_eq!(h.state().studio.sheet, Some(Sheet::Clip(ClipTarget::Emitter(0))));
+    h.get_by_label("close sheet").click();
+    h.run_steps(2);
+
+    // 4. Perform: clicking `›` (`"clip pad 1"`) opens `ClipTarget::Pad(0)` WITHOUT toggling the pad.
+    h.get_by_label("Perform").click();
+    h.run_steps(2);
+    let muted_before = h.state().project.lock().unwrap().tracks[0].muted;
+    assert!(muted_before, "pad 1 starts stopped");
+    h.get_by_label("clip pad 1").click();
+    h.run_steps(2);
+    assert_eq!(h.state().studio.sheet, Some(Sheet::Clip(ClipTarget::Pad(0))));
+    let muted_after = h.state().project.lock().unwrap().tracks[0].muted;
+    assert_eq!(muted_after, muted_before, "clicking `›` on a pad must not launch/toggle it");
+    h.get_by_label("close sheet").click();
+    h.run_steps(2);
+
+    // 5. Top bar `Project` button opens `Sheet::Project`, and master FX pills mutate `project.master_effects`.
+    h.get_by_label("Project").click();
+    h.run_steps(2);
+    assert_eq!(h.state().studio.sheet, Some(Sheet::Project));
+    assert!(h.state().project.lock().unwrap().master_effects.is_empty());
+    h.get_by_label("master fx reverb").click();
+    h.run_steps(2);
+    assert_eq!(h.state().project.lock().unwrap().master_effects.len(), 1);
+    h.get_by_label("close sheet").click();
+    h.run_steps(2);
+    assert_eq!(h.state().studio.sheet, None);
+}
+
+#[test]
+fn ui_hybrid_snapshots() {
+    let ver = version();
+    let tag = |what: &str, size: (f32, f32)| format!("261112_chromagrain_ui-hybrid_{what}_{}x{}_{ver}", size.0, size.1);
+
+    for size in [(1600.0f32, 1000.0f32), (960.0, 600.0)] {
+        // 1. Play (with on-object emitter rings, pitch dots, ADSR curves, gesture bubble on Emitter 2)
+        let mut h = harness(size, View::Play, |app| {
+            showcase(app);
+            app.studio.emitters[0].macros = [0.22, 0.5, 0.25, 0.0];
+            app.studio.emitters[1].macros[0] = 0.48;
+            app.studio.emitters[1].macros[1] = 0.66;
+            app.studio.emitters[1].adsr.picture = PictureCut::Fade;
+            app.studio.emitters[2].macros = [0.68, 0.66, 0.35, 0.0];
+            app.studio.emitters[3].macros[0] = 0.42;
+            app.studio.emitters[3].macros[1] = 0.36;
+            app.studio.gesture_hud = Some((1, "Pitch  +4 C#".into(), 999.0));
+        });
+        h.run_steps(8);
+        shot(&mut h, &tag("play", size));
+
+        // 2. Clip sheet opened over Play for Emitter 1 · horses
+        let mut h = harness(size, View::Play, |app| {
+            showcase(app);
+            app.with_studio(|st, host| st.set_view(host, View::Perform));
+            app.with_studio(|st, host| st.set_view(host, View::Play));
+            sliced(app, 0, 10);
+            app.studio.emitters[0].adsr = chromagrain_core::envelope::Adsr {
+                attack: 0.04,
+                decay: 0.28,
+                sustain: 0.68,
+                release: 0.35,
+                picture: PictureCut::Cut,
+                cut_threshold: 0.08,
+            };
+            app.studio.open_clip(ClipTarget::Emitter(0));
+        });
+        h.run_steps(8);
+        shot(&mut h, &tag("clip-sheet", size));
+
+        // 3. Perform (Tile layout with chopped slices, ADSR curves + `›` on pads, selected pad ring)
+        let mut h = harness(size, View::Perform, |app| {
+            showcase(app);
+            app.project.lock().unwrap().layout = Layout::Tile;
+            sliced(app, 0, 10);
+            app.with_studio(|st, host| {
+                st.slices_to_pads(host, 0);
+            });
+            for pad in [0usize, 2, 5, 11] {
+                app.toggle_pad(pad);
+            }
+            app.studio.sel_pad = 2;
+            app.playback.stop();
+            app.playhead_beats = 1.5;
+        });
+        h.run_steps(8);
+        shot(&mut h, &tag("perform-tile", size));
+
+        // 4. Project sheet over Sequence
+        let mut h = harness(size, View::Sequence, |app| {
+            showcase(app);
+            app.project.lock().unwrap().master_effects.push(chromagrain_core::fx::AvEffect {
+                kind: chromagrain_core::fx::EffectKind::Reverb { size: 0.6, damp: 0.4, mix: 0.35 },
+                audio: 0.35,
+                video: 0.25,
+            });
+            app.studio.sheet = Some(Sheet::Project);
+        });
+        h.run_steps(8);
+        shot(&mut h, &tag("project-sheet", size));
+    }
+
+    // 5. Sequence at 1600×1000
+    let mut h = harness((1600.0, 1000.0), View::Sequence, showcase);
+    h.run_steps(8);
+    shot(&mut h, &tag("sequence", (1600.0, 1000.0)));
+}
