@@ -52,7 +52,7 @@ use crate::grain::GrainEvent;
 use crate::music::{semitones_to_ratio, Key};
 use crate::timeline::{ClipTransform, Source, SourceId};
 use crate::video::{
-    blend_layer, AvLink, Frame, VideoClip, VisualGrainStyle,
+    AvLink, Frame, VideoClip, VisualGrainStyle,
 };
 use std::sync::Arc;
 
@@ -293,8 +293,11 @@ struct Voice {
     one_shot: bool,
     origin: GrainOrigin,
     gain: f32,
-    /// Tile slot + its (pan, gain) cue (layout `Tile`).
+    /// Tile slot + its (pan, gain) cue (layout `Tile` / `Split`).
     tile: Option<u8>,
+    choke_group: u8,
+    focus: (f32, f32),
+    caption: crate::chop::Caption,
 }
 
 impl Voice {
@@ -308,8 +311,8 @@ impl Voice {
     }
 }
 
-/// Tag a grain with its voice: id, envelope, and (layout `Tile`) its tile
-/// slot with the column→pan / row→gain cue of the grid at the grain's
+/// Tag a grain with its voice: id, envelope, and (layout `Tile` / `Split`)
+/// its tile slot with the column→pan / row→gain cue of the grid at the grain's
 /// onset (so a voice's pan follows its tile as the grid grows and shrinks).
 fn tag_grain(
     ev: &mut GrainEvent,
@@ -323,7 +326,7 @@ fn tag_grain(
     ev.tag.env = env;
     if let Some(slot) = tile {
         ev.tag.tile = Some(slot);
-        if layout_pan {
+        if layout_pan && !ev.tag.is_wash {
             let (cols, rows) = tiles.grid_at(ev.onset);
             let (pan, gain) = crate::tile::layout_pan(slot as usize, cols, rows);
             ev.pan = (pan + 0.2 * ev.pan).clamp(-1.0, 1.0);
@@ -332,9 +335,9 @@ fn tag_grain(
     }
 }
 
-/// Assign a tile to a voice starting at `t` (layout `Tile`).
+/// Assign a tile to a voice starting at `t` (layout `Tile` or `Split`).
 fn start_tile(tiles: &mut crate::tile::TileAssigner, layout: crate::tile::Layout, voice: u64, t: f64) -> Option<u8> {
-    (layout == crate::tile::Layout::Tile).then(|| tiles.assign(voice, t))
+    layout.uses_tiles().then(|| tiles.assign(voice, t))
 }
 
 #[derive(Clone)]
@@ -367,9 +370,11 @@ pub const PAD_NOTE: u8 = 36;
 /// Grain length of the pad loops' seamless 50%-overlap Hann train.
 const PAD_GRAIN: f64 = 0.08;
 
-/// What a pad plays: a loop `len_beats` long (it follows the host tempo)
-/// starting at `start` (0..1) in a source.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// What a pad plays: a loop `len_beats` long (it follows the host tempo, or
+/// loops asynchronously in real seconds when `sculpt.free_loop_secs` is set)
+/// starting at `start` (0..1) in a source, or a chopped one-shot `slice`.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct PadSlot {
     pub source: SourceId,
     pub start: f32,
@@ -380,11 +385,30 @@ pub struct PadSlot {
     pub slice: Option<crate::chop::Slice>,
     /// Envelope of the pad's voice (sound + picture). None = classic.
     pub adsr: Option<crate::envelope::Adsr>,
+    /// Continuous voice sculptor & tape-loop physics for this pad.
+    pub sculpt: crate::grain::VoiceSculpt,
+    /// MPC choke group (`0 = off`, `1..=4`).
+    pub choke_group: u8,
+}
+
+impl Default for PadSlot {
+    fn default() -> Self {
+        PadSlot::new(0, 1.0)
+    }
 }
 
 impl PadSlot {
     pub fn new(source: SourceId, len_beats: f32) -> PadSlot {
-        PadSlot { source, start: 0.0, len_beats, gain: 1.0, slice: None, adsr: None }
+        PadSlot {
+            source,
+            start: 0.0,
+            len_beats,
+            gain: 1.0,
+            slice: None,
+            adsr: None,
+            sculpt: crate::grain::VoiceSculpt::default(),
+            choke_group: 0,
+        }
     }
 
     /// A one-shot pad playing `slice` of `source` (whose media is
@@ -799,7 +823,23 @@ impl Instrument {
             }
         };
         let adsr = self.note_adsr;
-        self.start_voice(note, velocity.min(1.0), source, head, pitch_note, slice_end, adsr, false, GrainOrigin::Note, 1.0);
+        let focus = slice.map_or((0.5, 0.5), |sl| sl.focus);
+        let caption = slice.map_or_else(crate::chop::Caption::default, |sl| sl.caption);
+        self.start_voice(
+            note,
+            velocity.min(1.0),
+            source,
+            head,
+            pitch_note,
+            slice_end,
+            adsr,
+            false,
+            GrainOrigin::Note,
+            1.0,
+            0,
+            focus,
+            caption,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -815,6 +855,9 @@ impl Instrument {
         one_shot: bool,
         origin: GrainOrigin,
         gain: f32,
+        choke_group: u8,
+        focus: (f32, f32),
+        caption: crate::chop::Caption,
     ) {
         if self.voices.len() >= MAX_VOICES {
             let oldest = self.voices.remove(0);
@@ -842,23 +885,166 @@ impl Instrument {
             origin,
             gain,
             tile,
+            choke_group,
+            focus,
+            caption,
         });
+    }
+
+    /// Mute active voices/pads/grains in MPC choke group `group` (`1..=4`) at
+    /// `t_cut` with a click-free `3 ms` cosine release, never choking sibling
+    /// chord voices triggered at the same instant (`|onset - t_cut| <= 2 ms`).
+    /// Allocation-free.
+    fn choke_group_at(&mut self, group: u8, t_cut: f64) {
+        if group == 0 {
+            return;
+        }
+        let cut_end = t_cut + crate::grain::CHOKE_RELEASE_SECS;
+        for g in self.grains.iter_mut() {
+            if g.ev.tag.choke_group == group && g.ev.onset < t_cut - 0.002 {
+                g.ev.tag.choke_at = Some(g.ev.tag.choke_at.map_or(t_cut, |c| c.min(t_cut)));
+            }
+        }
+        self.grains.retain(|g| !(g.ev.tag.choke_group == group && g.ev.onset >= t_cut + 0.002));
+
+        let mut vi = self.voices.len();
+        while vi > 0 {
+            vi -= 1;
+            if vi < self.voices.len()
+                && self.voices[vi].choke_group == group
+                && self.voices[vi].start_t < t_cut - 0.002
+            {
+                let v = self.voices.remove(vi);
+                self.tiles.release(v.serial, cut_end);
+            }
+        }
+
+        for i in 0..PADS {
+            let p = &mut self.pads[i];
+            if p.on && p.slot.is_some_and(|s| s.choke_group == group) && p.env_on < t_cut - 0.002 {
+                p.on = false;
+                p.env_off = t_cut;
+                self.tiles.release(p.serial, cut_end);
+            }
+        }
     }
 
     /// A slice pad: a one-shot of its slice, now (not launch-quantized).
     fn hit_slice_pad(&mut self, i: usize, velocity: f32) {
         let Some(slot) = self.pads.get(i).and_then(|p| p.slot) else { return };
         let Some(sl) = slot.slice else { return };
-        if self.sources.get(slot.source).is_none_or(|s| s.duration() <= 0.0) {
+        let Some(src) = self.sources.get(slot.source) else { return };
+        let src_len = src.duration();
+        if src_len <= 0.0 {
+            return;
+        }
+        let base_hz = src.effective_base_hz();
+        let now = self.now_secs();
+        if slot.choke_group > 0 {
+            self.choke_group_at(slot.choke_group, now);
+        }
+        // Retrigger: the previous hit of this pad releases.
+        if let Some(vi) = self.voices.iter().position(|v| v.origin == GrainOrigin::Pad(i) && v.off.is_none()) {
+            self.release_voice_at(vi, now);
+        }
+        for g in self.grains.iter_mut() {
+            if g.origin == GrainOrigin::Pad(i) && g.ev.onset < now - 0.002 {
+                g.ev.tag.choke_at = Some(g.ev.tag.choke_at.map_or(now, |c| c.min(now)));
+            }
+        }
+        let adsr = slot.adsr.or(self.note_adsr);
+        // Sculpted one-shot pads (Kick / Snare / Hat / Pluck / Chord / Phrase)
+        // fire unified sculpted GrainEvent(s) directly at GRAIN = 0.
+        if slot.sculpt.is_active() && self.macro_value(Macro::Grain) < 0.05 {
+            if self.grains.len() >= MAX_GRAINS {
+                return;
+            }
+            let map = self.macro_map();
+            let ratio = semitones_to_ratio(map.pitch_st);
+            let dur = ((sl.len() / ratio.max(0.01) as f64) as f32).clamp(0.015, 30.0);
+            let comb_hz = if slot.sculpt.comb_mix > 1e-3 {
+                crate::grain::quantize_comb_hz(base_hz.max(40.0) * ratio, self.key.as_ref())
+            } else {
+                0.0
+            };
+            self.serial += 1;
+            let serial = self.serial;
+            let mut ev = GrainEvent {
+                onset: now,
+                source_pos: sl.start.rem_euclid(src_len.max(1e-6)),
+                duration: dur,
+                pitch_ratio: ratio,
+                gain: slot.gain * velocity,
+                pan: 0.0,
+                envelope: 0.08,
+                env_skew: 0.0,
+                reverse: false,
+                id: (5u64 << 60) | ((i as u64) << 48) | (serial & 0xFFFF_FFFF_FFFF),
+                sculpt: slot.sculpt,
+                comb_hz,
+                loop_pass: 0,
+                ..Default::default()
+            };
+            if let Some(a) = adsr {
+                let off = ev.onset + ev.duration as f64;
+                ev.duration += a.release;
+                ev.envelope = 0.01;
+                ev.tag.env = Some(crate::envelope::VoiceEnv { adsr: a, on: ev.onset, off });
+            }
+            ev.tag.voice = serial;
+            ev.tag.focus = sl.focus;
+            ev.tag.caption = sl.caption;
+            ev.tag.choke_group = slot.choke_group;
+            ev.tag.is_wash = slot.sculpt.is_wash();
+            ev.tag.zoom_punch = if slot.sculpt.sub_exciter > 0.2 || slot.sculpt.snare_snap > 0.2 {
+                0.08
+            } else {
+                0.03
+            };
+            let (chord_evs, n_evs) = crate::grain::expand_chord_grain_inline(
+                &ev,
+                slot.sculpt.chord,
+                base_hz,
+                self.key.as_ref(),
+            );
+            for (ci, cev) in chord_evs.iter().copied().enumerate().take(n_evs) {
+                if self.grains.len() >= MAX_GRAINS {
+                    break;
+                }
+                let mut cev = cev;
+                let v_id = serial.wrapping_add(ci as u64 * 0x1000_0000);
+                cev.tag.voice = v_id;
+                if let Some(tile) = start_tile(&mut self.tiles, self.layout, v_id, now) {
+                    self.tiles.release(v_id, cev.end());
+                    let env = cev.tag.env;
+                    tag_grain(&mut cev, v_id, env, Some(tile), self.layout_pan, &self.tiles);
+                }
+                self.grains.push(LiveGrain {
+                    source: slot.source,
+                    voice: v_id,
+                    ev: cev,
+                    origin: GrainOrigin::Pad(i),
+                    seen: false,
+                });
+            }
             return;
         }
         let note = PAD_NOTE + i as u8;
-        // Retrigger: the previous hit of this pad releases.
-        if let Some(vi) = self.voices.iter().position(|v| v.origin == GrainOrigin::Pad(i) && v.off.is_none()) {
-            self.release_voice_at(vi, self.now_secs());
-        }
-        let adsr = slot.adsr.or(self.note_adsr);
-        self.start_voice(note, velocity, slot.source, sl.start, 60, Some(sl.end), adsr, true, GrainOrigin::Pad(i), slot.gain);
+        self.start_voice(
+            note,
+            velocity,
+            slot.source,
+            sl.start,
+            60,
+            Some(sl.end),
+            adsr,
+            true,
+            GrainOrigin::Pad(i),
+            slot.gain,
+            slot.choke_group,
+            sl.focus,
+            sl.caption,
+        );
     }
 
     /// Note-off for voice `vi` at time `t`: with an envelope it releases
@@ -906,9 +1092,9 @@ impl Instrument {
         self.note_adsr
     }
 
-    /// Compositing layout (see [`crate::tile`]). In `Tile` every voice
-    /// gets a tile slot (`GrainEvent::tag.tile`), and with `layout_pan` its
-    /// column drives pan.
+    /// Compositing layout (see [`crate::tile`]). In `Tile` or `Split` every
+    /// voice gets a panel slot (`GrainEvent::tag.tile`), and with `layout_pan`
+    /// its column drives pan.
     pub fn set_layout(&mut self, layout: crate::tile::Layout) {
         self.layout = layout;
     }
@@ -957,6 +1143,26 @@ impl Instrument {
         n
     }
 
+    /// Populate pads `0..PADS` from multi-source [`crate::chop::KitPadSpec`]s
+    /// curated by [`crate::chop::build_kit_across_sources`] or
+    /// [`crate::chop::build_tape_loops_across_sources`]. Returns pads loaded.
+    pub fn kit_to_pads(&mut self, specs: &[crate::chop::KitPadSpec]) -> usize {
+        let mut n = 0;
+        for pad in 0..PADS {
+            if let Some(spec) = specs.get(pad) {
+                let Some(src_len) = self.sources.get(spec.source).map(|s| s.duration()) else {
+                    self.set_pad(pad, None);
+                    continue;
+                };
+                self.set_pad(pad, Some(spec.to_pad_slot(src_len)));
+                n += 1;
+            } else {
+                self.set_pad(pad, None);
+            }
+        }
+        n
+    }
+
     /// Stop every note (allocation- and free-free, so safe on the audio thread).
     pub fn all_notes_off(&mut self) {
         let now = self.now_secs();
@@ -993,8 +1199,28 @@ impl Instrument {
         if self.grains.len() >= MAX_GRAINS || self.sources.get(source).is_none() {
             return;
         }
-        ev.onset = self.now_secs();
-        self.grains.push(LiveGrain { source, voice: 0, ev, origin: GrainOrigin::Trigger, seen: false });
+        let now = self.now_secs();
+        ev.onset = now;
+        if ev.tag.choke_group > 0 {
+            self.choke_group_at(ev.tag.choke_group, now);
+        }
+        if ev.sculpt.chord != crate::grain::ChordVoicing::Off {
+            let base_hz = self.sources.get(source).map_or(440.0, |s| s.effective_base_hz());
+            let (chord_evs, n_evs) = crate::grain::expand_chord_grain_inline(
+                &ev,
+                ev.sculpt.chord,
+                base_hz,
+                self.key.as_ref(),
+            );
+            for cev in chord_evs.iter().copied().take(n_evs) {
+                if self.grains.len() >= MAX_GRAINS {
+                    break;
+                }
+                self.grains.push(LiveGrain { source, voice: 0, ev: cev, origin: GrainOrigin::Trigger, seen: false });
+            }
+        } else {
+            self.grains.push(LiveGrain { source, voice: 0, ev, origin: GrainOrigin::Trigger, seen: false });
+        }
     }
 
     /// Install step lanes (a `StepPattern`: rows = lanes, steps with
@@ -1011,60 +1237,117 @@ impl Instrument {
 
     /// Fire the pattern's steps whose boundary falls in `[t0, t1)`.
     fn sequence(&mut self, t0: f64, t1: f64) {
-        let Some(pat) = self.pattern.as_ref() else { return };
-        if !self.transport.playing || pat.rows.is_empty() {
+        if !self.transport.playing {
             return;
         }
-        let spb = pat.steps_per_beat.max(1) as f64;
+        let Some(spb) = self.pattern.as_ref().filter(|p| !p.rows.is_empty()).map(|p| p.steps_per_beat.max(1) as f64) else {
+            return;
+        };
+        let step_secs = (60.0 / self.transport.bpm) / spb;
         let (b0, b1) = (self.beat_at(t0), self.beat_at(t1));
+        let n_rows = self.pattern.as_ref().map_or(0, |p| p.rows.len());
         let mut k = (b0 * spb - 1e-9).ceil() as i64;
         while (k as f64) / spb < b1 {
             let t = self.grid_time(k as f64 / spb).clamp(t0, t1);
-            for (ri, row) in pat.rows.iter().enumerate() {
-                if row.muted || row.steps.is_empty() {
-                    continue;
-                }
-                let Some(src) = self.sources.get(row.source) else { continue };
+            for ri in 0..n_rows {
+                let (source, step, g, row_key, row_sculpt, row_choke) = {
+                    let Some(pat) = self.pattern.as_ref() else { break };
+                    let row = &pat.rows[ri];
+                    if row.muted || row.steps.is_empty() {
+                        continue;
+                    }
+                    let st = row.steps[k.rem_euclid(row.steps.len() as i64) as usize];
+                    (row.source, st, row.grains.clone(), row.key, row.sculpt, row.choke_group)
+                };
+                let Some(src) = self.sources.get(source) else { continue };
                 let len = src.duration();
                 if len <= 0.0 {
                     continue;
                 }
-                let step = row.steps[k.rem_euclid(row.steps.len() as i64) as usize];
+                let base_hz = src.effective_base_hz();
+                let chop = step.slice_index.and_then(|i| src.slices.get(i as usize).copied());
                 let roll = self.pat_rng.next_f32();
                 let jit = self.pat_rng.bipolar();
                 if !step.on || roll >= step.chance || self.grains.len() >= MAX_GRAINS {
                     continue;
                 }
-                let g = &row.grains;
-                let key = row.key.or(self.key);
-                let st = g.pitch + step.pitch + g.pitch_jitter * jit;
-                let ratio = crate::music::effective_ratio(st, key.as_ref(), src.effective_base_hz(), g.quantize_amount, g.detune_cents);
-                let at = if step.slice >= 0.0 { step.slice.min(1.0) } else { g.position };
-                let chop = step.slice_index.and_then(|i| src.slices.get(i as usize).copied());
-                let pos = chop.map_or(at as f64 * len, |sl| sl.start);
-                let mut ev = GrainEvent {
-                    onset: t,
-                    source_pos: pos.rem_euclid(len.max(1e-6)),
-                    duration: crate::seq::hit_duration(g, &step, chop, ratio),
-                    pitch_ratio: ratio,
-                    gain: g.gain * step.gain,
-                    pan: g.pan.clamp(-1.0, 1.0),
-                    envelope: g.envelope,
-                    env_skew: g.env_skew,
-                    reverse: g.reverse_prob >= 0.5,
-                    id: (1u64 << 62) | ((ri as u64) << 40) | (k as u64 & 0xFF_FFFF_FFFF),
-                    ..Default::default()
-                };
-                let voice = crate::seq::hit_voice(ri, k as u64, 0.0);
-                crate::seq::apply_hit_adsr(&mut ev, g, voice);
-                ev.tag.voice = voice;
-                if let Some(tile) = start_tile(&mut self.tiles, self.layout, voice, t) {
-                    self.tiles.release(voice, ev.end());
-                    let env = ev.tag.env;
-                    tag_grain(&mut ev, voice, env, Some(tile), self.layout_pan, &self.tiles);
+                let key = row_key.or(self.key);
+                let mut sculpt = if row_sculpt.is_active() { row_sculpt } else { g.sculpt };
+                if step.chord != crate::grain::ChordVoicing::Off {
+                    sculpt.chord = step.chord;
                 }
-                let source = row.source;
-                self.grains.push(LiveGrain { source, voice: 0, ev, origin: GrainOrigin::Step, seen: false });
+                let choke_group = if row_choke > 0 { row_choke.min(4) } else { g.choke_group.min(4) };
+                let at = if step.slice >= 0.0 { step.slice.min(1.0) } else { g.position };
+                let pos = chop.map_or(at as f64 * len, |sl| sl.start).rem_euclid(len.max(1e-6));
+                let r_count = step.ratchet.clamp(1, 8);
+                let sub_step_secs = step_secs / r_count as f64;
+
+                for sub in 0..r_count {
+                    if self.grains.len() >= MAX_GRAINS {
+                        break;
+                    }
+                    let sub_t = t + sub as f64 * sub_step_secs;
+                    if choke_group > 0 {
+                        self.choke_group_at(choke_group, sub_t);
+                    }
+                    let st = g.pitch + step.pitch + g.pitch_jitter * jit + sub as f32 * step.ratchet_pitch;
+                    let ratio = crate::music::effective_ratio(st, key.as_ref(), base_hz, g.quantize_amount, g.detune_cents);
+                    let mut dur = crate::seq::hit_duration(&g, &step, chop, ratio);
+                    if r_count > 1 {
+                        dur = dur.min((sub_step_secs * 0.92).max(0.01) as f32);
+                    }
+                    let sub_gain = if r_count > 1 { 0.88f32.powi(sub as i32) } else { 1.0 };
+                    let comb_hz = if sculpt.comb_mix > 1e-3 {
+                        crate::grain::quantize_comb_hz(base_hz.max(40.0) * ratio, key.as_ref())
+                    } else {
+                        0.0
+                    };
+                    let slot_u = if r_count == 1 { k as u64 } else { (k as u64).wrapping_mul(8).wrapping_add(sub as u64) };
+                    let mut ev = GrainEvent {
+                        onset: sub_t,
+                        source_pos: pos,
+                        duration: dur,
+                        pitch_ratio: ratio,
+                        gain: g.gain * step.gain * sub_gain,
+                        pan: g.pan.clamp(-1.0, 1.0),
+                        envelope: g.envelope,
+                        env_skew: g.env_skew,
+                        reverse: g.reverse_prob >= 0.5,
+                        id: (1u64 << 62) | ((ri as u64) << 40) | (slot_u & 0xFF_FFFF_FFFF),
+                        sculpt,
+                        comb_hz,
+                        loop_pass: 0,
+                        ..Default::default()
+                    };
+                    let voice = crate::seq::hit_voice(ri, slot_u, 0.0);
+                    crate::seq::apply_hit_adsr(&mut ev, &g, voice);
+                    ev.tag.voice = voice;
+                    ev.tag.focus = chop.map_or((0.5, 0.5), |sl| sl.focus);
+                    ev.tag.caption = chop.map_or_else(crate::chop::Caption::default, |sl| sl.caption);
+                    ev.tag.ratchet_odd = sub % 2 == 1;
+                    ev.tag.choke_group = choke_group;
+                    ev.tag.is_wash = sculpt.is_wash();
+
+                    let (chord_evs, n_evs) = crate::grain::expand_chord_grain_inline(
+                        &ev,
+                        sculpt.chord,
+                        base_hz,
+                        key.as_ref(),
+                    );
+                    for (ci, mut cev) in chord_evs.iter().copied().enumerate().take(n_evs) {
+                        if self.grains.len() >= MAX_GRAINS {
+                            break;
+                        }
+                        let cv = voice.wrapping_add(ci as u64 * 0x1000_0000);
+                        cev.tag.voice = cv;
+                        if let Some(tile) = start_tile(&mut self.tiles, self.layout, cv, sub_t) {
+                            self.tiles.release(cv, cev.end());
+                            let env = cev.tag.env;
+                            tag_grain(&mut cev, cv, env, Some(tile), self.layout_pan, &self.tiles);
+                        }
+                        self.grains.push(LiveGrain { source, voice: 0, ev: cev, origin: GrainOrigin::Step, seen: false });
+                    }
+                }
             }
             k += 1;
         }
@@ -1097,7 +1380,7 @@ impl Instrument {
         self.scratch.left.resize(n, 0.0);
         self.scratch.right.resize(n, 0.0);
         for g in &self.grains {
-            if g.ev.onset >= t1 || g.ev.end() <= t0 {
+            if g.ev.onset >= t1 || g.ev.audio_end() <= t0 {
                 continue;
             }
             let Some(audio) = self.sources.get(g.source).and_then(|s| s.audio.as_deref()) else {
@@ -1107,7 +1390,7 @@ impl Instrument {
         }
         left.copy_from_slice(&self.scratch.left);
         right.copy_from_slice(&self.scratch.right);
-        self.grains.retain(|g| g.ev.end() > t1);
+        self.grains.retain(|g| g.ev.audio_end() > t1);
 
         // SMEAR: echo + reverb, wet amounts live.
         if let EffectKind::Delay { feedback, mix, .. } = &mut self.smear_chain[0].kind {
@@ -1186,6 +1469,12 @@ impl Instrument {
                     let room = ((slice_end - ev.source_pos) / ev.pitch_ratio.max(0.01) as f64).max(0.005);
                     ev.duration = ev.duration.min(room as f32);
                 }
+                ev.tag.choke_group = v.choke_group;
+                ev.tag.focus = v.focus;
+                ev.tag.caption = v.caption;
+                ev.tag.hard_burst = v.adsr.is_some_and(|a| a.picture == crate::envelope::PictureCut::Cut)
+                    && cloud.spray * map.texture <= 0.08
+                    && ev.duration <= 0.095;
                 tag_grain(&mut ev, v.serial, v.env(), v.tile, layout_pan, &self.tiles);
                 let (source, serial, origin) = (v.source, v.serial, v.origin);
                 v.head += hop * map.speed as f64;
@@ -1305,6 +1594,10 @@ impl Instrument {
             if t >= t1 {
                 continue;
             }
+            let choke_group = self.pads[i].slot.map_or(0, |s| s.choke_group);
+            if start && choke_group > 0 {
+                self.choke_group_at(choke_group, t);
+            }
             self.serial += 1;
             let serial = self.serial;
             let p = &mut self.pads[i];
@@ -1317,7 +1610,12 @@ impl Instrument {
                 // A retrigger drops the old loop's pending grains.
                 self.grains.retain(|g| !(g.voice == old && g.origin == GrainOrigin::Pad(i) && g.ev.onset >= t));
                 self.tiles.release(old, t);
-                self.pads[i].tile = start_tile(&mut self.tiles, self.layout, serial, t);
+                let is_wash = p.slot.is_some_and(|s| s.sculpt.is_wash());
+                self.pads[i].tile = if self.layout == crate::tile::Layout::Split && is_wash {
+                    None
+                } else {
+                    start_tile(&mut self.tiles, self.layout, serial, t)
+                };
             } else {
                 p.on = false;
                 p.env_off = t;
@@ -1335,9 +1633,10 @@ impl Instrument {
         }
     }
 
-    /// The playing pads' grains up to `until`: a seamless 50%-overlap Hann
-    /// train reading the loop straight (the sample, unprocessed until SMEAR
-    /// and LOOK), phase-locked to the beat it started on.
+    /// The playing pads' grains up to `until`: either an asynchronous
+    /// real-seconds Basinski tape loop (`slot.sculpt.free_loop_secs` with `80ms`
+    /// raised-cosine seam and per-pass `disintegrate` / `ebb_flow`), or a
+    /// seamless 50%-overlap Hann train phase-locked to the host beat grid.
     fn schedule_pads(&mut self, until: f64) {
         let hop = PAD_GRAIN / 2.0;
         for i in 0..PADS {
@@ -1352,8 +1651,6 @@ impl Instrument {
                 continue;
             }
             let Some(len) = self.sources.get(slot.source).map(|s| s.duration()).filter(|l| *l > 0.0) else { continue };
-            let spb = 60.0 / self.transport.bpm;
-            let loop_secs = (slot.len_beats as f64 * spb).min(len);
             let mut next_t = p.next_t;
             let mut k = p.k;
             // Never look ahead past a queued stop.
@@ -1361,29 +1658,87 @@ impl Instrument {
                 Some(end) => until.min(end),
                 None => p.queued.filter(|q| !q.0).map_or(until, |q| until.min(self.grid_time(q.1) + slot.adsr.map_or(0.0, |a| a.release_secs()))),
             };
-            while next_t < until {
-                if self.grains.len() >= MAX_GRAINS {
-                    break;
+            if let Some(free_secs) = slot.sculpt.free_loop_secs.filter(|s| *s > 0.05) {
+                let period = (free_secs as f64).clamp(0.05, 120.0);
+                let seam = 0.08_f64.min(period * 0.25);
+                let dur_out = period + seam;
+                let env_taper = ((2.0 * seam) / dur_out).clamp(0.02, 0.90) as f32;
+                while next_t < until {
+                    if self.grains.len() >= MAX_GRAINS {
+                        break;
+                    }
+                    let pass_k = k as u32;
+                    let id = (3u64 << 61) | ((i as u64) << 48) | (k & 0xFFFF_FFFF_FFFF);
+                    let ebb = crate::grain::ebb_flow_gain_at(slot.sculpt.ebb_flow, pass_k, next_t, id);
+                    let ox = crate::grain::oxide_dropout_at(slot.sculpt.disintegrate, pass_k, 0.5, id);
+                    let mut ev = GrainEvent {
+                        onset: next_t,
+                        source_pos: (slot.start as f64 * len).rem_euclid(len),
+                        duration: dur_out as f32,
+                        pitch_ratio: 1.0,
+                        gain: slot.gain * p.velocity * ebb,
+                        pan: 0.0,
+                        envelope: env_taper,
+                        env_skew: 0.0,
+                        reverse: false,
+                        id,
+                        sculpt: slot.sculpt,
+                        comb_hz: 0.0,
+                        loop_pass: pass_k,
+                        ..Default::default()
+                    };
+                    ev.tag.choke_group = slot.choke_group;
+                    ev.tag.is_wash = true;
+                    ev.tag.oxide_dropout = (1.0 - ox).clamp(0.0, 1.0);
+                    tag_grain(&mut ev, p.serial, env, p.tile, self.layout_pan, &self.tiles);
+                    self.grains.push(LiveGrain { source: slot.source, voice: p.serial, ev, origin: GrainOrigin::Pad(i), seen: false });
+                    next_t += period;
+                    k += 1;
                 }
-                let phase = ((self.grid_beat(next_t) - p.start_beat) * spb).rem_euclid(loop_secs.max(1e-3));
-                let ev = GrainEvent {
-                    onset: next_t,
-                    source_pos: (slot.start as f64 * len + phase).rem_euclid(len),
-                    duration: PAD_GRAIN as f32,
-                    pitch_ratio: 1.0,
-                    gain: slot.gain * p.velocity,
-                    pan: 0.0,
-                    envelope: 1.0,
-                    env_skew: 0.0,
-                    reverse: false,
-                    id: (3u64 << 61) | ((i as u64) << 48) | (k & 0xFFFF_FFFF_FFFF),
-                    ..Default::default()
-                };
-                let mut ev = ev;
-                tag_grain(&mut ev, p.serial, env, p.tile, self.layout_pan, &self.tiles);
-                self.grains.push(LiveGrain { source: slot.source, voice: p.serial, ev, origin: GrainOrigin::Pad(i), seen: false });
-                next_t += hop;
-                k += 1;
+            } else {
+                let spb = 60.0 / self.transport.bpm;
+                let loop_secs = (slot.len_beats as f64 * spb).min(len);
+                while next_t < until {
+                    if self.grains.len() >= MAX_GRAINS {
+                        break;
+                    }
+                    let phase = ((self.grid_beat(next_t) - p.start_beat) * spb).rem_euclid(loop_secs.max(1e-3));
+                    let pass_k = if loop_secs > 1e-3 {
+                        (((self.grid_beat(next_t) - p.start_beat) * spb) / loop_secs).max(0.0) as u32
+                    } else {
+                        0
+                    };
+                    let id = (3u64 << 61) | ((i as u64) << 48) | (k & 0xFFFF_FFFF_FFFF);
+                    let ebb = if slot.sculpt.ebb_flow > 1e-3 {
+                        crate::grain::ebb_flow_gain_at(slot.sculpt.ebb_flow, pass_k, next_t, id)
+                    } else {
+                        1.0
+                    };
+                    let ox = crate::grain::oxide_dropout_at(slot.sculpt.disintegrate, pass_k, 0.5, id);
+                    let mut ev = GrainEvent {
+                        onset: next_t,
+                        source_pos: (slot.start as f64 * len + phase).rem_euclid(len),
+                        duration: PAD_GRAIN as f32,
+                        pitch_ratio: 1.0,
+                        gain: slot.gain * p.velocity * ebb,
+                        pan: 0.0,
+                        envelope: 1.0,
+                        env_skew: 0.0,
+                        reverse: false,
+                        id,
+                        sculpt: slot.sculpt,
+                        comb_hz: 0.0,
+                        loop_pass: pass_k,
+                        ..Default::default()
+                    };
+                    ev.tag.choke_group = slot.choke_group;
+                    ev.tag.is_wash = slot.sculpt.is_wash();
+                    ev.tag.oxide_dropout = (1.0 - ox).clamp(0.0, 1.0);
+                    tag_grain(&mut ev, p.serial, env, p.tile, self.layout_pan, &self.tiles);
+                    self.grains.push(LiveGrain { source: slot.source, voice: p.serial, ev, origin: GrainOrigin::Pad(i), seen: false });
+                    next_t += hop;
+                    k += 1;
+                }
             }
             (self.pads[i].next_t, self.pads[i].k) = (next_t, k);
         }
@@ -1507,14 +1862,44 @@ impl FrameRenderer {
         }
         let (w, h) = (out.width, out.height);
         let mut layer = Frame::transparent(w, h);
-        let grid = (frame.layout == crate::tile::Layout::Tile).then(|| {
-            crate::tile::frame_grid(
-                frame.grains.iter().filter(|(_, e)| t >= e.onset && t < e.end() && e.tag.picture_at(t) > 0.0).filter_map(|(_, e)| e.tag.tile),
-            )
-        });
+        let aspect = w as f32 / h.max(1) as f32;
+        let grid = match frame.layout {
+            crate::tile::Layout::Tile => {
+                let any_burst = frame
+                    .grains
+                    .iter()
+                    .any(|(_, e)| e.tag.hard_burst && t >= e.onset && t < e.end());
+                let active_slots = frame
+                    .grains
+                    .iter()
+                    .filter(|(_, e)| {
+                        let carry = if !e.tag.hard_burst && e.tag.env.is_none() && e.duration > 0.085 && e.duration < 0.35 {
+                            crate::video::OPTICAL_CARRY_SECS
+                        } else {
+                            0.0
+                        };
+                        t >= e.onset && t < e.end() + carry && e.tag.picture_at(t) > 0.0
+                    })
+                    .filter_map(|(_, e)| e.tag.tile);
+                Some(if any_burst && aspect > 1.3 {
+                    crate::tile::frame_portrait_grid(active_slots, aspect)
+                } else {
+                    crate::tile::frame_grid(active_slots)
+                })
+            }
+            crate::tile::Layout::Split => Some(crate::tile::frame_split_grid(
+                frame
+                    .grains
+                    .iter()
+                    .filter(|(_, e)| !e.tag.is_wash && t >= e.onset && t < e.end() + crate::video::OPTICAL_CARRY_SECS && e.tag.picture_at(t) > 0.0)
+                    .filter_map(|(_, e)| e.tag.tile),
+                aspect,
+            )),
+            _ => None,
+        };
         for (sid, ev) in &frame.grains {
             let Some(video) = sources.get(*sid).and_then(|s| s.video.as_deref()) else { continue };
-            crate::video::composite_grains_frame_layout(
+            crate::video::composite_grains_frame_stage(
                 video,
                 std::slice::from_ref(ev),
                 &frame.style,
@@ -1525,12 +1910,13 @@ impl FrameRenderer {
                 t,
                 false,
                 None,
+                frame.layout,
                 grid,
             );
         }
         fx::apply_video_chain(&mut layer, &frame.effects, &mut self.states);
         *out = Frame::black(w, h);
-        blend_layer(out, &layer, frame.style.additive, 1.0);
+        crate::video::blend_stage_layer(out, &layer, frame.layout, frame.style.additive, 1.0, false);
     }
 }
 

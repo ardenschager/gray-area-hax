@@ -611,6 +611,11 @@ fn hash01(x: u64) -> f32 {
     (z >> 40) as f32 / (1u64 << 24) as f32
 }
 
+/// Optical carry window (`52 ms`) holding percussive panel freeze-frames across
+/// micro-gaps between rapid cuts in `Tile` and `Split` layouts so 16th-note
+/// collages never strobe black between hits.
+pub const OPTICAL_CARRY_SECS: f64 = 0.052;
+
 /// Geometry + shading for one visual grain at output time `t` — the ONE
 /// place grain placement is computed. Both the CPU compositor and the GPU
 /// preview consume these, so they cannot drift.
@@ -631,6 +636,36 @@ pub struct GrainDraw {
     /// Drawn as a tile (layout `Tile`): hard-edged, opaque normal blend,
     /// no feather / shadow / additive.
     pub tiled: bool,
+    /// Horizontal mirror (`true` on odd ratchet sub-hits for Aphex rolls).
+    pub flip_x: bool,
+    /// Basinski tape oxide dropout wear (`0..1`; `0` = pristine, `1` = deep dropout).
+    pub oxide_dropout: f32,
+    /// Sustained wash layer in `Layout::Split` (bleeds full-canvas at `30%` screen).
+    pub is_wash: bool,
+    /// Interior shared seam edges `[left, right, top, bottom]` feathered in `Layout::Split`.
+    pub feather_edges: [bool; 4],
+}
+
+/// Cover-crop source patch `(x, y, w, h)` for a destination panel of aspect
+/// `panel_ar` against a source of aspect `src_ar`, centered around normalized
+/// subject `focus` `(cx, cy)` and zoomed by `zoom >= 1.0`.
+#[inline]
+pub fn focus_cover_patch(panel_ar: f32, src_ar: f32, focus: (f32, f32), zoom: f32) -> [f32; 4] {
+    let panel_ar = panel_ar.max(1e-4);
+    let src_ar = src_ar.max(1e-4);
+    let z = zoom.max(1.0);
+    let (base_w, base_h) = if panel_ar < src_ar {
+        (panel_ar / src_ar, 1.0)
+    } else {
+        (1.0, src_ar / panel_ar)
+    };
+    let pw = (base_w / z).clamp(0.05, 1.0);
+    let ph = (base_h / z).clamp(0.05, 1.0);
+    let fx = if focus.0 <= 0.0 && focus.1 <= 0.0 { 0.5 } else { focus.0.clamp(0.0, 1.0) };
+    let fy = if focus.0 <= 0.0 && focus.1 <= 0.0 { 0.5 } else { focus.1.clamp(0.0, 1.0) };
+    let px = (fx - pw * 0.5).clamp(0.0, (1.0 - pw).max(0.0));
+    let py = (fy - ph * 0.5).clamp(0.0, (1.0 - ph).max(0.0));
+    [px, py, pw, ph]
 }
 
 /// Compute the draw list for all events active at `t`. `aspect` is the
@@ -668,7 +703,7 @@ pub fn grain_draws_opts(
 /// for [`Layout::Tile`](crate::tile::Layout) (the frame's grid, from
 /// [`crate::tile::frame_grid`] over every visible grain's `tag.tile`).
 /// Tile-tagged grains then fill their tile rect ([`crate::tile::tile_rect`])
-/// with a centered cover crop of the source, at full opacity times the
+/// with a focus-centered cover crop of the source, at full opacity times the
 /// voice's picture weight (hard cut with ADSR `Cut`); untagged grains and
 /// `None` draw as before. In every mode a grain's opacity is multiplied by
 /// its voice's picture weight (`tag.picture_at(t)`).
@@ -684,6 +719,42 @@ pub fn grain_draws_layout(
     parked: bool,
     tile_grid: Option<(u32, u32)>,
 ) -> Vec<GrainDraw> {
+    let layout = if tile_grid.is_some() {
+        crate::tile::Layout::Tile
+    } else {
+        crate::tile::Layout::Stack
+    };
+    grain_draws_stage(
+        events,
+        style,
+        link,
+        transform,
+        source_duration,
+        t,
+        aspect,
+        parked,
+        layout,
+        tile_grid,
+    )
+}
+
+/// Stage-aware grain placement for all four [`crate::tile::Layout`] modes
+/// (`Stack`, `Split`, `Tile`, `Bleed`), honoring `VoiceTag::{focus, zoom_punch,
+/// ratchet_odd, oxide_dropout, is_wash}` and `52 ms` optical carry on short
+/// percussive cuts.
+#[allow(clippy::too_many_arguments)]
+pub fn grain_draws_stage(
+    events: &[GrainEvent],
+    style: &VisualGrainStyle,
+    link: &AvLink,
+    transform: &crate::timeline::ClipTransform,
+    source_duration: f64,
+    t: f64,
+    aspect: f32,
+    parked: bool,
+    layout: crate::tile::Layout,
+    panel_grid: Option<(u32, u32)>,
+) -> Vec<GrainDraw> {
     let mut out = Vec::new();
     let rot = transform.rotation.to_radians();
     let (sin_r, cos_r) = rot.sin_cos();
@@ -691,10 +762,28 @@ pub fn grain_draws_layout(
     let aspect = aspect.max(0.01);
     let fl = style.flicker.clamp(0.0, 1.0);
     for ev in events {
-        let vis_dur = if parked {
-            ev.duration.max(0.001) as f64
+        let dur_f64 = ev.duration.max(0.001) as f64;
+        // *MODELL 5* staccato micro-bursts (`<= 85 ms` or `hard_burst`) cut sharply
+        // on their exact frame boundary; rhythmic drum/phrase stabs (`85..350 ms`)
+        // hold `52 ms` optical carry across micro-gaps.
+        let carry = if !parked
+            && !ev.tag.hard_burst
+            && ev.tag.env.is_none()
+            && ev.tag.choke_at.is_none()
+            && layout.uses_tiles()
+            && ev.duration > 0.085
+            && ev.duration < 0.35
+        {
+            OPTICAL_CARRY_SECS
         } else {
-            style.visual_duration(ev.duration)
+            0.0
+        };
+        let vis_dur = if parked || ev.tag.hard_burst {
+            dur_f64
+        } else if layout.uses_tiles() && ev.tag.tile.is_some() {
+            dur_f64 + carry
+        } else {
+            style.visual_duration(ev.duration).max(dur_f64 + carry)
         };
         if t < ev.onset || t >= ev.onset + vis_dur {
             continue;
@@ -703,32 +792,133 @@ pub fn grain_draws_layout(
         if picture <= 0.0 {
             continue;
         }
-        if let (Some((cols, rows)), Some(slot)) = (tile_grid, ev.tag.tile) {
-            if t >= ev.onset + ev.duration as f64 {
-                continue; // tiles cut with the sound, no visual tail
+        let dt = (t - ev.onset).max(0.0);
+        let zoom = if ev.tag.zoom_punch > 1e-4 && !parked {
+            1.0 + ev.tag.zoom_punch.clamp(0.0, 0.35) * ((-dt / 0.095).exp() as f32)
+        } else {
+            1.0
+        };
+        let oxide = ev.tag.oxide_dropout.clamp(0.0, 1.0);
+        let oxide_alpha = 1.0 - 0.82 * oxide;
+
+        // 1. Crisp architectural `Layout::Tile` or feathered `Layout::Split` panel.
+        if let (Some((cols, rows)), Some(slot)) = (panel_grid, ev.tag.tile) {
+            if layout == crate::tile::Layout::Tile || (layout == crate::tile::Layout::Split && !ev.tag.is_wash) {
+                let carry_fade = if dt <= dur_f64 {
+                    1.0
+                } else if carry > 1e-6 {
+                    let u = ((dt - dur_f64) / carry).clamp(0.0, 1.0) as f32;
+                    0.5 * (1.0 + (std::f32::consts::PI * u).cos())
+                } else {
+                    continue;
+                };
+                if carry_fade <= 0.003 {
+                    continue;
+                }
+                let visual_rate = 1.0 + (ev.pitch_ratio - 1.0) * link.pitch_to_rate;
+                // Freeze-frame during optical carry after the audio slice finishes.
+                let eff_dt = dt.min(dur_f64);
+                let local = eff_dt * visual_rate as f64;
+                let src_time = if ev.reverse && link.reverse_video {
+                    ev.source_pos + dur_f64 * visual_rate as f64 - local
+                } else {
+                    ev.source_pos + local
+                };
+                let (r, feather_edges, tiled) = if layout == crate::tile::Layout::Split {
+                    let (sr, fe) = crate::tile::split_rect(slot as usize, cols, rows);
+                    (sr, fe, false)
+                } else {
+                    (crate::tile::tile_rect(slot as usize, cols, rows, aspect), [false; 4], true)
+                };
+                let tile_ar = r.w * aspect / r.h.max(1e-6);
+                let patch = focus_cover_patch(tile_ar, aspect, ev.tag.focus, zoom);
+                out.push(GrainDraw {
+                    dest: [r.x, r.y, r.w, r.h],
+                    rotation: 0.0,
+                    patch,
+                    src_time,
+                    alpha: (picture * carry_fade * oxide_alpha).clamp(0.0, 1.0),
+                    hue_shift: ev.semitones() * link.pitch_to_hue,
+                    tiled,
+                    flip_x: ev.tag.ratchet_odd,
+                    oxide_dropout: oxide,
+                    is_wash: false,
+                    feather_edges,
+                });
+                continue;
             }
-            let r = crate::tile::tile_rect(slot as usize, cols, rows, aspect);
+        }
+
+        // 2. Full-canvas optical `Layout::Bleed` OR sustained wash layer in `Layout::Split`.
+        if layout == crate::tile::Layout::Bleed
+            || (layout == crate::tile::Layout::Split && ev.tag.is_wash)
+        {
+            let phase = (dt / vis_dur).clamp(0.0, 1.0) as f32;
+            let taper = ev.envelope.max(0.18);
+            let env = if parked && ev.duration >= 0.25 {
+                1.0
+            } else {
+                grain_env_skewed(phase, taper, ev.env_skew * fl)
+            };
+            let env_part = 1.0 + (env - 1.0) * link.envelope_to_opacity;
+            let gain_part = 1.0 + (ev.gain.min(1.5) - 1.0) * link.gain_to_opacity;
+            let wash_scale = if layout == crate::tile::Layout::Split { 0.30 } else { 0.88 };
+            let alpha = (env_part * gain_part * picture * oxide_alpha * wash_scale).clamp(0.0, 1.0);
+            if alpha <= 0.003 {
+                continue;
+            }
             let visual_rate = 1.0 + (ev.pitch_ratio - 1.0) * link.pitch_to_rate;
-            let local = (t - ev.onset) * visual_rate as f64;
+            let local = dt.min(dur_f64) * visual_rate as f64;
             let src_time = if ev.reverse && link.reverse_video {
-                ev.source_pos + ev.duration as f64 * visual_rate as f64 - local
+                ev.source_pos + dur_f64 * visual_rate as f64 - local
             } else {
                 ev.source_pos + local
             };
-            // Cover crop (the source is assumed to share the canvas aspect).
-            let tile_ar = r.w * aspect / r.h.max(1e-6);
-            let (pw, ph) = if tile_ar < aspect { (tile_ar / aspect, 1.0) } else { (1.0, aspect / tile_ar) };
+            let patch = focus_cover_patch(aspect, aspect, ev.tag.focus, zoom);
             out.push(GrainDraw {
-                dest: [r.x, r.y, r.w, r.h],
-                rotation: 0.0,
-                patch: [(1.0 - pw) * 0.5, (1.0 - ph) * 0.5, pw, ph],
+                dest: [0.0, 0.0, 1.0, 1.0],
+                rotation: rot,
+                patch,
                 src_time,
-                alpha: picture.clamp(0.0, 1.0),
+                alpha,
                 hue_shift: ev.semitones() * link.pitch_to_hue,
-                tiled: true,
+                tiled: false,
+                flip_x: ev.tag.ratchet_odd,
+                oxide_dropout: oxide,
+                is_wash: true,
+                feather_edges: [false; 4],
             });
             continue;
         }
+
+        // 2b. *MODELL 5* Full-Frame Hard Micro-Burst (`PictureCut::Cut` + tight `spray <= 0.08` + micro-grain):
+        // renders 100% full-frame (`size = 1.0`, `feather = 0.0`, sharp cut) even in `Stack` mode!
+        if ev.tag.hard_burst && layout == crate::tile::Layout::Stack {
+            let visual_rate = 1.0 + (ev.pitch_ratio - 1.0) * link.pitch_to_rate;
+            let local = dt.min(dur_f64) * visual_rate as f64;
+            let src_time = if ev.reverse && link.reverse_video {
+                ev.source_pos + dur_f64 * visual_rate as f64 - local
+            } else {
+                ev.source_pos + local
+            };
+            let patch = focus_cover_patch(aspect, aspect, ev.tag.focus, zoom);
+            out.push(GrainDraw {
+                dest: [0.0, 0.0, 1.0, 1.0],
+                rotation: 0.0,
+                patch,
+                src_time,
+                alpha: (picture * oxide_alpha).clamp(0.0, 1.0),
+                hue_shift: ev.semitones() * link.pitch_to_hue,
+                tiled: true,
+                flip_x: ev.tag.ratchet_odd,
+                oxide_dropout: oxide,
+                is_wash: false,
+                feather_edges: [false; 4],
+            });
+            continue;
+        }
+
+        // 3. Classic `Layout::Stack` (and untagged grains).
         let phase = ((t - ev.onset) / vis_dur) as f32;
         let (vis_env_taper, vis_skew, flash_damp) = if fl < 0.999 && !parked {
             let taper = ev.envelope.max((1.0 - fl) * 0.85);
@@ -753,7 +943,7 @@ pub fn grain_draws_layout(
         }
         let env_part = 1.0 + (env - 1.0) * link.envelope_to_opacity;
         let gain_part = 1.0 + (ev.gain.min(1.5) - 1.0) * link.gain_to_opacity;
-        let alpha = (env_part * gain_part * picture).clamp(0.0, 1.0);
+        let alpha = (env_part * gain_part * picture * oxide_alpha).clamp(0.0, 1.0);
         if alpha <= 0.003 {
             continue;
         }
@@ -778,17 +968,28 @@ pub fn grain_draws_layout(
         (ox, oy) = (ox * cos_r - oy * sin_r, ox * sin_r + oy * cos_r);
         let cx = 0.5 + ox / aspect + transform.x * 0.5;
         let cy = 0.5 + oy + transform.y * 0.5;
-        let size = size * tscale;
+        let size = size * tscale * zoom;
 
         let src_frac = if source_duration > 0.0 {
             (ev.source_pos / source_duration).fract() as f32
         } else {
             0.0
         };
-        let patch_size = size.clamp(0.05, 1.0);
-        let sx0 = (src_frac * (1.0 - patch_size)).clamp(0.0, (1.0 - patch_size).max(0.0));
-        let sy0 = ((0.5 + jy * 0.5) * (1.0 - patch_size))
-            .clamp(0.0, (1.0 - patch_size).max(0.0));
+        let patch_size = (size / zoom).clamp(0.05, 1.0);
+        let has_custom_focus =
+            (ev.tag.focus.0 - 0.5).abs() > 0.01 || (ev.tag.focus.1 - 0.5).abs() > 0.01;
+        let (sx0, sy0) = if has_custom_focus && patch_size < 0.98 {
+            (
+                (ev.tag.focus.0 - patch_size * 0.5).clamp(0.0, (1.0 - patch_size).max(0.0)),
+                (ev.tag.focus.1 - patch_size * 0.5).clamp(0.0, (1.0 - patch_size).max(0.0)),
+            )
+        } else {
+            (
+                (src_frac * (1.0 - patch_size)).clamp(0.0, (1.0 - patch_size).max(0.0)),
+                ((0.5 + jy * 0.5) * (1.0 - patch_size))
+                    .clamp(0.0, (1.0 - patch_size).max(0.0)),
+            )
+        };
 
         out.push(GrainDraw {
             dest: [cx - size / 2.0, cy - size / 2.0, size, size],
@@ -798,6 +999,10 @@ pub fn grain_draws_layout(
             alpha,
             hue_shift: ev.semitones() * link.pitch_to_hue,
             tiled: false,
+            flip_x: ev.tag.ratchet_odd,
+            oxide_dropout: oxide,
+            is_wash: ev.tag.is_wash,
+            feather_edges: [false; 4],
         });
     }
     out
@@ -815,6 +1020,33 @@ fn border_feather(qx: f32, qy: f32, feather: f32) -> f32 {
         0.5 - 0.5 * (std::f32::consts::PI * u).cos()
     };
     edge(qx) * edge(qy)
+}
+
+#[inline]
+fn split_edge_feather(qx: f32, qy: f32, edges: [bool; 4]) -> f32 {
+    if !edges.iter().any(|&e| e) {
+        return 1.0;
+    }
+    // Interior overlap zone spans ~11.5% of the expanded panel width (`2 * 0.065 / 1.13`).
+    const ZONE: f32 = 0.13;
+    let taper = |dist: f32| -> f32 {
+        let u = (dist / ZONE).clamp(0.0, 1.0);
+        0.5 - 0.5 * (std::f32::consts::PI * u).cos()
+    };
+    let mut w = 1.0f32;
+    if edges[0] && qx < ZONE {
+        w *= taper(qx);
+    }
+    if edges[1] && (1.0 - qx) < ZONE {
+        w *= taper(1.0 - qx);
+    }
+    if edges[2] && qy < ZONE {
+        w *= taper(qy);
+    }
+    if edges[3] && (1.0 - qy) < ZONE {
+        w *= taper(1.0 - qy);
+    }
+    w
 }
 
 /// Composite every grain active at output time `t` (timeline seconds) onto
@@ -870,16 +1102,76 @@ pub fn composite_grains_frame_layout(
     hue_override: Option<f32>,
     tile_grid: Option<(u32, u32)>,
 ) {
+    let layout = if tile_grid.is_some() {
+        crate::tile::Layout::Tile
+    } else {
+        crate::tile::Layout::Stack
+    };
+    composite_grains_frame_stage(
+        clip,
+        events,
+        style,
+        link,
+        transform,
+        color_filter,
+        out,
+        t,
+        blend_frames,
+        hue_override,
+        layout,
+        tile_grid,
+    );
+}
+
+/// Stage-aware CPU grain rasterizer supporting all four [`crate::tile::Layout`]
+/// modes (`Stack`, `Split` with feathered screen-blended seams & `30%` wash bleed,
+/// `Tile` crisp architectural grid, and `Bleed` full-canvas multi-exposure melt),
+/// plus `focus` subject crop, `ratchet_odd` horizontal mirror, and `oxide_dropout`
+/// ferric wear.
+#[allow(clippy::too_many_arguments)]
+pub fn composite_grains_frame_stage(
+    clip: &VideoClip,
+    events: &[GrainEvent],
+    style: &VisualGrainStyle,
+    link: &AvLink,
+    transform: &crate::timeline::ClipTransform,
+    color_filter: Option<&ColorFilter>,
+    out: &mut Frame,
+    t: f64,
+    blend_frames: bool,
+    hue_override: Option<f32>,
+    layout: crate::tile::Layout,
+    panel_grid: Option<(u32, u32)>,
+) {
     let ow = out.width as f32;
     let oh = out.height as f32;
     let aspect = ow / oh.max(1.0);
     let add = style.additive.clamp(0.0, 1.0);
     let feath = style.feather.clamp(0.0, 1.0);
     let shad = style.shadow.clamp(0.0, 1.0);
-    let draws = grain_draws_layout(events, style, link, transform, clip.duration(), t, aspect, false, tile_grid);
+    let draws = grain_draws_stage(
+        events,
+        style,
+        link,
+        transform,
+        clip.duration(),
+        t,
+        aspect,
+        false,
+        layout,
+        panel_grid,
+    );
 
     for d in draws {
-        let (add, feath, shad) = if d.tiled { (0.0, 0.0, 0.0) } else { (add, feath, shad) };
+        let is_split_panel =
+            layout == crate::tile::Layout::Split && !d.is_wash && d.feather_edges.iter().any(|&e| e);
+        let use_screen = layout == crate::tile::Layout::Bleed
+            || (layout == crate::tile::Layout::Split && (d.is_wash || is_split_panel));
+        let (add, feath, shad) = if d.tiled || layout == crate::tile::Layout::Split {
+            (0.0, 0.0, 0.0)
+        } else {
+            (add, feath, shad)
+        };
         let src_cow = if blend_frames {
             clip.frame_looped_at(d.src_time, 0.32)
         } else {
@@ -893,7 +1185,7 @@ pub fn composite_grains_frame_layout(
         // sample the entire padded silhouette bounding box rather than cropping
         // a small square window that guillotines limbs along a rectangle edge.
         let mut patch = d.patch;
-        if patch[2] < 0.98 {
+        if !d.tiled && layout == crate::tile::Layout::Stack && patch[2] < 0.98 {
             if let Some(bounds) = src.alpha_bounds() {
                 patch = bounds;
             } else if let Some((fx, fy)) = src.alpha_focus() {
@@ -936,14 +1228,19 @@ pub fn composite_grains_frame_layout(
                 if !(0.0..1.0).contains(&qx) || !(0.0..1.0).contains(&qy) {
                     continue;
                 }
-                let sx = ((patch[0] + qx * patch[2]) * (sw - 1.0)) as u32;
+                let sample_qx = if d.flip_x { 1.0 - qx } else { qx };
+                let sx = ((patch[0] + sample_qx * patch[2]) * (sw - 1.0)) as u32;
                 let sy = ((patch[1] + qy * patch[3]) * (sh - 1.0)) as u32;
                 let [mut r, mut g, mut b, ta] =
                     src.get(sx.min(src.width - 1), sy.min(src.height - 1));
 
                 // The source frame's own alpha participates: segmented
                 // (masked) sources composite only where the object is.
-                let mut a = alpha * (ta as f32 / 255.0) * border_feather(qx, qy, feath);
+                let seam_f = split_edge_feather(qx, qy, d.feather_edges);
+                let mut a = alpha
+                    * (ta as f32 / 255.0)
+                    * border_feather(qx, qy, feath)
+                    * seam_f;
                 if a <= 0.003 {
                     continue;
                 }
@@ -958,10 +1255,17 @@ pub fn composite_grains_frame_layout(
                     let (nr, ng, nb) = hsv_to_rgb(h + hue_shift, s, v);
                     (r, g, b) = (nr, ng, nb);
                 }
+                // Basinski tape oxide chroma wear: desaturates toward warm sepia ferric oxide.
+                if d.oxide_dropout > 0.015 {
+                    let ox = d.oxide_dropout.clamp(0.0, 1.0);
+                    let luma = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
+                    let keep_c = 1.0 - 0.65 * ox;
+                    r = (r as f32 * keep_c + luma * 1.08 * (1.0 - keep_c)).clamp(0.0, 255.0) as u8;
+                    g = (g as f32 * keep_c + luma * 0.94 * (1.0 - keep_c)).clamp(0.0, 255.0) as u8;
+                    b = (b as f32 * keep_c + luma * 0.76 * (1.0 - keep_c)).clamp(0.0, 255.0) as u8;
+                }
                 if shad > 0.002 {
                     let luma = (0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32) / 255.0;
-                    // Detect 2-px silhouette alpha contour so dark shadow figures
-                    // carry a luminous rim highlight over dark nocturnal backgrounds.
                     let sx_c = sx.min(src.width - 1);
                     let sy_c = sy.min(src.height - 1);
                     let a_l = src.get(sx_c.saturating_sub(2), sy_c)[3];
@@ -981,17 +1285,25 @@ pub fn composite_grains_frame_layout(
                     b = (b as f32 * keep + floor_lift + rim_boost * 0.68).clamp(0.0, 255.0) as u8;
                 }
 
-                // Straight-alpha accumulation into the layer, with an
-                // unpremultiplied additive component for true glow.
                 let dst = out.get(x as u32, y as u32);
                 let da = dst[3] as f32 / 255.0;
                 let out_a = (a + da * (1.0 - a)).max(1e-6);
                 let blend = |src_c: u8, dst_c: u8| -> u8 {
                     let s = src_c as f32;
                     let dd = dst_c as f32;
-                    let over = (s * a + dd * da * (1.0 - a)) / out_a;
-                    let additive = ((dd * da + s * a) / out_a).min(255.0);
-                    (over * (1.0 - add) + additive * add) as u8
+                    if use_screen && da > 0.01 {
+                        let sn = (s * a) / 255.0;
+                        let dn = (dd * da) / 255.0;
+                        let scr = 1.0 - (1.0 - sn) * (1.0 - dn);
+                        let over = (s * a + dd * da * (1.0 - a)) / (out_a * 255.0);
+                        let w_scr = if seam_f < 0.999 || d.is_wash { 0.85 } else { 0.35 };
+                        ((over * (1.0 - w_scr) + (scr / out_a).min(1.0) * w_scr) * 255.0)
+                            .clamp(0.0, 255.0) as u8
+                    } else {
+                        let over = (s * a + dd * da * (1.0 - a)) / out_a;
+                        let additive = ((dd * da + s * a) / out_a).min(255.0);
+                        (over * (1.0 - add) + additive * add) as u8
+                    }
                 };
                 out.put(
                     x as u32,
@@ -1003,6 +1315,210 @@ pub fn composite_grains_frame_layout(
                         (out_a * 255.0) as u8,
                     ],
                 );
+            }
+        }
+    }
+}
+
+/// Blend a track layer onto the master stage frame according to `layout`:
+/// - `Stack` / `Tile`: standard `blend_layer` (`additive`, `opacity`).
+/// - `Split`: optical screen-blend along feathered interior panel seams and
+///   sustained wash layers so shared boundaries glow like overlapping film gates
+///   instead of dimming to gray.
+/// - `Bleed`: luma-keyed optical screen + soft-exclusion highlight roll-off so
+///   multiple overlapping video streams melt together without blowing out to white.
+pub fn blend_stage_layer(
+    dst: &mut Frame,
+    layer: &Frame,
+    layout: crate::tile::Layout,
+    additive: f32,
+    opacity: f32,
+    is_wash_track: bool,
+) {
+    match layout {
+        crate::tile::Layout::Stack | crate::tile::Layout::Tile => {
+            blend_layer(dst, layer, additive, opacity);
+        }
+        crate::tile::Layout::Split => {
+            let opacity = opacity.clamp(0.0, 1.0);
+            if opacity <= 0.002 {
+                return;
+            }
+            for (d, s) in dst.data.chunks_exact_mut(4).zip(layer.data.chunks_exact(4)) {
+                let raw_a = s[3] as f32 / 255.0;
+                let la = raw_a * opacity;
+                if la <= 0.002 {
+                    continue;
+                }
+                let dst_luma = (0.299 * d[0] as f32 + 0.587 * d[1] as f32 + 0.114 * d[2] as f32) / 255.0;
+                // Where `dst` is already lit (interior feathered seam or wash bleed),
+                // blend via optical screen so neither panel darkens at the seam.
+                let seam_screen = if is_wash_track {
+                    0.92
+                } else if raw_a < 0.97 && dst_luma > 0.02 {
+                    0.82
+                } else {
+                    additive.clamp(0.0, 1.0) * 0.35
+                };
+                for c in 0..3 {
+                    let dn = d[c] as f32 / 255.0;
+                    let sn = (s[c] as f32 / 255.0) * la;
+                    let over = d[c] as f32 * (1.0 - la) + s[c] as f32 * la;
+                    let screen = (1.0 - (1.0 - dn) * (1.0 - sn)) * 255.0;
+                    d[c] = (over * (1.0 - seam_screen) + screen * seam_screen).clamp(0.0, 255.0) as u8;
+                }
+                d[3] = 255;
+            }
+        }
+        crate::tile::Layout::Bleed => {
+            let opacity = opacity.clamp(0.0, 1.0);
+            if opacity <= 0.002 {
+                return;
+            }
+            for (d, s) in dst.data.chunks_exact_mut(4).zip(layer.data.chunks_exact(4)) {
+                let raw_a = s[3] as f32 / 255.0 * opacity;
+                if raw_a <= 0.002 {
+                    continue;
+                }
+                let src_val = s[0].max(s[1]).max(s[2]) as f32 / 255.0;
+                let dst_val = d[0].max(d[1]).max(d[2]) as f32 / 255.0;
+                // Smoothstep value key (`0.05..0.65`) so dark shadows stay translucent obsidian
+                // while saturated/bright subjects project optically onto existing footage.
+                let lk_t = ((src_val - 0.05) / 0.60).clamp(0.0, 1.0);
+                let luma_key = 0.45 + 0.55 * (lk_t * lk_t * (3.0 - 2.0 * lk_t));
+                let la = (raw_a * luma_key).clamp(0.0, 1.0);
+                for c in 0..3 {
+                    let dn = d[c] as f32 / 255.0;
+                    let sn = (s[c] as f32 / 255.0) * la;
+                    let screen = 1.0 - (1.0 - dn) * (1.0 - sn);
+                    // Soft-exclusion roll-off when both layers are bright prevents flat white clip.
+                    let hi = (dn * sn).max(0.0);
+                    let melted = if dst_val > 0.02 {
+                        (screen - 0.22 * hi * dst_val).clamp(0.0, 1.0)
+                    } else {
+                        dn * (1.0 - la) + (s[c] as f32 / 255.0) * la
+                    };
+                    d[c] = (melted * 255.0).round().clamp(0.0, 255.0) as u8;
+                }
+                d[3] = 255;
+            }
+        }
+    }
+}
+
+/// Built-in 5×7 uppercase pixel glyph rows (MSB = leftmost column of 5 bits)
+/// for deterministic headless & cross-platform VJ stage captions (`captions_on`).
+fn glyph_5x7(ch: char) -> [u8; 7] {
+    match ch.to_ascii_uppercase() {
+        'A' => [0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
+        'B' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110],
+        'C' => [0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110],
+        'D' => [0b11100, 0b10010, 0b10001, 0b10001, 0b10001, 0b10010, 0b11100],
+        'E' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111],
+        'F' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000],
+        'G' => [0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01110],
+        'H' => [0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
+        'I' => [0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
+        'J' => [0b00111, 0b00010, 0b00010, 0b00010, 0b10010, 0b10010, 0b01100],
+        'K' => [0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001],
+        'L' => [0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111],
+        'M' => [0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001],
+        'N' => [0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001],
+        'O' => [0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
+        'P' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000],
+        'Q' => [0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101],
+        'R' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001],
+        'S' => [0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110],
+        'T' => [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100],
+        'U' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
+        'V' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100],
+        'W' => [0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b11011, 0b10001],
+        'X' => [0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001],
+        'Y' => [0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100],
+        'Z' => [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111],
+        '0' => [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110],
+        '1' => [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
+        '2' => [0b01110, 0b10001, 0b00001, 0b00110, 0b01000, 0b10000, 0b11111],
+        '3' => [0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110],
+        '4' => [0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010],
+        '5' => [0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110],
+        '6' => [0b01110, 0b10000, 0b11110, 0b10001, 0b10001, 0b10001, 0b01110],
+        '7' => [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000],
+        '8' => [0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110],
+        '9' => [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110],
+        '!' => [0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00000, 0b00100],
+        '?' => [0b01110, 0b10001, 0b00010, 0b00100, 0b00100, 0b00000, 0b00100],
+        '.' => [0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00100],
+        ',' => [0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00100, 0b01000],
+        '\'' => [0b00100, 0b00100, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000],
+        '-' => [0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000],
+        _ => [0; 7],
+    }
+}
+
+/// Render a high-contrast kinetic VJ stage caption (`text`) onto `frame`.
+/// `opacity` (`0..1`) fades the caption card cleanly with the active vocal grain.
+pub fn draw_stage_caption(frame: &mut Frame, text: &str, opacity: f32) {
+    let trimmed = text.trim();
+    let op = opacity.clamp(0.0, 1.0);
+    if trimmed.is_empty() || op <= 0.02 || frame.width < 16 || frame.height < 16 {
+        return;
+    }
+    let chars: Vec<char> = trimmed.chars().take(32).collect();
+    let scale = ((frame.height / 150).max(1)).min(6);
+    let glyph_w = 5 * scale;
+    let glyph_h = 7 * scale;
+    let gap = scale;
+    let total_w = chars.len() as u32 * (glyph_w + gap) - gap;
+    if total_w + 4 >= frame.width {
+        return;
+    }
+    let x0 = (frame.width - total_w) / 2;
+    let y0 = ((frame.height as f32 * 0.83) as u32).min(frame.height.saturating_sub(glyph_h + 4 * scale));
+    let pad_x = (2 * scale).min(x0);
+    let pad_y = scale.min(y0);
+
+    // Subtle smoked obsidian backing plate for legibility over bright footage.
+    let bx0 = x0.saturating_sub(pad_x);
+    let bx1 = (x0 + total_w + pad_x).min(frame.width);
+    let by0 = y0.saturating_sub(pad_y);
+    let by1 = (y0 + glyph_h + pad_y).min(frame.height);
+    let plate_a = 0.58 * op;
+    for y in by0..by1 {
+        for x in bx0..bx1 {
+            let mut px = frame.get(x, y);
+            px[0] = (px[0] as f32 * (1.0 - plate_a) + 10.0 * plate_a) as u8;
+            px[1] = (px[1] as f32 * (1.0 - plate_a) + 10.0 * plate_a) as u8;
+            px[2] = (px[2] as f32 * (1.0 - plate_a) + 12.0 * plate_a) as u8;
+            frame.put(x, y, px);
+        }
+    }
+
+    // Crisp warm-cream studio lettering (`#F4F0E8`) with 95% max blend.
+    let fg_a = 0.95 * op;
+    for (ci, &ch) in chars.iter().enumerate() {
+        let rows = glyph_5x7(ch);
+        let gx0 = x0 + ci as u32 * (glyph_w + gap);
+        for (ry, &bits) in rows.iter().enumerate() {
+            if bits == 0 {
+                continue;
+            }
+            for rx in 0..5u32 {
+                if (bits >> (4 - rx)) & 1 == 1 {
+                    for sy in 0..scale {
+                        for sx in 0..scale {
+                            let px_x = gx0 + rx * scale + sx;
+                            let px_y = y0 + ry as u32 * scale + sy;
+                            if px_x < frame.width && px_y < frame.height {
+                                let mut px = frame.get(px_x, px_y);
+                                px[0] = (px[0] as f32 * (1.0 - fg_a) + 244.0 * fg_a) as u8;
+                                px[1] = (px[1] as f32 * (1.0 - fg_a) + 240.0 * fg_a) as u8;
+                                px[2] = (px[2] as f32 * (1.0 - fg_a) + 232.0 * fg_a) as u8;
+                                frame.put(px_x, px_y, px);
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -1545,7 +2061,7 @@ mod tests {
             gain: 1.0,
             envelope: 0.01,
             id: voice,
-            tag: crate::grain::VoiceTag { voice, env: Some(env), tile },
+            tag: crate::grain::VoiceTag { voice, env: Some(env), tile, ..Default::default() },
             ..Default::default()
         };
         let (style, link, tr) = (VisualGrainStyle::default(), AvLink::default(), crate::timeline::ClipTransform::default());

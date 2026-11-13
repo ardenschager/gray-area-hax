@@ -9,14 +9,14 @@
 //!
 //! Track order is the video z-order: later tracks composite on top.
 
-use crate::audio::{render_grains_audio_spatial, StereoBuffer, TapeState};
+use crate::audio::{render_grains_audio_spatial, StereoBuffer, StudioBusState, TapeState};
 use crate::fx;
-use crate::grain::{schedule_grains_auto, GrainEvent};
+use crate::grain::{schedule_grains_auto, ChordVoicing, GrainEvent, VoiceSculpt};
 use crate::seq::pattern_events;
 use crate::timeline::{Clip, ClipKind, DuckState, Project, Source};
 use crate::video::{
-    apply_video_tape, blend_layer, blend_layer_over, composite_grains_frame,
-    composite_grains_frame_layout, composite_grains_frame_opts, Frame, VisualGrainStyle,
+    apply_video_tape, blend_layer_over, blend_stage_layer, composite_grains_frame_stage,
+    draw_stage_caption, Frame, VisualGrainStyle, OPTICAL_CARRY_SECS,
 };
 
 pub struct RenderOutput {
@@ -93,6 +93,8 @@ fn snippet_events(
     clip_t0: f64,
     clip_len: f64,
     secs_per_beat: f64,
+    eff_sculpt: VoiceSculpt,
+    eff_choke: u8,
 ) -> Vec<GrainEvent> {
     let g = &clip.grains;
     let source_len = source.duration();
@@ -114,8 +116,116 @@ fn snippet_events(
 
     let base_ratio = quantized(g.pitch, g);
     let eff_speed0 = if g.varispeed { base_ratio } else { g.speed };
+
+    // Asynchronous real-seconds Basinski tape loop (`free_loop_secs`) independent
+    // of the BPM bar grid, with an `80ms` raised-cosine crossfade seam and
+    // per-pass `disintegrate` / `ebb_flow` evolution.
+    if let Some(free_secs) = eff_sculpt.free_loop_secs.filter(|s| *s > 0.05) {
+        let period = (free_secs as f64).clamp(0.05, 120.0);
+        let seam = 0.08_f64.min(period * 0.25);
+        let rev = g.reverse_prob >= 0.5;
+        let mut raw_events = Vec::new();
+        let mut t = 0.0f64;
+        let mut pass_k = 0u32;
+        while t < clip_len {
+            let rem = clip_len - t;
+            let dur = if rem > period + seam { period + seam } else { rem.max(0.02) };
+            let env_taper = ((2.0 * seam) / dur).clamp(0.02, 0.90) as f32;
+            let id = g.seed.wrapping_add(pass_k as u64);
+            let ebb = crate::grain::ebb_flow_gain_at(eff_sculpt.ebb_flow, pass_k, clip_t0 + t, g.seed);
+            let ox = crate::grain::oxide_dropout_at(eff_sculpt.disintegrate, pass_k, 0.5, id);
+            let comb_hz = if eff_sculpt.comb_mix > 1e-3 {
+                crate::grain::quantize_comb_hz(base_hz.max(40.0) * base_ratio, clip.key.as_ref())
+            } else {
+                0.0
+            };
+            let mut ev = GrainEvent {
+                onset: clip_t0 + t,
+                source_pos: start_pos,
+                duration: dur as f32,
+                pitch_ratio: base_ratio,
+                gain: g.gain * ebb,
+                pan: g.pan.clamp(-1.0, 1.0),
+                envelope: env_taper,
+                env_skew: 0.0,
+                reverse: rev,
+                id,
+                sculpt: eff_sculpt,
+                comb_hz,
+                loop_pass: pass_k,
+                ..Default::default()
+            };
+            ev.tag.is_wash = true;
+            ev.tag.choke_group = eff_choke;
+            ev.tag.oxide_dropout = (1.0 - ox).clamp(0.0, 1.0);
+            if eff_sculpt.chord != ChordVoicing::Off {
+                crate::grain::expand_chord_grain(
+                    &ev,
+                    eff_sculpt.chord,
+                    base_hz,
+                    clip.key.as_ref(),
+                    &mut raw_events,
+                );
+            } else {
+                raw_events.push(ev);
+            }
+            t += period;
+            pass_k += 1;
+        }
+        return raw_events;
+    }
+
+    let enrich_snippet_grains = |raw: Vec<GrainEvent>| -> Vec<GrainEvent> {
+        if !eff_sculpt.is_active() && eff_choke == 0 {
+            return raw;
+        }
+        let mut out = Vec::with_capacity(raw.len());
+        for mut ev in raw {
+            ev.sculpt = eff_sculpt;
+            ev.tag.choke_group = eff_choke;
+            ev.tag.is_wash = eff_sculpt.is_wash();
+            if eff_sculpt.comb_mix > 1e-3 && ev.comb_hz <= 0.0 {
+                ev.comb_hz = crate::grain::quantize_comb_hz(
+                    base_hz.max(40.0) * ev.pitch_ratio,
+                    clip.key.as_ref(),
+                );
+            }
+            if eff_sculpt.disintegrate > 1e-3 {
+                let ox = crate::grain::oxide_dropout_at(
+                    eff_sculpt.disintegrate,
+                    ev.loop_pass,
+                    0.5,
+                    ev.id ^ g.seed,
+                );
+                ev.tag.oxide_dropout = (1.0 - ox).clamp(0.0, 1.0);
+            }
+            if eff_sculpt.ebb_flow > 1e-3 {
+                ev.gain *= crate::grain::ebb_flow_gain_at(eff_sculpt.ebb_flow, ev.loop_pass, ev.onset, g.seed);
+            }
+            if eff_sculpt.chord != ChordVoicing::Off {
+                crate::grain::expand_chord_grain(
+                    &ev,
+                    eff_sculpt.chord,
+                    base_hz,
+                    clip.key.as_ref(),
+                    &mut out,
+                );
+            } else {
+                out.push(ev);
+            }
+        }
+        out
+    };
+
     if g.texture > 1e-3 {
-        return textured_events(clip, source_len, clip_t0, clip_len, secs_per_beat, &quantized);
+        return enrich_snippet_grains(textured_events(
+            clip,
+            source_len,
+            clip_t0,
+            clip_len,
+            secs_per_beat,
+            &quantized,
+        ));
     }
     if clip.automation.is_empty() && (eff_speed0 - base_ratio).abs() < 1e-3 {
         let rev = g.reverse_prob >= 0.5;
@@ -128,7 +238,7 @@ fn snippet_events(
         let first_out_dur = first_avail / base_ratio.max(0.05) as f64;
         // If the snippet fits inside the source media, emit a single pristine grain.
         if clip_len <= first_out_dur + 1e-4 || audio_len < 0.25 {
-            return vec![GrainEvent {
+            return enrich_snippet_grains(vec![GrainEvent {
                 onset: clip_t0,
                 source_pos: start_pos,
                 duration: clip_len as f32,
@@ -140,7 +250,7 @@ fn snippet_events(
                 reverse: rev,
                 id: g.seed,
                 ..Default::default()
-            }];
+            }]);
         }
         // Otherwise seamlessly crossfade-loop across `audio_len` using raised-cosine
         // Tukey overlaps (`cos^2` / complementary half-cosines sum to exact 1.0),
@@ -169,6 +279,7 @@ fn snippet_events(
                 env_skew: 0.0,
                 reverse: rev,
                 id: g.seed.wrapping_add(pass_idx),
+                loop_pass: pass_idx as u32,
                 ..Default::default()
             });
             if t + dur >= clip_len - 1e-5 {
@@ -177,7 +288,7 @@ fn snippet_events(
             t += (dur - xfade).max(0.02);
             pass_idx += 1;
         }
-        return events;
+        return enrich_snippet_grains(events);
     }
 
     // WSOLA-aligned granular time-stretch train: 200 ms Hann grains at 50%
@@ -232,7 +343,7 @@ fn snippet_events(
         head += HOP * speed.max(0.05) as f64;
         k += 1;
     }
-    events
+    enrich_snippet_grains(events)
 }
 
 /// Continuous visual event(s) for an untextured stretched snippet (`texture == 0`
@@ -244,9 +355,15 @@ fn snippet_video_events(
     source: &Source,
     clip_t0: f64,
     clip_len: f64,
+    eff_sculpt: VoiceSculpt,
+    eff_choke: u8,
 ) -> Option<Vec<GrainEvent>> {
     let g = &clip.grains;
-    if g.texture > 1e-3 {
+    if g.texture > 1e-3
+        || eff_sculpt.free_loop_secs.is_some()
+        || eff_sculpt.chord != ChordVoicing::Off
+        || eff_sculpt.disintegrate > 1e-3
+    {
         return None;
     }
     let source_len = source.duration();
@@ -277,7 +394,7 @@ fn snippet_video_events(
     if clip.automation.is_empty() && (eff_speed - base_ratio).abs() < 1e-3 && !wraps_audio && !wraps_video {
         return None; // `parts` is already a single unbroken grain
     }
-    Some(vec![GrainEvent {
+    let mut ev = GrainEvent {
         onset: clip_t0,
         source_pos: start_pos,
         duration: clip_len as f32,
@@ -288,8 +405,12 @@ fn snippet_video_events(
         env_skew: g.env_skew,
         reverse: g.reverse_prob >= 0.5,
         id: g.seed,
+        sculpt: eff_sculpt,
         ..Default::default()
-    }])
+    };
+    ev.tag.choke_group = eff_choke;
+    ev.tag.is_wash = eff_sculpt.is_wash();
+    Some(vec![ev])
 }
 
 /// The sample <-> grains morph (`texture` > 0): a grain train whose read
@@ -405,10 +526,78 @@ fn tile_events(
                 e.source_pos = (e.source_pos + shift).rem_euclid(lay.source_len);
             }
             e.duration = e.duration.min((end - e.onset) as f32);
+            e.loop_pass = e.loop_pass.saturating_add(k as u32);
+            if k > 0 && e.sculpt.disintegrate > 1e-3 {
+                let ox = crate::grain::oxide_dropout_at(
+                    e.sculpt.disintegrate,
+                    e.loop_pass,
+                    0.5,
+                    e.id ^ clip.grains.seed,
+                );
+                e.tag.oxide_dropout = (1.0 - ox).clamp(0.0, 1.0);
+            }
+            if k > 0 && e.sculpt.ebb_flow > 1e-3 {
+                e.gain *= crate::grain::ebb_flow_gain_at(
+                    e.sculpt.ebb_flow,
+                    e.loop_pass,
+                    e.onset,
+                    e.id ^ clip.grains.seed,
+                );
+            }
             out.push(e);
         }
     }
     out
+}
+
+/// Apply MPC choke groups (`1..=4`) across all planned events on unmuted tracks:
+/// triggering any voice in group `g > 0` at `t_cut` mutes earlier voices in group `g`
+/// (`e.onset < t_cut - 0.002`) with a click-free `3 ms` raised-cosine release while
+/// preserving simultaneous chord siblings (`|t_cut - e.onset| <= 2 ms`).
+pub fn apply_choke_groups(plans: &mut [ClipPlan], project: &Project) {
+    let mut triggers: [Vec<f64>; 4] = Default::default();
+    for cp in plans.iter() {
+        if project.tracks.get(cp.track).is_some_and(|t| t.muted) {
+            continue;
+        }
+        for (_, evs) in &cp.parts {
+            for e in evs {
+                let g = e.tag.choke_group;
+                if (1..=4).contains(&g) {
+                    triggers[(g - 1) as usize].push(e.onset);
+                }
+            }
+        }
+    }
+    if triggers.iter().all(|v| v.is_empty()) {
+        return;
+    }
+    for list in &mut triggers {
+        list.sort_by(|a, b| a.total_cmp(b));
+        list.dedup_by(|a, b| (*a - *b).abs() <= 1e-4);
+    }
+
+    for cp in plans.iter_mut() {
+        if project.tracks.get(cp.track).is_some_and(|t| t.muted) {
+            continue;
+        }
+        for (_, evs) in cp.parts.iter_mut().chain(cp.video_parts.iter_mut().flatten()) {
+            for e in evs.iter_mut() {
+                let g = e.tag.choke_group;
+                if !(1..=4).contains(&g) {
+                    continue;
+                }
+                let list = &triggers[(g - 1) as usize];
+                let min_cut = e.onset + 0.002;
+                let idx = list.partition_point(|&t| t <= min_cut);
+                if let Some(&t_cut) = list.get(idx) {
+                    if t_cut < e.audio_end() {
+                        e.tag.choke_at = Some(e.tag.choke_at.map_or(t_cut, |c| c.min(t_cut)));
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Schedule every clip in the project (absolute timeline seconds). Shared
@@ -420,16 +609,36 @@ pub fn plan_project(project: &Project) -> Vec<ClipPlan> {
         for (ci, clip) in track.clips.iter().enumerate() {
             let clip_t0 = project.beats_to_secs(clip.start_beat);
             let full_len = project.beats_to_secs(clip.length_beats);
-            // Repeating clips plan one pass, then tile it (below).
-            let clip_len = project.beats_to_secs(clip.pass_beats());
+            let eff_sculpt = if clip.grains.sculpt.is_active() {
+                clip.grains.sculpt
+            } else {
+                track.sculpt
+            };
+            let eff_choke = if clip.grains.choke_group > 0 {
+                clip.grains.choke_group.min(4)
+            } else {
+                track.choke_group.min(4)
+            };
+            // Free-running asynchronous tape loops plan over `full_len` directly;
+            // beat-repeating clips plan one pass, then tile it (below).
+            let has_free_loop =
+                matches!(clip.kind, ClipKind::Snippet) && eff_sculpt.free_loop_secs.is_some();
+            let clip_len = if has_free_loop {
+                full_len
+            } else {
+                project.beats_to_secs(clip.pass_beats())
+            };
             let (parts, video_parts, style) = match clip.kind {
                 ClipKind::Granular => {
                     let Some(source) = project.sources.get(clip.source) else { continue };
                     if source.duration() <= 0.0 {
                         continue;
                     }
+                    let mut g_cfg = clip.grains.clone();
+                    g_cfg.sculpt = eff_sculpt;
+                    g_cfg.choke_group = eff_choke;
                     let events = schedule_grains_auto(
-                        &clip.grains,
+                        &g_cfg,
                         &clip.automation,
                         secs_per_beat,
                         clip_t0,
@@ -445,9 +654,24 @@ pub fn plan_project(project: &Project) -> Vec<ClipPlan> {
                     if source.duration() <= 0.0 {
                         continue;
                     }
-                    let evs = snippet_events(clip, source, clip_t0, clip_len, secs_per_beat);
-                    let vevs = snippet_video_events(clip, source, clip_t0, clip_len)
-                        .map(|v| vec![(clip.source, v)]);
+                    let evs = snippet_events(
+                        clip,
+                        source,
+                        clip_t0,
+                        clip_len,
+                        secs_per_beat,
+                        eff_sculpt,
+                        eff_choke,
+                    );
+                    let vevs = snippet_video_events(
+                        clip,
+                        source,
+                        clip_t0,
+                        clip_len,
+                        eff_sculpt,
+                        eff_choke,
+                    )
+                    .map(|v| vec![(clip.source, v)]);
                     (
                         vec![(clip.source, evs)],
                         vevs,
@@ -460,7 +684,7 @@ pub fn plan_project(project: &Project) -> Vec<ClipPlan> {
                 }
                 ClipKind::Pattern(pid) => {
                     let Some(pattern) = project.patterns.get(pid) else { continue };
-                    let parts = pattern_events(
+                    let mut parts = pattern_events(
                         pattern,
                         &project.sources,
                         clip_t0,
@@ -469,6 +693,19 @@ pub fn plan_project(project: &Project) -> Vec<ClipPlan> {
                         clip.key.as_ref(),
                         &clip.automation,
                     );
+                    if track.sculpt.is_active() || track.choke_group > 0 {
+                        for (_, evs) in &mut parts {
+                            for e in evs {
+                                if !e.sculpt.is_active() && track.sculpt.is_active() {
+                                    e.sculpt = track.sculpt;
+                                    e.tag.is_wash = track.sculpt.is_wash();
+                                }
+                                if e.tag.choke_group == 0 && track.choke_group > 0 {
+                                    e.tag.choke_group = track.choke_group.min(4);
+                                }
+                            }
+                        }
+                    }
                     (parts, None, clip.visual)
                 }
             };
@@ -513,8 +750,9 @@ pub fn plan_project(project: &Project) -> Vec<ClipPlan> {
                     })
                     .collect()
             };
-            let parts = if clip.loop_beats.is_some() { tile_part_list(parts) } else { parts };
-            let mut video_parts = if clip.loop_beats.is_some() {
+            let should_tile = clip.loop_beats.is_some() && !has_free_loop;
+            let parts = if should_tile { tile_part_list(parts) } else { parts };
+            let mut video_parts = if should_tile {
                 video_parts.map(tile_part_list)
             } else {
                 video_parts
@@ -529,7 +767,9 @@ pub fn plan_project(project: &Project) -> Vec<ClipPlan> {
                 let voice = clip_voice(ti, ci);
                 for (_, evs) in parts.iter_mut().chain(video_parts.iter_mut().flatten()) {
                     for e in evs.iter_mut() {
-                        e.tag.voice = voice;
+                        if e.tag.voice == 0 {
+                            e.tag.voice = voice;
+                        }
                         e.tag.env = Some(env);
                     }
                 }
@@ -537,11 +777,32 @@ pub fn plan_project(project: &Project) -> Vec<ClipPlan> {
             plans.push(ClipPlan { track: ti, clip_index: ci, parts, video_parts, style });
         }
     }
-    if project.layout == crate::tile::Layout::Tile {
+
+    apply_choke_groups(&mut plans, project);
+
+    if project.layout.uses_tiles() {
         // Muted tracks aren't heard or drawn, so they get no tile (no
         // holes in the grid; their grains keep `tag.tile == None`).
+        // In `Layout::Split`, sustained wash clips (`is_wash`) stay untiled
+        // (`tile == None`) so they bleed full-canvas at `30%` screen.
         let muted = |cp: &ClipPlan| project.tracks.get(cp.track).is_some_and(|t| t.muted);
-        assign_tiles_where(&mut plans, project.layout_pan, |cp| !muted(cp));
+        let is_split = project.layout == crate::tile::Layout::Split;
+        assign_tiles_where(&mut plans, project.layout_pan, |cp| {
+            if muted(cp) {
+                return false;
+            }
+            if is_split {
+                let all_wash = cp
+                    .parts
+                    .iter()
+                    .flat_map(|(_, evs)| evs.iter())
+                    .all(|e| e.tag.is_wash)
+                    && cp.parts.iter().any(|(_, evs)| !evs.is_empty());
+                !all_wash
+            } else {
+                true
+            }
+        });
     }
     plans
 }
@@ -551,7 +812,7 @@ fn clip_voice(track: usize, clip: usize) -> u64 {
     0xC000_0000_0000_0000 | ((track as u64 & 0xFFFF) << 32) | (clip as u64 & 0xFFFF_FFFF)
 }
 
-/// Layout `Tile`: give every voice in the plan a stable tile slot, in
+/// Layout `Tile` / `Split`: give every voice in the plan a stable tile slot, in
 /// voice-start order, preferring the slot its track used last (the same assignment the realtime engine replays,
 /// since it plays this plan). Grains without a voice belong to their
 /// clip's voice. With `layout_pan`, the slot's column sets the grain pan
@@ -565,8 +826,8 @@ pub fn assign_tiles(plans: &mut [ClipPlan], layout_pan: bool) {
 /// unmuted tracks); the others get no tile and don't count toward the grid.
 pub fn assign_tiles_where(plans: &mut [ClipPlan], layout_pan: bool, include: impl Fn(&ClipPlan) -> bool) {
     use std::collections::BTreeMap;
-    // voice -> (start, end, track)
-    let mut spans: BTreeMap<u64, (f64, f64, usize)> = BTreeMap::new();
+    // voice -> (start, end, track, pitch_ratio)
+    let mut spans: BTreeMap<u64, (f64, f64, usize, f32)> = BTreeMap::new();
     for cp in plans.iter_mut() {
         if !include(cp) {
             continue;
@@ -574,17 +835,21 @@ pub fn assign_tiles_where(plans: &mut [ClipPlan], layout_pan: bool, include: imp
         let fallback = clip_voice(cp.track, cp.clip_index);
         for (_, evs) in cp.parts.iter_mut().chain(cp.video_parts.iter_mut().flatten()) {
             for e in evs.iter_mut() {
+                if is_wash_only_in_split(e) {
+                    continue;
+                }
                 if e.tag.voice == 0 {
                     e.tag.voice = fallback;
                 }
                 let end = e.tag.env.map_or(e.end(), |v| v.end().min(e.end()));
-                let s = spans.entry(e.tag.voice).or_insert((e.onset, end, cp.track));
+                let s = spans.entry(e.tag.voice).or_insert((e.onset, end, cp.track, e.pitch_ratio));
                 s.0 = s.0.min(e.onset);
                 s.1 = s.1.max(end);
             }
         }
     }
-    let mut order: Vec<(u64, f64, f64, usize)> = spans.into_iter().map(|(v, (a, b, t))| (v, a, b, t)).collect();
+    let mut order: Vec<(u64, f64, f64, usize, f32)> =
+        spans.into_iter().map(|(v, (a, b, t, pr))| (v, a, b, t, pr)).collect();
     order.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
     let mut tiles = crate::tile::TileAssigner::new();
     let mut slot_of: BTreeMap<u64, u8> = BTreeMap::new();
@@ -592,11 +857,13 @@ pub fn assign_tiles_where(plans: &mut [ClipPlan], layout_pan: bool, include: imp
     // One tile per track (a pad's loop passes) or per pattern lane (step
     // hits, `seq::hit_voice`): the next pass / hit keeps its tile.
     let key_of = |voice: u64, track: usize| {
+        let chord_sub = if (voice >> 60) == 0xD { (voice & 0xF) + 1 } else { 0 };
         let lane = if voice >> 60 == 0xA { 1 + ((voice >> 52) & 0xFF) } else { 0 };
-        ((track as u64) << 9) | lane
+        ((track as u64) << 14) | (lane << 5) | chord_sub
     };
     // When the key's previous voice ends (continuations at a shared start
-    // claim their slots before new keys pick the lowest free one).
+    // claim their slots before new keys pick the lowest free one; simultaneous
+    // chord voices sort low -> high pitch left-to-right).
     let mut key_end: BTreeMap<u64, f64> = BTreeMap::new();
     let mut g = 0;
     while g < order.len() {
@@ -606,11 +873,15 @@ pub fn assign_tiles_where(plans: &mut [ClipPlan], layout_pan: bool, include: imp
             h += 1;
         }
         let group = &mut order[g..h];
-        group.sort_by_key(|&(voice, s, _, track)| {
-            let cont = key_end.get(&key_of(voice, track)).is_some_and(|&e| e >= s - 1e-9);
-            (!cont, voice)
+        group.sort_by(|a, b| {
+            let cont_a = key_end.get(&key_of(a.0, a.3)).is_some_and(|&e| e >= a.1 - 1e-9);
+            let cont_b = key_end.get(&key_of(b.0, b.3)).is_some_and(|&e| e >= b.1 - 1e-9);
+            (!cont_a)
+                .cmp(&(!cont_b))
+                .then_with(|| a.4.total_cmp(&b.4))
+                .then_with(|| a.0.cmp(&b.0))
         });
-        for &(voice, start, end, track) in group.iter() {
+        for &(voice, start, end, track, _) in group.iter() {
             let key = key_of(voice, track);
             let slot = tiles.assign_keyed(voice, key, start);
             tiles.release(voice, end);
@@ -630,7 +901,7 @@ pub fn assign_tiles_where(plans: &mut [ClipPlan], layout_pan: bool, include: imp
             for e in evs.iter_mut() {
                 if let Some(&slot) = slot_of.get(&e.tag.voice) {
                     e.tag.tile = Some(slot);
-                    if layout_pan {
+                    if layout_pan && !e.tag.is_wash {
                         let (cols, rows) = crate::tile::grid_in(&grids, e.onset);
                         let (pan, gain) = crate::tile::layout_pan(slot as usize, cols, rows);
                         e.pan = (pan + 0.2 * e.pan).clamp(-1.0, 1.0);
@@ -642,28 +913,119 @@ pub fn assign_tiles_where(plans: &mut [ClipPlan], layout_pan: bool, include: imp
     }
 }
 
+#[inline]
+fn is_wash_only_in_split(_e: &GrainEvent) -> bool {
+    false
+}
+
+/// Stage-aware `Layout::Tile` grid timeline: uses *MODELL 5* vertical portrait columns
+/// (`2×1` / `3×1` / `4×1` on wide `aspect > 1.3`) when `portrait_columns` is set OR
+/// when active grains on that frame carry `hard_burst`.
+pub fn frame_tile_grids_stage(
+    plans: &[ClipPlan],
+    t0: f64,
+    fps: f32,
+    n_frames: usize,
+    aspect: f32,
+    portrait_columns: bool,
+) -> Vec<(u32, u32)> {
+    let slots = collect_frame_panel_slots(plans, t0, fps, n_frames, false);
+    if aspect <= 1.3 {
+        return slots.into_iter().map(crate::tile::frame_grid).collect();
+    }
+    let fps_f = fps.max(1e-3) as f64;
+    let mut burst_frame = vec![portrait_columns; n_frames];
+    if !portrait_columns {
+        for cp in plans {
+            for (_, evs) in &cp.parts {
+                for e in evs.iter().filter(|e| e.tag.hard_burst) {
+                    let f0 = ((e.onset - t0) * fps_f).floor().max(0.0) as usize;
+                    let f1 = (((e.end() - t0) * fps_f).ceil().max(0.0) as usize).min(n_frames);
+                    for bf in burst_frame.iter_mut().take(f1).skip(f0) {
+                        *bf = true;
+                    }
+                }
+            }
+        }
+    }
+    slots
+        .into_iter()
+        .enumerate()
+        .map(|(fi, s)| {
+            if burst_frame[fi] {
+                crate::tile::frame_portrait_grid(s, aspect)
+            } else {
+                crate::tile::frame_grid(s)
+            }
+        })
+        .collect()
+}
+
 /// Tile grid for each frame (layout `Tile`): from the tile slots of every
 /// grain visible in it, across all clips (see [`crate::tile::frame_grid`]).
 pub fn frame_tile_grids(plans: &[ClipPlan], t0: f64, fps: f32, n_frames: usize) -> Vec<(u32, u32)> {
+    collect_frame_panel_slots(plans, t0, fps, n_frames, false)
+        .into_iter()
+        .map(crate::tile::frame_grid)
+        .collect()
+}
+
+/// Architectural split grid `(cols, rows)` for each frame in [`crate::tile::Layout::Split`],
+/// ignoring full-canvas wash layers (`is_wash == true`) and holding `52 ms` optical carry
+/// on short percussive cuts.
+pub fn frame_split_grids(
+    plans: &[ClipPlan],
+    t0: f64,
+    fps: f32,
+    n_frames: usize,
+    aspect: f32,
+) -> Vec<(u32, u32)> {
+    collect_frame_panel_slots(plans, t0, fps, n_frames, true)
+        .into_iter()
+        .map(|s| crate::tile::frame_split_grid(s, aspect))
+        .collect()
+}
+
+fn collect_frame_panel_slots(
+    plans: &[ClipPlan],
+    t0: f64,
+    fps: f32,
+    n_frames: usize,
+    skip_wash: bool,
+) -> Vec<Vec<u8>> {
     let mut slots: Vec<Vec<u8>> = vec![Vec::new(); n_frames];
     let fps = fps.max(1e-3) as f64;
     for cp in plans {
         let vparts = cp.video_parts.as_deref().unwrap_or(&cp.parts);
         for (_, evs) in vparts {
             for e in evs {
+                if skip_wash && e.tag.is_wash {
+                    continue;
+                }
                 let Some(slot) = e.tag.tile else { continue };
+                let carry = if !e.tag.hard_burst
+                    && e.tag.env.is_none()
+                    && e.tag.choke_at.is_none()
+                    && e.duration > 0.085
+                    && e.duration < 0.35
+                {
+                    OPTICAL_CARRY_SECS
+                } else {
+                    0.0
+                };
+                let vis_end = e.end() + carry;
                 let f0 = ((e.onset - t0) * fps).ceil().max(0.0) as usize;
-                let f1 = (((e.end() - t0) * fps).ceil().max(0.0) as usize).min(n_frames);
+                let f1 = (((vis_end - t0) * fps).ceil().max(0.0) as usize).min(n_frames);
                 for (fi, list) in slots.iter_mut().enumerate().take(f1).skip(f0) {
                     let ft = t0 + fi as f64 / fps;
-                    if ft >= e.onset && ft < e.end() && e.tag.picture_at(ft) > 0.0 && !list.contains(&slot) {
+                    if ft >= e.onset && ft < vis_end && e.tag.picture_at(ft) > 0.0 && !list.contains(&slot) {
                         list.push(slot);
                     }
                 }
             }
         }
     }
-    slots.into_iter().map(crate::tile::frame_grid).collect()
+    slots
 }
 
 /// The clip transform's audio placement: x -> pan offset, scale ->
@@ -706,8 +1068,19 @@ pub fn render_project(project: &Project, from_beat: f64, to_beat: f64) -> Render
     let plan = plan_project(project);
     let mut master_audio = StereoBuffer::new(len, project.sample_rate);
     let n_frames = (len * project.fps as f64).ceil() as usize;
-    let tile_grids: Option<Vec<(u32, u32)>> =
-        (project.layout == crate::tile::Layout::Tile).then(|| frame_tile_grids(&plan, t0, project.fps, n_frames));
+    let aspect = project.width as f32 / project.height.max(1) as f32;
+    let panel_grids: Option<Vec<(u32, u32)>> = match project.layout {
+        crate::tile::Layout::Tile => Some(frame_tile_grids_stage(
+            &plan,
+            t0,
+            project.fps,
+            n_frames,
+            aspect,
+            project.portrait_columns,
+        )),
+        crate::tile::Layout::Split => Some(frame_split_grids(&plan, t0, project.fps, n_frames, aspect)),
+        crate::tile::Layout::Stack | crate::tile::Layout::Bleed => None,
+    };
     let mut frames: Vec<Frame> =
         (0..n_frames).map(|_| Frame::black(project.width, project.height)).collect();
 
@@ -879,14 +1252,16 @@ pub fn render_project(project: &Project, from_beat: f64, to_beat: f64) -> Render
             let ft = t0 + fi as f64 / project.fps as f64;
             let mut track_layer: Option<Frame> = None;
             let mut active_add: Option<f32> = None;
+            let mut track_is_wash = track.sculpt.is_wash();
 
             for (cpi, cp) in clip_plans.iter().enumerate() {
                 let clip = &track.clips[cp.clip_index];
                 let vparts = cp.video_parts.as_deref().unwrap_or(&cp.parts);
                 let is_stretched_snippet = cp.video_parts.is_some();
+                let carry_pad = if project.layout.uses_tiles() { OPTICAL_CARRY_SECS } else { 0.0 };
                 let any_active = vparts.iter().any(|(_, evs)| {
                     evs.iter().any(|e| {
-                        ft >= e.onset && ft < e.onset + cp.style.visual_duration(e.duration)
+                        ft >= e.onset && ft < e.onset + cp.style.visual_duration(e.duration).max(e.duration as f64 + carry_pad)
                     })
                 });
                 if !any_active && clip.effects.is_empty() {
@@ -895,6 +1270,9 @@ pub fn render_project(project: &Project, from_beat: f64, to_beat: f64) -> Render
                 let mut clip_layer = Frame::transparent(project.width, project.height);
                 if any_active {
                     active_add = Some(active_add.unwrap_or(0.0).max(cp.style.additive));
+                    if vparts.iter().any(|(_, evs)| evs.iter().any(|e| e.tag.is_wash && ft >= e.onset && ft < e.end())) {
+                        track_is_wash = true;
+                    }
                     let hue_override = if is_stretched_snippet {
                         let bh = project
                             .sources
@@ -912,49 +1290,25 @@ pub fn render_project(project: &Project, from_beat: f64, to_beat: f64) -> Render
                     } else {
                         None
                     };
+                    let grid_fi = panel_grids.as_ref().map(|g| g[fi]);
                     for (sid, evs) in vparts {
                         if let Some(video) =
                             project.sources.get(*sid).and_then(|s| s.video.as_ref())
                         {
-                            if let Some(grids) = &tile_grids {
-                                composite_grains_frame_layout(
-                                    video,
-                                    evs,
-                                    &cp.style,
-                                    &clip.link,
-                                    &clip.transform,
-                                    clip.color_filter.as_ref(),
-                                    &mut clip_layer,
-                                    ft,
-                                    is_stretched_snippet,
-                                    hue_override,
-                                    Some(grids[fi]),
-                                );
-                            } else if is_stretched_snippet {
-                                composite_grains_frame_opts(
-                                    video,
-                                    evs,
-                                    &cp.style,
-                                    &clip.link,
-                                    &clip.transform,
-                                    clip.color_filter.as_ref(),
-                                    &mut clip_layer,
-                                    ft,
-                                    true,
-                                    hue_override,
-                                );
-                            } else {
-                                composite_grains_frame(
-                                    video,
-                                    evs,
-                                    &cp.style,
-                                    &clip.link,
-                                    &clip.transform,
-                                    clip.color_filter.as_ref(),
-                                    &mut clip_layer,
-                                    ft,
-                                );
-                            }
+                            composite_grains_frame_stage(
+                                video,
+                                evs,
+                                &cp.style,
+                                &clip.link,
+                                &clip.transform,
+                                clip.color_filter.as_ref(),
+                                &mut clip_layer,
+                                ft,
+                                is_stretched_snippet,
+                                hue_override,
+                                project.layout,
+                                grid_fi,
+                            );
                         }
                     }
                 }
@@ -997,12 +1351,16 @@ pub fn render_project(project: &Project, from_beat: f64, to_beat: f64) -> Render
             let track_add = track
                 .additive
                 .unwrap_or_else(|| active_add.unwrap_or(fallback_add));
-            blend_layer(frame, &tl, track_add, opacity);
+            blend_stage_layer(frame, &tl, project.layout, track_add, opacity, track_is_wash);
         }
     }
 
     // ---- master chain ----
-    fx::apply_audio_chain(&mut master_audio, &project.master_effects);
+    if project.studio_bus {
+        let mut studio_bus = StudioBusState::new(project.sample_rate);
+        studio_bus.process_eq(&mut master_audio.left, &mut master_audio.right);
+    }
+    fx::apply_audio_chain_opts(&mut master_audio, &project.master_effects, project.studio_bus);
     if project.master_tape.is_active() {
         let mut master_tape = TapeState::new(0x4D41_5354);
         master_tape.process_block(
@@ -1056,6 +1414,7 @@ pub fn render_project(project: &Project, from_beat: f64, to_beat: f64) -> Render
     };
     let mut master_states = fx::video_chain_states(&project.master_effects, project.fps);
     for (fi, frame) in frames.iter_mut().enumerate() {
+        let ft = t0 + fi as f64 / project.fps as f64;
         fx::apply_video_chain(frame, &project.master_effects, &mut master_states);
         if project.master_tape.is_active() {
             apply_video_tape(frame, &project.master_tape, fi, project.fps, 0x4D41_5354);
@@ -1071,9 +1430,34 @@ pub fn render_project(project: &Project, from_beat: f64, to_beat: f64) -> Render
                 }
             }
         }
+        if project.captions_on {
+            let mut best_cap: Option<(&str, f64, f32)> = None;
+            for cp in &plan {
+                if project.tracks.get(cp.track).is_some_and(|t| t.muted) {
+                    continue;
+                }
+                for (_, evs) in &cp.parts {
+                    for e in evs {
+                        if !e.tag.caption.is_empty() && ft >= e.onset && ft < e.end() {
+                            let pic = e.tag.picture_at(ft);
+                            if pic > 0.05 && best_cap.is_none_or(|(_, prev_on, _)| e.onset >= prev_on) {
+                                best_cap = Some((&e.tag.caption, e.onset, pic));
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some((cap, _, pic)) = best_cap {
+                draw_stage_caption(frame, cap, pic);
+            }
+        }
     }
 
-    master_audio.soft_clip();
+    if project.studio_bus {
+        StudioBusState::process_ceiling(&mut master_audio.left, &mut master_audio.right);
+    } else {
+        master_audio.soft_clip();
+    }
     let events = plan.into_iter().map(|p| p.parts.into_iter().flat_map(|(_, e)| e).collect()).collect();
     RenderOutput { audio: master_audio, frames, fps: project.fps, events }
 }
@@ -1113,7 +1497,14 @@ mod tests {
     }
 
     fn snippet_project() -> Project {
-        let mut p = Project { bpm: 120.0, width: 96, height: 54, fps: 12.0, ..Default::default() };
+        let mut p = Project {
+            bpm: 120.0,
+            width: 96,
+            height: 54,
+            fps: 12.0,
+            studio_bus: false,
+            ..Default::default()
+        };
         let src = crate::timeline::Source {
             name: "src".into(),
             audio: Some(std::sync::Arc::new(crate::audio::AudioClip::sine(220.0, 4.0, p.sample_rate))),
@@ -2014,5 +2405,288 @@ mod tests {
         }
         let corr = cov / (vf.sqrt() * vd.sqrt() + 1e-9);
         assert!(corr > 0.38, "expected whole-frame onset<->diff corr > 0.38, got {corr:.3}");
+    }
+
+    #[test]
+    fn choke_group_cuts_prior_hat_in_3ms_while_preserving_simultaneous_chord_voices() {
+        let mut p = snippet_project();
+        p.studio_bus = false;
+        let sid = 0;
+        p.tracks.clear();
+
+        let mut pat = crate::seq::StepPattern::new("hats_and_chords");
+        // Row 0: Open hat on step 0 (long 0.45s), closed hat on step 2 (0.25s later) in choke_group 1.
+        let r_hat = pat.add_row(sid);
+        pat.rows[r_hat].choke_group = 1;
+        pat.rows[r_hat].grains.duration = 0.45;
+        pat.rows[r_hat].grains.envelope = 0.02;
+        pat.rows[r_hat].steps[0] = crate::seq::Step { on: true, length: 1.0, ..Default::default() };
+        pat.rows[r_hat].steps[2] = crate::seq::Step { on: true, length: 0.12, ..Default::default() };
+
+        // Row 1: Min7 4-voice chord on step 0 in choke_group 2, choked later on step 8 (1.0s).
+        let r_ch = pat.add_row(sid);
+        pat.rows[r_ch].choke_group = 2;
+        pat.rows[r_ch].grains.duration = 1.5;
+        pat.rows[r_ch].steps[0] = crate::seq::Step {
+            on: true,
+            chord: crate::grain::ChordVoicing::Min7,
+            ..Default::default()
+        };
+        pat.rows[r_ch].steps[8] = crate::seq::Step { on: true, length: 0.1, ..Default::default() };
+
+        let pid = p.add_pattern(pat);
+        let t_hat = p.add_track("seq");
+        p.tracks[t_hat].clips.push(Clip::new_pattern(pid, 0.0, 4.0));
+
+        let plans = plan_project(&p);
+        let all_evs: Vec<&GrainEvent> = plans[0].parts.iter().flat_map(|(_, e)| e.iter()).collect();
+        // All 4 simultaneous Min7 chord voices at t=0.0 must choke at t=1.0 (step 8), NEVER at t=0.0!
+        let chord_t0: Vec<&GrainEvent> = all_evs
+            .iter()
+            .copied()
+            .filter(|e| e.tag.choke_group == 2 && e.onset < 0.01)
+            .collect();
+        assert_eq!(chord_t0.len(), 4, "Min7 expanded to 4 polyphonic voices");
+        for ce in &chord_t0 {
+            assert_eq!(ce.tag.choke_at, Some(1.0), "sibling chord voices never self-choke");
+            assert!(ce.sculpt.hpf_hz >= 210.0, "chord stack HPF >= 210 Hz");
+        }
+        // Open hat at t=0.0 is choked at step 2 (t = 0.25s) and silent after closed hat ends (~0.31s).
+        let open_hat = all_evs
+            .iter()
+            .copied()
+            .find(|e| e.tag.choke_group == 1 && e.onset < 0.01)
+            .expect("open hat");
+        assert_eq!(open_hat.tag.choke_at, Some(0.25));
+
+        // Render solo hat row to verify silence after closed hat finishes and click-free 3ms ramp.
+        p.patterns[pid].rows[r_ch].muted = true;
+        let out = render_project(&p, 0.0, 2.0);
+        let sr = p.sample_rate as usize;
+        let post_closed = &out.audio.left[(0.34 * sr as f64) as usize..(0.44 * sr as f64) as usize];
+        let post_rms = (post_closed.iter().map(|s| s * s).sum::<f32>() / post_closed.len() as f32).sqrt();
+        assert!(post_rms < 1e-5, "open hat tail cleanly choked by closed hat: {post_rms}");
+    }
+
+    #[test]
+    fn studio_bus_ceiling_and_realtime_parity_hold_with_sculptors_and_kaleido() {
+        let mut p = Project {
+            bpm: 124.0,
+            width: 64,
+            height: 36,
+            fps: 12.0,
+            ..Default::default()
+        };
+        assert!(p.studio_bus, "studio_bus defaults to true");
+        let sid = p.add_source(crate::timeline::Source {
+            name: " rich ".into(),
+            audio: Some(std::sync::Arc::new(crate::audio::AudioClip::saw_stack(110.0, 3.0, p.sample_rate))),
+            video: Some(std::sync::Arc::new(VideoClip::test_pattern(64, 36, 12.0, 3.0))),
+            base_hz: 110.0,
+            ..Default::default()
+        });
+        let mut pat = crate::seq::StepPattern::new("vgs");
+        let r0 = pat.add_row(sid);
+        pat.rows[r0].sculpt = crate::grain::VoiceSculpt::preset(crate::grain::Stamp::Kick);
+        pat.rows[r0].steps[0].on = true;
+        pat.rows[r0].steps[8].on = true;
+
+        let r1 = pat.add_row(sid);
+        pat.rows[r1].sculpt = crate::grain::VoiceSculpt::preset(crate::grain::Stamp::Pluck);
+        pat.rows[r1].steps[4] = crate::seq::Step {
+            on: true,
+            ratchet: 3,
+            ratchet_pitch: 2.0,
+            ..Default::default()
+        };
+        pat.rows[r1].steps[12] = crate::seq::Step {
+            on: true,
+            chord: crate::grain::ChordVoicing::Min7,
+            ..Default::default()
+        };
+        let pid = p.add_pattern(pat);
+        let t_seq = p.add_track("drums");
+        p.tracks[t_seq].clips.push(Clip::new_pattern(pid, 0.0, 4.0));
+
+        let t_loop = p.add_track("basinski");
+        let mut loop_clip = Clip::new_snippet(sid, 0.0, 4.0);
+        loop_clip.grains.gain = 1.4; // push into studio ceiling
+        loop_clip.grains.sculpt = crate::grain::VoiceSculpt {
+            free_loop_secs: Some(0.61),
+            ..crate::grain::VoiceSculpt::preset(crate::grain::Stamp::Disintegrate)
+        };
+        loop_clip.effects.push(AvEffect::new(EffectKind::Kaleido { folds: 6.0, spin: 0.35 }));
+        p.tracks[t_loop].clips.push(loop_clip);
+
+        p.master_effects.push(AvEffect::new(EffectKind::Reverb { size: 0.7, damp: 0.4, mix: 0.25 }));
+
+        let offline = render_project(&p, 0.0, 4.0);
+        assert!(
+            offline.audio.peak() <= crate::audio::STUDIO_CEILING + 1e-4,
+            "studio ceiling (-1.4 dBTP) respected: peak={}",
+            offline.audio.peak()
+        );
+
+        let total = offline.audio.len();
+        let mut rt = crate::realtime::RealtimeAudio::new(p, 0.0, None);
+        let (mut left, mut right) = (vec![0.0f32; total], vec![0.0f32; total]);
+        let blocks = [256usize, 64, 1024, 513, 2048];
+        let (mut pos, mut bi) = (0, 0);
+        while pos < total {
+            let b = blocks[bi % blocks.len()].min(total - pos);
+            rt.next_block(&mut left[pos..pos + b], &mut right[pos..pos + b]);
+            pos += b;
+            bi += 1;
+        }
+        let max_diff = left
+            .iter()
+            .zip(&offline.audio.left)
+            .chain(right.iter().zip(&offline.audio.right))
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_diff < 1e-5, "RealtimeAudio == render_project with StudioBus + Sculpt + Kaleido: {max_diff}");
+    }
+
+    #[test]
+    fn stage_layouts_split_tile_bleed_aspect_and_captions_render_on_cpu() {
+        let mut p = two_track_project(true);
+        p.set_aspect(crate::tile::AspectRatio::Vertical9x16);
+        assert_eq!((p.width, p.height), (18, 32));
+        p.set_aspect_hd(crate::tile::AspectRatio::Vertical9x16);
+        assert_eq!((p.width, p.height), (1080, 1920));
+        p.set_aspect_hd(crate::tile::AspectRatio::Square1x1);
+        assert_eq!((p.width, p.height), (1080, 1080));
+        // Use fast test resolution while preserving 16:9 aspect.
+        p.width = 96;
+        p.height = 54;
+        p.fps = 20.0;
+
+        // Add a third sustained wash track (`TapeLoop`) + caption on track 0.
+        let green = p.add_source(crate::timeline::Source {
+            name: "wash".into(),
+            audio: Some(std::sync::Arc::new(crate::audio::AudioClip::sine(165.0, 2.0, p.sample_rate))),
+            video: Some(std::sync::Arc::new(solid_video(20, 180, 60))),
+            base_hz: 165.0,
+            ..Default::default()
+        });
+        let tw = p.add_track("wash");
+        let mut wc = Clip::new_snippet(green, 0.0, 2.0);
+        wc.grains.sculpt = crate::grain::VoiceSculpt::preset(crate::grain::Stamp::TapeLoop);
+        p.tracks[tw].clips.push(wc);
+
+        for layout in [
+            crate::tile::Layout::Split,
+            crate::tile::Layout::Tile,
+            crate::tile::Layout::Bleed,
+        ] {
+            p.layout = layout;
+            let out = render_project(&p, 0.0, 1.0);
+            let mid = &out.frames[out.frames.len() / 2];
+            assert!(mid.mean_luma() > 12.0, "{layout:?} lit the stage: {}", mid.mean_luma());
+            if layout == crate::tile::Layout::Split {
+                // Left panel carries red + green wash bleed; right panel carries blue + green wash bleed.
+                let left_px = mid.get(16, 27);
+                let right_px = mid.get(80, 27);
+                assert!(left_px[0] > left_px[2] + 30, "Split left panel is red-dominant: {left_px:?}");
+                assert!(right_px[2] > right_px[0] + 30, "Split right panel is blue-dominant: {right_px:?}");
+                assert!(left_px[1] > 25 && right_px[1] > 25, "Wash bleeds across both Split panels");
+            }
+            if layout == crate::tile::Layout::Bleed {
+                let center_px = mid.get(48, 27);
+                assert!(
+                    center_px[0] > 40 && center_px[1] > 40 && center_px[2] > 40 && center_px[0] < 252,
+                    "Bleed melts all 3 layers without clipping flat white: {center_px:?}"
+                );
+            }
+        }
+
+        // Captions: attach a vocal slice with a Caption and compare captions_on true vs false.
+        let mut cap_proj = snippet_project();
+        cap_proj.width = 160;
+        cap_proj.height = 90;
+        let mut sl = crate::chop::Slice::new(0.0, 1.0);
+        sl.caption = crate::chop::Caption::new("PURE SAMPLE");
+        cap_proj.sources[0].slices = vec![sl];
+        let mut pat = crate::seq::StepPattern::new("vox");
+        let r = pat.add_row(0);
+        pat.rows[r].steps[0] = crate::seq::Step {
+            on: true,
+            slice_index: Some(0),
+            ..Default::default()
+        };
+        let pid = cap_proj.add_pattern(pat);
+        cap_proj.tracks[0].clips.clear();
+        cap_proj.tracks[0].clips.push(Clip::new_pattern(pid, 0.0, 2.0));
+        cap_proj.captions_on = true;
+        let with_cap = render_project(&cap_proj, 0.0, 1.0);
+        cap_proj.captions_on = false;
+        let no_cap = render_project(&cap_proj, 0.0, 1.0);
+        assert_ne!(
+            with_cap.frames[2].data, no_cap.frames[2].data,
+            "captions_on draws kinetic stage typography"
+        );
+    }
+
+    #[test]
+    fn modell5_micro_bursts_render_full_cell_and_portrait_columns() {
+        let mut p = Project {
+            bpm: 120.0,
+            width: 96,
+            height: 54,
+            fps: 30.0,
+            layout: crate::tile::Layout::Tile,
+            ..Default::default()
+        };
+        // Three side-by-side portrait voices at offset audio-rate micro-burst densities (18 / 19 / 20 Hz).
+        for (k, (rgb, dens)) in [([230, 30, 30], 18.0f32), ([30, 220, 60], 19.0), ([40, 80, 240], 20.0)]
+            .into_iter()
+            .enumerate()
+        {
+            let sid = p.add_source(crate::timeline::Source {
+                name: format!("m5_{k}"),
+                audio: Some(std::sync::Arc::new(crate::audio::AudioClip::sine(180.0 + k as f32 * 25.0, 2.0, p.sample_rate))),
+                video: Some(std::sync::Arc::new(solid_video(rgb[0], rgb[1], rgb[2]))),
+                base_hz: 180.0,
+                ..Default::default()
+            });
+            let tid = p.add_track(&format!("face_{k}"));
+            let mut c = Clip::new(sid, 0.0, 2.0);
+            c.grains.density = dens;
+            c.grains.duration = 0.042; // 42 ms micro-grain
+            c.grains.spray = 0.02; // tight <= 0.08
+            c.grains.scan_speed = 0.06;
+            c.grains.adsr = Some(crate::envelope::Adsr {
+                attack: 0.001,
+                decay: 0.0,
+                sustain: 1.0,
+                release: 0.02,
+                picture: crate::envelope::PictureCut::Cut,
+                ..Default::default()
+            });
+            p.tracks[tid].clips.push(c);
+        }
+
+        let plan = plan_project(&p);
+        assert!(plan.iter().all(|cp| cp.parts[0].1.iter().all(|e| e.tag.hard_burst)));
+        // On 16:9 (96x54), 3 simultaneous MODELL 5 voices form a 3x1 portrait triptych!
+        let grids = frame_tile_grids_stage(&plan, 0.0, p.fps, 30, 96.0 / 54.0, p.portrait_columns);
+        assert!(grids.iter().skip(2).any(|&g| g == (3, 1)), "3 voices -> 3x1 portrait columns: {grids:?}");
+
+        // Stack mode with hard_burst ALSO renders full-frame (dest = [0, 0, 1, 1], tiled = true).
+        let draws = crate::video::grain_draws_stage(
+            &plan[0].parts[0].1,
+            &crate::video::VisualGrainStyle::default(),
+            &crate::video::AvLink::default(),
+            &crate::timeline::ClipTransform::default(),
+            2.0,
+            plan[0].parts[0].1[0].onset + 0.01,
+            16.0 / 9.0,
+            false,
+            crate::tile::Layout::Stack,
+            None,
+        );
+        assert!(!draws.is_empty());
+        assert_eq!(draws[0].dest, [0.0, 0.0, 1.0, 1.0], "MODELL 5 micro-burst fills full frame in Stack");
+        assert!(draws[0].tiled, "hard-edged zero-feather cut");
     }
 }

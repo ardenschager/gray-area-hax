@@ -5,14 +5,16 @@
 //! event, so every hit gets the full AV correspondence.
 
 use crate::dsp::Rng;
-use crate::grain::{GrainEvent, GrainSettings};
+use crate::grain::{ChordVoicing, GrainEvent, GrainSettings, VoiceSculpt};
 use crate::music::Key;
 use crate::timeline::{Source, SourceId};
+use serde::{Deserialize, Serialize};
 
 /// One step of a row: on/off, semitone offset, gain multiplier, plus the
 /// chop-sequencing extras: which slice of the source it plays, how long,
-/// and how likely it is to fire.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// how likely it is to fire, Aphex-style ratcheting, and chord voicings.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Step {
     pub on: bool,
     pub pitch: f32,
@@ -35,6 +37,16 @@ pub struct Step {
     /// position = slice start, length = the slice (`length` scales it).
     /// Takes precedence over `slice` when the source has that slice.
     pub slice_index: Option<u16>,
+    /// Sub-step ratchet count (`1..=8`, default `1`): subdivides the step
+    /// into `ratchet` rapid sub-hits. Odd sub-hits set `VoiceTag::ratchet_odd`
+    /// so the stage compositor mirrors `flipX` on Aphex rolls.
+    pub ratchet: u8,
+    /// Semitone ramp per ratchet sub-hit (`0.0` default; `+1.0` / `-2.0` for
+    /// rising or diving Aphex drill rolls).
+    pub ratchet_pitch: f32,
+    /// Optional per-step polyphonic chord override (`ChordVoicing::Off` uses
+    /// the row/grain sculptor's chord setting).
+    pub chord: ChordVoicing,
 }
 
 impl Default for Step {
@@ -50,24 +62,30 @@ impl Default for Step {
             every_n: 1,
             every_offset: 0,
             slice_index: None,
+            ratchet: 1,
+            ratchet_pitch: 0.0,
+            chord: ChordVoicing::Off,
         }
     }
 }
 
 /// How a row makes sound.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum RowMode {
     /// Beat-quantized step triggers. The row cycles its OWN step count at
     /// the pattern's step rate — a 12-step row against a 16-step pattern
     /// drifts in and out of phase (polymeter).
+    #[default]
     Steps,
     /// Not sequenced: the row loops a start..stop segment of its source,
-    /// repeating seamlessly for the whole clip.
+    /// repeating seamlessly for the whole clip (or asynchronously in real
+    /// seconds when `sculpt.free_loop_secs` is set).
     Loop,
 }
 
 /// A sampler pad row: a source, how its hits sound/look, and its steps.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SeqRow {
     pub source: SourceId,
     /// Hit preset: duration, position, pitch, gain, pan(+spread), envelope,
@@ -85,6 +103,17 @@ pub struct SeqRow {
     pub swing: Option<f32>,
     /// Deterministic timing humanize jitter in seconds (0 = tight).
     pub humanize: f32,
+    /// MPC choke group (`0 = off`, `1..=4`). Triggering a hit in group `g > 0`
+    /// mutes prior voices in group `g` with a click-free `3 ms` cosine release.
+    pub choke_group: u8,
+    /// Optional per-row continuous voice sculptor / tape-loop physics.
+    pub sculpt: VoiceSculpt,
+}
+
+impl Default for SeqRow {
+    fn default() -> Self {
+        SeqRow::new(0, 16)
+    }
 }
 
 impl SeqRow {
@@ -106,6 +135,8 @@ impl SeqRow {
             muted: false,
             swing: None,
             humanize: 0.0,
+            choke_group: 0,
+            sculpt: VoiceSculpt::default(),
         }
     }
 
@@ -116,7 +147,8 @@ impl SeqRow {
 }
 
 /// A step pattern: a grid of rows x steps covering `length_beats`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct StepPattern {
     pub name: String,
     pub steps_per_beat: u32,
@@ -125,6 +157,12 @@ pub struct StepPattern {
     /// shuffle delaying odd steps by `(swing - 0.5) * 2 * step_secs`.
     pub swing: f32,
     pub rows: Vec<SeqRow>,
+}
+
+impl Default for StepPattern {
+    fn default() -> Self {
+        StepPattern::new("pattern")
+    }
 }
 
 impl StepPattern {
@@ -246,6 +284,17 @@ pub fn pattern_events(
             }
         };
 
+        let eff_sculpt_for = |g: &GrainSettings| -> VoiceSculpt {
+            if row.sculpt.is_active() { row.sculpt } else { g.sculpt }
+        };
+        let eff_choke_for = |g: &GrainSettings| -> u8 {
+            if row.choke_group > 0 {
+                row.choke_group.min(4)
+            } else {
+                g.choke_group.min(4)
+            }
+        };
+
         match row.mode {
             RowMode::Steps => {
                 // Slot k cycles this row's own step count — rows shorter or
@@ -292,68 +341,276 @@ pub fn pattern_events(
                     } else {
                         base_hz
                     };
-                    let st = g.pitch + step.pitch + g.pitch_jitter * pitch_j;
-                    let ratio = crate::music::effective_ratio(
-                        st,
-                        key,
-                        step_base_hz,
-                        g.quantize_amount,
-                        g.detune_cents,
-                    );
 
-                    let mut ev = GrainEvent {
-                        onset: clip_start_secs + t,
-                        source_pos: pos,
-                        duration: hit_duration(&g, &step, chop, ratio),
-                        pitch_ratio: ratio,
-                        gain: g.gain * step.gain,
-                        pan: (g.pan + g.pan_spread * pan_j).clamp(-1.0, 1.0),
-                        envelope: g.envelope,
-                        env_skew: g.env_skew,
-                        reverse: rev_j < g.reverse_prob,
-                        id,
-                        ..Default::default()
+                    let mut sculpt = eff_sculpt_for(&g);
+                    if step.chord != ChordVoicing::Off {
+                        sculpt.chord = step.chord;
+                    }
+                    let choke_group = eff_choke_for(&g);
+                    let focus = chop.map_or((0.5, 0.5), |sl| sl.focus);
+                    let caption = chop.map_or_else(crate::chop::Caption::default, |sl| sl.caption);
+                    let zoom_punch = if sculpt.sub_exciter > 0.2 || sculpt.snare_snap > 0.2 {
+                        0.08
+                    } else if chop.is_some_and(|sl| sl.role_hint == crate::chop::SliceRole::Phrase) {
+                        0.05
+                    } else {
+                        0.0
                     };
-                    apply_hit_adsr(&mut ev, &g, hit_voice(row_idx, slot as u64, clip_start_secs));
-                    events.push(ev);
-                    id += 1;
+
+                    let r_count = step.ratchet.clamp(1, 8);
+                    let sub_step_secs = step_secs / r_count as f64;
+                    for sub in 0..r_count {
+                        let sub_t = t + sub as f64 * sub_step_secs;
+                        if sub_t >= clip_len_secs {
+                            break;
+                        }
+                        let st = g.pitch
+                            + step.pitch
+                            + g.pitch_jitter * pitch_j
+                            + sub as f32 * step.ratchet_pitch;
+                        let ratio = crate::music::effective_ratio(
+                            st,
+                            key,
+                            step_base_hz,
+                            g.quantize_amount,
+                            g.detune_cents,
+                        );
+                        let mut dur = hit_duration(&g, &step, chop, ratio);
+                        if r_count > 1 {
+                            dur = dur.min((sub_step_secs * 0.92).max(0.01) as f32);
+                        }
+                        let sub_gain = if r_count > 1 {
+                            0.88f32.powi(sub as i32)
+                        } else {
+                            1.0
+                        };
+                        let comb_hz = if sculpt.comb_mix > 1e-3 {
+                            crate::grain::quantize_comb_hz(step_base_hz.max(40.0) * ratio, key)
+                        } else {
+                            0.0
+                        };
+                        let voice_slot = if r_count == 1 {
+                            slot as u64
+                        } else {
+                            (slot as u64).wrapping_mul(8).wrapping_add(sub as u64)
+                        };
+                        let mut ev = GrainEvent {
+                            onset: clip_start_secs + sub_t,
+                            source_pos: pos,
+                            duration: dur,
+                            pitch_ratio: ratio,
+                            gain: g.gain * step.gain * sub_gain,
+                            pan: (g.pan + g.pan_spread * pan_j).clamp(-1.0, 1.0),
+                            envelope: g.envelope,
+                            env_skew: g.env_skew,
+                            reverse: rev_j < g.reverse_prob,
+                            id,
+                            sculpt,
+                            comb_hz,
+                            loop_pass: pass_idx as u32,
+                            ..Default::default()
+                        };
+                        apply_hit_adsr(&mut ev, &g, hit_voice(row_idx, voice_slot, clip_start_secs));
+                        ev.tag.focus = focus;
+                        ev.tag.caption = caption;
+                        ev.tag.ratchet_odd = sub % 2 == 1;
+                        ev.tag.zoom_punch = zoom_punch;
+                        ev.tag.choke_group = choke_group;
+                        ev.tag.is_wash = sculpt.is_wash();
+                        if sculpt.disintegrate > 1e-3 {
+                            let ox = crate::grain::oxide_dropout_at(
+                                sculpt.disintegrate,
+                                pass_idx as u32,
+                                0.5,
+                                id ^ row.grains.seed,
+                            );
+                            ev.tag.oxide_dropout = (1.0 - ox).clamp(0.0, 1.0);
+                        }
+                        if sculpt.ebb_flow > 1e-3 {
+                            ev.gain *= crate::grain::ebb_flow_gain_at(
+                                sculpt.ebb_flow,
+                                pass_idx as u32,
+                                ev.onset,
+                                id ^ row.grains.seed,
+                            );
+                        }
+                        if sculpt.chord != ChordVoicing::Off {
+                            let before_len = events.len();
+                            crate::grain::expand_chord_grain(
+                                &ev,
+                                sculpt.chord,
+                                step_base_hz,
+                                key,
+                                &mut events,
+                            );
+                            id += (events.len() - before_len) as u64;
+                        } else {
+                            events.push(ev);
+                            id += 1;
+                        }
+                    }
                 }
             }
             RowMode::Loop => {
                 // Not sequenced: repeat the start..stop source segment
-                // seamlessly for the whole clip.
+                // seamlessly for the whole clip, or asynchronously in real
+                // seconds when `sculpt.free_loop_secs` is set.
                 let s0 = row.loop_start.clamp(0.0, 1.0) as f64;
                 let s1 = row.loop_end.clamp(0.0, 1.0) as f64;
                 let seg_src = ((s1 - s0) * source_len).max(0.02);
-                let mut t = 0.0f64;
-                while t < clip_len_secs {
-                    let pan_j = rng.bipolar();
-                    let g = eff_at(t);
-                    let ratio = crate::music::effective_ratio(
-                        g.pitch,
-                        key,
-                        base_hz,
-                        g.quantize_amount,
-                        g.detune_cents,
-                    );
-                    // Playing the segment at `ratio` takes seg/ratio output
-                    // seconds; repetitions tile back to back.
-                    let dur_out = (seg_src / ratio.max(0.01) as f64).clamp(0.02, 60.0);
-                    events.push(GrainEvent {
-                        onset: clip_start_secs + t,
-                        source_pos: (s0 * source_len).min(source_len),
-                        duration: dur_out as f32,
-                        pitch_ratio: ratio,
-                        gain: g.gain,
-                        pan: (g.pan + g.pan_spread * pan_j).clamp(-1.0, 1.0),
-                        envelope: g.envelope,
-                        env_skew: g.env_skew,
-                        reverse: g.reverse_prob >= 0.5,
-                        id,
-                        ..Default::default()
-                    });
-                    id += 1;
-                    t += dur_out;
+                let base_sculpt = eff_sculpt_for(&row.grains);
+                if let Some(free_secs) = base_sculpt.free_loop_secs.filter(|s| *s > 0.05) {
+                    let period = (free_secs as f64).clamp(0.05, 120.0);
+                    let seam = 0.08_f64.min(period * 0.25);
+                    let mut t = 0.0f64;
+                    let mut pass_k = 0u32;
+                    while t < clip_len_secs {
+                        let pan_j = rng.bipolar();
+                        let g = eff_at(t);
+                        let sculpt = eff_sculpt_for(&g);
+                        let choke_group = eff_choke_for(&g);
+                        let ratio = crate::music::effective_ratio(
+                            g.pitch,
+                            key,
+                            base_hz,
+                            g.quantize_amount,
+                            g.detune_cents,
+                        );
+                        let rem = clip_len_secs - t;
+                        let dur_out = if rem > period + seam {
+                            period + seam
+                        } else {
+                            rem.max(0.02)
+                        };
+                        let env_taper = ((2.0 * seam) / dur_out).clamp(0.02, 0.90) as f32;
+                        let ebb = crate::grain::ebb_flow_gain_at(
+                            sculpt.ebb_flow,
+                            pass_k,
+                            clip_start_secs + t,
+                            row.grains.seed ^ (row_idx as u64),
+                        );
+                        let ox = crate::grain::oxide_dropout_at(
+                            sculpt.disintegrate,
+                            pass_k,
+                            0.5,
+                            id ^ row.grains.seed,
+                        );
+                        let comb_hz = if sculpt.comb_mix > 1e-3 {
+                            crate::grain::quantize_comb_hz(base_hz.max(40.0) * ratio, key)
+                        } else {
+                            0.0
+                        };
+                        let mut ev = GrainEvent {
+                            onset: clip_start_secs + t,
+                            source_pos: (s0 * source_len).min(source_len),
+                            duration: dur_out as f32,
+                            pitch_ratio: ratio,
+                            gain: g.gain * ebb,
+                            pan: (g.pan + g.pan_spread * pan_j).clamp(-1.0, 1.0),
+                            envelope: env_taper,
+                            env_skew: 0.0,
+                            reverse: g.reverse_prob >= 0.5,
+                            id,
+                            sculpt,
+                            comb_hz,
+                            loop_pass: pass_k,
+                            ..Default::default()
+                        };
+                        ev.tag.is_wash = true;
+                        ev.tag.choke_group = choke_group;
+                        ev.tag.oxide_dropout = (1.0 - ox).clamp(0.0, 1.0);
+                        if sculpt.chord != ChordVoicing::Off {
+                            let before_len = events.len();
+                            crate::grain::expand_chord_grain(
+                                &ev,
+                                sculpt.chord,
+                                base_hz,
+                                key,
+                                &mut events,
+                            );
+                            id += (events.len() - before_len) as u64;
+                        } else {
+                            events.push(ev);
+                            id += 1;
+                        }
+                        t += period;
+                        pass_k += 1;
+                    }
+                } else {
+                    let mut t = 0.0f64;
+                    let mut pass_k = 0u32;
+                    while t < clip_len_secs {
+                        let pan_j = rng.bipolar();
+                        let g = eff_at(t);
+                        let sculpt = eff_sculpt_for(&g);
+                        let choke_group = eff_choke_for(&g);
+                        let ratio = crate::music::effective_ratio(
+                            g.pitch,
+                            key,
+                            base_hz,
+                            g.quantize_amount,
+                            g.detune_cents,
+                        );
+                        // Playing the segment at `ratio` takes seg/ratio output
+                        // seconds; repetitions tile back to back.
+                        let dur_out = (seg_src / ratio.max(0.01) as f64).clamp(0.02, 60.0);
+                        let ebb = if sculpt.ebb_flow > 1e-3 {
+                            crate::grain::ebb_flow_gain_at(
+                                sculpt.ebb_flow,
+                                pass_k,
+                                clip_start_secs + t,
+                                row.grains.seed ^ (row_idx as u64),
+                            )
+                        } else {
+                            1.0
+                        };
+                        let ox = crate::grain::oxide_dropout_at(
+                            sculpt.disintegrate,
+                            pass_k,
+                            0.5,
+                            id ^ row.grains.seed,
+                        );
+                        let comb_hz = if sculpt.comb_mix > 1e-3 {
+                            crate::grain::quantize_comb_hz(base_hz.max(40.0) * ratio, key)
+                        } else {
+                            0.0
+                        };
+                        let mut ev = GrainEvent {
+                            onset: clip_start_secs + t,
+                            source_pos: (s0 * source_len).min(source_len),
+                            duration: dur_out as f32,
+                            pitch_ratio: ratio,
+                            gain: g.gain * ebb,
+                            pan: (g.pan + g.pan_spread * pan_j).clamp(-1.0, 1.0),
+                            envelope: g.envelope,
+                            env_skew: g.env_skew,
+                            reverse: g.reverse_prob >= 0.5,
+                            id,
+                            sculpt,
+                            comb_hz,
+                            loop_pass: pass_k,
+                            ..Default::default()
+                        };
+                        ev.tag.choke_group = choke_group;
+                        ev.tag.is_wash = sculpt.is_wash();
+                        ev.tag.oxide_dropout = (1.0 - ox).clamp(0.0, 1.0);
+                        if sculpt.chord != ChordVoicing::Off {
+                            let before_len = events.len();
+                            crate::grain::expand_chord_grain(
+                                &ev,
+                                sculpt.chord,
+                                base_hz,
+                                key,
+                                &mut events,
+                            );
+                            id += (events.len() - before_len) as u64;
+                        } else {
+                            events.push(ev);
+                            id += 1;
+                        }
+                        t += dur_out;
+                        pass_k += 1;
+                    }
                 }
             }
         }
@@ -619,5 +876,64 @@ mod tests {
         assert_ne!(hit_voice(0, 1, 0.0), hit_voice(0, 1, 2.0));
         let step = Step { length: 2.0, ..Step::default() };
         assert!((hit_duration(&p.rows[0].grains, &step, Some(crate::chop::Slice::new(0.0, 1.0)), 2.0) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn ratchet_subdivides_step_ramps_pitch_and_marks_odd_flips() {
+        let mut p = StepPattern::new("aphex");
+        let r = p.add_row(0);
+        p.rows[r].steps[0] = Step {
+            on: true,
+            ratchet: 4,
+            ratchet_pitch: 2.0,
+            ..Step::default()
+        };
+        let sources = source_440();
+        // 120 BPM -> 0.5s/beat -> 0.125s per 16th step -> 0.03125s per ratchet sub-hit.
+        let parts = pattern_events(&p, &sources, 0.0, 2.0, 0.5, None, &[]);
+        let evs = &parts[0].1;
+        assert_eq!(evs.len(), 4);
+        for (sub, ev) in evs.iter().enumerate() {
+            assert!((ev.onset - sub as f64 * 0.03125).abs() < 1e-9);
+            assert_eq!(ev.tag.ratchet_odd, sub % 2 == 1);
+            if sub > 0 {
+                assert!(ev.pitch_ratio > evs[sub - 1].pitch_ratio, "ratchet_pitch ramps up");
+            }
+        }
+    }
+
+    #[test]
+    fn free_loop_secs_loops_asynchronously_in_real_seconds_without_seam_clicks() {
+        let mut p = StepPattern::new("basinski");
+        let r = p.add_row(0);
+        p.rows[r].mode = RowMode::Loop;
+        p.rows[r].sculpt = VoiceSculpt {
+            free_loop_secs: Some(0.47),
+            disintegrate: 0.65,
+            ebb_flow: 0.30,
+            ..VoiceSculpt::preset(crate::grain::Stamp::TapeLoop)
+        };
+        let sources = source_440();
+        // Compare 90 BPM vs 150 BPM over 2.0 real seconds: onsets stay locked to 0.47s real seconds!
+        let parts_90 = pattern_events(&p, &sources, 0.0, 2.0, 60.0 / 90.0, None, &[]);
+        let parts_150 = pattern_events(&p, &sources, 0.0, 2.0, 60.0 / 150.0, None, &[]);
+        let evs = &parts_90[0].1;
+        assert_eq!(evs.len(), parts_150[0].1.len());
+        for (k, (a, b)) in evs.iter().zip(&parts_150[0].1).enumerate() {
+            assert!((a.onset - k as f64 * 0.47f32 as f64).abs() < 1e-6);
+            assert!((a.onset - b.onset).abs() < 1e-9, "BPM-independent real-seconds loop");
+            assert_eq!(a.loop_pass, k as u32);
+        }
+        // Render across the 0.47s seam and verify smooth continuity (no seam jump/click).
+        let sr = 48_000u32;
+        let mut buf = crate::audio::StereoBuffer::new(1.2, sr);
+        crate::audio::render_grains_audio(sources[0].audio.as_deref().unwrap(), evs, &mut buf, 0.0);
+        let s_a = (0.44 * sr as f64) as usize;
+        let s_b = (0.58 * sr as f64) as usize;
+        let max_jump = buf.left[s_a..s_b]
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_jump < 0.12, "80ms crossfaded seam is click-free: max_jump={max_jump}");
     }
 }

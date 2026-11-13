@@ -264,6 +264,11 @@ pub struct MasterConditioner;
 pub const MASTER_CEILING: f32 = 0.891_250_9;
 const MASTER_KNEE: f32 = 0.65;
 
+/// Studio clarity bus ceiling (`-1.40 dBFS` / `-1.4 dBTP`) preventing post-AAC
+/// inter-sample overs on transient-rich video collages.
+pub const STUDIO_CEILING: f32 = 0.851_138_04;
+const STUDIO_KNEE: f32 = 0.58;
+
 /// Smooth C1-continuous soft-knee ceiling limiter. Linear below `MASTER_KNEE`
 /// (unit slope at the knee — zero kink or step discontinuity) and smoothly
 /// asymptotic to `±MASTER_CEILING`.
@@ -282,11 +287,73 @@ pub fn soft_limit_sample(x: f32) -> f32 {
     }
 }
 
+/// Transparent C1-continuous soft-knee limiter capped at `-1.4 dBTP` ([`STUDIO_CEILING`]).
+#[inline]
+pub fn soft_limit_studio_sample(x: f32) -> f32 {
+    if !x.is_finite() {
+        return 0.0;
+    }
+    let a = x.abs();
+    if a <= STUDIO_KNEE {
+        x
+    } else {
+        let span = STUDIO_CEILING - STUDIO_KNEE;
+        let y = STUDIO_KNEE + span * ((a - STUDIO_KNEE) / span).tanh();
+        y.copysign(x)
+    }
+}
+
 impl MasterConditioner {
     #[inline]
     pub fn process_block(&mut self, left: &mut [f32], right: &mut [f32], _sample_rate: u32) {
         for s in left.iter_mut().chain(right.iter_mut()) {
             *s = soft_limit_sample(*s);
+        }
+    }
+}
+
+/// Streaming-safe Studio Clarity Bus shared identically by offline [`crate::render::render_project`]
+/// and [`crate::realtime::RealtimeAudio`]:
+/// - `26 Hz` infrasonic DC cleanup
+/// - `+2.4 dB @ 56 Hz` warm sub shelf/bell (`Q = 0.82`)
+/// - `-3.2 dB @ 285 Hz` gentle low-mid mud control (`Q = 0.72`)
+/// - `-1.4 dBTP` transparent knee ceiling ([`soft_limit_studio_sample`])
+#[derive(Debug, Clone)]
+pub struct StudioBusState {
+    dc_hp: [crate::dsp::Biquad; 2],
+    sub_eq: [crate::dsp::Biquad; 2],
+    mud_eq: [crate::dsp::Biquad; 2],
+}
+
+impl StudioBusState {
+    pub fn new(sample_rate: u32) -> Self {
+        let sr = sample_rate.max(1) as f32;
+        let hp = crate::dsp::Biquad::new(crate::dsp::FilterKind::HighPass, sr, 24.0, 0.707);
+        let sub = crate::dsp::Biquad::peaking(sr, 56.0, 0.82, 2.4);
+        let mud = crate::dsp::Biquad::peaking(sr, 285.0, 0.72, -3.2);
+        StudioBusState {
+            dc_hp: [hp.clone(), hp],
+            sub_eq: [sub.clone(), sub],
+            mud_eq: [mud.clone(), mud],
+        }
+    }
+
+    #[inline]
+    pub fn process_eq(&mut self, left: &mut [f32], right: &mut [f32]) {
+        for (c, ch) in [&mut *left, &mut *right].into_iter().enumerate() {
+            for s in ch.iter_mut() {
+                let mut v = self.dc_hp[c].process(*s);
+                v = self.sub_eq[c].process(v);
+                v = self.mud_eq[c].process(v);
+                *s = v;
+            }
+        }
+    }
+
+    #[inline]
+    pub fn process_ceiling(left: &mut [f32], right: &mut [f32]) {
+        for s in left.iter_mut().chain(right.iter_mut()) {
+            *s = soft_limit_studio_sample(*s);
         }
     }
 }
@@ -377,6 +444,10 @@ pub fn render_grains_audio_spatial(
     let side = clip.side.as_deref();
 
     for ev in events {
+        if ev.sculpt.has_audio_dsp() {
+            render_sculpted_grain(clip, ev, out, t0, pan_offset, gain_mult);
+            continue;
+        }
         // Rounded independently so block-wise rendering at t0 = k/sr is
         // sample-exact against a single full render at t0 = 0.
         let abs_start = (ev.onset * out_sr).round() as i64;
@@ -392,6 +463,9 @@ pub fn render_grains_audio_spatial(
         if venv.is_some_and(|e| ev.onset >= e.end()) {
             continue;
         }
+        if ev.tag.choke_at.is_some_and(|tc| ev.onset >= tc + crate::grain::CHOKE_RELEASE_SECS) {
+            continue;
+        }
         // Equal-power pan (grain pan + clip placement offset).
         let pan = (ev.pan + pan_offset).clamp(-1.0, 1.0);
         let angle = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
@@ -400,6 +474,7 @@ pub fn render_grains_audio_spatial(
 
         let src_start = ev.source_pos * src_sr;
         let grain_src_len = ev.duration as f64 * ev.pitch_ratio as f64 * src_sr;
+        let has_choke = ev.tag.choke_at.is_some();
 
         for i in 0..n {
             let oi = start_sample + i;
@@ -408,8 +483,12 @@ pub fn render_grains_audio_spatial(
             }
             let phase = i as f32 / n as f32;
             let mut env = grain_env_skewed(phase, ev.envelope, ev.env_skew);
-            if let Some(e) = venv {
-                env *= e.level_at((abs_start + i) as f64 / out_sr);
+            if venv.is_some() || has_choke {
+                let t_abs = (abs_start + i) as f64 / out_sr;
+                env *= ev.tag.level_at(t_abs);
+                if env <= 0.0 {
+                    continue;
+                }
             }
             let src_off = if ev.reverse {
                 grain_src_len - i as f64 * ev.pitch_ratio as f64
@@ -428,6 +507,476 @@ pub fn render_grains_audio_spatial(
                     out.left[oi as usize] += (m + s) * gain_l;
                     out.right[oi as usize] += (m - s) * gain_r;
                 }
+            }
+        }
+    }
+}
+
+/// Pure-sample, zero-oscillator, stack-only `VoiceSculpt` & `TapeLoop` DSP renderer.
+/// Uses zero heap allocations (plugin `assert_no_alloc`-safe) and maintains sample-accurate
+/// parity between offline full-buffer rendering and arbitrary-block streaming.
+#[allow(clippy::too_many_arguments)]
+fn render_sculpted_grain(
+    clip: &AudioClip,
+    ev: &GrainEvent,
+    out: &mut StereoBuffer,
+    t0: f64,
+    pan_offset: f32,
+    gain_mult: f32,
+) {
+    if clip.samples.is_empty() || clip.sample_rate == 0 || out.sample_rate == 0 {
+        return;
+    }
+    let out_sr = out.sample_rate as f64;
+    let sr_f = out.sample_rate as f32;
+    let src_sr = clip.sample_rate as f64;
+    let sr_ratio = src_sr / out_sr;
+    let out_len = out.len() as i64;
+    let side = clip.side.as_deref();
+    let sc = &ev.sculpt;
+
+    let venv = ev.tag.env;
+    if venv.is_some_and(|e| ev.onset >= e.end()) {
+        return;
+    }
+    if ev.tag.choke_at.is_some_and(|tc| ev.onset >= tc + crate::grain::CHOKE_RELEASE_SECS) {
+        return;
+    }
+
+    let abs_start = (ev.onset * out_sr).round() as i64;
+    let start_sample = abs_start - (t0 * out_sr).round() as i64;
+    let n_nom = (ev.duration as f64 * out_sr).round() as i64;
+    let n_tail = (sc.tail_secs() as f64 * out_sr).round() as i64;
+    let n_tot = n_nom + n_tail;
+    if n_nom <= 0 || n_tot <= 0 {
+        return;
+    }
+    let i_blk0 = (-start_sample).max(0);
+    let i_blk1 = (out_len - start_sample).min(n_tot);
+    if i_blk0 >= i_blk1 {
+        return;
+    }
+
+    // Warm up recursive IIR / Comb / Shimmer / Ghost ring states across chunk boundaries:
+    // grains <= 1.5s run from i=0 (100% bit-exact); multi-second tape loops warm up 1.50s.
+    let warm_span = (1.50 * out_sr).round() as i64;
+    let i_warm = if i_blk0 <= warm_span {
+        0
+    } else {
+        (i_blk0 - warm_span).max(0)
+    };
+
+    let pan = (ev.pan + pan_offset).clamp(-1.0, 1.0);
+    let angle = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
+    let g = ev.gain * gain_mult.max(0.0);
+    let (gain_l, gain_r) = (angle.cos() * g, angle.sin() * g);
+
+    let src_start = ev.source_pos * src_sr;
+    let base_rate = ev.pitch_ratio.max(0.02) as f64 * sr_ratio;
+    let p_env_st = sc.pitch_env_semitones.clamp(-24.0, 24.0) as f64;
+    let p_env_tau = (sc.pitch_env_ms.clamp(10.0, 250.0) as f64) * 0.001;
+
+    // 16-panel Simpson rule to integrate source read phase from 0..t_warm cleanly.
+    let mut read_off = if i_warm > 0 {
+        let t_w = i_warm as f64 / out_sr;
+        if p_env_st.abs() > 1e-4 {
+            let steps = 32usize;
+            let h = t_w / steps as f64;
+            let f_rate = |t: f64| -> f64 { 2.0f64.powf((p_env_st / 12.0) * (-t / p_env_tau).exp()) };
+            let mut sum = f_rate(0.0) + f_rate(t_w);
+            for k in 1..steps {
+                let c = if k % 2 == 1 { 4.0 } else { 2.0 };
+                sum += c * f_rate(k as f64 * h);
+            }
+            (sum * h / 3.0) * out_sr * base_rate
+        } else {
+            i_warm as f64 * base_rate
+        }
+    } else {
+        0.0
+    };
+    let grain_src_len = n_nom as f64 * base_rate;
+
+    // Pre-compute filter stages (with Basinski per-pass progressive LPF darkening).
+    let base_wear = (sc.disintegrate.clamp(0.0, 1.0) * (0.14 + 0.22 * ev.loop_pass as f32)).clamp(0.0, 0.96);
+    let eff_lpf_hz = (sc.lpf_hz * (0.14f32).powf(base_wear)).clamp(90.0, 20_000.0);
+    let eff_hpf_hz = sc.hpf_hz.clamp(20.0, 16_000.0);
+    let res_q = sc.resonance_q.clamp(0.4, 8.0);
+    let steep_kick_lpf = sc.lpf_hz <= 200.0;
+    let steep_hpf = eff_hpf_hz >= 200.0;
+
+    let mut hp1 = (eff_hpf_hz > 22.0).then(|| {
+        let bq = crate::dsp::Biquad::new(crate::dsp::FilterKind::HighPass, sr_f, eff_hpf_hz, if steep_hpf { 0.707 } else { res_q });
+        [bq.clone(), bq]
+    });
+    let mut hp2 = (steep_hpf && eff_hpf_hz > 22.0).then(|| {
+        let bq = crate::dsp::Biquad::new(crate::dsp::FilterKind::HighPass, sr_f, eff_hpf_hz, res_q.max(0.707));
+        [bq.clone(), bq]
+    });
+    let mut lp1 = (eff_lpf_hz < 19_800.0).then(|| {
+        let bq = crate::dsp::Biquad::new(crate::dsp::FilterKind::LowPass, sr_f, eff_lpf_hz, if steep_kick_lpf { 0.707 } else { res_q });
+        [bq.clone(), bq]
+    });
+    let mut lp2 = steep_kick_lpf.then(|| {
+        let bq = crate::dsp::Biquad::new(crate::dsp::FilterKind::LowPass, sr_f, eff_lpf_hz, res_q.max(0.85));
+        [bq.clone(), bq]
+    });
+    let kick_sub_makeup = if steep_kick_lpf { 1.48f32 } else { 1.0 };
+
+    let snap = sc.snare_snap.clamp(0.0, 1.0);
+    let mut snare_body = (snap > 1e-3).then(|| {
+        let bq = crate::dsp::Biquad::peaking(sr_f, 220.0, 1.25, 4.5 * snap);
+        [bq.clone(), bq]
+    });
+    let mut snare_crack = (snap > 1e-3).then(|| {
+        let bq = crate::dsp::Biquad::peaking(sr_f, 2600.0, 0.92, 6.2 * snap);
+        [bq.clone(), bq]
+    });
+    let mut pocket_bq = (sc.pocket_carve && eff_hpf_hz < 420.0 && eff_lpf_hz > 650.0).then(|| {
+        let bq = crate::dsp::Biquad::peaking(sr_f, 290.0, 0.90, -4.0);
+        [bq.clone(), bq]
+    });
+
+    // Drive (strictly PRE-FILTER!).
+    let drive_db = sc.drive_db.clamp(0.0, 18.0);
+    let drive_lin = if drive_db > 1e-3 { 10.0f32.powf(drive_db / 20.0) } else { 1.0 };
+    let drive_comp = if drive_db > 1e-3 { 1.0 / drive_lin.powf(0.56) } else { 1.0 };
+
+    // Cytomic ZDF swept-SVF state for `sub_exciter` (0 oscillators: sample-transient only!).
+    let sub_mix = sc.sub_exciter.clamp(0.0, 1.0);
+    let mut svf_ic1 = 0.0f32;
+    let mut svf_ic2 = 0.0f32;
+    let mut sub_env_dc = 0.0f32;
+    let sub_dc_a = 1.0 - (-2.0 * std::f32::consts::PI * 34.0 / sr_f).exp();
+
+    // Karplus-Strong fractional-delay comb resonator (stack buffer, 0 heap allocs).
+    const COMB_LEN: usize = 1024;
+    let comb_mix = sc.comb_mix.clamp(0.0, 1.0);
+    let comb_fb = sc.comb_feedback.clamp(0.60, 0.975);
+    let comb_hz_l = if ev.comb_hz > 20.0 {
+        ev.comb_hz.clamp(55.0, 1100.0)
+    } else {
+        (220.0 * ev.pitch_ratio).clamp(55.0, 1100.0)
+    };
+    let comb_hz_r = (comb_hz_l * 1.0018).min(1100.0);
+    let comb_del = [
+        (sr_f / comb_hz_l).clamp(2.0, (COMB_LEN - 3) as f32),
+        (sr_f / comb_hz_r).clamp(2.0, (COMB_LEN - 3) as f32),
+    ];
+    let comb_damp = if comb_hz_l < 130.0 { 0.30f32 } else { 0.18f32 };
+    let mut comb_ring = [[0.0f32; COMB_LEN]; 2];
+    let mut comb_pos = (i_warm as usize) % COMB_LEN;
+    let mut comb_lp = [0.0f32; 2];
+    let mut comb_dc_x = [0.0f32; 2];
+    let mut comb_dc_y = [0.0f32; 2];
+    let mut comb_in_e = [1e-4f32; 2];
+    let mut comb_wet_e = [1e-4f32; 2];
+    let rms_coef = (-1.0 / (0.025 * sr_f)).exp();
+
+    // Shared stack delay ring for 85ms 5-tap stereo gated snare room + dual-ratio shimmer + Basinski ghost tail.
+    const FX_RING: usize = 2048;
+    let mut fx_ring = [[0.0f32; FX_RING]; 2];
+    let mut fx_pos = (i_warm as usize) % FX_RING;
+    let room_taps_l: [usize; 5] = [0.0059f32, 0.0117, 0.0183, 0.0267, 0.0353]
+        .map(|s| ((s * sr_f) as usize).clamp(1, FX_RING - 2));
+    let room_taps_r: [usize; 5] = [0.0071f32, 0.0131, 0.0203, 0.0289, 0.0379]
+        .map(|s| ((s * sr_f) as usize).clamp(1, FX_RING - 2));
+    const ROOM_WEIGHTS: [f32; 5] = [1.0, -0.85, 0.72, -0.60, 0.50];
+
+    let shimmer_amt = sc.shimmer.clamp(0.0, 1.0);
+    let mut shim_hp = (shimmer_amt > 1e-3).then(|| {
+        let bq = crate::dsp::Biquad::new(crate::dsp::FilterKind::HighPass, sr_f, 380.0, 0.707);
+        [bq.clone(), bq]
+    });
+    let mut shim_lp = (shimmer_amt > 1e-3).then(|| {
+        let bq = crate::dsp::Biquad::new(crate::dsp::FilterKind::LowPass, sr_f, 11_500.0f32.min(sr_f * 0.46), 0.707);
+        [bq.clone(), bq]
+    });
+    // Ghost reverb tank (2 dark cross-coupled combs on stack) for Basinski disintegrate & shimmer.
+    const GHOST_LEN: usize = 1024;
+    let mut ghost_ring = [[0.0f32; GHOST_LEN]; 2];
+    let ghost_lens = [
+        ((0.0173 * sr_f) as usize).clamp(16, GHOST_LEN - 1),
+        ((0.0209 * sr_f) as usize).clamp(16, GHOST_LEN - 1),
+    ];
+    let mut ghost_pos = [
+        (i_warm as usize) % ghost_lens[0],
+        (i_warm as usize) % ghost_lens[1],
+    ];
+    let mut ghost_lp = [0.0f32; 2];
+    let ghost_lp_a = 1.0 - (-2.0 * std::f32::consts::PI * 1850.0 / sr_f).exp();
+
+    let src_len_samps = clip.samples.len() as f64;
+    let read_stereo = |src_idx: f64, ratio: f32| -> (f32, f32) {
+        if src_idx < 0.0 || src_idx >= src_len_samps {
+            return (0.0, 0.0);
+        }
+        let m = sample_pitched(&clip.samples, src_idx, ratio);
+        match side {
+            None => (m, m),
+            Some(sd) => {
+                let s = sample_pitched(sd, src_idx, ratio);
+                (m + s, m - s)
+            }
+        }
+    };
+
+    let anti_click_samps = (0.0025 * out_sr).max(1.0) as f32;
+    let eff_wow = (sc.wow_flutter.clamp(0.0, 1.0) + 0.28 * base_wear).clamp(0.0, 1.0) as f64;
+    let phase_seed = (ev.id & 0xFFFF) as f64 * 0.000_095;
+
+    for i in i_warm..i_blk1 {
+        let t_rel = i as f64 / out_sr;
+        let t_abs = (abs_start + i) as f64 / out_sr;
+
+        let pitch_mult = if p_env_st.abs() > 1e-4 {
+            2.0f64.powf((p_env_st / 12.0) * (-t_rel / p_env_tau).exp())
+        } else {
+            1.0
+        };
+        let inst_ratio = (ev.pitch_ratio * pitch_mult as f32).clamp(0.05, 8.0);
+
+        // 1. Sample read (with 0.82 Hz wow + 4.25 Hz flutter + subtle R Haas chorus).
+        let (mut sig_l, mut sig_r) = if i < n_nom {
+            let phase = (i as f32 / n_nom as f32).clamp(0.0, 1.0);
+            let mut w_env = grain_env_skewed(phase, ev.envelope, ev.env_skew);
+            if (i as f32) < anti_click_samps {
+                let u = (i as f32) / anti_click_samps;
+                w_env *= 0.5 * (1.0 - (std::f32::consts::PI * u).cos());
+            }
+            let base_idx = if ev.reverse {
+                src_start + (grain_src_len - read_off)
+            } else {
+                src_start + read_off
+            };
+            let (wl, wr) = if eff_wow > 1e-4 {
+                let wow_l = (std::f64::consts::TAU * 0.82 * t_abs + phase_seed).sin() * 0.0024
+                    + (std::f64::consts::TAU * 4.25 * t_abs + phase_seed * 1.7).sin() * 0.000_38;
+                let wow_r = (std::f64::consts::TAU * 0.84 * t_abs + phase_seed + 1.15).sin() * 0.0024
+                    + (std::f64::consts::TAU * 4.35 * t_abs + phase_seed * 2.1).sin() * 0.000_38
+                    + 0.000_35 * eff_wow;
+                (wow_l * eff_wow * src_sr, wow_r * eff_wow * src_sr)
+            } else {
+                (0.0, 0.0)
+            };
+            let (dl, _) = read_stereo(base_idx + wl, inst_ratio);
+            let (_, dr) = read_stereo(base_idx + wr, inst_ratio);
+            let (mut l, mut r) = (dl * w_env, dr * w_env);
+
+            // 2. `snare_snap` 3-grain micro-flam (`0 / 6.5 / 14 ms`) + `130 ms` speech-spill gate.
+            if snap > 1e-3 {
+                let mut fl_l = l * 0.92;
+                let mut fl_r = r * 0.92;
+                let flam_win = 0.056 * src_sr;
+                if t_rel >= 0.0065 {
+                    let off1 = ((t_rel - 0.0065) * out_sr * base_rate * 1.045) % flam_win.max(1.0);
+                    let (g1l, g1r) = read_stereo(src_start + off1, inst_ratio * 1.045);
+                    fl_l += g1l * 0.72 * w_env;
+                    fl_r += g1r * 0.44 * w_env;
+                }
+                if t_rel >= 0.014 {
+                    let off2 = ((t_rel - 0.014) * out_sr * base_rate * 0.962) % flam_win.max(1.0);
+                    let (g2l, g2r) = read_stereo(src_start + off2, inst_ratio * 0.962);
+                    fl_l += g2l * 0.44 * w_env;
+                    fl_r += g2r * 0.72 * w_env;
+                }
+                // 130 ms speech-spill tail gate: holds full body to 55ms, closes smoothly by 130ms.
+                let gate_floor = (1.0 - snap * 1.25).max(0.0);
+                let tail_gate = if t_rel <= 0.055 {
+                    1.0
+                } else if t_rel < 0.130 {
+                    let u = ((t_rel - 0.055) / 0.075) as f32;
+                    let c = 0.5 * (1.0 + (std::f32::consts::PI * u).cos());
+                    gate_floor + (1.0 - gate_floor) * c
+                } else {
+                    gate_floor
+                };
+                l = (l * (1.0 - snap) + fl_l * snap * 0.78) * tail_gate;
+                r = (r * (1.0 - snap) + fl_r * snap * 0.78) * tail_gate;
+            }
+            (l, r)
+        } else {
+            (0.0, 0.0)
+        };
+        read_off += base_rate * pitch_mult;
+
+        // 3. `sub_exciter`: 68ms-transient-gated Cytomic ZDF swept SVF (`155 -> 50 Hz`, `Q = 8.2`, 0 oscillators!).
+        // Uses both direct waveform AND DC-blocked transient envelope rectification so even high-pitched
+        // taps/snaps/consonants excite natural sub weight while digital silence produces exact 0.0!
+        if sub_mix > 1e-3 && t_rel < 0.48 {
+            let ex_in = if t_rel < 0.068 {
+                let mono = 0.5 * (sig_l + sig_r);
+                let rect = mono.abs();
+                let env_imp = rect - sub_env_dc;
+                sub_env_dc += sub_dc_a * env_imp;
+                (mono * 0.45 + env_imp * 1.55) * ((-t_rel / 0.024).exp() as f32)
+            } else {
+                0.0
+            };
+            let f_svf = (50.0 + 105.0 * (-t_rel / 0.042).exp() as f32).min(sr_f * 0.42);
+            let g_svf = (std::f32::consts::PI * f_svf / sr_f).tan();
+            let k_svf = 1.0 / 8.2f32;
+            let a1 = 1.0 / (1.0 + g_svf * (g_svf + k_svf));
+            let a2 = g_svf * a1;
+            let a3 = g_svf * a2;
+            let v3 = ex_in - svf_ic2;
+            let v1 = a1 * svf_ic1 + a2 * v3;
+            let v2 = svf_ic2 + a2 * svf_ic1 + a3 * v3;
+            svf_ic1 = 2.0 * v1 - svf_ic1;
+            svf_ic2 = 2.0 * v2 - svf_ic2;
+            let body_env = (-t_rel / 0.165).exp() as f32;
+            let shaped_sub = ((v1 * 1.45 + v2 * 0.78) * body_env * 2.2).tanh() * 0.72;
+            sig_l = sig_l * (1.0 - sub_mix * 0.28) + shaped_sub * sub_mix;
+            sig_r = sig_r * (1.0 - sub_mix * 0.28) + shaped_sub * sub_mix;
+        }
+
+        // 4. PRE-FILTER loudness-compensated `tanh` saturation (`drive_db`).
+        if drive_db > 1e-3 {
+            sig_l = (sig_l * drive_lin).tanh() * drive_comp;
+            sig_r = (sig_r * drive_lin).tanh() * drive_comp;
+        }
+
+        // 5. Post-drive filtering + 24dB/oct sub cleanup + 290Hz pocket carve + snare presence & 85ms gated room.
+        if let Some(f) = &mut hp1 {
+            sig_l = f[0].process(sig_l);
+            sig_r = f[1].process(sig_r);
+        }
+        if let Some(f) = &mut hp2 {
+            sig_l = f[0].process(sig_l);
+            sig_r = f[1].process(sig_r);
+        }
+        if let Some(f) = &mut lp1 {
+            sig_l = f[0].process(sig_l);
+            sig_r = f[1].process(sig_r);
+        }
+        if let Some(f) = &mut lp2 {
+            sig_l = f[0].process(sig_l) * kick_sub_makeup;
+            sig_r = f[1].process(sig_r) * kick_sub_makeup;
+        }
+        if let Some(f) = &mut snare_body {
+            sig_l = f[0].process(sig_l);
+            sig_r = f[1].process(sig_r);
+        }
+        if let Some(f) = &mut snare_crack {
+            sig_l = f[0].process(sig_l);
+            sig_r = f[1].process(sig_r);
+        }
+        if let Some(f) = &mut pocket_bq {
+            sig_l = f[0].process(sig_l);
+            sig_r = f[1].process(sig_r);
+        }
+
+        fx_ring[0][fx_pos] = sig_l;
+        fx_ring[1][fx_pos] = sig_r;
+
+        if snap > 1e-3 && t_rel < 0.085 {
+            let u = (t_rel / 0.085) as f32;
+            let room_gate = (1.0 - u * u * u).max(0.0) * 0.32 * snap;
+            let (mut rl, mut rr) = (0.0f32, 0.0f32);
+            for k in 0..5 {
+                let il = (fx_pos + FX_RING - room_taps_l[k]) % FX_RING;
+                let ir = (fx_pos + FX_RING - room_taps_r[k]) % FX_RING;
+                // Cross-channel stereo gated room reflections (0 noise oscillators!).
+                rl += fx_ring[1][il] * ROOM_WEIGHTS[k];
+                rr += fx_ring[0][ir] * ROOM_WEIGHTS[k];
+            }
+            sig_l += rl * room_gate;
+            sig_r += rr * room_gate;
+        }
+
+        // 6. Scale-locked fractional-delay Karplus-Strong comb resonator (`comb_mix`, `comb_feedback`).
+        if comb_mix > 1e-3 {
+            let mut pair = [sig_l, sig_r];
+            for (c, x) in pair.iter_mut().enumerate() {
+                let dry = *x;
+                let d = comb_del[c];
+                let rd = comb_pos as f32 + COMB_LEN as f32 - d;
+                let idx0 = rd.floor();
+                let frac = rd - idx0;
+                let a = idx0 as usize % COMB_LEN;
+                let b = (a + 1) % COMB_LEN;
+                let delayed = comb_ring[c][a] + (comb_ring[c][b] - comb_ring[c][a]) * frac;
+                comb_lp[c] = delayed * (1.0 - comb_damp) + comb_lp[c] * comb_damp;
+                let fb_s = comb_lp[c] * comb_fb + dry * 0.44;
+                // In-loop DC blocker + safety tanh.
+                let dc_clean = fb_s - comb_dc_x[c] + 0.995 * comb_dc_y[c];
+                comb_dc_x[c] = fb_s;
+                comb_dc_y[c] = dc_clean;
+                let stored = dc_clean.tanh();
+                comb_ring[c][comb_pos] = stored;
+
+                comb_in_e[c] = comb_in_e[c] * rms_coef + (dry * dry).max(1e-4) * (1.0 - rms_coef);
+                comb_wet_e[c] = comb_wet_e[c] * rms_coef + (stored * stored).max(1e-7) * (1.0 - rms_coef);
+                let rms_match = ((comb_in_e[c].max(0.0012) / comb_wet_e[c].max(1e-6)).sqrt() * 1.12).clamp(0.32, 2.4);
+                *x = dry * (1.0 - 0.62 * comb_mix) + stored * rms_match * comb_mix;
+            }
+            sig_l = pair[0];
+            sig_r = pair[1];
+            comb_pos = (comb_pos + 1) % COMB_LEN;
+        }
+
+        // 7. Dual-ratio (`+12st` L, `+7st` R) windowed grain shimmer + Basinski oxide wear & dark ghost tail.
+        let mut wet_tail_l = 0.0f32;
+        let mut wet_tail_r = 0.0f32;
+        if shimmer_amt > 1e-3 {
+            let win = (0.036 * sr_f).clamp(64.0, (FX_RING - 8) as f32);
+            let sample_shimmer = |ch: usize, rate: f32, idx_samp: i64| -> f32 {
+                let mut acc = 0.0f32;
+                for ph_k in 0..2 {
+                    let ph = (((idx_samp as f32 * (rate - 1.0)) / win) + 0.5 * ph_k as f32).rem_euclid(1.0);
+                    let w = 0.5 * (1.0 - (std::f32::consts::TAU * ph).cos());
+                    let d = (1.0 - ph) * win;
+                    let rd = fx_pos as f32 + FX_RING as f32 - d.clamp(1.0, (FX_RING - 3) as f32);
+                    let i0 = rd.floor();
+                    let f = rd - i0;
+                    let a = i0 as usize % FX_RING;
+                    let b = (a + 1) % FX_RING;
+                    acc += (fx_ring[ch][a] + (fx_ring[ch][b] - fx_ring[ch][a]) * f) * w;
+                }
+                acc
+            };
+            let mut sh_l = sample_shimmer(0, 2.0, i); // +12 st octave
+            let mut sh_r = sample_shimmer(1, 1.498_307, i); // +7 st fifth
+            if let Some(f) = &mut shim_hp {
+                sh_l = f[0].process(sh_l);
+                sh_r = f[1].process(sh_r);
+            }
+            if let Some(f) = &mut shim_lp {
+                sh_l = f[0].process(sh_l);
+                sh_r = f[1].process(sh_r);
+            }
+            wet_tail_l += sh_l * 0.36 * shimmer_amt;
+            wet_tail_r += sh_r * 0.36 * shimmer_amt;
+        }
+
+        let oxide = crate::grain::oxide_dropout_at(sc.disintegrate, ev.loop_pass, t_rel, ev.id);
+        if sc.disintegrate > 1e-3 || shimmer_amt > 1e-3 {
+            let feed_g = 0.25 * shimmer_amt + 0.42 * base_wear;
+            let gl = ghost_ring[0][ghost_pos[0]];
+            let gr = ghost_ring[1][ghost_pos[1]];
+            ghost_lp[0] += ghost_lp_a * (gl - ghost_lp[0]);
+            ghost_lp[1] += ghost_lp_a * (gr - ghost_lp[1]);
+            ghost_ring[0][ghost_pos[0]] = (sig_l * feed_g + wet_tail_l) + ghost_lp[1] * 0.78;
+            ghost_ring[1][ghost_pos[1]] = (sig_r * feed_g + wet_tail_r) + ghost_lp[0] * 0.78;
+            ghost_pos[0] = (ghost_pos[0] + 1) % ghost_lens[0];
+            ghost_pos[1] = (ghost_pos[1] + 1) % ghost_lens[1];
+            wet_tail_l += ghost_lp[0] * 0.52;
+            wet_tail_r += ghost_lp[1] * 0.52;
+        }
+
+        let dry_keep = (1.0 - 0.88 * oxide).clamp(0.02, 1.0);
+        let ebb = crate::grain::ebb_flow_gain_at(sc.ebb_flow, ev.loop_pass, t_rel, ev.id);
+        sig_l = (sig_l * dry_keep + wet_tail_l) * ebb;
+        sig_r = (sig_r * dry_keep + wet_tail_r) * ebb;
+
+        fx_pos = (fx_pos + 1) % FX_RING;
+
+        if i >= i_blk0 {
+            let oi = (start_sample + i) as usize;
+            let v_level = ev.tag.level_at(t_abs);
+            if v_level > 0.0 {
+                out.left[oi] += sig_l * gain_l * v_level;
+                out.right[oi] += sig_r * gain_r * v_level;
             }
         }
     }
@@ -798,7 +1347,7 @@ mod tests {
             gain: 1.0,
             envelope: 0.01,
             id: 1,
-            tag: crate::grain::VoiceTag { voice: 5, env: Some(env), tile: None },
+            tag: crate::grain::VoiceTag { voice: 5, env: Some(env), tile: None, ..Default::default() },
             ..Default::default()
         };
         let mut whole = StereoBuffer::new(1.2, sr);
@@ -825,5 +1374,167 @@ mod tests {
         let mut buf = StereoBuffer::new(1.2, sr);
         render_grains_audio(&clip, std::slice::from_ref(&late), &mut buf, 0.0);
         assert_eq!(buf.rms(), 0.0);
+    }
+
+    #[test]
+    fn kick_sculptor_excites_real_sample_sub_with_zero_oscillators() {
+        let sr = 48_000u32;
+        // 1) Silence in -> exact zero out (0 oscillators!).
+        let silent_clip = AudioClip::new(vec![0.0; sr as usize], sr);
+        let kick_ev = GrainEvent {
+            onset: 0.0,
+            source_pos: 0.0,
+            duration: 0.35,
+            pitch_ratio: 1.0,
+            gain: 1.0,
+            envelope: 0.05,
+            sculpt: crate::grain::VoiceSculpt::preset(crate::grain::Stamp::Kick),
+            ..Default::default()
+        };
+        let mut silent_out = StereoBuffer::new(0.5, sr);
+        render_grains_audio(&silent_clip, std::slice::from_ref(&kick_ev), &mut silent_out, 0.0);
+        assert_eq!(silent_out.peak(), 0.0, "Kick sculptor must emit 0.0 on silent sample");
+
+        // 2) Thin 420 Hz desk tap -> Kick sculptor excites real sub-90 Hz punch.
+        let mut tap = vec![0.0f32; sr as usize];
+        for (i, s) in tap.iter_mut().enumerate().take((0.06 * sr as f64) as usize) {
+            let t = i as f32 / sr as f32;
+            *s = 0.7 * (-t / 0.012).exp() * (2.0 * std::f32::consts::PI * 420.0 * t).sin();
+        }
+        let tap_clip = AudioClip::new(tap, sr);
+        let raw_ev = GrainEvent { sculpt: crate::grain::VoiceSculpt::default(), ..kick_ev };
+        let (mut raw_out, mut sculpted_out) = (StereoBuffer::new(0.5, sr), StereoBuffer::new(0.5, sr));
+        render_grains_audio(&tap_clip, std::slice::from_ref(&raw_ev), &mut raw_out, 0.0);
+        render_grains_audio(&tap_clip, std::slice::from_ref(&kick_ev), &mut sculpted_out, 0.0);
+
+        let mut lp_raw = crate::dsp::Biquad::new(crate::dsp::FilterKind::LowPass, sr as f32, 95.0, 0.707);
+        let mut lp_sc = crate::dsp::Biquad::new(crate::dsp::FilterKind::LowPass, sr as f32, 95.0, 0.707);
+        let mut raw_sub = raw_out.left.clone();
+        let mut sc_sub = sculpted_out.left.clone();
+        lp_raw.process_buffer(&mut raw_sub);
+        lp_sc.process_buffer(&mut sc_sub);
+        let e_raw: f32 = raw_sub.iter().map(|x| x * x).sum();
+        let e_sc: f32 = sc_sub.iter().map(|x| x * x).sum();
+        assert!(e_sc > e_raw * 6.0 + 1e-4, "sub_exciter + pitch drop added real sub weight: {e_sc} vs {e_raw}");
+    }
+
+    #[test]
+    fn snare_sculptor_flams_widens_and_gates_trailing_speech() {
+        let sr = 48_000u32;
+        let mut samples = vec![0.0f32; sr as usize];
+        let mut rng = crate::dsp::Rng::new(77);
+        // Transient clap at 0.00..0.04s, then loud unwanted speech spill at 0.22..0.45s.
+        for s in samples.iter_mut().take((0.04 * sr as f64) as usize) {
+            *s = 0.8 * rng.bipolar();
+        }
+        for (i, s) in samples
+            .iter_mut()
+            .enumerate()
+            .take((0.45 * sr as f64) as usize)
+            .skip((0.22 * sr as f64) as usize)
+        {
+            let t = i as f32 / sr as f32;
+            *s = 0.65 * (2.0 * std::f32::consts::PI * 520.0 * t).sin();
+        }
+        let clip = AudioClip::new(samples, sr);
+        let raw_ev = GrainEvent {
+            onset: 0.0,
+            source_pos: 0.0,
+            duration: 0.45,
+            pitch_ratio: 1.0,
+            gain: 1.0,
+            envelope: 0.04,
+            ..Default::default()
+        };
+        let snare_ev = GrainEvent {
+            sculpt: crate::grain::VoiceSculpt::preset(crate::grain::Stamp::Snare),
+            ..raw_ev
+        };
+        let (mut raw_buf, mut sn_buf) = (StereoBuffer::new(0.6, sr), StereoBuffer::new(0.6, sr));
+        render_grains_audio(&clip, std::slice::from_ref(&raw_ev), &mut raw_buf, 0.0);
+        render_grains_audio(&clip, std::slice::from_ref(&snare_ev), &mut sn_buf, 0.0);
+
+        let a = (0.24 * sr as f64) as usize;
+        let b = (0.42 * sr as f64) as usize;
+        let raw_spill: f32 = (raw_buf.left[a..b].iter().map(|x| x * x).sum::<f32>() / (b - a) as f32).sqrt();
+        let sn_spill: f32 = (sn_buf.left[a..b].iter().map(|x| x * x).sum::<f32>() / (b - a) as f32).sqrt();
+        assert!(sn_spill < raw_spill * 0.08, "130ms snare tail gate muted trailing speech: {sn_spill} vs {raw_spill}");
+
+        // Stereo room decorrelation during the gated body [0.02..0.10s].
+        let r0 = (0.02 * sr as f64) as usize;
+        let r1 = (0.10 * sr as f64) as usize;
+        let side_e: f32 = sn_buf.left[r0..r1]
+            .iter()
+            .zip(&sn_buf.right[r0..r1])
+            .map(|(l, r)| (l - r).powi(2))
+            .sum();
+        assert!(side_e > 1e-3, "5-tap gated room created stereo width: {side_e}");
+    }
+
+    #[test]
+    fn pluck_comb_tunes_unpitched_click_and_disintegrate_darkens_over_passes() {
+        let sr = 48_000u32;
+        let mut click = vec![0.0f32; sr as usize];
+        let mut rng = crate::dsp::Rng::new(1234);
+        // 14ms unpitched noise burst ("page turn").
+        for s in click.iter_mut().take((0.014 * sr as f64) as usize) {
+            *s = 0.85 * rng.bipolar();
+        }
+        let click_clip = AudioClip::new(click, sr);
+        let pluck_ev = GrainEvent {
+            onset: 0.0,
+            source_pos: 0.0,
+            duration: 0.18,
+            pitch_ratio: 1.0,
+            gain: 1.0,
+            envelope: 0.05,
+            sculpt: crate::grain::VoiceSculpt::preset(crate::grain::Stamp::Pluck),
+            comb_hz: 220.0,
+            ..Default::default()
+        };
+        let mut pluck_buf = StereoBuffer::new(0.45, sr);
+        render_grains_audio(&click_clip, std::slice::from_ref(&pluck_ev), &mut pluck_buf, 0.0);
+        let (f0_opt, conf) = crate::dsp::detect_pitch_nsdf(
+            &pluck_buf.left[(0.01 * sr as f64) as usize..(0.16 * sr as f64) as usize],
+            sr,
+        );
+        let f0 = f0_opt.expect("Karplus-Strong comb pitched the noise click");
+        assert!((f0 - 220.0).abs() < 6.0 && conf > 0.65, "tuned f0={f0:.1} Hz, conf={conf:.2}");
+        // Ring-out extends past 0.18s (+140ms tail).
+        let tail_rms: f32 = (pluck_buf.left[(0.185 * sr as f64) as usize..(0.25 * sr as f64) as usize]
+            .iter()
+            .map(|x| x * x)
+            .sum::<f32>()
+            / (0.065 * sr as f32))
+            .sqrt();
+        assert!(tail_rms > 1e-4, "comb rings out into +140ms tail: {tail_rms}");
+
+        // Basinski disintegrate: progressive HF darkening across pass 0 -> pass 14.
+        let rich = AudioClip::saw_stack(220.0, 1.0, sr);
+        let hf_ratio = |pass: u32| -> f32 {
+            let ev = GrainEvent {
+                onset: 0.0,
+                source_pos: 0.0,
+                duration: 0.6,
+                pitch_ratio: 1.0,
+                gain: 1.0,
+                envelope: 0.1,
+                id: 99,
+                sculpt: crate::grain::VoiceSculpt::preset(crate::grain::Stamp::Disintegrate),
+                loop_pass: pass,
+                ..Default::default()
+            };
+            let mut b = StereoBuffer::new(0.7, sr);
+            render_grains_audio(&rich, std::slice::from_ref(&ev), &mut b, 0.0);
+            let total: f32 = b.left.iter().map(|x| x * x).sum::<f32>().max(1e-9);
+            let mut hp = crate::dsp::Biquad::new(crate::dsp::FilterKind::HighPass, sr as f32, 2400.0, 0.707);
+            let mut hi = b.left.clone();
+            hp.process_buffer(&mut hi);
+            hi.iter().map(|x| x * x).sum::<f32>() / total
+        };
+        let r0 = hf_ratio(0);
+        let r6 = hf_ratio(6);
+        let r16 = hf_ratio(16);
+        assert!(r16 < r6 && r6 < r0, "progressive Basinski HF loss: pass0={r0:.4} > pass6={r6:.4} > pass16={r16:.4}");
     }
 }

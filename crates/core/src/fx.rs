@@ -59,6 +59,14 @@ pub enum EffectKind {
     /// short decaying taps within ~40–120 ms (a "tiled" sound), mirror
     /// ping-pongs alternate taps L/R. count 1 = exact passthrough.
     Tile { count: f32, mirror: f32, spin: f32 },
+    /// True polar kaleidoscope. Video: `folds` radial wedges (`2..12`, angle
+    /// `π / folds`) around `(0.5, 0.5)` with alternating mirror reflection on
+    /// odd wedges (`fold_idx % 2 == 1`) and angular revolution rate `spin`
+    /// (`-1..1` rev/s). Audio: N-tap stereo-symmetric radial prism cluster
+    /// (`pan_k = sin(2π*k/N + ω*t)`) where even taps are forward reflections
+    /// and odd (mirrored) taps are windowed time-reflected reverse / fifth
+    /// reflections, with stereo pan & allpass phaser notches phase-locked to `spin`.
+    Kaleido { folds: f32, spin: f32 },
 }
 
 impl EffectKind {
@@ -85,7 +93,7 @@ impl EffectKind {
                 focus: 0.5,
             },
             "tile" | "tiles" | "grid" => EffectKind::Tile { count: 2.0, mirror: 0.0, spin: 0.0 },
-            "kaleido" | "kaleidoscope" => EffectKind::Tile { count: 3.0, mirror: 1.0, spin: 0.0 },
+            "kaleido" | "kaleidoscope" | "prism" => EffectKind::Kaleido { folds: 6.0, spin: 0.12 },
             _ => return None,
         })
     }
@@ -99,12 +107,15 @@ impl EffectKind {
             EffectKind::Tint { .. } => "tint",
             EffectKind::Tune { .. } => "tune",
             EffectKind::Tile { .. } => "tile",
+            EffectKind::Kaleido { .. } => "kaleido",
         }
     }
 
     /// Canonical parse names of every effect kind, in UI order (each one
     /// round-trips through [`EffectKind::parse`] to its default).
-    pub const KINDS: [&'static str; 7] = ["tune", "crush", "delay", "reverb", "compress", "tint", "tile"];
+    pub const KINDS: [&'static str; 8] = [
+        "tune", "crush", "delay", "reverb", "compress", "tint", "tile", "kaleido",
+    ];
 
     /// One-line "audio ↔ video" description for UIs.
     pub fn blurb(&self) -> &'static str {
@@ -116,6 +127,7 @@ impl EffectKind {
             EffectKind::Tint { .. } => "resonance ↔ color",
             EffectKind::Tune { .. } => "frequencies → key ↔ hues → key colors",
             EffectKind::Tile { .. } => "multi-tap echoes ↔ tiled / kaleidoscope picture",
+            EffectKind::Kaleido { .. } => "radial reverse-mirror prism ↔ polar kaleidoscope",
         }
     }
 }
@@ -210,6 +222,11 @@ impl AvEffect {
                 "turn" | "spin" | "rotate" | "rotation" => *spin = value.clamp(-0.5, 0.5),
                 _ => return Err(format!("tile has no parameter '{name}'")),
             },
+            EffectKind::Kaleido { folds, spin } => match key.as_str() {
+                "folds" | "wedges" | "count" | "n" | "tiles" => *folds = value.clamp(2.0, 12.0),
+                "spin" | "turn" | "rotate" | "rotation" | "omega" => *spin = value.clamp(-1.0, 1.0),
+                _ => return Err(format!("kaleido has no parameter '{name}'")),
+            },
         }
         Ok(())
     }
@@ -229,7 +246,7 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
 /// Persistent state for one audio effect instance.
 pub enum AudioFxState {
     Crush { hold: [f32; 2], phase: [f32; 2] },
-    Delay { ring: [Vec<f32>; 2], pos: usize },
+    Delay { ring: [Vec<f32>; 2], pos: usize, wet_hp: [crate::dsp::Biquad; 2] },
     Reverb { channels: [ReverbChannel; 2] },
     Compress { channels: [SpectralState; 2] },
     Tint { bq: [crate::dsp::Biquad; 2] },
@@ -237,6 +254,15 @@ pub enum AudioFxState {
     /// Dry-input history for the multi-tap tiling (feed-forward, so the
     /// tap times can move freely with `count` without rebuilding).
     Tile { ring: [Vec<f32>; 2], pos: usize, sr: f32 },
+    /// Radial stereo-symmetric prism + time-reflected reverse mirror wedges +
+    /// spin-locked stereo allpass phaser (`Kaleido`).
+    Kaleido {
+        ring: [Vec<f32>; 2],
+        pos: usize,
+        sample_idx: u64,
+        ap: [[f32; 2]; 2],
+        sr: f32,
+    },
 }
 
 /// Longest Tile span (seconds), used at count = 8. With the fractional
@@ -248,32 +274,34 @@ const TILE_MIN_SPAN: f32 = 0.04;
 const TILE_WET: f32 = 0.35;
 /// Per-tap decay.
 const TILE_DECAY: f32 = 0.75;
+/// History length (~170 ms @ 48 kHz) for `Kaleido` forward + reverse-mirror taps.
+const KALEIDO_RING_SECS: f32 = 0.18;
 
-/// Tap layout for count `n`: (delay seconds, gain) per tap, gains
-/// normalized to sum to 1. The last tap fades in with the fractional part
-/// of `n`, so sweeping `count` never pops a tap in at full level.
-fn tile_taps(n: f32) -> Vec<(f32, f32)> {
+/// Stack-allocated tap layout for count `n`: `([(delay_secs, gain); 8], tap_count)`.
+fn tile_taps_inline(n: f32) -> ([(f32, f32); 8], usize) {
+    let mut out = [(0.0f32, 0.0f32); 8];
     let extra = (n.clamp(1.0, 8.0) - 1.0).max(0.0);
     if extra <= 1e-4 {
-        return Vec::new();
+        return (out, 0);
     }
-    let k_max = extra.ceil() as usize;
+    let k_max = (extra.ceil() as usize).clamp(1, 8);
     let span = TILE_MIN_SPAN + (TILE_MAX_SPAN - TILE_MIN_SPAN) * ((extra - 1.0).max(0.0) / 6.0);
     let spacing = span / extra.max(1.0);
-    let mut taps: Vec<(f32, f32)> = (1..=k_max)
-        .map(|k| {
-            let mut g = TILE_DECAY.powi(k as i32 - 1);
-            if k == k_max {
-                g *= extra - (k_max - 1) as f32;
-            }
-            (spacing * k as f32, g)
-        })
-        .collect();
-    let sum: f32 = taps.iter().map(|t| t.1).sum::<f32>().max(1e-6);
-    for t in taps.iter_mut() {
-        t.1 /= sum;
+    let mut sum = 0.0f32;
+    for (idx, item) in out.iter_mut().enumerate().take(k_max) {
+        let k = idx + 1;
+        let mut g = TILE_DECAY.powi(k as i32 - 1);
+        if k == k_max {
+            g *= extra - (k_max - 1) as f32;
+        }
+        *item = (spacing * k as f32, g);
+        sum += g;
     }
-    taps
+    let inv = 1.0 / sum.max(1e-6);
+    for item in out.iter_mut().take(k_max) {
+        item.1 *= inv;
+    }
+    (out, k_max)
 }
 
 /// Build fresh states for a chain. Rebuild whenever the chain's shape or
@@ -287,7 +315,13 @@ pub fn audio_chain_states(chain: &[AvEffect], sample_rate: u32) -> Vec<AudioFxSt
             }
             EffectKind::Delay { time, .. } => {
                 let d = ((time * sample_rate as f32) as usize).max(1);
-                AudioFxState::Delay { ring: [vec![0.0; d], vec![0.0; d]], pos: 0 }
+                let hp = crate::dsp::Biquad::new(
+                    crate::dsp::FilterKind::HighPass,
+                    sample_rate.max(1) as f32,
+                    245.0,
+                    0.707,
+                );
+                AudioFxState::Delay { ring: [vec![0.0; d], vec![0.0; d]], pos: 0, wet_hp: [hp.clone(), hp] }
             }
             EffectKind::Reverb { size, damp, .. } => AudioFxState::Reverb {
                 channels: [
@@ -331,6 +365,17 @@ pub fn audio_chain_states(chain: &[AvEffect], sample_rate: u32) -> Vec<AudioFxSt
                 let len = (TILE_MAX_SPAN * 1.5 * sr).ceil() as usize + 4;
                 AudioFxState::Tile { ring: [vec![0.0; len], vec![0.0; len]], pos: 0, sr }
             }
+            EffectKind::Kaleido { .. } => {
+                let sr = sample_rate.max(1) as f32;
+                let len = ((KALEIDO_RING_SECS * sr).ceil() as usize + 16).max(512);
+                AudioFxState::Kaleido {
+                    ring: [vec![0.0; len], vec![0.0; len]],
+                    pos: 0,
+                    sample_idx: 0,
+                    ap: [[0.0; 2]; 2],
+                    sr,
+                }
+            }
         })
         .collect()
 }
@@ -338,7 +383,7 @@ pub fn audio_chain_states(chain: &[AvEffect], sample_rate: u32) -> Vec<AudioFxSt
 /// Samples of latency the chain introduces (spectral compression is
 /// windowed and cannot be zero-latency in a stream).
 pub fn audio_chain_latency(chain: &[AvEffect]) -> usize {
-    // Only Compress is windowed; everything else (incl. Tint) is 0-latency.
+    // Only Compress is windowed; everything else (incl. Tint / Kaleido) is 0-latency.
     chain
         .iter()
         .filter(|fx| {
@@ -356,6 +401,18 @@ pub fn process_audio_chain(
     right: &mut [f32],
     chain: &[AvEffect],
     states: &mut [AudioFxState],
+) {
+    process_audio_chain_opts(left, right, chain, states, false);
+}
+
+/// Like [`process_audio_chain`], with optional `>= 240 Hz` (`245 Hz`) high-pass
+/// on Delay & Reverb wet tails (`studio_tail_hpf = true` on the Studio master bus).
+pub fn process_audio_chain_opts(
+    left: &mut [f32],
+    right: &mut [f32],
+    chain: &[AvEffect],
+    states: &mut [AudioFxState],
+    studio_tail_hpf: bool,
 ) {
     for (fx, state) in chain.iter().zip(states.iter_mut()) {
         if fx.audio <= 0.001 {
@@ -377,13 +434,14 @@ pub fn process_audio_chain(
                     }
                 }
             }
-            (EffectKind::Delay { feedback, mix, .. }, AudioFxState::Delay { ring, pos }) => {
+            (EffectKind::Delay { feedback, mix, .. }, AudioFxState::Delay { ring, pos, wet_hp }) => {
                 let mix = mix * fx.audio;
                 let len = ring[0].len();
                 let mut p = *pos;
                 for i in 0..left.len() {
                     for (c, s) in [&mut left[i], &mut right[i]].into_iter().enumerate() {
-                        let wet = ring[c][p];
+                        let raw_wet = ring[c][p];
+                        let wet = if studio_tail_hpf { wet_hp[c].process(raw_wet) } else { raw_wet };
                         ring[c][p] = *s + wet * feedback;
                         *s += wet * mix;
                     }
@@ -394,7 +452,7 @@ pub fn process_audio_chain(
             (EffectKind::Reverb { mix, .. }, AudioFxState::Reverb { channels }) => {
                 let mix = mix * fx.audio;
                 for (c, ch) in [&mut *left, &mut *right].into_iter().enumerate() {
-                    channels[c].process(ch, mix);
+                    channels[c].process_opts(ch, mix, studio_tail_hpf);
                 }
             }
             (EffectKind::Compress { quality }, AudioFxState::Compress { channels }) => {
@@ -440,6 +498,12 @@ pub fn process_audio_chain(
             (EffectKind::Tile { count, mirror, .. }, AudioFxState::Tile { ring, pos, sr }) => {
                 process_tile(left, right, ring, pos, *sr, count, mirror, fx.audio);
             }
+            (
+                EffectKind::Kaleido { folds, spin },
+                AudioFxState::Kaleido { ring, pos, sample_idx, ap, sr },
+            ) => {
+                process_kaleido(left, right, ring, pos, sample_idx, ap, *sr, folds, spin, fx.audio);
+            }
             _ => debug_assert!(false, "chain/state mismatch — rebuild states"),
         }
     }
@@ -447,7 +511,7 @@ pub fn process_audio_chain(
 
 /// Multi-tap "tiling": each output sample adds N-1 decaying copies of the
 /// recent dry input. Feed-forward (no feedback) so it can never run away,
-/// and fractional (linear-interp) tap reads so sweeping `count` glides.
+/// fractional (linear-interp) tap reads, and 100% allocation-free per block.
 #[allow(clippy::too_many_arguments)]
 fn process_tile(
     left: &mut [f32],
@@ -460,32 +524,29 @@ fn process_tile(
     amount: f32,
 ) {
     let len = ring[0].len();
-    let taps = tile_taps(count);
+    let (raw_taps, n_taps) = tile_taps_inline(count);
     let extra = (count.clamp(1.0, 8.0) - 1.0).max(0.0);
     let wet = TILE_WET * (extra / 7.0) * amount.clamp(0.0, 1.0);
     let cross = mirror >= 0.5;
-    // Precompute tap read offsets in samples (kept inside the ring).
-    let taps: Vec<(f32, f32, bool)> = taps
-        .iter()
-        .enumerate()
-        .map(|(k, &(d, g))| ((d * sr).clamp(1.0, (len - 2) as f32), g, cross && k % 2 == 0))
-        .collect();
+    let mut taps = [(0.0f32, 0.0f32, false); 8];
+    for k in 0..n_taps {
+        let (d, g) = raw_taps[k];
+        taps[k] = ((d * sr).clamp(1.0, (len - 2) as f32), g, cross && k % 2 == 0);
+    }
     let mut p = *pos;
     for i in 0..left.len() {
         let (dl, dr) = (left[i], right[i]);
         ring[0][p] = dl;
         ring[1][p] = dr;
-        if wet > 0.0 && !taps.is_empty() {
+        if wet > 0.0 && n_taps > 0 {
             let mut acc = [0.0f32; 2];
-            for &(d, g, swap) in &taps {
+            for &(d, g, swap) in &taps[..n_taps] {
                 let rd = p as f32 + len as f32 - d;
                 let i0 = rd.floor();
                 let f = rd - i0;
                 let a = i0 as usize % len;
                 let b = (a + 1) % len;
                 for (c, out) in acc.iter_mut().enumerate() {
-                    // Mirror: alternate taps come from the opposite side,
-                    // so the echoes ping-pong L/R like flipped tiles.
                     let src = if swap { 1 - c } else { c };
                     let h = &ring[src];
                     *out += g * (h[a] + (h[b] - h[a]) * f);
@@ -499,22 +560,140 @@ fn process_tile(
     *pos = p;
 }
 
+/// 1:1 sonic counterpart of [`EffectKind::Kaleido`]:
+/// `folds` (`N = 2..12`) radial taps arrayed symmetrically around the stereo field
+/// (`pan_k = sin(2π*k/N + ω*t)`), where even taps are forward Doppler reflections
+/// and odd (mirrored) taps are Hann-windowed time-reflected reverse + fifth
+/// micro-grains, followed by a stereo 2-stage allpass phaser rotating at `ω = 2π * spin`.
+#[allow(clippy::too_many_arguments)]
+fn process_kaleido(
+    left: &mut [f32],
+    right: &mut [f32],
+    ring: &mut [Vec<f32>; 2],
+    pos: &mut usize,
+    sample_idx: &mut u64,
+    ap: &mut [[f32; 2]; 2],
+    sr: f32,
+    folds: f32,
+    spin: f32,
+    amount: f32,
+) {
+    let mix = amount.clamp(0.0, 1.0);
+    let len = ring[0].len().max(1);
+    let n_folds = (folds.round() as usize).clamp(2, 12);
+    let norm = 0.62 / (n_folds as f32).sqrt();
+    let omega = spin.clamp(-1.0, 1.0) * std::f32::consts::TAU;
+    let rev_win = (0.044 * sr).clamp(64.0, (len.saturating_sub(8)) as f32);
+
+    let mut p = *pos;
+    let mut s_idx = *sample_idx;
+    let n = left.len().min(right.len());
+
+    let read_frac = |buf: &[f32], delay_samps: f32, write_p: usize| -> f32 {
+        let d = delay_samps.clamp(1.0, (len - 3) as f32);
+        let rd = write_p as f32 + len as f32 - d;
+        let i0 = rd.floor();
+        let f = rd - i0;
+        let a = i0 as usize % len;
+        let b = (a + 1) % len;
+        buf[a] + (buf[b] - buf[a]) * f
+    };
+
+    for i in 0..n {
+        let dl = left[i];
+        let dr = right[i];
+        ring[0][p] = dl;
+        ring[1][p] = dr;
+
+        if mix > 1e-4 {
+            let t = (s_idx as f64 / sr.max(1.0) as f64) as f32;
+            let mono = 0.5 * (dl + dr);
+            let side = 0.5 * (dl - dr);
+            let mut prism_l = 0.0f32;
+            let mut prism_r = 0.0f32;
+
+            for k in 0..n_folds {
+                let phi = std::f32::consts::TAU * (k as f32 / n_folds as f32) + omega * t;
+                let (sin_p, cos_p) = phi.sin_cos();
+                let pan_k = sin_p * 0.92;
+                let gl = ((1.0 - pan_k) * 0.5).sqrt();
+                let gr = ((1.0 + pan_k) * 0.5).sqrt();
+                let src_ch = k & 1;
+
+                let tap_sig = if k % 2 == 0 {
+                    // Even wedge: forward radial reflection with gentle spin Doppler.
+                    let base_d = (0.009 + 0.0068 * k as f32 + 0.0014 * cos_p) * sr;
+                    read_frac(&ring[src_ch], base_d, p)
+                } else {
+                    // Odd (mirrored) wedge: 2-phase Hann-windowed time-reflected reverse + fifth grain!
+                    let rate = if k % 4 == 1 { -1.0f32 } else { -1.498_307f32 }; // reverse unity & reverse fifth
+                    let step_rate = 1.0 - rate; // 2.0 or 2.4983 samples of delay advance per sample -> backwards playback!
+                    let mut acc = 0.0f32;
+                    for ph_i in 0..2 {
+                        let ph = (((s_idx as f32 * step_rate) / rev_win)
+                            + 0.5 * ph_i as f32
+                            + k as f32 * 0.17)
+                            .rem_euclid(1.0);
+                        let w = 0.5 * (1.0 - (std::f32::consts::TAU * ph).cos());
+                        let d = 8.0 + ph * rev_win;
+                        acc += read_frac(&ring[1 - src_ch], d, p) * w;
+                    }
+                    acc * 0.92
+                };
+
+                prism_l += tap_sig * gl;
+                prism_r += tap_sig * gr;
+            }
+
+            // Phase-locked stereo 2-stage allpass phaser notch revolving with `omega * t`.
+            let (lfo_s, lfo_c) = (omega * t).sin_cos();
+            let ap_c_l = (0.35 + 0.42 * (0.5 + 0.5 * lfo_s)).clamp(0.05, 0.88);
+            let ap_c_r = (0.35 + 0.42 * (0.5 + 0.5 * lfo_c)).clamp(0.05, 0.88);
+
+            let mut wl = prism_l * norm + (mono + side * lfo_c) * 0.28;
+            let mut wr = prism_r * norm + (mono - side * lfo_c) * 0.28;
+            for stg in 0..2 {
+                let yl = -ap_c_l * wl + ap[0][stg];
+                ap[0][stg] = wl + ap_c_l * yl;
+                wl = yl;
+
+                let yr = -ap_c_r * wr + ap[1][stg];
+                ap[1][stg] = wr + ap_c_r * yr;
+                wr = yr;
+            }
+
+            left[i] = dl * (1.0 - 0.52 * mix) + wl * mix;
+            right[i] = dr * (1.0 - 0.52 * mix) + wr * mix;
+        }
+
+        p = (p + 1) % len;
+        s_idx = s_idx.wrapping_add(1);
+    }
+    *pos = p;
+    *sample_idx = s_idx;
+}
+
 /// One-shot convenience: process a whole buffer, compensating for any
 /// chain latency so offline renders stay time-aligned.
 pub fn apply_audio_chain(buf: &mut StereoBuffer, chain: &[AvEffect]) {
+    apply_audio_chain_opts(buf, chain, false);
+}
+
+/// Like [`apply_audio_chain`], with optional `>= 240 Hz` (`245 Hz`) wet-tail HPF on Delay & Reverb.
+pub fn apply_audio_chain_opts(buf: &mut StereoBuffer, chain: &[AvEffect], studio_tail_hpf: bool) {
     let mut states = audio_chain_states(chain, buf.sample_rate);
     let latency = audio_chain_latency(chain);
     let n = buf.len();
     if latency == 0 {
         let (l, r) = (&mut buf.left, &mut buf.right);
-        process_audio_chain(l, r, chain, &mut states);
+        process_audio_chain_opts(l, r, chain, &mut states, studio_tail_hpf);
         return;
     }
     let mut l = buf.left.clone();
     let mut r = buf.right.clone();
     l.resize(n + latency + SPECTRAL_N, 0.0);
     r.resize(n + latency + SPECTRAL_N, 0.0);
-    process_audio_chain(&mut l, &mut r, chain, &mut states);
+    process_audio_chain_opts(&mut l, &mut r, chain, &mut states, studio_tail_hpf);
     buf.left.copy_from_slice(&l[latency..latency + n]);
     buf.right.copy_from_slice(&r[latency..latency + n]);
 }
@@ -547,7 +726,7 @@ struct AllPass {
 }
 
 impl AllPass {
-    fn new(len: usize) -> AllPass {
+    fn new(len: usize, ) -> AllPass {
         AllPass { buf: vec![0.0; len.max(1)], i: 0 }
     }
     #[inline]
@@ -561,13 +740,15 @@ impl AllPass {
 }
 
 /// Freeverb-style reverb tank for one channel (8 combs + 4 allpasses) with a
-/// 160 Hz wet-input high-pass and natural HF damping floor so reverb tails
-/// stay dense and velvety without low-end boom or narrow 4-comb ringing.
+/// 160 Hz (`245 Hz` in Studio master mode) wet-input high-pass and natural HF
+/// damping floor so reverb tails stay dense and velvety without low-end boom.
 pub struct ReverbChannel {
     combs: Vec<Comb>,
     aps: Vec<AllPass>,
     hp_lp: f32,
     hp_a: f32,
+    hp_studio_a: f32,
+    out_hp_lp: f32,
 }
 
 impl ReverbChannel {
@@ -577,6 +758,7 @@ impl ReverbChannel {
         let feedback = 0.68 + 0.24 * size.clamp(0.0, 1.0);
         let damp = 0.16 + damp.clamp(0.0, 1.0) * 0.68;
         let hp_a = 1.0 - (-2.0 * std::f32::consts::PI * 160.0 / sr).exp();
+        let hp_studio_a = 1.0 - (-2.0 * std::f32::consts::PI * 245.0 / sr).exp();
         ReverbChannel {
             combs: [1116.0f32, 1188.0, 1277.0, 1356.0, 1422.0, 1491.0, 1557.0, 1617.0]
                 .iter()
@@ -588,16 +770,23 @@ impl ReverbChannel {
                 .collect(),
             hp_lp: 0.0,
             hp_a,
+            hp_studio_a,
+            out_hp_lp: 0.0,
         }
     }
 
-    fn process(&mut self, samples: &mut [f32], mix: f32) {
+    fn process_opts(&mut self, samples: &mut [f32], mix: f32, studio_hpf: bool) {
+        let a = if studio_hpf { self.hp_studio_a } else { self.hp_a };
         for s in samples.iter_mut() {
-            self.hp_lp += self.hp_a * (*s - self.hp_lp);
+            self.hp_lp += a * (*s - self.hp_lp);
             let input = (*s - self.hp_lp) * 0.13;
             let mut wet: f32 = self.combs.iter_mut().map(|c| c.process(input)).sum();
             for ap in self.aps.iter_mut() {
                 wet = ap.process(wet);
+            }
+            if studio_hpf {
+                self.out_hp_lp += self.hp_studio_a * (wet - self.out_hp_lp);
+                wet -= self.out_hp_lp;
             }
             *s += wet * mix;
         }
@@ -787,6 +976,7 @@ pub enum VideoFxState {
     Stateless,
     Delay { ring: VecDeque<Frame>, delay_frames: usize },
     Reverb { acc: Vec<f32> },
+    Kaleido { angle_rad: f32, fps: f32 },
 }
 
 /// Build the state vector for a chain.
@@ -799,6 +989,10 @@ pub fn video_chain_states(chain: &[AvEffect], fps: f32) -> Vec<VideoFxState> {
                 delay_frames: ((time * fps).round() as usize).max(1),
             },
             EffectKind::Reverb { .. } => VideoFxState::Reverb { acc: Vec::new() },
+            EffectKind::Kaleido { .. } => VideoFxState::Kaleido {
+                angle_rad: 0.0,
+                fps: fps.max(1.0),
+            },
             EffectKind::Crush { .. }
             | EffectKind::Compress { .. }
             | EffectKind::Tint { .. }
@@ -817,12 +1011,21 @@ pub fn apply_video_chain(
 ) {
     for (fx, state) in chain.iter().zip(states.iter_mut()) {
         if fx.video <= 0.001 {
-            // Still record history so enabling mid-stream behaves.
-            if let VideoFxState::Delay { ring, delay_frames } = state {
-                ring.push_back(frame.clone());
-                while ring.len() > *delay_frames {
-                    ring.pop_front();
+            // Still record history / advance phase so enabling mid-stream behaves.
+            match state {
+                VideoFxState::Delay { ring, delay_frames } => {
+                    ring.push_back(frame.clone());
+                    while ring.len() > *delay_frames {
+                        ring.pop_front();
+                    }
                 }
+                VideoFxState::Kaleido { angle_rad, fps } => {
+                    if let EffectKind::Kaleido { spin, .. } = fx.kind {
+                        *angle_rad = (*angle_rad + spin.clamp(-1.0, 1.0) * std::f32::consts::TAU / fps.max(1.0))
+                            .rem_euclid(std::f32::consts::TAU);
+                    }
+                }
+                _ => {}
             }
             continue;
         }
@@ -863,6 +1066,93 @@ pub fn apply_video_chain(
             EffectKind::Tile { count, mirror, spin } => {
                 let (n, turn) = tile_video_params(count, spin, fx.video);
                 video_tile(frame, n, mirror, turn);
+            }
+            EffectKind::Kaleido { folds, spin } => {
+                let angle = match state {
+                    VideoFxState::Kaleido { angle_rad, fps } => {
+                        let cur = *angle_rad;
+                        *angle_rad = (*angle_rad + spin.clamp(-1.0, 1.0) * std::f32::consts::TAU / fps.max(1.0))
+                            .rem_euclid(std::f32::consts::TAU);
+                        cur
+                    }
+                    _ => 0.0,
+                };
+                video_kaleido(frame, folds, angle, (0.5, 0.5), fx.video);
+            }
+        }
+    }
+}
+
+/// Effective `(folds, angle_rad, blend)` for the GPU `Kaleido` pass at elapsed `time_secs`.
+pub fn kaleido_video_params(folds: f32, spin: f32, time_secs: f64, video: f32) -> (f32, f32, f32) {
+    let f = folds.clamp(2.0, 12.0);
+    let omega = spin.clamp(-1.0, 1.0) as f64 * std::f64::consts::TAU;
+    let angle = (omega * time_secs).rem_euclid(std::f64::consts::TAU) as f32;
+    (f, angle, video.clamp(0.0, 1.0))
+}
+
+/// Exact polar radial kaleidoscope UV mapping around `center` (`(0.5, 0.5)` default),
+/// shared 1:1 with the WGSL GPU shader:
+/// - `folds` radial wedges of angle `π / folds` (`2..12`)
+/// - alternating mirror reflection on odd wedges (`fold_idx % 2 == 1`)
+/// - continuous angular revolution `angle_rad`
+pub fn kaleido_source_uv(
+    u: f32,
+    v: f32,
+    folds: f32,
+    angle_rad: f32,
+    center: (f32, f32),
+    aspect: f32,
+) -> (f32, f32) {
+    let aspect = if aspect.is_finite() && aspect > 1e-4 { aspect } else { 1.0 };
+    let dx = (u - center.0) * aspect;
+    let dy = v - center.1;
+    let r = (dx * dx + dy * dy).sqrt();
+    let theta = dy.atan2(dx) - angle_rad;
+    let wedge = std::f32::consts::PI / folds.clamp(2.0, 12.0);
+    let q = theta.rem_euclid(std::f32::consts::TAU) / wedge;
+    let fold_idx = q.floor() as i32;
+    let f = q - fold_idx as f32;
+    let folded = if fold_idx.rem_euclid(2) == 1 { 1.0 - f } else { f };
+    let src_theta = folded * wedge + angle_rad * 0.35;
+    let raw_u = center.0 + (r * src_theta.cos()) / aspect;
+    let raw_v = center.1 + r * src_theta.sin();
+    let mirror_wrap = |t: f32| -> f32 {
+        let m = t.rem_euclid(2.0);
+        if m > 1.0 { 2.0 - m } else { m }
+    };
+    (mirror_wrap(raw_u).clamp(0.0, 1.0), mirror_wrap(raw_v).clamp(0.0, 1.0))
+}
+
+fn video_kaleido(frame: &mut Frame, folds: f32, angle_rad: f32, center: (f32, f32), blend: f32) {
+    let blend = blend.clamp(0.0, 1.0);
+    if blend <= 0.001 {
+        return;
+    }
+    let (w, h) = (frame.width as usize, frame.height as usize);
+    if w == 0 || h == 0 {
+        return;
+    }
+    let src = frame.data.clone();
+    let aspect = w as f32 / h as f32;
+    let folds = folds.clamp(2.0, 12.0);
+    for y in 0..h {
+        let v = (y as f32 + 0.5) / h as f32;
+        for x in 0..w {
+            let u = (x as f32 + 0.5) / w as f32;
+            let (su, sv) = kaleido_source_uv(u, v, folds, angle_rad, center, aspect);
+            let sx = ((su * w as f32) as usize).min(w - 1);
+            let sy = ((sv * h as f32) as usize).min(h - 1);
+            let di = (y * w + x) * 4;
+            let si = (sy * w + sx) * 4;
+            if blend >= 0.999 {
+                frame.data[di..di + 4].copy_from_slice(&src[si..si + 4]);
+            } else {
+                for c in 0..4 {
+                    let d = src[di + c] as f32;
+                    let s = src[si + c] as f32;
+                    frame.data[di + c] = (d + (s - d) * blend).round().clamp(0.0, 255.0) as u8;
+                }
             }
         }
     }
@@ -1929,7 +2219,7 @@ mod tests {
         assert_eq!(EffectKind::parse("grid"), EffectKind::parse("tiles"));
         assert_eq!(
             EffectKind::parse("kaleido"),
-            Some(EffectKind::Tile { count: 3.0, mirror: 1.0, spin: 0.0 })
+            Some(EffectKind::Kaleido { folds: 6.0, spin: 0.12 })
         );
         let mut fx = AvEffect::new(EffectKind::parse("tile").unwrap());
         fx.set_param("tiles", 12.0).unwrap();
@@ -1937,10 +2227,79 @@ mod tests {
         fx.set_param("turn", 0.125).unwrap();
         assert_eq!(fx.kind, EffectKind::Tile { count: 8.0, mirror: 1.0, spin: 0.125 });
         assert!(fx.set_param("hue", 1.0).is_err());
+
+        let mut kfx = AvEffect::new(EffectKind::parse("kaleido").unwrap());
+        kfx.set_param("folds", 8.0).unwrap();
+        kfx.set_param("spin", -0.25).unwrap();
+        assert_eq!(kfx.kind, EffectKind::Kaleido { folds: 8.0, spin: -0.25 });
+
         for name in EffectKind::KINDS {
             let k = EffectKind::parse(name).unwrap();
             assert_eq!(k.name(), name);
             assert!(!k.blurb().is_empty());
+        }
+    }
+
+    #[test]
+    fn kaleido_polar_wedges_and_audio_streaming_parity() {
+        // 1. Video: 6-fold polar kaleidoscope around (0.5, 0.5) has exact 6-fold rotational
+        //    symmetry (rotating output point by 2*pi/6 = 60 deg lands on the exact same source UV!)
+        //    AND mirror continuity across wedge boundaries.
+        let folds = 6.0f32;
+        let r = 0.28f32;
+        let base_ang = 0.19f32;
+        let uv0 = kaleido_source_uv(0.5 + r * base_ang.cos(), 0.5 + r * base_ang.sin(), folds, 0.0, (0.5, 0.5), 1.0);
+        for k in 1..6 {
+            let ang = base_ang + k as f32 * (std::f32::consts::TAU / folds);
+            let uvk = kaleido_source_uv(0.5 + r * ang.cos(), 0.5 + r * ang.sin(), folds, 0.0, (0.5, 0.5), 1.0);
+            assert!((uv0.0 - uvk.0).abs() < 1e-5 && (uv0.1 - uvk.1).abs() < 1e-5, "sector {k}: {uv0:?} vs {uvk:?}");
+        }
+        // Mirror reflection across odd wedge boundary (pi / 6): angles pi/6 - eps and pi/6 + eps match!
+        let seam = std::f32::consts::PI / folds;
+        let eps = 0.03f32;
+        let a_pre = kaleido_source_uv(0.5 + r * (seam - eps).cos(), 0.5 + r * (seam - eps).sin(), folds, 0.0, (0.5, 0.5), 1.0);
+        let a_post = kaleido_source_uv(0.5 + r * (seam + eps).cos(), 0.5 + r * (seam + eps).sin(), folds, 0.0, (0.5, 0.5), 1.0);
+        assert!((a_pre.0 - a_post.0).abs() < 1e-5 && (a_pre.1 - a_post.1).abs() < 1e-5, "mirror seam continuity");
+
+        // Spin advances frame-by-frame.
+        let clip = VideoClip::test_pattern(48, 48, 24.0, 0.2);
+        let chain_v = [AvEffect::new(EffectKind::Kaleido { folds: 6.0, spin: 0.4 })];
+        let mut st_v = video_chain_states(&chain_v, 24.0);
+        let mut f0 = clip.frames[0].clone();
+        let mut f1 = clip.frames[0].clone();
+        apply_video_chain(&mut f0, &chain_v, &mut st_v);
+        apply_video_chain(&mut f1, &chain_v, &mut st_v);
+        assert_ne!(f0.data, f1.data, "spin revolves kaleidoscope across frames");
+
+        // 2. Audio: stereo prism spreads mono input into rotating L/R reflections and streams bit-identically.
+        let sr = 48_000u32;
+        let n = sr as usize / 2;
+        let src: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.063).sin() * 0.45).collect();
+        let chain_a = [AvEffect::new(EffectKind::Kaleido { folds: 6.0, spin: 0.35 })];
+        let (mut l1, mut r1) = (src.clone(), src.clone());
+        let mut st1 = audio_chain_states(&chain_a, sr);
+        process_audio_chain(&mut l1, &mut r1, &chain_a, &mut st1);
+
+        let side_e: f32 = l1.iter().zip(&r1).map(|(a, b)| (a - b) * (a - b)).sum::<f32>() / n as f32;
+        assert!(side_e > 1e-4, "mono input fans into wide rotating stereo prism: side_e={side_e}");
+
+        let (mut l2, mut r2) = (src.clone(), src.clone());
+        let mut st2 = audio_chain_states(&chain_a, sr);
+        let mut pos = 0;
+        for b in [113usize, 256, 512, 777, 1024] {
+            if pos >= n {
+                break;
+            }
+            let len = b.min(n - pos);
+            process_audio_chain(&mut l2[pos..pos + len], &mut r2[pos..pos + len], &chain_a, &mut st2);
+            pos += len;
+        }
+        if pos < n {
+            process_audio_chain(&mut l2[pos..], &mut r2[pos..], &chain_a, &mut st2);
+        }
+        for i in 0..n {
+            assert!((l1[i] - l2[i]).abs() < 1e-6);
+            assert!((r1[i] - r2[i]).abs() < 1e-6);
         }
     }
 }

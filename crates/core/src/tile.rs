@@ -24,32 +24,213 @@ use serde::{Deserialize, Serialize};
 pub const MAX_TILES: usize = 9;
 /// Gap between tiles, as a fraction of the canvas' shorter side.
 pub const TILE_GAP: f32 = 0.004;
+/// Fractional interior-edge overlap in [`Layout::Split`] (`+6.5%`) for
+/// feathered optical-screen seam blending.
+pub const SPLIT_BLEED_OVERLAP: f32 = 0.065;
+
+/// Output stage aspect ratio (`16:9`, `1:1`, `9:16`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum AspectRatio {
+    #[default]
+    Wide16x9,
+    Square1x1,
+    Vertical9x16,
+}
+
+impl AspectRatio {
+    pub const ALL: [AspectRatio; 3] = [
+        AspectRatio::Wide16x9,
+        AspectRatio::Square1x1,
+        AspectRatio::Vertical9x16,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            AspectRatio::Wide16x9 => "16:9",
+            AspectRatio::Square1x1 => "1:1",
+            AspectRatio::Vertical9x16 => "9:16",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<AspectRatio> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "16:9" | "16x9" | "wide" | "landscape" => Some(AspectRatio::Wide16x9),
+            "1:1" | "1x1" | "square" => Some(AspectRatio::Square1x1),
+            "9:16" | "9x16" | "vertical" | "portrait" => Some(AspectRatio::Vertical9x16),
+            _ => None,
+        }
+    }
+
+    pub fn ratio(self) -> f32 {
+        match self {
+            AspectRatio::Wide16x9 => 16.0 / 9.0,
+            AspectRatio::Square1x1 => 1.0,
+            AspectRatio::Vertical9x16 => 9.0 / 16.0,
+        }
+    }
+
+    /// Full-HD export dimensions `(width, height)`.
+    pub fn hd_dimensions(self) -> (u32, u32) {
+        match self {
+            AspectRatio::Wide16x9 => (1920, 1080),
+            AspectRatio::Square1x1 => (1080, 1080),
+            AspectRatio::Vertical9x16 => (1080, 1920),
+        }
+    }
+
+    /// Even `(width, height)` scaled to a target long-edge pixel count.
+    pub fn dimensions_for_long_edge(self, long_edge: u32) -> (u32, u32) {
+        let le = (long_edge.max(16)) & !1;
+        match self {
+            AspectRatio::Wide16x9 => {
+                let h = (((le as f32 * 9.0 / 16.0).round() as u32).max(16)) & !1;
+                (le, h)
+            }
+            AspectRatio::Square1x1 => (le, le),
+            AspectRatio::Vertical9x16 => {
+                let w = (((le as f32 * 9.0 / 16.0).round() as u32).max(16)) & !1;
+                (w, le)
+            }
+        }
+    }
+}
 
 /// Compositing mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Layout {
-    /// Layered compositing (default).
+    /// Layered spatial grain compositing (default).
     #[default]
     Stack,
-    /// One tile per sounding voice.
+    /// Feathered Split + Bleed (`1 -> full`, `2 -> 2-up`, `3 -> triptych`,
+    /// `4 -> 2x2`) with `+6.5%` screen-blended interior seams and sustained
+    /// wash voices bleeding full-screen at `30%`.
+    Split,
+    /// Crisp architectural Grid (`1.5px` obsidian dividers).
     Tile,
+    /// Full-canvas optical luma-key + screen multi-exposure melt.
+    Bleed,
 }
 
 impl Layout {
+    pub const ALL: [Layout; 4] = [Layout::Stack, Layout::Split, Layout::Tile, Layout::Bleed];
+
     pub fn name(self) -> &'static str {
         match self {
             Layout::Stack => "stack",
+            Layout::Split => "split",
             Layout::Tile => "tile",
+            Layout::Bleed => "bleed",
         }
+    }
+
+    /// Short stage pill label (`stack | split | grid | bleed`).
+    pub fn label(self) -> &'static str {
+        match self {
+            Layout::Stack => "stack",
+            Layout::Split => "split",
+            Layout::Tile => "grid",
+            Layout::Bleed => "bleed",
+        }
+    }
+
+    /// True when discrete voices claim spatial panel slots (`Split` or `Tile`).
+    pub fn uses_tiles(self) -> bool {
+        matches!(self, Layout::Split | Layout::Tile)
     }
 
     pub fn parse(s: &str) -> Option<Layout> {
         match s.trim().to_ascii_lowercase().as_str() {
             "stack" => Some(Layout::Stack),
+            "split" | "split+bleed" | "smart" => Some(Layout::Split),
             "tile" | "tiles" | "grid" => Some(Layout::Tile),
+            "bleed" | "blend" | "fullbleed" => Some(Layout::Bleed),
             _ => None,
         }
     }
+}
+
+/// Architectural split grid `(cols, rows)` for [`Layout::Split`]:
+/// `1 -> 1x1`, `2 -> 2x1` (`1x2` in portrait `9:16`), `3 -> 3x1` triptych
+/// (`1x3` in portrait), `4 -> 2x2`, `5..=9 -> 3x3`.
+pub fn split_grid_for(n: usize, aspect: f32) -> (u32, u32) {
+    let portrait = aspect.is_finite() && aspect < 0.85;
+    match n {
+        0 | 1 => (1, 1),
+        2 => if portrait { (1, 2) } else { (2, 1) },
+        3 => if portrait { (1, 3) } else { (3, 1) },
+        4 => (2, 2),
+        _ => (3, 3),
+    }
+}
+
+/// Split-grid `(cols, rows)` for one frame from active discrete voice slots.
+pub fn frame_split_grid(slots: impl IntoIterator<Item = u8>, aspect: f32) -> (u32, u32) {
+    let (mut n, mut hi) = (0usize, 0usize);
+    let mut seen = [false; MAX_TILES];
+    for s in slots {
+        let s = (s as usize).min(MAX_TILES - 1);
+        if !seen[s] {
+            seen[s] = true;
+            n += 1;
+            hi = hi.max(s + 1);
+        }
+    }
+    split_grid_for(n.max(hi), aspect)
+}
+
+/// *MODELL 5* (Hentschläger & Langheinrich, 1994) vertical portrait-column grid
+/// on wide canvases (`aspect > 1.3`): `1 -> 1×1`, `2 -> 2×1`, `3 -> 3×1`
+/// triptych monoliths, `4 -> 4×1` quad portrait strips (`1×N` in portrait `9:16`,
+/// `3×3` for `5+`).
+pub fn portrait_grid_for(n: usize, aspect: f32) -> (u32, u32) {
+    let wide = !aspect.is_finite() || aspect > 1.3;
+    let portrait = aspect.is_finite() && aspect < 0.85;
+    match n {
+        0 | 1 => (1, 1),
+        2 => if portrait { (1, 2) } else { (2, 1) },
+        3 => if wide { (3, 1) } else if portrait { (1, 3) } else { (2, 2) },
+        4 => if wide { (4, 1) } else if portrait { (1, 4) } else { (2, 2) },
+        _ => (3, 3),
+    }
+}
+
+/// *MODELL 5* portrait-column grid `(cols, rows)` for one frame from active slots.
+pub fn frame_portrait_grid(slots: impl IntoIterator<Item = u8>, aspect: f32) -> (u32, u32) {
+    let (mut n, mut hi) = (0usize, 0usize);
+    let mut seen = [false; MAX_TILES];
+    for s in slots {
+        let s = (s as usize).min(MAX_TILES - 1);
+        if !seen[s] {
+            seen[s] = true;
+            n += 1;
+            hi = hi.max(s + 1);
+        }
+    }
+    portrait_grid_for(n.max(hi), aspect)
+}
+
+/// Feathered panel rect and interior-edge flags `[left, right, top, bottom]`
+/// for `slot` in [`Layout::Split`]. Interior shared seams expand symmetrically
+/// by [`SPLIT_BLEED_OVERLAP`] (`+6.5%`) for optical screen feathering.
+pub fn split_rect(slot: usize, cols: u32, rows: u32) -> (TileRect, [bool; 4]) {
+    let (cols, rows) = (cols.max(1), rows.max(1));
+    let slot = slot.min((cols * rows) as usize - 1) as u32;
+    let (c, r) = (slot % cols, slot / cols);
+    let base_w = 1.0 / cols as f32;
+    let base_h = 1.0 / rows as f32;
+    let base_x = c as f32 * base_w;
+    let base_y = r as f32 * base_h;
+    let fl = c > 0;
+    let fr = c + 1 < cols;
+    let ft = r > 0;
+    let fb = r + 1 < rows;
+    let ox = SPLIT_BLEED_OVERLAP * base_w;
+    let oy = SPLIT_BLEED_OVERLAP * base_h;
+    let x0 = if fl { (base_x - ox).max(0.0) } else { base_x };
+    let x1 = if fr { (base_x + base_w + ox).min(1.0) } else { base_x + base_w };
+    let y0 = if ft { (base_y - oy).max(0.0) } else { base_y };
+    let y1 = if fb { (base_y + base_h + oy).min(1.0) } else { base_y + base_h };
+    (TileRect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }, [fl, fr, ft, fb])
 }
 
 /// Grid (cols, rows) that holds `n` tiles: 1 → 1×1, 2 → 2×1, 3–4 → 2×2,
