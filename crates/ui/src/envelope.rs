@@ -6,7 +6,7 @@
 use crate::theme::*;
 use crate::widgets::*;
 use chromagrain_core::envelope::{Adsr, PictureCut};
-use egui::{self, Color32, Pos2, Rect, Sense, Stroke, StrokeKind, TextureId, Ui};
+use egui::{self, Color32, Pos2, Rect, Sense, Stroke, TextureId, Ui};
 
 /// Longest attack / decay and release the editor offers (seconds).
 pub const MAX_AD: f32 = 2.0;
@@ -69,13 +69,13 @@ pub fn adsr_editor(ui: &mut Ui, rect: Rect, id: egui::Id, env: &mut Adsr, thumb:
     let fade = env.picture == PictureCut::Fade;
     let cut_level = env.cut_threshold;
     let p = ui.painter().clone();
-    p.rect_filled(rect, r(10), G1);
+    monitor_well(&p, rect, 8);
     let inner = rect.shrink2(egui::vec2(14.0, 12.0));
     let pts = points(inner, env);
     // The picture: dim everywhere, lit where (and as much as) the envelope
     // lets it through.
     if let Some((tex, uv)) = thumb {
-        tile(&p, rect, 10, tex, uv, gray(0.16));
+        tile(&p, rect.shrink(1.5), 7, tex, uv, gray(0.22));
         // Strips only inside `inner` (the curve's span), so the rounded
         // corners stay the dim tile.
         let strips = 64;
@@ -88,7 +88,7 @@ pub fn adsr_editor(ui: &mut Ui, rect: Rect, id: egui::Id, env: &mut Adsr, thumb:
             if a <= 0.0 {
                 continue;
             }
-            let sr = Rect::from_min_max(egui::pos2(x0, rect.top()), egui::pos2(x0 + sw + 0.5, rect.bottom()));
+            let sr = Rect::from_min_max(egui::pos2(x0, rect.top() + 1.5), egui::pos2(x0 + sw + 0.5, rect.bottom() - 1.5));
             let suv = Rect::from_min_max(egui::pos2(u_of(sr.left()), uv.top()), egui::pos2(u_of(sr.right()), uv.bottom()));
             let v = (a * 0.86 * 255.0) as u8;
             p.image(tex, sr, suv, Color32::from_rgb(v, v, v));
@@ -100,13 +100,12 @@ pub fn adsr_editor(ui: &mut Ui, rect: Rect, id: egui::Id, env: &mut Adsr, thumb:
         let mut x = inner.left();
         while x < inner.right() {
             let x1 = (x + 3.0).min(inner.right());
-            p.line_segment([egui::pos2(x, ty), egui::pos2(x1, ty)], Stroke::new(1.0, Color32::from_white_alpha(95)));
+            p.line_segment([egui::pos2(x, ty), egui::pos2(x1, ty)], Stroke::new(1.0, Color32::from_white_alpha(115)));
             x += 6.0;
         }
     }
-    p.add(egui::Shape::line(pts.to_vec(), Stroke::new(1.6, HI)));
-    p.line_segment([egui::pos2(inner.left(), inner.bottom()), egui::pos2(inner.right(), inner.bottom())], hair(LINE2));
-    p.rect_stroke(rect, r(10), hair(LINE2), StrokeKind::Inside);
+    p.add(egui::Shape::line(pts.to_vec(), Stroke::new(1.8, AMBER_MID)));
+    p.line_segment([egui::pos2(inner.left(), inner.bottom()), egui::pos2(inner.right(), inner.bottom())], hair(WELL_LINE2));
 
     // Handles: A (attack time), D (decay time + sustain), S (sustain), R (release time).
     let mut changed = false;
@@ -132,8 +131,8 @@ pub fn adsr_editor(ui: &mut Ui, rect: Rect, id: egui::Id, env: &mut Adsr, thumb:
             changed |= *env != before;
         }
         let rad = if active { 7.0 } else { 5.5 };
-        p.circle_filled(at, rad, if active { HI } else { G1 });
-        p.circle_stroke(at, rad, Stroke::new(1.6, HI));
+        p.circle_filled(at, rad, if active { AMBER_CORE } else { WELL });
+        p.circle_stroke(at, rad, Stroke::new(1.7, AMBER_MID));
         if active {
             let v = match k {
                 0 => format!("A {}", ms(env.attack)),
@@ -145,10 +144,10 @@ pub fn adsr_editor(ui: &mut Ui, rect: Rect, id: egui::Id, env: &mut Adsr, thumb:
         }
     }
     if let Some((at, v)) = shown {
-        let g = p.layout_no_wrap(v, mono(11.0), INK);
+        let g = p.layout_no_wrap(v, mono(11.0), CREAM);
         let tag = Rect::from_center_size(egui::pos2(at.x.clamp(rect.left() + 40.0, rect.right() - 40.0), (at.y - 22.0).max(rect.top() + 12.0)), g.size() + egui::vec2(14.0, 8.0));
-        p.rect_filled(tag, r(6), Color32::from_black_alpha(190));
-        p.galley(tag.center() - g.size() / 2.0, g, INK);
+        p.rect_filled(tag, r(5), Color32::from_black_alpha(215));
+        p.galley(tag.center() - g.size() / 2.0, g, CREAM);
     }
     changed
 }

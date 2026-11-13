@@ -11,7 +11,7 @@ use crate::theme::*;
 use crate::widgets::*;
 use chromagrain_core::fx::{AvEffect, EffectKind};
 use chromagrain_core::music::{Key, ScaleKind};
-use egui::{self, Align2, Color32, Rect, Sense, Stroke, StrokeKind};
+use egui::{self, Align2, Rect, Sense, Stroke, StrokeKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeepTarget {
@@ -67,31 +67,30 @@ pub fn view_back_name(v: View) -> &'static str {
     }
 }
 
-/// `< Play` / `< Sequence` / `< Perform` back pill (accessibility name `"close sheet"`).
+/// `< Play` / `< Sequence` / `< Perform` hardware console back button (`"close sheet"`).
 pub fn sheet_back_button(ui: &mut egui::Ui, pos: egui::Pos2, view: View, id: egui::Id) -> (Rect, bool) {
     let vname = view_back_name(view);
     let p = ui.painter().clone();
-    let tw = p.layout_no_wrap(vname.into(), font_medium(12.5), INK).size().x;
+    let tw = p.layout_no_wrap(vname.into(), font_semibold(12.5), INK).size().x;
     let w = (tw + 34.0).max(76.0);
     let rect = Rect::from_min_size(pos, egui::vec2(w, 36.0));
     let resp = hit(ui, rect, id.with("back"), Sense::click(), "close sheet");
     let hov = resp.hovered() || resp.is_pointer_button_down_on();
-    raised(&p, rect, 10, if hov { G3 } else { G2 });
-    draw_icon(&p, Icon::ChevronLeft, egui::pos2(rect.left() + 14.0, rect.center().y), 13.0, if hov { HI } else { INK2 });
+    paint_switch_cap(&p, rect, SwitchKind::PuttyAmber, false, hov, resp.is_pointer_button_down_on());
+    draw_icon(&p, Icon::ChevronLeft, egui::pos2(rect.left() + 14.0, rect.center().y), 13.0, INK);
     p.text(
         egui::pos2(rect.left() + 24.0, rect.center().y),
         Align2::LEFT_CENTER,
         vname,
-        font_medium(12.5),
-        if hov { HI } else { INK },
+        font_semibold(12.5),
+        INK,
     );
     (rect, resp.clicked())
 }
 
-/// Paint a calm dark section card inside a sheet and return its content rect.
+/// Paint a brushed warm putty hardware sub-panel (`ATTEN.` style) and return its content rect.
 pub fn sheet_card(p: &egui::Painter, rect: Rect, title: &str) -> Rect {
-    p.rect_filled(rect, r(12), Color32::from_rgb(0x10, 0x10, 0x12));
-    p.rect_stroke(rect, r(12), hair(LINE), StrokeKind::Inside);
+    putty_panel(p, rect, 7);
     caps(p, egui::pos2(rect.left() + 14.0, rect.top() + 14.0), Align2::LEFT_CENTER, title, 10.0);
     Rect::from_min_max(
         egui::pos2(rect.left() + 14.0, rect.top() + 27.0),
@@ -268,7 +267,8 @@ impl Studio {
                         let script_h = if has_script { 216.0 } else { 0.0 };
                         let fx_h = 374.0;
                         let row2_h = (lib_h + if has_script { gap + script_h } else { 0.0 }).max(fx_h);
-                        let total_h = row1_h + gap + row2_h + 4.0;
+                        let isol8_h = 138.0;
+                        let total_h = row1_h + gap + isol8_h + gap + row2_h + 4.0;
 
                         let (canvas, _) = ui.allocate_exact_size(egui::vec2(avail_w, total_h), Sense::hover());
                         if caps_cfg.scenes {
@@ -281,7 +281,13 @@ impl Studio {
                             self.project_time_card(host, ui, c_time, &caps_cfg);
                         }
 
-                        let r2_top = canvas.top() + row1_h + gap;
+                        let c_isol8 = Rect::from_min_size(
+                            egui::pos2(canvas.left(), canvas.top() + row1_h + gap),
+                            egui::vec2(avail_w, isol8_h),
+                        );
+                        self.isolator_rack_ui(host, ui, c_isol8, "proj-isol8");
+
+                        let r2_top = c_isol8.bottom() + gap;
                         let r2_left_w = (avail_w * 0.63).floor();
                         let r2_right_w = avail_w - r2_left_w - gap;
                         let c_lib = Rect::from_min_size(egui::pos2(canvas.left(), r2_top), egui::vec2(r2_left_w, lib_h));
@@ -308,7 +314,8 @@ impl Studio {
                         let lib_h = 44.0 + lib_rows as f32 * 84.0;
                         let fx_h = 204.0;
                         let script_h = if has_script { 216.0 } else { 0.0 };
-                        let mut total_h = time_h + gap + lib_h + gap + fx_h + 6.0;
+                        let isol8_h = 128.0;
+                        let mut total_h = time_h + gap + isol8_h + gap + lib_h + gap + fx_h + 6.0;
                         if caps_cfg.scenes {
                             total_h += song_h + gap;
                         }
@@ -321,6 +328,10 @@ impl Studio {
                         let c_time = Rect::from_min_size(egui::pos2(canvas.left(), y), egui::vec2(avail_w, time_h));
                         self.project_time_card(host, ui, c_time, &caps_cfg);
                         y = c_time.bottom() + gap;
+
+                        let c_isol8 = Rect::from_min_size(egui::pos2(canvas.left(), y), egui::vec2(avail_w, isol8_h));
+                        self.isolator_rack_ui(host, ui, c_isol8, "proj-isol8-n");
+                        y = c_isol8.bottom() + gap;
 
                         if caps_cfg.scenes {
                             let c_song = Rect::from_min_size(egui::pos2(canvas.left(), y), egui::vec2(avail_w, song_h));
@@ -386,8 +397,8 @@ impl Studio {
             p.circle_stroke(tc, krad * 0.78, hair(LINE2));
             p.text(tc, Align2::CENTER_CENTER, format!("{bpm:.0}"), mono_medium(13.0), INK);
         }
-        caps(&p, egui::pos2(tc.x, ky + krad + 14.0), Align2::CENTER_CENTER, "Tempo", 9.5);
-        p.text(egui::pos2(tc.x, ky + krad + 28.0), Align2::CENTER_CENTER, format!("{bpm:.0}"), mono(11.5), INK);
+        caps(&p, egui::pos2(tc.x, ky + krad + 11.0), Align2::CENTER_CENTER, "Tempo", 9.0);
+        lcd_readout(&p, Rect::from_center_size(egui::pos2(tc.x, ky + krad + 27.0), egui::vec2(54.0, 18.0)), &format!("{bpm:.0}"), 10.5);
 
         // 2. Key tile.
         let kc = egui::pos2(top_r.left() + col_w * 1.5, ky + 8.0);
@@ -449,13 +460,12 @@ impl Studio {
             drop(pp);
             host.mark();
         }
-        caps(&p, egui::pos2(sc.x, ky + krad + 14.0), Align2::CENTER_CENTER, "Swing", 9.5);
-        p.text(
-            egui::pos2(sc.x, ky + krad + 28.0),
-            Align2::CENTER_CENTER,
-            format!("{:.0}%", swing_pct * 50.0),
-            mono(11.5),
-            INK,
+        caps(&p, egui::pos2(sc.x, ky + krad + 11.0), Align2::CENTER_CENTER, "Swing", 9.0);
+        lcd_readout(
+            &p,
+            Rect::from_center_size(egui::pos2(sc.x, ky + krad + 27.0), egui::vec2(54.0, 18.0)),
+            &format!("{:.0}%", swing_pct * 50.0),
+            10.5,
         );
 
         // 4. Master Level knob.
@@ -470,13 +480,12 @@ impl Studio {
             host.project().lock().unwrap().master_gain_db = -24.0 + lvl * 30.0;
             host.mark();
         }
-        caps(&p, egui::pos2(lc.x, ky + krad + 14.0), Align2::CENTER_CENTER, "Level", 9.5);
-        p.text(
-            egui::pos2(lc.x, ky + krad + 28.0),
-            Align2::CENTER_CENTER,
-            format!("{:.0}%", lvl * 100.0),
-            mono(11.5),
-            INK,
+        caps(&p, egui::pos2(lc.x, ky + krad + 11.0), Align2::CENTER_CENTER, "Level", 9.0);
+        lcd_readout(
+            &p,
+            Rect::from_center_size(egui::pos2(lc.x, ky + krad + 27.0), egui::vec2(54.0, 18.0)),
+            &format!("{:.0}%", lvl * 100.0),
+            10.5,
         );
 
         // Bottom row: `stack | split | grid | bleed` + `now | beat | bar`.

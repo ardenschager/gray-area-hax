@@ -16,23 +16,32 @@ use egui::{Align2, Color32, CornerRadius, Rect, Sense, Stroke, StrokeKind};
 impl Studio {
     pub fn perform_view(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, area: Rect) {
         let narrow = area.width() < 1100.0;
+        let compact_h = area.height() < 560.0;
         let has_set_bar = host.caps().scenes;
-        let set_h = if has_set_bar { 32.0 } else { 0.0 };
-        let set_gap = if has_set_bar { 10.0 } else { 0.0 };
-        let bar_h = if narrow { 40.0 } else { 44.0 };
-        let bot_gap = if narrow { 12.0 } else { 18.0 };
-        let fx_h = 34.0;
-        let fx_gap = 8.0;
-        let gap = if narrow { 14.0 } else { 20.0 };
+        let set_h = if has_set_bar { if compact_h { 28.0 } else { 32.0 } } else { 0.0 };
+        let set_gap = if has_set_bar { if compact_h { 6.0 } else { 8.0 } } else { 0.0 };
+        let isol8_h = if compact_h {
+            106.0
+        } else if area.height() < 760.0 {
+            126.0
+        } else {
+            148.0
+        };
+        let isol8_gap = if compact_h { 6.0 } else { 10.0 };
+        let bar_h = if compact_h { 36.0 } else if narrow { 38.0 } else { 42.0 };
+        let bot_gap = if compact_h { 6.0 } else if narrow { 8.0 } else { 12.0 };
+        let fx_h = if compact_h { 30.0 } else { 34.0 };
+        let fx_gap = if compact_h { 6.0 } else { 8.0 };
+        let gap = if narrow { 12.0 } else { 18.0 };
 
-        let pads_w = if narrow { area.width() * 0.42 } else { (area.width() * 0.37).min(640.0) };
+        let pads_w = if narrow { area.width() * 0.42 } else { (area.width() * 0.38).min(640.0) };
         let stage_w = area.width() - pads_w - gap;
-        let max_main_h = (area.height() - set_h - set_gap - bot_gap - bar_h).max(220.0);
+        let max_main_h = (area.height() - set_h - set_gap - isol8_gap - isol8_h - bot_gap - bar_h).max(190.0);
         let ideal_stage_h = (stage_w * 9.0 / 16.0).floor();
         let main_h = (ideal_stage_h + fx_gap + fx_h).min(max_main_h);
-        let stage_h = (main_h - fx_gap - fx_h).max(160.0);
+        let stage_h = (main_h - fx_gap - fx_h).max(150.0);
 
-        let block_h = set_h + set_gap + main_h + bot_gap + bar_h;
+        let block_h = set_h + set_gap + main_h + isol8_gap + isol8_h + bot_gap + bar_h;
         let mut y = area.top() + ((area.height() - block_h) * 0.5).max(0.0);
 
         if has_set_bar {
@@ -42,24 +51,34 @@ impl Studio {
         }
 
         let stage = Rect::from_min_size(egui::pos2(area.left(), y), egui::vec2(stage_w, stage_h));
-        self.stage(host, ui, stage, 14.0);
+        self.stage(host, ui, stage, 8.0);
         self.layout_switch(host, ui, stage);
         if let Some(sub) = host.perform().and_then(|p| p.output()) {
             let p = ui.painter();
-            p.rect_filled(stage, r(14), Color32::from_black_alpha(170));
-            draw_icon(p, Icon::Display2, stage.center() - egui::vec2(0.0, 26.0), 40.0, INK2);
-            p.text(stage.center() + egui::vec2(0.0, 10.0), Align2::CENTER_CENTER, "Live on Display 2", font_medium(15.0), INK);
-            p.text(stage.center() + egui::vec2(0.0, 32.0), Align2::CENTER_CENTER, sub, mono(11.0), INK3);
+            p.rect_filled(stage, r(8), Color32::from_black_alpha(190));
+            draw_icon(p, Icon::Display2, stage.center() - egui::vec2(0.0, 26.0), 40.0, CREAM2);
+            p.text(stage.center() + egui::vec2(0.0, 10.0), Align2::CENTER_CENTER, "Live on Display 2", font_medium(15.0), CREAM);
+            p.text(stage.center() + egui::vec2(0.0, 32.0), Align2::CENTER_CENTER, sub, mono(11.0), CREAM3);
         }
 
-        // 6 Tactile VJ Punch-In FX Pills right under the stage (`Stutter`, `Tape Stop`, `Comb`, `Dub`, `Shimmer`, `Wear`).
+        // 6 Tactile Backlit Amber VJ Punch-In FX Switches right under the stage.
         let fx_rect = Rect::from_min_size(egui::pos2(area.left(), stage.bottom() + fx_gap), egui::vec2(stage_w, fx_h));
         self.perform_punch_fx_bar(host, ui, fx_rect);
 
         let pads = Rect::from_min_size(egui::pos2(stage.right() + gap, y), egui::vec2(pads_w, main_h));
         self.pads(host, ui, pads);
 
-        let bar = Rect::from_min_size(egui::pos2(area.left(), y + main_h + bot_gap), egui::vec2(area.width(), bar_h));
+        // Dedicated `ISOL8 · 5-BAND FREQUENCY MONITOR` hardware rack bay!
+        let isol8_rect = Rect::from_min_size(
+            egui::pos2(area.left(), y + main_h + isol8_gap),
+            egui::vec2(area.width(), isol8_h),
+        );
+        self.isolator_rack_ui(host, ui, isol8_rect, "perf-isol8");
+
+        let bar = Rect::from_min_size(
+            egui::pos2(area.left(), isol8_rect.bottom() + bot_gap),
+            egui::vec2(area.width(), bar_h),
+        );
         self.perform_bar(host, ui, bar);
     }
 
@@ -96,18 +115,14 @@ impl Studio {
             }
 
             let on = self.punch_fx[k];
-            if on {
-                p.rect_filled(rc, r(9), HI);
-            } else {
-                raised(&p, rc, 9, if resp.hovered() || down { G3 } else { G2 });
-            }
-            let fsz = if pw < 76.0 { 10.5 } else { 11.5 };
+            paint_switch_cap(&p, rc, SwitchKind::Amber, on, resp.hovered(), down);
+            let fsz = if pw < 76.0 { 10.0 } else { 11.0 };
             p.text(
                 rc.center(),
                 Align2::CENTER_CENTER,
                 PUNCH_FX_LABELS[k],
-                font_medium(fsz),
-                if on { ON_HI } else if resp.hovered() { INK } else { INK2 },
+                font_semibold(fsz),
+                if on { ON_HI } else { Color32::from_rgb(0x24, 0x1c, 0x09) },
             );
         }
     }
@@ -115,9 +130,11 @@ impl Studio {
     fn pads(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, area: Rect) {
         let ctx = ui.ctx().clone();
         let p = ui.painter().clone();
-        let g = 6.0;
-        let pw = (area.width() - 3.0 * g) / 4.0;
-        let ph = (area.height() - 3.0 * g) / 4.0;
+        monitor_well(&p, area, 7);
+        let inner_area = area.shrink(4.5);
+        let g = 5.0;
+        let pw = (inner_area.width() - 3.0 * g) / 4.0;
+        let ph = (inner_area.height() - 3.0 * g) / 4.0;
         let now = host.clock();
         let playing = host.playing();
         let beat = host.playhead_beats();
@@ -143,7 +160,10 @@ impl Studio {
         let t_ui = ui.input(|i| i.time);
         for (i, pad) in pads.into_iter().enumerate().take(16) {
             let rc = Rect::from_min_size(
-                egui::pos2(area.left() + (i % 4) as f32 * (pw + g), area.top() + (i / 4) as f32 * (ph + g)),
+                egui::pos2(
+                    inner_area.left() + (i % 4) as f32 * (pw + g),
+                    inner_area.top() + (i / 4) as f32 * (ph + g),
+                ),
                 egui::vec2(pw, ph),
             );
             let resp = hit(ui, rc, ui.id().with(("pad", i)), Sense::click(), &format!("pad {}", i + 1));
@@ -151,7 +171,7 @@ impl Studio {
             let is_sel = i == self.sel_pad;
             if pad.source.is_none() {
                 if let Some((pd, _)) = pending.iter().find(|(_, t)| *t == crate::host::AddTarget::Pad(i)) {
-                    super::add::placeholder_tile(&p, rc, 10, pd, t_ui, true);
+                    super::add::placeholder_tile(&p, rc, 6, pd, t_ui, true);
                     ctx.request_repaint();
                     continue;
                 }
@@ -189,25 +209,25 @@ impl Studio {
                     };
                     if let Some((tex, a)) = self.atlas(host, &ctx, src) {
                         let frame = if on && playing { (base_frame + (now * 4.0) as usize) % atlas::FRAMES } else { base_frame };
-                        let bright = if on { 0.88 } else if is_sel { 0.62 } else { 0.46 };
-                        tile(&p, rc, 10, tex, a.uv_cover(frame, pw / ph), gray(bright));
+                        let bright = if on { 0.90 } else if is_sel { 0.65 } else { 0.50 };
+                        tile(&p, rc, 6, tex, a.uv_cover(frame, pw / ph), gray(bright));
                     } else {
-                        p.rect_filled(rc, r(10), G2);
+                        p.rect_filled(rc, r(6), WELL2);
                     }
-                    let top_scrim = Rect::from_min_size(rc.min, egui::vec2(pw, 24.0_f32.min(ph * 0.4)));
-                    p.rect_filled(top_scrim, CornerRadius { nw: 10, ne: 10, sw: 0, se: 0 }, Color32::from_black_alpha(75));
-                    let scrim = Rect::from_min_max(egui::pos2(rc.left(), (rc.bottom() - 28.0).max(rc.top())), rc.max);
-                    p.rect_filled(scrim, CornerRadius { nw: 0, ne: 0, sw: 10, se: 10 }, Color32::from_black_alpha(125));
+                    let top_scrim = Rect::from_min_size(rc.min, egui::vec2(pw, 22.0_f32.min(ph * 0.4)));
+                    p.rect_filled(top_scrim, CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 }, Color32::from_black_alpha(105));
+                    let scrim = Rect::from_min_max(egui::pos2(rc.left(), (rc.bottom() - 26.0).max(rc.top())), rc.max);
+                    p.rect_filled(scrim, CornerRadius { nw: 0, ne: 0, sw: 6, se: 6 }, Color32::from_black_alpha(145));
 
                     let env_w = (pw * 0.30).clamp(18.0, 34.0);
-                    let env_r = Rect::from_min_size(egui::pos2(rc.left() + 8.0, rc.top() + 7.0), egui::vec2(env_w, 11.0));
-                    mini_adsr(&p, env_r, &pad_envs[i], if on || is_sel { 0.92 } else { 0.65 });
+                    let env_r = Rect::from_min_size(egui::pos2(rc.left() + 7.0, rc.top() + 6.0), egui::vec2(env_w, 10.5));
+                    mini_adsr(&p, env_r, &pad_envs[i], if on || is_sel { 0.92 } else { 0.68 });
 
-                    if is_sel {
+                    if is_sel && ph >= 62.0 {
                         draw_on_object_ring(&p, rc, pad_grain, pad_pitch_m, pad_pitch_st, 0.0, true);
                     }
 
-                    let room = ((pw - 34.0) / 6.2).max(5.0) as usize;
+                    let room = ((pw - 32.0) / 6.2).max(5.0) as usize;
                     let raw_label = pad.name.clone().unwrap_or_else(|| self.source_name(host, src));
                     let label = super::strip_media_ext(&raw_label);
                     let cap = room.min(17);
@@ -227,53 +247,53 @@ impl Studio {
                         short(label, cap)
                     };
                     p.text(
-                        egui::pos2(rc.left() + 9.0, rc.bottom() - 8.0),
+                        egui::pos2(rc.left() + 8.0, rc.bottom() - 6.5),
                         Align2::LEFT_BOTTOM,
                         name,
-                        font_medium(11.0),
-                        if on || is_sel { INK } else { INK2 },
+                        font_medium(10.5),
+                        if on || is_sel { CREAM } else { CREAM2 },
                     );
                     let icon = match pad.kind {
                         PadKind::Loop => Icon::Loop,
                         PadKind::Cloud => Icon::Cloud,
                         PadKind::Chop => Icon::Chop,
                     };
-                    draw_icon(&p, icon, egui::pos2(rc.right() - 13.0, rc.bottom() - 13.5), 13.0, INK3);
+                    draw_icon(&p, icon, egui::pos2(rc.right() - 12.0, rc.bottom() - 12.0), 12.0, CREAM3);
 
                     if on {
-                        p.rect_stroke(rc, r(10), Stroke::new(2.0, HI), StrokeKind::Inside);
+                        p.rect_stroke(rc, r(6), Stroke::new(2.0, AMBER_MID), StrokeKind::Inside);
                         let prog = if let Some(free_s) = self.pad_sculpt[i].free_loop_secs {
                             ((now.rem_euclid(free_s.max(0.5) as f64)) / free_s.max(0.5) as f64) as f32
                         } else {
                             let len = pad.len_beats.max(1.0);
                             (((beat - loop_start).rem_euclid(len)) / len) as f32
                         };
-                        let y = rc.bottom() - 3.0;
+                        let y = rc.bottom() - 2.5;
                         p.line_segment(
-                            [egui::pos2(rc.left() + 8.0, y), egui::pos2(rc.left() + 8.0 + (rc.width() - 16.0) * prog, y)],
-                            Stroke::new(2.0, HI),
+                            [egui::pos2(rc.left() + 6.0, y), egui::pos2(rc.left() + 6.0 + (rc.width() - 12.0) * prog, y)],
+                            Stroke::new(2.0, AMBER_CORE),
                         );
                     } else if is_sel {
-                        p.rect_stroke(rc, r(10), Stroke::new(1.5, Color32::from_white_alpha(155)), StrokeKind::Inside);
+                        p.rect_stroke(rc, r(6), Stroke::new(1.5, CREAM2), StrokeKind::Inside);
                     } else {
-                        p.rect_stroke(rc, r(10), hair(LINE), StrokeKind::Inside);
+                        p.rect_stroke(rc, r(6), hair(WELL_LINE), StrokeKind::Inside);
                     }
 
                     if let Some(target) = pad.queued {
                         if (t_ui * 3.0).fract() < 0.6 {
-                            let tip = egui::pos2(rc.right() - 36.0, rc.top() + 14.5);
+                            let tip = egui::pos2(rc.right() - 34.0, rc.top() + 13.5);
                             let pts = if target {
                                 vec![tip + egui::vec2(-3.5, -4.5), tip + egui::vec2(4.5, 0.0), tip + egui::vec2(-3.5, 4.5)]
                             } else {
                                 vec![tip + egui::vec2(-3.5, -3.5), tip + egui::vec2(3.5, -3.5), tip + egui::vec2(3.5, 3.5), tip + egui::vec2(-3.5, 3.5)]
                             };
-                            p.add(egui::Shape::convex_polygon(pts, HI, Stroke::NONE));
+                            p.add(egui::Shape::convex_polygon(pts, AMBER_MID, Stroke::NONE));
                         }
                         ctx.request_repaint();
                     }
 
-                    let chev_vis = Rect::from_min_size(egui::pos2(rc.right() - 26.0, rc.top() + 5.0), egui::vec2(21.0, 21.0));
-                    let chev_hit = Rect::from_center_size(chev_vis.center(), egui::vec2(26.0, 26.0));
+                    let chev_vis = Rect::from_min_size(egui::pos2(rc.right() - 24.0, rc.top() + 4.0), egui::vec2(20.0, 20.0));
+                    let chev_hit = Rect::from_center_size(chev_vis.center(), egui::vec2(25.0, 25.0));
                     let chev_resp = chev_button(ui, chev_vis, chev_hit, ui.id().with(("pad-clip", i)), &format!("clip pad {}", i + 1));
 
                     let h = hold(ui, &resp, 0.45);
@@ -289,9 +309,9 @@ impl Studio {
                     }
                 }
                 None => {
-                    p.rect_filled(rc, r(10), G1);
-                    p.rect_stroke(rc, r(10), hair(LINE), StrokeKind::Inside);
-                    draw_icon(&p, Icon::Plus, rc.center(), 16.0, INK4);
+                    p.rect_filled(rc, r(6), WELL2);
+                    p.rect_stroke(rc, r(6), hair(WELL_LINE), StrokeKind::Inside);
+                    draw_icon(&p, Icon::Plus, rc.center(), 15.0, CREAM3);
                     if resp.clicked() {
                         load = Some(i);
                     }
@@ -348,7 +368,7 @@ impl Studio {
         x = q.right() + 14.0;
         for k in 0..4 {
             let on = playing && k == beat_i;
-            p.circle_filled(egui::pos2(x + k as f32 * 10.0, cy), 2.6, if on { HI } else { G5 });
+            jewel_led(&p, egui::pos2(x + k as f32 * 11.0, cy), 3.0, on, false);
         }
         x += 50.0;
         if routing {
@@ -444,15 +464,15 @@ impl Studio {
             let top = Rect::from_min_size(full.min + egui::vec2(20.0, 20.0), egui::vec2(full.width() - 40.0, 40.0));
             let beats = host.playhead_beats().max(0.0);
             let pos = format!("{:03}.{}", (beats / 4.0).floor() as u32 + 1, (beats % 4.0).floor() as u32 + 1);
-            let pr = p.text(egui::pos2(top.left() + 14.0, top.center().y), Align2::LEFT_CENTER, &pos, mono(13.0), INK);
-            p.rect_filled(pr.expand2(egui::vec2(14.0, 9.0)), r(10), Color32::from_black_alpha(130));
-            p.text(egui::pos2(top.left() + 14.0, top.center().y), Align2::LEFT_CENTER, &pos, mono(13.0), INK);
+            let pr = p.text(egui::pos2(top.left() + 14.0, top.center().y), Align2::LEFT_CENTER, &pos, mono(13.0), CREAM);
+            p.rect_filled(pr.expand2(egui::vec2(14.0, 9.0)), r(10), Color32::from_black_alpha(150));
+            p.text(egui::pos2(top.left() + 14.0, top.center().y), Align2::LEFT_CENTER, &pos, mono(13.0), CREAM);
             let xr = Rect::from_min_size(egui::pos2(top.right() - 96.0, top.top()), egui::vec2(96.0, 40.0));
-            p.rect_filled(xr, r(10), Color32::from_black_alpha(130));
+            p.rect_filled(xr, r(10), Color32::from_black_alpha(150));
             if hit(ui, xr, ui.id().with("fs-exit"), Sense::click(), "exit fullscreen").clicked() {
                 host.toggle_fullscreen(ui.ctx());
             }
-            runs(&p, xr.center(), Align2::CENTER_CENTER, &[("Exit  ", font_medium(13.0), INK), ("F", mono(10.0), INK3)]);
+            runs(&p, xr.center(), Align2::CENTER_CENTER, &[("Exit  ", font_medium(13.0), CREAM), ("F", mono(10.0), CREAM3)]);
             let bpm = host.project().lock().unwrap().bpm;
             let playing = host.playing();
             let pads: Vec<Pad> = host.perform().map(|perf| perf.pads()).unwrap_or_default();
@@ -467,26 +487,26 @@ impl Studio {
                 n => format!("{} · +{}", on_names[..3].join(" · "), n - 3),
             };
             let bl = egui::pos2(full.left() + 20.0, full.bottom() - 20.0);
-            let names_w = if names.is_empty() { 0.0 } else { p.layout_no_wrap(names.clone(), font(12.0), INK2).size().x + 22.0 };
+            let names_w = if names.is_empty() { 0.0 } else { p.layout_no_wrap(names.clone(), font(12.0), CREAM2).size().x + 22.0 };
             let info = Rect::from_min_max(bl - egui::vec2(0.0, 64.0), bl + egui::vec2(206.0 + names_w, 0.0));
-            p.rect_filled(info, r(12), Color32::from_black_alpha(130));
+            p.rect_filled(info, r(12), Color32::from_black_alpha(150));
             runs(
                 &p,
                 egui::pos2(info.left() + 16.0, info.center().y),
                 Align2::LEFT_CENTER,
-                &[(&format!("{bpm:.0}"), mono_medium(26.0), INK), (" bpm", font(12.0), INK3)],
+                &[(&format!("{bpm:.0}"), mono_medium(26.0), CREAM), (" bpm", font(12.0), CREAM3)],
             );
             let bi = (beats % 4.0).floor() as usize;
             for k in 0..4 {
-                p.circle_filled(egui::pos2(info.left() + 140.0 + k as f32 * 14.0, info.center().y), 3.5, if k == bi && playing { HI } else { G5 });
+                p.circle_filled(egui::pos2(info.left() + 140.0 + k as f32 * 14.0, info.center().y), 3.5, if k == bi && playing { AMBER_MID } else { CREAM3 });
             }
             if !names.is_empty() {
-                p.text(egui::pos2(info.left() + 206.0, info.center().y), Align2::LEFT_CENTER, &names, font(12.0), INK2);
+                p.text(egui::pos2(info.left() + 206.0, info.center().y), Align2::LEFT_CENTER, &names, font(12.0), CREAM2);
             }
             let (mw, mh, mg) = (52.0, 32.0, 5.0);
             let gsize = egui::vec2(4.0 * mw + 3.0 * mg, 4.0 * mh + 3.0 * mg);
             let grid = Rect::from_min_size(egui::pos2(full.right() - 28.0 - gsize.x, full.bottom() - 28.0 - gsize.y), gsize);
-            p.rect_filled(grid.expand(8.0), r(12), Color32::from_black_alpha(130));
+            p.rect_filled(grid.expand(8.0), r(12), Color32::from_black_alpha(150));
             let ctx = ui.ctx().clone();
             let mut toggle = None;
             for (i, pad) in pads.iter().enumerate().take(16) {
@@ -494,13 +514,13 @@ impl Studio {
                 match pad.source.and_then(|s| self.atlas(host, &ctx, s)) {
                     Some((tex, a)) => tile(&p, c, 5, tex, a.uv_cover(5, mw / mh), gray(if pad.on { 0.95 } else { 0.45 })),
                     None => {
-                        p.rect_filled(c, r(5), G1);
+                        p.rect_filled(c, r(5), WELL2);
                     }
                 }
                 if pad.on {
-                    p.rect_stroke(c, r(5), Stroke::new(1.5, HI), StrokeKind::Inside);
+                    p.rect_stroke(c, r(5), Stroke::new(1.5, AMBER_MID), StrokeKind::Inside);
                 } else if pad.queued.is_some() && (ui.input(|i| i.time) * 3.0).fract() < 0.6 {
-                    p.rect_stroke(c, r(5), Stroke::new(1.0, INK2), StrokeKind::Inside);
+                    p.rect_stroke(c, r(5), Stroke::new(1.0, CREAM2), StrokeKind::Inside);
                 }
                 if hit(ui, c, ui.id().with(("mini-pad", i)), Sense::click(), &format!("mini pad {}", i + 1)).clicked() && pad.source.is_some() {
                     toggle = Some(i);

@@ -40,6 +40,7 @@ impl Studio {
             Rect::from_min_size(egui::pos2(grid.left() + c as f32 * (cw + g), grid.top() + r as f32 * (ch + g)), egui::vec2(cw, ch))
         };
         let p = ui.painter().clone();
+        monitor_well(&p, grid.expand(3.5), 7);
         let now = host.clock();
         let sel_col = self.emitters[self.sel_emitter].col;
         let pending = self.pending_slots(host);
@@ -51,8 +52,8 @@ impl Studio {
             let head = Rect::from_min_size(egui::pos2(area.left() + c as f32 * (cw + g), area.top()), egui::vec2(cw, head_h));
             let hresp = hit(ui, head, ui.id().with(("col-head", c)), Sense::click(), &format!("column {}", c + 1));
             let hovered = hresp.hovered();
-            p.rect_filled(head, r(8), if src.is_some() && c == sel_col { G2 } else if hovered { G2 } else { G1 });
-            p.rect_stroke(head, r(8), hair(if c == sel_col && src.is_some() { LINE2 } else { LINE }), StrokeKind::Inside);
+            let col_lit = src.is_some() && c == sel_col;
+            paint_switch_cap(&p, head, SwitchKind::PuttyAmber, col_lit, hovered, hresp.is_pointer_button_down_on());
             match src {
                 Some(s) => {
                     let h = hold(ui, &hresp, 0.45);
@@ -61,8 +62,8 @@ impl Studio {
                     let clean = super::strip_media_ext(&raw);
                     let right_pad = if n_slices > 0 { 26.0 } else { 16.0 };
                     let room = ((cw - 10.0 - right_pad) / 6.2).max(3.0) as usize;
-                    let col = if c == sel_col { INK } else { INK2 };
-                    let name_galley = p.layout_no_wrap(short(clean, room), font(11.0), col);
+                    let col = if col_lit { ON_HI } else { INK };
+                    let name_galley = p.layout_no_wrap(short(clean, room), font_medium(11.0), col);
                     let nx = (head.center().x - (name_galley.size().x + 8.0) * 0.5).max(head.left() + 6.0);
                     p.galley(egui::pos2(nx, head.center().y - name_galley.size().y * 0.5), name_galley.clone(), col);
                     draw_icon(
@@ -70,10 +71,10 @@ impl Studio {
                         Icon::ChevronRight,
                         egui::pos2((nx + name_galley.size().x + 6.0).min(head.right() - 7.0), head.center().y + 0.5),
                         10.0,
-                        INK3,
+                        if col_lit { ON_HI } else { INK3 },
                     );
                     if n_slices > 0 {
-                        draw_icon(&p, Icon::Chop, egui::pos2(head.right() - 8.0, head.center().y), 11.0, INK3);
+                        draw_icon(&p, Icon::Chop, egui::pos2(head.right() - 8.0, head.center().y), 11.0, if col_lit { ON_HI } else { INK3 });
                     }
                     if h.fired {
                         open_clip = Some(c);
@@ -90,14 +91,14 @@ impl Studio {
                     if hresp.clicked() {
                         open_add = Some(c);
                     }
-                    draw_icon(&p, Icon::Plus, head.center(), 13.0, if hovered { INK2 } else { INK3 });
+                    draw_icon(&p, Icon::Plus, head.center(), 13.0, if hovered { INK } else { INK3 });
                 }
             }
             // An add still arriving for this column: one tall placeholder.
             if src.is_none() {
                 if let Some((pd, _)) = pending.iter().find(|(_, t)| *t == crate::host::AddTarget::Column(c)) {
                     let col_rect = Rect::from_min_max(cell(c, 0).min, cell(c, ROWS - 1).max);
-                    super::add::placeholder_tile(&p, col_rect, 6, pd, t_ui, true);
+                    super::add::placeholder_tile(&p, col_rect, 5, pd, t_ui, true);
                     ctx.request_repaint();
                     continue;
                 }
@@ -113,19 +114,19 @@ impl Studio {
                             .filter(|(k, _)| *k == (c, row))
                             .map(|(_, t)| (1.0 - (now - t) / 0.4).max(0.0) as f32)
                             .fold(0.0f32, f32::max);
-                        let base = if c == sel_col { 0.86 } else { 0.7 };
+                        let base = if c == sel_col { 0.88 } else { 0.72 };
                         let v = base + (1.0 - base) * lit;
-                        tile(&p, rc, 6, tex, a.uv_cover(row * 2 + 1, cw / ch), gray(v));
+                        tile(&p, rc, 4, tex, a.uv_cover(row * 2 + 1, cw / ch), gray(v));
                         if lit > 0.0 {
-                            p.rect_filled(rc, r(6), Color32::from_white_alpha((lit * 26.0) as u8));
+                            p.rect_filled(rc, r(4), Color32::from_rgba_unmultiplied(252, 227, 93, (lit * 42.0) as u8));
                         }
                     }
                     None => {
-                        p.rect_filled(rc, r(6), G1);
-                        p.rect_stroke(rc, r(6), hair(LINE), StrokeKind::Inside);
+                        p.rect_filled(rc, r(4), WELL2);
+                        p.rect_stroke(rc, r(4), hair(WELL_LINE), StrokeKind::Inside);
                         if row == 0 {
                             let resp = hit(ui, rc, ui.id().with(("add-col", c)), Sense::click(), "add a clip");
-                            draw_icon(&p, Icon::Plus, rc.center(), 16.0, if resp.hovered() { INK2 } else { INK3 });
+                            draw_icon(&p, Icon::Plus, rc.center(), 16.0, if resp.hovered() { CREAM } else { CREAM3 });
                             if resp.clicked() {
                                 open_add = Some(c);
                             }
@@ -266,8 +267,7 @@ impl Studio {
         let ctx = ui.ctx().clone();
         let p = ui.painter().clone();
         let small = rect.height() < 320.0;
-        p.rect_filled(rect, r(14), G1);
-        p.rect_stroke(rect, r(14), hair(LINE), StrokeKind::Inside);
+        putty_panel(&p, rect, 8);
         let pad = if small { 8.0 } else { 12.0 };
         let inner = rect.shrink(pad);
         let t_ui = ui.input(|i| i.time);
@@ -343,17 +343,19 @@ impl Studio {
             let raw_name = src.map(|s| self.source_name(host, s)).unwrap_or_default();
             let clip_name = super::strip_media_ext(&raw_name);
 
-            // Card footage backdrop + contrast scrims.
+            // Card footage backdrop + recessed dark bakelite monitor bezel + contrast scrims.
+            monitor_well(&p, card, 8);
+            let inner_card = card.shrink(1.5);
             if let Some((tex, a)) = src.and_then(|s| self.atlas(host, &ctx, s)) {
-                let bright = if is_sel { 0.62 } else { 0.44 };
-                tile(&p, card, 12, tex, a.uv_cover(atlas::frame_at(pos), cw / ch), gray(bright));
+                let bright = if is_sel { 0.66 } else { 0.48 };
+                tile(&p, inner_card, 7, tex, a.uv_cover(atlas::frame_at(pos), cw / ch), gray(bright));
             } else {
-                p.rect_filled(card, r(12), G2);
+                p.rect_filled(inner_card, r(7), WELL2);
             }
-            let top_scrim = Rect::from_min_size(card.min, egui::vec2(cw, 28.0_f32.min(ch * 0.45)));
-            p.rect_filled(top_scrim, CornerRadius { nw: 12, ne: 12, sw: 0, se: 0 }, Color32::from_black_alpha(88));
-            let bot_scrim = Rect::from_min_max(egui::pos2(card.left(), (card.bottom() - 28.0).max(card.top())), card.max);
-            p.rect_filled(bot_scrim, CornerRadius { nw: 0, ne: 0, sw: 12, se: 12 }, Color32::from_black_alpha(115));
+            let top_scrim = Rect::from_min_size(inner_card.min, egui::vec2(inner_card.width(), 28.0_f32.min(ch * 0.45)));
+            p.rect_filled(top_scrim, CornerRadius { nw: 7, ne: 7, sw: 0, se: 0 }, Color32::from_black_alpha(115));
+            let bot_scrim = Rect::from_min_max(egui::pos2(inner_card.left(), (inner_card.bottom() - 28.0).max(inner_card.top())), inner_card.max);
+            p.rect_filled(bot_scrim, CornerRadius { nw: 0, ne: 0, sw: 7, se: 7 }, Color32::from_black_alpha(135));
 
             // On-object grain ring + cloud dots + smear trail + pitch dot.
             let map = MacroMap::resolve(&macros, Some(&key));
@@ -374,20 +376,20 @@ impl Studio {
             if bar_bot > bar_top + 6.0 {
                 let max_bh = bar_bot - bar_top;
                 let bh = (max_bh * level.clamp(0.0, 1.0)).max(3.0);
-                let lb = Rect::from_min_size(egui::pos2(card.right() - 5.5, bar_bot - bh), egui::vec2(2.0, bh));
-                p.rect_filled(lb, r(1), Color32::from_white_alpha(125));
+                let lb = Rect::from_min_size(egui::pos2(card.right() - 5.5, bar_bot - bh), egui::vec2(2.2, bh));
+                p.rect_filled(lb, r(1), AMBER_MID);
             }
 
             // Top-left numbered badge + clip name.
             let badge_c = egui::pos2(card.left() + 17.0, card.top() + if small { 15.0 } else { 17.0 });
             let badge_r = if small { 8.5 } else { 9.5 };
             if is_sel {
-                p.circle_filled(badge_c, badge_r, HI);
+                p.circle_filled(badge_c, badge_r, AMBER_MID);
                 p.text(badge_c, Align2::CENTER_CENTER, (i + 1).to_string(), mono_medium(10.5), ON_HI);
             } else {
-                p.circle_filled(badge_c, badge_r, Color32::from_black_alpha(120));
-                p.circle_stroke(badge_c, badge_r, Stroke::new(1.2, INK2));
-                p.text(badge_c, Align2::CENTER_CENTER, (i + 1).to_string(), mono(10.5), INK);
+                p.circle_filled(badge_c, badge_r, Color32::from_black_alpha(150));
+                p.circle_stroke(badge_c, badge_r, Stroke::new(1.2, CREAM2));
+                p.text(badge_c, Align2::CENTER_CENTER, (i + 1).to_string(), mono(10.5), CREAM);
             }
             let max_name_chars = ((cw - 92.0) / 6.2).max(4.0) as usize;
             p.text(
@@ -395,17 +397,15 @@ impl Studio {
                 Align2::LEFT_CENTER,
                 short(clip_name, max_name_chars.min(18)),
                 font_medium(if small { 11.0 } else { 11.5 }),
-                if is_sel { INK } else { INK2 },
+                if is_sel { CREAM } else { CREAM2 },
             );
 
             // Card border (selection + active halo).
             if held || now - last_fire < 0.25 {
-                p.rect_stroke(card.shrink(1.0), r(11), Stroke::new(1.0, Color32::from_white_alpha(95)), StrokeKind::Inside);
+                p.rect_stroke(card.shrink(1.5), r(7), Stroke::new(1.2, AMBER_CORE), StrokeKind::Inside);
             }
             if is_sel {
-                p.rect_stroke(card, r(12), Stroke::new(2.0, HI), StrokeKind::Inside);
-            } else {
-                p.rect_stroke(card, r(12), hair(LINE2), StrokeKind::Inside);
+                p.rect_stroke(card, r(8), Stroke::new(2.0, AMBER_MID), StrokeKind::Inside);
             }
 
             // --- Interactive zones on Card `i` ---
@@ -456,7 +456,7 @@ impl Studio {
 
             // Top-right `Look` chip.
             let look_str = super::look_name(map.look);
-            let look_w = (p.layout_no_wrap(look_str.into(), font(11.0), INK).size().x + 16.0).max(44.0);
+            let look_w = (p.layout_no_wrap(look_str.into(), font(11.0), CREAM).size().x + 16.0).max(44.0);
             let look_vis = Rect::from_min_size(
                 egui::pos2(card.right() - look_w - 7.0, card.top() + 6.0),
                 egui::vec2(look_w, if small { 20.0 } else { 22.0 }),
@@ -471,16 +471,16 @@ impl Studio {
             );
             p.rect_filled(
                 look_vis,
-                r(7),
-                Color32::from_black_alpha(if look_resp.hovered() { 195 } else { 150 }),
+                r(5),
+                Color32::from_black_alpha(if look_resp.hovered() { 220 } else { 185 }),
             );
-            p.rect_stroke(look_vis, r(7), hair(LINE2), StrokeKind::Inside);
+            p.rect_stroke(look_vis, r(5), hair(WELL_LINE2), StrokeKind::Inside);
             p.text(
                 look_vis.center(),
                 Align2::CENTER_CENTER,
                 look_str,
                 mono(10.5),
-                if map.look > 0 { INK } else { INK2 },
+                if map.look > 0 { AMBER_MID } else { CREAM2 },
             );
 
             // Bottom-right `Clip ›` dark pill (`"emitter settings"` on selected card).
@@ -501,21 +501,21 @@ impl Studio {
                 &clip_a11y,
             );
             let clip_hov = clip_resp.hovered() || clip_resp.is_pointer_button_down_on();
-            p.rect_filled(clip_vis, r(8), Color32::from_black_alpha(if clip_hov { 215 } else { 175 }));
-            p.rect_stroke(clip_vis, r(8), hair(if clip_hov { LINE3 } else { LINE2 }), StrokeKind::Inside);
+            p.rect_filled(clip_vis, r(5), Color32::from_black_alpha(if clip_hov { 230 } else { 195 }));
+            p.rect_stroke(clip_vis, r(5), hair(if clip_hov { AMBER_MID } else { WELL_LINE2 }), StrokeKind::Inside);
             p.text(
-                egui::pos2(clip_vis.left() + 9.0, clip_vis.center().y),
+                egui::pos2(clip_vis.left() + 8.5, clip_vis.center().y),
                 Align2::LEFT_CENTER,
                 "Clip",
                 font_medium(11.0),
-                if clip_hov { HI } else { INK },
+                if clip_hov { AMBER_MID } else { CREAM },
             );
             draw_icon(
                 &p,
                 Icon::ChevronRight,
-                egui::pos2(clip_vis.right() - 10.0, clip_vis.center().y + 0.5),
+                egui::pos2(clip_vis.right() - 9.5, clip_vis.center().y + 0.5),
                 10.5,
-                if clip_hov { HI } else { INK2 },
+                if clip_hov { AMBER_MID } else { CREAM2 },
             );
 
             // Apply interactions.
@@ -630,42 +630,40 @@ impl Studio {
             self.open_clip(ClipTarget::Emitter(em_i));
         }
 
-        // Full-width Footer: Rec (standalone) or Load clip (plugin).
+        // Full-width Footer: Smoked Ruby -> Lit Ruby `Rec` switch (standalone) or `Load clip` (plugin).
         let recording = self.rec.is_some();
         if !host.caps().rec {
             if chip(ui, foot, ui.id().with("load-clip"), "load a clip", false, false).clicked() {
                 host.import_media();
             }
-            draw_icon(&p, Icon::Plus, egui::pos2(foot.left() + 20.0, foot.center().y), 14.0, INK2);
-            p.text(egui::pos2(foot.left() + 36.0, foot.center().y), Align2::LEFT_CENTER, "Load clip", font_medium(12.5), INK);
+            draw_icon(&p, Icon::Plus, egui::pos2(foot.left() + 20.0, foot.center().y), 14.0, INK);
+            p.text(egui::pos2(foot.left() + 36.0, foot.center().y), Align2::LEFT_CENTER, "Load clip", font_semibold(12.5), INK);
             if let Some(b) = host.busy() {
                 p.text(egui::pos2(foot.right() - 14.0, foot.center().y), Align2::RIGHT_CENTER, short(&b, 32), font(11.0), INK3);
             }
         } else {
-            if chip(ui, foot, ui.id().with("rec-big"), "rec", false, false).clicked() {
+            let fresp = hit(ui, foot, ui.id().with("rec-big"), Sense::click(), "rec");
+            paint_switch_cap(&p, foot, SwitchKind::Ruby, recording, fresp.hovered(), fresp.is_pointer_button_down_on());
+            if fresp.clicked() {
                 self.toggle_rec(host);
             }
             let rc = egui::pos2(foot.left() + 20.0, foot.center().y);
-            if recording {
-                p.rect_filled(foot, r(10), Color32::from_rgba_unmultiplied(229, 72, 77, 26));
-                p.circle_filled(rc, 5.5, REC);
-            } else {
-                p.circle_stroke(rc, 5.5, Stroke::new(1.5, INK2));
-            }
+            let fg = Color32::from_rgb(0x24, 0x0b, 0x09);
+            p.circle_filled(rc, 5.0, fg);
             p.text(
                 egui::pos2(rc.x + 15.0, rc.y),
                 Align2::LEFT_CENTER,
-                if recording { "Stop" } else { "Rec" },
-                font_medium(12.5),
-                INK,
+                if recording { "STOP TAKE" } else { "REC TAKE" },
+                font_semibold(12.0),
+                fg,
             );
             let secs = self.rec.as_ref().map(|r| host.clock() - r.t0).unwrap_or(0.0);
             p.text(
                 egui::pos2(foot.right() - 16.0, rc.y),
                 Align2::RIGHT_CENTER,
                 format!("{}:{:02}", (secs / 60.0) as u32, secs as u32 % 60),
-                mono(11.5),
-                if recording { INK } else { INK3 },
+                mono_medium(11.5),
+                fg,
             );
         }
         if recording {

@@ -85,7 +85,9 @@ impl App {
                     p.tracks[ti].muted = true;
                     if let Some(mut c) = seeds.get(i).cloned() {
                         c.start_beat = 0.0;
-                        c.length_beats = pow2_beats(c.length_beats);
+                        if c.grains.sculpt.free_loop_secs.is_none() {
+                            c.length_beats = pow2_beats(c.length_beats);
+                        }
                         p.tracks[ti].clips.push(c);
                     }
                 }
@@ -128,15 +130,19 @@ impl App {
         self.perform_tick();
     }
 
-    /// Make every pad loop: snap its first clip, then tile copies of it
-    /// across the shared loop (as long as the longest pad).
-    fn perform_fill(&mut self) {
+    /// Make every pad loop: beat-synced pads snap to a power-of-two bar/beat
+    /// length and tile across `loop_len`, while free-running tape loop pads
+    /// (`free_loop_secs: Some(s)`) stay as one unbroken clip across a `>= 64`-beat
+    /// span (`>= 6` passes of the longest free loop) so `loop_pass` advances
+    /// continuously for Basinski-style phase drift & disintegration.
+    pub(crate) fn perform_fill(&mut self) {
         if self.mode != AppMode::Perform || self.fill_rev == self.project_rev {
             return;
         }
         let mut loop_len = 4.0f64;
         {
             let mut p = self.project.lock().unwrap();
+            let bpm = p.bpm.max(20.0);
             while p.tracks.len() < PADS {
                 let n = p.tracks.len();
                 let ti = p.add_track(&format!("pad {}", n + 1));
@@ -144,14 +150,31 @@ impl App {
             }
             for t in &mut p.tracks {
                 t.clips.truncate(1);
+                let track_free = t.sculpt.free_loop_secs;
                 if let Some(c0) = t.clips.first_mut() {
                     c0.start_beat = 0.0;
-                    c0.length_beats = pow2_beats(c0.length_beats);
-                    loop_len = loop_len.max(c0.length_beats);
+                    if let Some(s) = c0.grains.sculpt.free_loop_secs.or(track_free) {
+                        c0.grains.sculpt.free_loop_secs = Some(s);
+                        let min_beats = (s.max(0.5) as f64 * 6.0 * bpm / 60.0).ceil();
+                        let bar_aligned = ((min_beats / 4.0).ceil() * 4.0).max(64.0);
+                        loop_len = loop_len.max(bar_aligned);
+                    } else {
+                        c0.length_beats = pow2_beats(c0.length_beats);
+                        loop_len = loop_len.max(c0.length_beats);
+                    }
                 }
             }
             for t in &mut p.tracks {
-                if let Some(c0) = t.clips.first().cloned() {
+                let is_free = t.sculpt.free_loop_secs.is_some()
+                    || t.clips
+                        .first()
+                        .is_some_and(|c0| c0.grains.sculpt.free_loop_secs.is_some());
+                if is_free {
+                    if let Some(c0) = t.clips.first_mut() {
+                        c0.start_beat = 0.0;
+                        c0.length_beats = loop_len;
+                    }
+                } else if let Some(c0) = t.clips.first().cloned() {
                     let n = (loop_len / c0.length_beats).round() as usize;
                     for k in 1..n {
                         let mut c = c0.clone();

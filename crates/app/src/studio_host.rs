@@ -323,7 +323,16 @@ impl Host for App {
             } else {
                 format!("{src_name} ~ {}", spec.label)
             };
-            staged.push((pad, clip, track_name, spec.stamp, spec.sculpt, spec.choke_group, spec.slice.focus));
+            staged.push((
+                pad,
+                clip,
+                track_name,
+                spec.stamp,
+                spec.sculpt,
+                spec.choke_group,
+                spec.slice.focus,
+                spec.slice.caption,
+            ));
         }
         let tracks = if perform { &mut p.tracks } else { &mut self.other_tracks };
         while tracks.len() < PADS {
@@ -331,7 +340,7 @@ impl Host for App {
             tracks.push(Track { name: format!("pad {}", k + 1), muted: true, ..Default::default() });
         }
         let count = staged.len();
-        for (pad, clip, track_name, stamp, sculpt, choke, focus) in staged {
+        for (pad, clip, track_name, stamp, sculpt, choke, focus, caption) in staged {
             let sid = clip.source;
             tracks[pad].clips = vec![clip];
             tracks[pad].name = track_name;
@@ -340,12 +349,21 @@ impl Host for App {
             tracks[pad].tape.wow = sculpt.wow_flutter;
             tracks[pad].tape.age = sculpt.disintegrate * 0.8;
             self.studio.pad_sculpt[pad] = chromagrain_ui::SculptParams::from_core(stamp, sculpt, choke);
+            if !caption.is_empty() {
+                self.studio.pad_captions[pad] = caption.as_str().to_string();
+            } else {
+                self.studio.pad_captions[pad].clear();
+            }
             if !self.studio.source_focus.contains_key(&sid) && ((focus.0 - 0.5).abs() > 0.02 || (focus.1 - 0.5).abs() > 0.02) {
                 self.studio.source_focus.insert(sid, focus);
             }
         }
         drop(p);
+        self.fill_rev = 0;
         self.mark_now();
+        if perform {
+            self.perform_fill();
+        }
         count
     }
     fn build_loops_to_pads(&mut self) -> usize {
@@ -397,9 +415,14 @@ impl Host for App {
             tracks[pad].tape.wow = sculpt.wow_flutter.max(0.25);
             tracks[pad].tape.age = sculpt.disintegrate.max(0.20);
             self.studio.pad_sculpt[pad] = chromagrain_ui::SculptParams::from_core(stamp, sculpt, 0);
+            self.studio.pad_captions[pad].clear();
         }
         drop(p);
+        self.fill_rev = 0;
         self.mark_now();
+        if perform {
+            self.perform_fill();
+        }
         count
     }
     fn pending(&self) -> Vec<Pending> {
@@ -494,10 +517,15 @@ impl Host for App {
 impl PerformHost for App {
     fn pads(&self) -> Vec<Pad> {
         let p = self.project.lock().unwrap();
+        let pad_tracks = if self.mode == AppMode::Perform {
+            &p.tracks
+        } else {
+            &self.other_tracks
+        };
         let now = self.app_clock.secs();
         (0..PADS)
             .map(|i| {
-                let t = p.tracks.get(i);
+                let t = pad_tracks.get(i);
                 let clip = t.and_then(|t| t.clips.first());
                 let is_slice_pad = t.is_some_and(|t| t.name.contains(" · "));
                 let (source, kind, len) = match clip {
@@ -589,21 +617,82 @@ impl PerformHost for App {
         self.mark_now();
     }
     fn pad_env(&self, i: usize) -> Option<chromagrain_core::envelope::Adsr> {
-        self.project.lock().unwrap().tracks.get(i).and_then(|t| t.clips.first()).and_then(|c| c.grains.adsr)
+        let p = self.project.lock().unwrap();
+        let tracks = if self.mode == AppMode::Perform { &p.tracks } else { &self.other_tracks };
+        tracks.get(i).and_then(|t| t.clips.first()).and_then(|c| c.grains.adsr)
     }
     fn set_pad_env(&mut self, i: usize, adsr: chromagrain_core::envelope::Adsr) {
+        if i >= PADS {
+            return;
+        }
+        self.studio_seed_pads();
+        let perform = self.mode == AppMode::Perform;
         let mut picture_flipped = false;
-        if let Some(t) = self.project.lock().unwrap().tracks.get_mut(i) {
-            for c in &mut t.clips {
-                if c.grains.adsr.is_some_and(|old| old.picture != adsr.picture) {
-                    picture_flipped = true;
+        {
+            let mut p = self.project.lock().unwrap();
+            let tracks = if perform { &mut p.tracks } else { &mut self.other_tracks };
+            if let Some(t) = tracks.get_mut(i) {
+                for c in &mut t.clips {
+                    if c.grains.adsr.is_some_and(|old| old.picture != adsr.picture) {
+                        picture_flipped = true;
+                    }
+                    c.grains.adsr = Some(adsr);
                 }
-                c.grains.adsr = Some(adsr);
             }
         }
         self.mark();
-        if picture_flipped {
+        if picture_flipped && perform {
             self.toggle_pad(i);
+        }
+    }
+    fn pad_sculpt(&self, i: usize) -> Option<(chromagrain_core::grain::VoiceSculpt, u8)> {
+        let p = self.project.lock().unwrap();
+        let tracks = if self.mode == AppMode::Perform { &p.tracks } else { &self.other_tracks };
+        tracks.get(i).map(|t| (t.sculpt, t.choke_group))
+    }
+    fn set_pad_sculpt(
+        &mut self,
+        i: usize,
+        sculpt: chromagrain_core::grain::VoiceSculpt,
+        choke: u8,
+    ) {
+        if i >= PADS {
+            return;
+        }
+        self.studio_seed_pads();
+        let perform = self.mode == AppMode::Perform;
+        let choke = choke.min(4);
+        {
+            let mut p = self.project.lock().unwrap();
+            let bpm = p.bpm.max(20.0);
+            let tracks = if perform { &mut p.tracks } else { &mut self.other_tracks };
+            while tracks.len() < PADS {
+                let k = tracks.len();
+                tracks.push(Track {
+                    name: format!("pad {}", k + 1),
+                    muted: true,
+                    ..Default::default()
+                });
+            }
+            if let Some(t) = tracks.get_mut(i) {
+                t.sculpt = sculpt;
+                t.choke_group = choke;
+                t.tape.wow = sculpt.wow_flutter;
+                t.tape.age = sculpt.disintegrate * 0.8;
+                for c in &mut t.clips {
+                    c.grains.sculpt = sculpt;
+                    c.grains.choke_group = choke;
+                    if let Some(free_s) = sculpt.free_loop_secs {
+                        let beats = (free_s.max(0.5) as f64 * bpm / 60.0).clamp(0.5, 64.0);
+                        c.length_beats = beats;
+                    }
+                }
+            }
+        }
+        self.fill_rev = 0;
+        self.mark_now();
+        if perform {
+            self.perform_fill();
         }
     }
     fn quantize(&self) -> usize {

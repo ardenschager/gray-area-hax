@@ -550,25 +550,26 @@ impl Studio {
                 at.map(|(ci, _)| ci) == Some(i)
             };
             let queued = self.seq.queued == Some(s) && !cur;
-            p.rect_filled(cr, r(8), if cur { G3 } else if resp.hovered() { G3 } else { G2 });
+            paint_switch_cap(&p, cr, SwitchKind::PuttyAmber, cur, resp.hovered(), resp.is_pointer_button_down_on());
             if let (true, Some((_, prog))) = (cur && !self.seq.hold_scene, at) {
-                let fill = Rect::from_min_size(cr.min, egui::vec2(cr.width() * prog.clamp(0.0, 1.0) as f32, h));
-                p.rect_filled(fill, r(8), G4);
+                let fill = Rect::from_min_size(
+                    egui::pos2(cr.left() + 3.0, cr.bottom() - 3.5),
+                    egui::vec2((cr.width() - 6.0) * prog.clamp(0.0, 1.0) as f32, 2.0),
+                );
+                p.rect_filled(fill, r(1), ON_HI);
             }
             if queued && (ui.input(|inp| inp.time) * 3.0).fract() < 0.55 {
-                p.rect_stroke(cr, r(8), Stroke::new(1.5, HI), StrokeKind::Inside);
+                p.rect_stroke(cr, r(4), Stroke::new(1.8, AMBER_MID), StrokeKind::Inside);
                 ui.ctx().request_repaint();
-            } else {
-                p.rect_stroke(cr, r(8), hair(if cur { LINE3 } else { LINE }), StrokeKind::Inside);
             }
             runs(
                 &p,
                 cr.center(),
                 Align2::CENTER_CENTER,
                 &[
-                    (&head, font_medium(11.5), if cur { HI } else { INK }),
-                    (" ", mono(10.5), INK3),
-                    (&rep_str, mono(10.5), if cur { INK2 } else { INK3 }),
+                    (&head, font_semibold(11.0), if cur { ON_HI } else { INK }),
+                    (" ", mono(10.0), INK3),
+                    (&rep_str, mono(10.0), if cur { ON_HI } else { INK3 }),
                 ],
             );
 
@@ -669,23 +670,23 @@ impl Studio {
             let src = self.seq.lanes[lane];
             let Some(src) = src else {
                 if let Some((pd, _)) = pending.iter().find(|(_, t)| *t == crate::host::AddTarget::Lane(lane)) {
-                    super::add::placeholder_tile(&p, header, 8, pd, t_ui, true);
+                    super::add::placeholder_tile(&p, header, 6, pd, t_ui, true);
                     ctx.request_repaint();
                     continue;
                 }
-                p.rect_filled(header, r(8), G1);
-                p.rect_stroke(header, r(8), hair(LINE), StrokeKind::Inside);
+                monitor_well(&p, header, 6);
                 if first_empty {
                     first_empty = false;
                     let resp = hit(ui, header, ui.id().with(("lane-add", lane)), Sense::click(), "add a lane");
-                    draw_icon(&p, Icon::Plus, header.center(), 16.0, if resp.hovered() { INK2 } else { INK3 });
+                    draw_icon(&p, Icon::Plus, header.center(), 16.0, if resp.hovered() { CREAM } else { CREAM3 });
                     if resp.clicked() {
                         self.open_add(host, crate::host::AddTarget::Lane(lane));
                     }
                 }
                 for s in 0..STEPS {
                     let c = Rect::from_min_size(egui::pos2(step_x(s), y), egui::vec2(sw, lh));
-                    p.rect_stroke(c, r(6), hair(LINE), StrokeKind::Inside);
+                    p.rect_filled(c, r(4), Color32::from_rgba_unmultiplied(24, 27, 28, 85));
+                    p.rect_stroke(c, r(4), hair(LINE2), StrokeKind::Inside);
                 }
                 continue;
             };
@@ -703,38 +704,39 @@ impl Studio {
             };
             let is_sel = lane == self.sel_lane;
             let lane_adsr = self.target_env(host, super::clip::EnvTarget::Lane(lane)).unwrap_or_default();
+            monitor_well(&p, header, 6);
             if let Some((tex, a)) = at {
-                tile(&p, header, 8, tex, a.uv_cover(5, hw / lh), gray(if muted { 0.28 } else if silent { 0.48 } else { 0.78 }));
-                p.rect_filled(Rect::from_min_size(header.min, egui::vec2(3.0, lh)), r(2), a.swatch);
+                tile(&p, header.shrink(1.2), 5, tex, a.uv_cover(5, hw / lh), gray(if muted { 0.28 } else if silent { 0.50 } else { 0.80 }));
+                p.rect_filled(Rect::from_min_size(header.min + egui::vec2(1.0, 1.0), egui::vec2(3.0, lh - 2.0)), r(2), a.swatch);
             }
+            let top_scrim = Rect::from_min_size(header.min, egui::vec2(hw, 20.0_f32.min(lh * 0.45)));
+            p.rect_filled(top_scrim, egui::CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 }, Color32::from_black_alpha(110));
             let bot_scrim = Rect::from_min_max(egui::pos2(header.left(), (header.bottom() - 22.0).max(header.top())), header.max);
-            p.rect_filled(bot_scrim, egui::CornerRadius { nw: 0, ne: 0, sw: 8, se: 8 }, Color32::from_black_alpha(105));
+            p.rect_filled(bot_scrim, egui::CornerRadius { nw: 0, ne: 0, sw: 6, se: 6 }, Color32::from_black_alpha(135));
             if lh >= 42.0 && hw >= 88.0 {
                 let raw_name = self.source_name(host, src);
                 let clean = super::strip_media_ext(&raw_name);
                 let room = ((hw - 36.0) / 6.0).max(4.0) as usize;
                 p.text(
-                    egui::pos2(header.left() + 9.0, header.top() + 7.0),
+                    egui::pos2(header.left() + 9.0, header.top() + 6.5),
                     Align2::LEFT_TOP,
                     super::play::short(clean, room.min(16)),
                     font_medium(10.5),
-                    if muted { INK3 } else if is_sel { INK } else { INK2 },
+                    if muted { CREAM3 } else if is_sel { CREAM } else { CREAM2 },
                 );
             }
             if !muted {
                 let env_w = (hw * 0.36).clamp(18.0, 48.0);
                 let env_r = Rect::from_min_size(egui::pos2(header.left() + 9.0, header.bottom() - 16.5), egui::vec2(env_w, 10.5));
-                mini_adsr(&p, env_r, &lane_adsr, if is_sel { 0.9 } else { 0.68 });
+                mini_adsr(&p, env_r, &lane_adsr, if is_sel { 0.92 } else { 0.68 });
             } else {
-                p.text(header.left_bottom() + egui::vec2(10.0, -5.0), Align2::LEFT_BOTTOM, "muted", font(10.0), INK2);
+                p.text(header.left_bottom() + egui::vec2(10.0, -5.0), Align2::LEFT_BOTTOM, "MUTED", font_semibold(9.5), RUBY_MID);
             }
             if len != STEPS {
-                p.text(header.right_bottom() + egui::vec2(-8.0, -5.0), Align2::RIGHT_BOTTOM, len.to_string(), mono(10.0), INK2);
+                p.text(header.right_bottom() + egui::vec2(-8.0, -5.0), Align2::RIGHT_BOTTOM, len.to_string(), mono(10.0), CREAM2);
             }
             if is_sel {
-                p.rect_stroke(header, r(8), Stroke::new(1.5, Color32::from_white_alpha(150)), StrokeKind::Inside);
-            } else {
-                p.rect_stroke(header, r(8), hair(LINE), StrokeKind::Inside);
+                p.rect_stroke(header, r(6), Stroke::new(1.8, AMBER_MID), StrokeKind::Inside);
             }
             let hresp = hit(ui, header, ui.id().with(("lane-head", lane)), Sense::click(), &format!("lane {}", lane + 1));
             let chev_vis = Rect::from_min_size(egui::pos2(header.right() - 24.0, header.top() + 4.0), egui::vec2(20.0, 20.0));
@@ -756,7 +758,7 @@ impl Studio {
                 let c = Rect::from_min_size(egui::pos2(step_x(s), y), egui::vec2(sw, lh));
                 if s >= len {
                     if s == len {
-                        draw_loop_glyph(&p, egui::pos2(c.left() + 10.0, c.center().y), INK4);
+                        draw_loop_glyph(&p, egui::pos2(c.left() + 10.0, c.center().y), INK3);
                     }
                     continue;
                 }
@@ -764,39 +766,41 @@ impl Studio {
                 let (ratchet, _, step_chord) = self.step_ratchet_ext(scene, lane, s);
                 let ghost = if muted { 0.35 } else { 1.0 };
                 if st.on {
+                    monitor_well(&p, c, 5);
                     if let Some((tex, a)) = at {
                         let slice = match st.slice_index.and_then(|k| chop_starts.get(k as usize)) {
                             Some(pos) => atlas::frame_at(*pos),
                             None if st.slice >= 0.0 => atlas::frame_at(st.slice),
                             None => s,
                         };
-                        tile(&p, c, 6, tex, a.uv_cover(slice, sw / lh), gray(0.9 * ghost));
+                        tile(&p, c.shrink(1.2), 4, tex, a.uv_cover(slice, sw / lh), gray(0.92 * ghost));
                     }
                     if st.pitch.abs() > 0.01 {
                         let d = semis_to_degree(&key, st.pitch);
-                        p.text(c.left_top() + egui::vec2(5.0, 4.0), Align2::LEFT_TOP, format!("{d:+}"), mono(10.0), INK);
+                        p.text(c.left_top() + egui::vec2(5.0, 4.0), Align2::LEFT_TOP, format!("{d:+}"), mono_medium(10.0), CREAM);
                     }
                     if st.chance < 0.999 {
-                        p.text(c.right_top() + egui::vec2(-5.0, 4.0), Align2::RIGHT_TOP, format!("{:.0}%", st.chance * 100.0), mono(9.0), INK2);
+                        p.text(c.right_top() + egui::vec2(-5.0, 4.0), Align2::RIGHT_TOP, format!("{:.0}%", st.chance * 100.0), mono(9.0), CREAM2);
                     }
                     if ratchet > 1 && sw >= 24.0 {
                         let tag_r = Rect::from_min_size(egui::pos2(c.left() + 3.0, c.bottom() - 14.0), egui::vec2(18.0, 11.0));
-                        p.rect_filled(tag_r, r(3), Color32::from_black_alpha(175));
-                        p.text(tag_r.center(), Align2::CENTER_CENTER, format!("×{ratchet}"), mono(8.5), HI);
+                        p.rect_filled(tag_r, r(3), Color32::from_black_alpha(200));
+                        p.text(tag_r.center(), Align2::CENTER_CENTER, format!("×{ratchet}"), mono_medium(8.5), AMBER_MID);
                     }
                     if step_chord != ChordChoice::Off && sw >= 34.0 {
-                        p.text(c.right_bottom() + egui::vec2(-4.0, -3.0), Align2::RIGHT_BOTTOM, step_chord.label(), mono(8.0), HI);
+                        p.text(c.right_bottom() + egui::vec2(-4.0, -3.0), Align2::RIGHT_BOTTOM, step_chord.label(), mono_medium(8.0), MINT_MID);
                     }
+                    p.rect_stroke(c, r(5), Stroke::new(1.2, AMBER_EDGE), StrokeKind::Inside);
                 } else {
-                    p.rect_filled(c, r(6), G1);
-                    p.circle_filled(c.center(), 1.5, if s % 4 == 0 { INK3 } else { INK4 });
+                    monitor_well(&p, c, 5);
+                    p.circle_filled(c.center(), if s % 4 == 0 { 2.0 } else { 1.4 }, if s % 4 == 0 { CREAM3 } else { Color32::from_white_alpha(45) });
                 }
                 if cur == Some(s) {
-                    p.rect_stroke(c, r(6), Stroke::new(1.5, HI), StrokeKind::Inside);
+                    p.rect_stroke(c, r(5), Stroke::new(2.0, AMBER_CORE), StrokeKind::Inside);
                 }
                 if self.seq.hold == Some((lane, s)) {
                     self.hold_rect = Some(c);
-                    p.rect_stroke(c.expand(1.0), r(7), Stroke::new(2.0, HI), StrokeKind::Inside);
+                    p.rect_stroke(c.expand(1.0), r(6), Stroke::new(2.0, AMBER_MID), StrokeKind::Inside);
                 }
                 let resp = hit(ui, c, ui.id().with(("step", lane, s)), Sense::click_and_drag(), &format!("lane {} step {}", lane + 1, s + 1));
                 let h = hold(ui, &resp, 0.45);
@@ -838,12 +842,12 @@ impl Studio {
         let on = s == current;
         let resp = hit(ui, rect, ui.id().with(("scene", s)), Sense::click(), &format!("scene {}", s + 1));
         if on {
-            p.rect_filled(rect, r(9), HI);
+            paint_switch_cap(&p, rect, SwitchKind::Amber, true, resp.hovered(), resp.is_pointer_button_down_on());
         } else if exists {
-            raised(&p, rect, 9, if resp.hovered() { G3 } else { G2 });
+            paint_switch_cap(&p, rect, SwitchKind::PuttyAmber, false, resp.hovered(), resp.is_pointer_button_down_on());
         } else {
-            p.rect_filled(rect, r(9), G1);
-            p.rect_stroke(rect, r(9), hair(LINE), StrokeKind::Inside);
+            p.rect_filled(rect, r(4), LCD_BG);
+            p.rect_stroke(rect, r(4), hair(LINE2), StrokeKind::Inside);
         }
         if self.seq.queued == Some(s) && !on {
             let t = ui.input(|i| i.time);
@@ -1055,10 +1059,11 @@ impl Studio {
         egui::Area::new(id).fixed_pos(sheet.min).order(egui::Order::Foreground).show(&ctx, |ui| {
             let (rect, _) = ui.allocate_exact_size(sheet.size(), Sense::click());
             let p = ui.painter().clone();
-            p.add(egui::epaint::Shadow { offset: [0, 10], blur: 30, spread: 0, color: Color32::from_black_alpha(140) }.as_shape(rect, r(14)));
-            p.rect_filled(rect, r(14), G2);
-            p.rect_stroke(rect, r(14), hair(LINE2), StrokeKind::Inside);
-            let inner = rect.shrink(10.0);
+            p.add(egui::epaint::Shadow { offset: [0, 10], blur: 28, spread: 0, color: Color32::from_black_alpha(130) }.as_shape(rect, r(8)));
+            chassis_plate(&p, rect, CHASSIS_TOP, CHASSIS_BOT);
+            p.rect_stroke(rect, r(8), Stroke::new(1.2, BEVEL_LO), StrokeKind::Inside);
+            chassis_screws(&p, rect, 6.5);
+            let inner = rect.shrink(11.0);
 
             // 1. Slice grid (8×2).
             let cw = (inner.width() - 7.0 * 4.0) / 8.0;
@@ -1080,14 +1085,15 @@ impl Studio {
                     egui::vec2(cw, chh),
                 );
                 let frame = if chops.is_empty() { i } else { atlas::frame_at((chops[i].start / src_len.max(1e-6)) as f32) };
+                p.rect_filled(c, r(4), WELL);
                 if let Some((tex, a)) = at {
-                    tile(&p, c, 4, tex, a.uv_cover(frame, cw / chh), gray(if i == cur_slice { 1.0 } else { 0.6 }));
+                    tile(&p, c.shrink(0.8), 3, tex, a.uv_cover(frame, cw / chh), gray(if i == cur_slice { 1.0 } else { 0.6 }));
                 }
                 if !chops.is_empty() {
-                    p.text(c.left_top() + egui::vec2(4.0, 2.0), Align2::LEFT_TOP, (i + 1).to_string(), mono(9.0), INK);
+                    p.text(c.left_top() + egui::vec2(4.0, 2.0), Align2::LEFT_TOP, (i + 1).to_string(), mono(9.0), CREAM);
                 }
                 if i == cur_slice {
-                    p.rect_stroke(c, r(4), Stroke::new(1.5, HI), StrokeKind::Inside);
+                    p.rect_stroke(c, r(4), Stroke::new(1.6, AMBER_MID), StrokeKind::Inside);
                 }
                 if hit(ui, c, id.with(("slice", i)), Sense::click(), &format!("slice {}", i + 1)).clicked() {
                     if chops.is_empty() {
@@ -1133,10 +1139,10 @@ impl Studio {
                     egui::pos2(inner.left() + col_i as f32 * (pw + 6.0), py + row_i as f32 * (cell_h + row_gap)),
                     egui::vec2(pw, cell_h),
                 );
-                p.rect_filled(c, r(9), G1);
-                p.rect_stroke(c, r(9), hair(LINE), StrokeKind::Inside);
-                p.text(c.center() - egui::vec2(0.0, 6.5), Align2::CENTER_CENTER, val_s, mono_medium(14.5), INK);
-                p.text(c.center() + egui::vec2(0.0, 11.5), Align2::CENTER_CENTER, *title, font(10.0), INK3);
+                putty_panel(&p, c, 5);
+                let lcd_r = Rect::from_center_size(c.center() - egui::vec2(0.0, 7.5), egui::vec2((pw - 14.0).max(40.0), 21.0));
+                lcd_readout(&p, lcd_r, val_s, 12.0);
+                caps(&p, c.center() + egui::vec2(0.0, 12.5), Align2::CENTER_CENTER, title, 8.5);
                 let resp = hit(ui, c, id.with(("param", k)), Sense::click_and_drag(), a11y);
 
                 if k == 3 && resp.clicked() && !resp.dragged() {

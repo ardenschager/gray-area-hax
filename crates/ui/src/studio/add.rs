@@ -76,16 +76,15 @@ fn fmt_dur(secs: f64) -> String {
 
 /// A tile still arriving: a slow sheen, what's happening, progress.
 pub fn placeholder_tile(p: &egui::Painter, rect: Rect, radius: u8, pend: &Pending, t: f64, compact: bool) {
-    p.rect_filled(rect, r(radius), G2);
+    p.rect_filled(rect, r(radius), WELL2);
     if pend.failed.is_none() {
-        // A soft band sweeping left to right every 1.6 s.
         let phase = (t / 1.6).fract() as f32;
         let bw = rect.width() * 0.45;
         let x = rect.left() - bw + (rect.width() + bw) * phase;
         let band = Rect::from_min_max(egui::pos2(x.max(rect.left()), rect.top()), egui::pos2((x + bw).min(rect.right()), rect.bottom()));
         if band.width() > 0.0 {
             let mut mesh = egui::Mesh::default();
-            let (c0, c1) = (Color32::from_white_alpha(0), Color32::from_white_alpha(14));
+            let (c0, c1) = (Color32::from_white_alpha(0), Color32::from_white_alpha(20));
             let mid = x + bw * 0.5;
             for (a, b) in [(band.left(), mid.clamp(band.left(), band.right())), (mid.clamp(band.left(), band.right()), band.right())] {
                 let i = mesh.vertices.len() as u32;
@@ -101,15 +100,15 @@ pub fn placeholder_tile(p: &egui::Painter, rect: Rect, radius: u8, pend: &Pendin
             p.add(egui::Shape::mesh(mesh));
         }
     }
-    p.rect_stroke(rect, r(radius), Stroke::new(1.0, if pend.failed.is_some() { REC.gamma_multiply(0.6) } else { LINE3 }), StrokeKind::Inside);
+    p.rect_stroke(rect, r(radius), Stroke::new(1.0, if pend.failed.is_some() { RUBY_MID } else { WELL_LINE2 }), StrokeKind::Inside);
     if pend.failed.is_none() {
         let icon = if pend.label.starts_with("digging") { Icon::Dig } else if pend.label.starts_with("loading") { Icon::Folder } else { Icon::Link };
         let c = egui::pos2(rect.center().x, rect.center().y.min(rect.top() + 44.0).max(rect.top() + rect.height() * 0.4));
-        draw_icon(p, icon, c - egui::vec2(0.0, 8.0), if compact { 18.0 } else { 22.0 }, INK2);
+        draw_icon(p, icon, c - egui::vec2(0.0, 8.0), if compact { 18.0 } else { 22.0 }, CREAM2);
         for k in 0..3 {
             let ph = ((t * 2.2 - k as f64 * 0.22).rem_euclid(1.0)) as f32;
             let a = (1.0 - (ph * 2.0 - 1.0).abs()).clamp(0.15, 1.0);
-            p.circle_filled(c + egui::vec2((k as f32 - 1.0) * 8.0, 14.0), 2.2, Color32::from_white_alpha((a * 160.0) as u8));
+            p.circle_filled(c + egui::vec2((k as f32 - 1.0) * 8.0, 14.0), 2.2, Color32::from_rgba_unmultiplied(252, 227, 93, (a * 195.0) as u8));
         }
     }
     let label = match &pend.failed {
@@ -117,31 +116,32 @@ pub fn placeholder_tile(p: &egui::Painter, rect: Rect, radius: u8, pend: &Pendin
         None => super::play::short(&pend.label, if compact { 14 } else { 40 }),
     };
     let size = if compact { 10.0 } else { 11.5 };
-    p.text(egui::pos2(rect.left() + 8.0, rect.bottom() - if compact { 10.0 } else { 14.0 }), Align2::LEFT_BOTTOM, label, font(size), if pend.failed.is_some() { REC } else { INK2 });
+    p.text(egui::pos2(rect.left() + 8.0, rect.bottom() - if compact { 10.0 } else { 14.0 }), Align2::LEFT_BOTTOM, label, font(size), if pend.failed.is_some() { RUBY_MID } else { CREAM2 });
     if let (Some(f), None) = (pend.progress, &pend.failed) {
         let y = rect.bottom() - 4.0;
         let w = (rect.width() - 16.0).max(0.0);
-        p.line_segment([egui::pos2(rect.left() + 8.0, y), egui::pos2(rect.left() + 8.0 + w, y)], Stroke::new(2.0, G4));
-        p.line_segment([egui::pos2(rect.left() + 8.0, y), egui::pos2(rect.left() + 8.0 + w * f.clamp(0.0, 1.0), y)], Stroke::new(2.0, INK2));
+        p.line_segment([egui::pos2(rect.left() + 8.0, y), egui::pos2(rect.left() + 8.0 + w, y)], Stroke::new(2.0, WELL3));
+        p.line_segment([egui::pos2(rect.left() + 8.0, y), egui::pos2(rect.left() + 8.0 + w * f.clamp(0.0, 1.0), y)], Stroke::new(2.0, AMBER_MID));
     }
 }
 
-/// Scrim + centred sheet; returns whether the scrim was tapped.
+/// Scrim + centred hardware console sheet; returns whether the scrim was tapped.
 pub fn modal(ctx: &egui::Context, id: &str, size: egui::Vec2, body: impl FnOnce(&mut egui::Ui, Rect)) -> bool {
     let screen = ctx.screen_rect();
     let mut closed = false;
     egui::Area::new(egui::Id::new((id, "scrim"))).fixed_pos(screen.min).order(egui::Order::Middle).show(ctx, |ui| {
         let (rect, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
-        ui.painter().rect_filled(rect, 0.0, Color32::from_black_alpha(150));
+        ui.painter().rect_filled(rect, 0.0, Color32::from_black_alpha(155));
         closed = resp.clicked();
     });
     let sheet = Rect::from_center_size(screen.center(), size);
     egui::Area::new(egui::Id::new(id)).fixed_pos(sheet.min).order(egui::Order::Foreground).show(ctx, |ui| {
         let (rect, _) = ui.allocate_exact_size(sheet.size(), Sense::click());
         let p = ui.painter().clone();
-        p.add(egui::epaint::Shadow { offset: [0, 18], blur: 48, spread: 0, color: Color32::from_black_alpha(160) }.as_shape(rect, r(18)));
-        p.rect_filled(rect, r(18), G1);
-        p.rect_stroke(rect, r(18), hair(LINE2), StrokeKind::Inside);
+        p.add(egui::epaint::Shadow { offset: [0, 18], blur: 48, spread: 0, color: Color32::from_black_alpha(170) }.as_shape(rect, r(10)));
+        chassis_plate(&p, rect, CHASSIS_TOP, CHASSIS_BOT);
+        p.rect_stroke(rect, r(10), Stroke::new(1.5, BEVEL_LO), StrokeKind::Inside);
+        chassis_screws(&p, rect, 10.0);
         body(ui, rect);
     });
     closed
@@ -150,31 +150,39 @@ pub fn modal(ctx: &egui::Context, id: &str, size: egui::Vec2, body: impl FnOnce(
 /// The sheet's header: title, subtitle, Done. Returns true on Done.
 pub fn sheet_header(ui: &mut egui::Ui, inner: Rect, title: &str, sub: &str, id: egui::Id) -> bool {
     let p = ui.painter().clone();
-    p.text(egui::pos2(inner.left(), inner.top() + 16.0), Align2::LEFT_CENTER, title, font_semibold(18.0), INK);
-    p.text(egui::pos2(inner.left(), inner.top() + 38.0), Align2::LEFT_CENTER, sub, font(12.0), INK3);
-    let done = Rect::from_min_size(egui::pos2(inner.right() - 72.0, inner.top() + 4.0), egui::vec2(72.0, 40.0));
-    let c = chip(ui, done, id.with("done"), "close sheet", true, false).clicked();
-    p.text(done.center(), Align2::CENTER_CENTER, "Done", font(13.0), INK2);
+    p.text(egui::pos2(inner.left(), inner.top() + 16.0), Align2::LEFT_CENTER, title.to_uppercase(), font_semibold(17.0), INK);
+    p.text(egui::pos2(inner.left(), inner.top() + 37.0), Align2::LEFT_CENTER, sub, font(12.0), INK3);
+    let done = Rect::from_min_size(egui::pos2(inner.right() - 74.0, inner.top() + 4.0), egui::vec2(74.0, 36.0));
+    let c = button_named(ui, done, id.with("done"), "Done", "close sheet", false, None, None).clicked();
     c
 }
 
-/// A text field in the studio's look. Returns (response, enter pressed).
+/// A sunken LCD-style text input field in the hardware console's look.
 pub fn field(ui: &mut egui::Ui, rect: Rect, id: egui::Id, text: &mut String, hint: &str, label: &str) -> (egui::Response, bool) {
-    field_sized(ui, rect, id, text, hint, label, 13.5)
+    field_sized(ui, rect, id, text, hint, label, 13.0)
 }
 
 /// [`field`] with explicit font size.
 pub fn field_sized(ui: &mut egui::Ui, rect: Rect, id: egui::Id, text: &mut String, hint: &str, label: &str, font_size: f32) -> (egui::Response, bool) {
-    ui.painter().rect_filled(rect, r(10), G2);
-    ui.painter().rect_stroke(rect, r(10), hair(LINE2), StrokeKind::Inside);
-    let inner = rect.shrink2(egui::vec2(12.0, 0.0));
+    let p = ui.painter().clone();
+    p.rect_filled(rect, r(4), LCD_BG);
+    p.line_segment(
+        [egui::pos2(rect.left() + 2.0, rect.top() + 0.8), egui::pos2(rect.right() - 2.0, rect.top() + 0.8)],
+        Stroke::new(1.2, LCD_SHADOW),
+    );
+    p.line_segment(
+        [egui::pos2(rect.left() + 2.0, rect.bottom() + 0.6), egui::pos2(rect.right() - 2.0, rect.bottom() + 0.6)],
+        Stroke::new(1.0, BEVEL_HI),
+    );
+    p.rect_stroke(rect, r(4), Stroke::new(1.0, Color32::from_rgb(0x66, 0x62, 0x54)), StrokeKind::Inside);
+    let inner = rect.shrink2(egui::vec2(10.0, 0.0));
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(inner).layout(egui::Layout::left_to_right(egui::Align::Center)));
     let resp = child.add(
         egui::TextEdit::singleline(text)
             .id(id)
             .frame(false)
-            .font(font(font_size))
-            .text_color(INK)
+            .font(font_medium(font_size))
+            .text_color(LCD_INK)
             .hint_text(egui::RichText::new(hint).color(INK3))
             .desired_width(inner.width()),
     );
@@ -505,19 +513,17 @@ impl Studio {
         }
         let (searching, err, hits) = host.youtube_state();
         if searching {
-            p.rect_filled(mid, r(10), Color32::from_rgb(0x10, 0x10, 0x12));
-            p.rect_stroke(mid, r(10), hair(LINE), StrokeKind::Inside);
-            p.text(mid.center(), Align2::CENTER_CENTER, "searching YouTube…", font(12.5), INK2);
+            putty_panel(&p, mid, 6);
+            p.text(mid.center(), Align2::CENTER_CENTER, "searching YouTube…", font_medium(12.5), INK2);
             return;
         }
         if hits.is_empty() {
-            p.rect_filled(mid, r(10), Color32::from_rgb(0x10, 0x10, 0x12));
-            p.rect_stroke(mid, r(10), hair(LINE), StrokeKind::Inside);
+            putty_panel(&p, mid, 6);
             let mut sx = mid.left() + 12.0;
             let sy = mid.top() + 12.0;
             let mut picked_sug: Option<&str> = None;
             for sug in YT_SUGGESTIONS {
-                let sw = p.layout_no_wrap(sug.into(), font(11.5), INK2).size().x + 22.0;
+                let sw = p.layout_no_wrap(sug.into(), font_medium(11.5), INK).size().x + 22.0;
                 if sx + sw > mid.right() - 12.0 {
                     break;
                 }
@@ -525,7 +531,7 @@ impl Studio {
                 if chip(ui, sr, ui.id().with(("yt-sug", sug)), &format!("suggest {sug}"), false, false).clicked() {
                     picked_sug = Some(sug);
                 }
-                p.text(sr.center(), Align2::CENTER_CENTER, sug, font(11.5), INK2);
+                p.text(sr.center(), Align2::CENTER_CENTER, sug, font_medium(11.5), INK);
                 sx += sw + 8.0;
             }
             if let Some(s) = picked_sug {
@@ -568,7 +574,7 @@ impl Studio {
                     }
                     let resp = hit(ui, rr, egui::Id::new(("yt-hit", i)), Sense::click(), &format!("youtube result {}", i + 1));
                     let hov = resp.hovered() || resp.is_pointer_button_down_on();
-                    raised(&lp, rr, 9, if hov { G3 } else { G2 });
+                    paint_switch_cap(&lp, rr, SwitchKind::PuttyAmber, hov, hov, resp.is_pointer_button_down_on());
 
                     let mut meta_parts = Vec::new();
                     if !h.uploader.is_empty() {
@@ -581,23 +587,23 @@ impl Studio {
                         meta_parts.push(fmt_dur(d));
                     }
                     let meta = meta_parts.join(" · ");
-                    let meta_w = lp.layout_no_wrap(meta.clone(), mono(10.5), INK3).size().x;
+                    let meta_w = lp.layout_no_wrap(meta.clone(), mono(10.5), INK2).size().x;
                     let max_title_chars = ((rr.width() - meta_w - 48.0) / 7.0).max(12.0) as usize;
 
-                    draw_icon(&lp, Icon::Play, egui::pos2(rr.left() + 15.0, rr.center().y), 11.5, if hov { HI } else { INK3 });
+                    draw_icon(&lp, Icon::Play, egui::pos2(rr.left() + 15.0, rr.center().y), 11.5, if hov { ON_HI } else { INK2 });
                     lp.text(
                         egui::pos2(rr.left() + 28.0, rr.center().y),
                         Align2::LEFT_CENTER,
                         super::play::short(&h.title, max_title_chars),
-                        font_medium(12.0),
-                        if hov { HI } else { INK },
+                        font_semibold(12.0),
+                        if hov { ON_HI } else { INK },
                     );
                     lp.text(
                         egui::pos2(rr.right() - 12.0, rr.center().y),
                         Align2::RIGHT_CENTER,
                         meta,
                         mono(10.5),
-                        if hov { INK2 } else { INK3 },
+                        if hov { ON_HI } else { INK3 },
                     );
                     if resp.clicked() {
                         picked_url = Some(h.url.clone());
@@ -618,10 +624,9 @@ impl Studio {
         let resp = hit(ui, b, ui.id().with("dig"), Sense::click(), "dig");
         let h = hold(ui, &resp, 0.6);
         let down = resp.is_pointer_button_down_on();
-        p.add(egui::epaint::Shadow { offset: [0, 6], blur: 18, spread: 0, color: Color32::from_black_alpha(90) }.as_shape(b, r(22)));
-        p.rect_filled(b, r(22), if down { INK } else { HI });
+        paint_switch_cap(&p, b, SwitchKind::Amber, true, resp.hovered(), down);
         draw_icon(&p, Icon::Dig, c - egui::vec2(0.0, 14.0), if compact { 26.0 } else { 30.0 }, ON_HI);
-        p.text(c + egui::vec2(0.0, 20.0), Align2::CENTER_CENTER, "Dig", font_semibold(17.0), ON_HI);
+        p.text(c + egui::vec2(0.0, 20.0), Align2::CENTER_CENTER, "DIG", font_semibold(17.0), ON_HI);
         if down {
             let t0 = ui.input(|i| i.pointer.press_start_time()).unwrap_or(0.0);
             let f = ((ui.input(|i| i.time) - t0) / 0.6).clamp(0.0, 1.0) as f32;
@@ -696,12 +701,12 @@ impl Studio {
             let scrim = Rect::from_min_max(egui::pos2(rc.left(), rc.bottom() - 42.0), rc.max);
             p.rect_filled(scrim, egui::CornerRadius { nw: 0, ne: 0, sw: 10, se: 10 }, Color32::from_black_alpha(205));
             let name = self.source_name(host, src);
-            p.text(egui::pos2(rc.left() + 9.0, rc.bottom() - 26.0), Align2::LEFT_CENTER, super::play::short(&name, 22), font_medium(11.5), INK);
-            p.text(egui::pos2(rc.left() + 9.0, rc.bottom() - 10.0), Align2::LEFT_CENTER, super::play::short(&self.provenance_line(host, src), 32), font(10.0), INK2);
+            p.text(egui::pos2(rc.left() + 9.0, rc.bottom() - 26.0), Align2::LEFT_CENTER, super::play::short(&name, 22), font_medium(11.5), CREAM);
+            p.text(egui::pos2(rc.left() + 9.0, rc.bottom() - 10.0), Align2::LEFT_CENTER, super::play::short(&self.provenance_line(host, src), 32), font(10.0), CREAM2);
             let cb = Rect::from_min_size(egui::pos2(rc.right() - 66.0, rc.top() + 6.0), egui::vec2(60.0, 30.0));
-            p.rect_filled(cb, r(8), Color32::from_black_alpha(160));
-            draw_icon(&p, Icon::Chop, egui::pos2(cb.left() + 15.0, cb.center().y), 13.0, INK);
-            p.text(egui::pos2(cb.left() + 26.0, cb.center().y), Align2::LEFT_CENTER, "Chop", font(11.5), INK);
+            p.rect_filled(cb, r(6), Color32::from_black_alpha(190));
+            draw_icon(&p, Icon::Chop, egui::pos2(cb.left() + 15.0, cb.center().y), 13.0, CREAM);
+            p.text(egui::pos2(cb.left() + 26.0, cb.center().y), Align2::LEFT_CENTER, "Chop", font_medium(11.5), CREAM);
             if hit(ui, cb.expand2(egui::vec2(4.0, 7.0)), ui.id().with(("chop-new", src)), Sense::click(), &format!("chop {name}")).clicked() {
                 chop = Some(src);
             }

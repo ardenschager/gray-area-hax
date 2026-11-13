@@ -1,5 +1,8 @@
-//! Studio widgets, custom-painted: segmented switches, chips, knobs,
-//! emitter rings, rounded footage tiles, icons, hold detection.
+//! Tactile broadcast / studio hardware widgets (`ISOL8` industrial design):
+//! anodized sand-olive chassis plates, machined corner screws, brushed putty
+//! sub-panels, recessed bakelite monitor bezels, cylindrical charcoal pointer
+//! knobs with sunken LCD readouts, and backlit translucent incandescent
+//! amber / smoked ruby / mint-putty console switches.
 
 use crate::theme::*;
 use egui::{
@@ -31,9 +34,9 @@ pub fn text_spaced(
     rect
 }
 
-/// 10.5 px uppercase label, `ink-3`, +0.08 em tracking.
+/// Silkscreened uppercase section header on sand/putty metal (`ISOL8`, `CH. MODE`, `OUTPUT`).
 pub fn caps(painter: &Painter, pos: Pos2, align: Align2, text: &str, size: f32) -> Rect {
-    text_spaced(painter, pos, align, &text.to_uppercase(), font_medium(size), INK3, size * 0.1)
+    text_spaced(painter, pos, align, &text.to_uppercase(), font_semibold(size), INK2, size * 0.08)
 }
 
 /// Text made of (string, font, colour) runs.
@@ -48,16 +51,360 @@ pub fn runs(painter: &Painter, pos: Pos2, align: Align2, parts: &[(&str, FontId,
     rect
 }
 
-/// Raised surface: g2 fill, 1 px hairline, 1 px top inner highlight.
-pub fn raised(painter: &Painter, rect: Rect, radius: u8, fill: Color32) {
-    painter.rect_filled(rect, r(radius), fill);
-    painter.rect_stroke(rect, r(radius), hair(LINE), StrokeKind::Inside);
-    let y = rect.top() + 0.5;
-    let inset = radius as f32 * 0.7;
+// ============================================================================
+// Hardware Chassis, Sub-Panels, Monitor Bezels, Screws, LEDs & LCD Readouts
+// ============================================================================
+
+/// Paint vertical linear-gradient quad.
+pub fn vgrad_rect(painter: &Painter, rect: Rect, top: Color32, bot: Color32) {
+    if rect.width() <= 0.0 || rect.height() <= 0.0 {
+        return;
+    }
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(rect.left_top(), top);
+    mesh.colored_vertex(rect.right_top(), top);
+    mesh.colored_vertex(rect.right_bottom(), bot);
+    mesh.colored_vertex(rect.left_bottom(), bot);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    painter.add(Shape::mesh(mesh));
+}
+
+/// Paint radial lamp / keycap gradient inside `rect` (center filament -> mid -> outer edge).
+pub fn radial_lens(painter: &Painter, rect: Rect, core: Color32, mid: Color32, edge: Color32) {
+    if rect.width() <= 1.0 || rect.height() <= 1.0 {
+        return;
+    }
+    let c = rect.center();
+    let inner = rect.shrink2(egui::vec2(rect.width() * 0.24, rect.height() * 0.24));
+    let mut mesh = egui::Mesh::default();
+    // 0: hot center
+    mesh.colored_vertex(c, core);
+    // 1..=4: mid ring
+    let mid_pts = [inner.left_top(), inner.right_top(), inner.right_bottom(), inner.left_bottom()];
+    for pt in mid_pts {
+        mesh.colored_vertex(pt, mid);
+    }
+    // 5..=8: outer edge
+    let out_pts = [rect.left_top(), rect.right_top(), rect.right_bottom(), rect.left_bottom()];
+    for pt in out_pts {
+        mesh.colored_vertex(pt, edge);
+    }
+    for k in 0..4u32 {
+        let nk = (k + 1) % 4;
+        mesh.add_triangle(0, 1 + k, 1 + nk);
+        mesh.add_triangle(1 + k, 5 + k, 5 + nk);
+        mesh.add_triangle(1 + k, 5 + nk, 1 + nk);
+    }
+    painter.add(Shape::mesh(mesh));
+}
+
+/// Main warm anodized sand-olive metal faceplate with machined top/bottom bevels.
+pub fn chassis_plate(painter: &Painter, rect: Rect, top: Color32, bot: Color32) {
+    vgrad_rect(painter, rect, top, bot);
     painter.line_segment(
-        [egui::pos2(rect.left() + inset, y), egui::pos2(rect.right() - inset, y)],
-        Stroke::new(1.0, Color32::from_white_alpha(9)),
+        [egui::pos2(rect.left(), rect.top() + 0.5), egui::pos2(rect.right(), rect.top() + 0.5)],
+        Stroke::new(1.0, BEVEL_HI),
     );
+    painter.line_segment(
+        [egui::pos2(rect.left(), rect.bottom() - 0.5), egui::pos2(rect.right(), rect.bottom() - 0.5)],
+        Stroke::new(1.0, BEVEL_LO),
+    );
+}
+
+/// 4 machined slotted gunmetal rack/corner screws on outer faceplates & modals.
+pub fn chassis_screws(painter: &Painter, rect: Rect, inset: f32) {
+    if rect.width() < 120.0 || rect.height() < 80.0 {
+        return;
+    }
+    let angles = [0.55f32, -0.42, 0.78, -0.25];
+    for ((x, y), ang) in [
+        (rect.left() + inset, rect.top() + inset),
+        (rect.right() - inset, rect.top() + inset),
+        (rect.left() + inset, rect.bottom() - inset),
+        (rect.right() - inset, rect.bottom() - inset),
+    ]
+    .into_iter()
+    .zip(angles)
+    {
+        let c = egui::pos2(x, y);
+        painter.circle_filled(c + egui::vec2(0.0, 1.0), 4.8, Color32::from_rgba_unmultiplied(255, 250, 232, 75));
+        painter.circle_filled(c, 4.5, Color32::from_rgb(0x52, 0x4d, 0x3d));
+        painter.circle_filled(c, 3.6, Color32::from_rgb(0x6e, 0x68, 0x55));
+        painter.circle_stroke(c, 4.2, Stroke::new(0.8, Color32::from_rgb(0x34, 0x30, 0x24)));
+        let d = egui::vec2(ang.cos() * 2.7, ang.sin() * 2.7);
+        painter.line_segment([c - d, c + d], Stroke::new(1.2, Color32::from_rgb(0x28, 0x25, 0x1c)));
+    }
+}
+
+/// Lighter brushed putty inset sub-panel (like `ATTEN.` in `ISOL8`).
+pub fn putty_panel(painter: &Painter, rect: Rect, radius: u8) {
+    painter.rect_filled(rect.translate(egui::vec2(0.0, 1.0)), r(radius), Color32::from_rgba_unmultiplied(255, 250, 234, 65));
+    painter.rect_filled(rect, r(radius), PANEL);
+    painter.rect_stroke(rect, r(radius), Stroke::new(1.0, PANEL_LO), StrokeKind::Inside);
+    let inset = (radius as f32 * 0.6).max(2.0);
+    painter.line_segment(
+        [egui::pos2(rect.left() + inset, rect.top() + 1.2), egui::pos2(rect.right() - inset, rect.top() + 1.2)],
+        Stroke::new(1.0, PANEL_HI),
+    );
+}
+
+/// Recessed dark bakelite / CRT monitor well for footage, waveforms, and step matrices.
+pub fn monitor_well(painter: &Painter, rect: Rect, radius: u8) {
+    painter.rect_filled(rect, r(radius), WELL);
+    // Sunken top shadow + warm anodized bottom catchlight.
+    let inset = (radius as f32 * 0.5).max(2.0);
+    painter.line_segment(
+        [egui::pos2(rect.left() + inset, rect.top() + 1.0), egui::pos2(rect.right() - inset, rect.top() + 1.0)],
+        Stroke::new(1.8, Color32::from_black_alpha(180)),
+    );
+    painter.line_segment(
+        [egui::pos2(rect.left() + inset, rect.bottom() + 0.8), egui::pos2(rect.right() - inset, rect.bottom() + 0.8)],
+        Stroke::new(1.0, BEVEL_HI),
+    );
+    painter.rect_stroke(rect, r(radius), Stroke::new(1.4, Color32::from_rgb(0x0d, 0x0f, 0x10)), StrokeKind::Inside);
+}
+
+/// Draw the outer sunken dark bezel rim around a stage/preview after `mask_corners`.
+pub fn monitor_bezel(painter: &Painter, rect: Rect, radius: u8) {
+    let inset = (radius as f32 * 0.55).max(2.0);
+    painter.line_segment(
+        [egui::pos2(rect.left() + inset, rect.bottom() + 1.0), egui::pos2(rect.right() - inset, rect.bottom() + 1.0)],
+        Stroke::new(1.0, BEVEL_HI),
+    );
+    painter.rect_stroke(rect, r(radius), Stroke::new(2.2, WELL), StrokeKind::Inside);
+    painter.rect_stroke(rect.shrink(1.6), r(radius.saturating_sub(1)), Stroke::new(1.0, Color32::from_black_alpha(190)), StrokeKind::Inside);
+}
+
+/// Sunken brushed-silver LCD value box (`200`, `700`, `2500`, `8000`, `-18.0`).
+pub fn lcd_readout(painter: &Painter, rect: Rect, text: &str, font_size: f32) {
+    painter.rect_filled(rect, r(3), LCD_BG);
+    painter.line_segment(
+        [egui::pos2(rect.left() + 2.0, rect.top() + 0.8), egui::pos2(rect.right() - 2.0, rect.top() + 0.8)],
+        Stroke::new(1.2, LCD_SHADOW),
+    );
+    painter.line_segment(
+        [egui::pos2(rect.left() + 2.0, rect.bottom() + 0.6), egui::pos2(rect.right() - 2.0, rect.bottom() + 0.6)],
+        Stroke::new(1.0, BEVEL_HI),
+    );
+    painter.rect_stroke(rect, r(3), Stroke::new(1.0, Color32::from_rgb(0x66, 0x62, 0x54)), StrokeKind::Inside);
+    painter.text(rect.center(), Align2::CENTER_CENTER, text, mono_medium(font_size), LCD_INK);
+}
+
+/// Sunken dark charcoal display slot (`STEREO`, `24 dB/Oct`).
+pub fn sunken_display(painter: &Painter, rect: Rect, text: &str, font_size: f32) {
+    painter.rect_filled(rect, r(3), SLOT_BG);
+    painter.line_segment(
+        [egui::pos2(rect.left() + 2.0, rect.top() + 0.8), egui::pos2(rect.right() - 2.0, rect.top() + 0.8)],
+        Stroke::new(1.2, Color32::from_black_alpha(190)),
+    );
+    painter.line_segment(
+        [egui::pos2(rect.left() + 2.0, rect.bottom() + 0.7), egui::pos2(rect.right() - 2.0, rect.bottom() + 0.7)],
+        Stroke::new(1.0, BEVEL_HI),
+    );
+    painter.rect_stroke(rect, r(3), Stroke::new(1.0, Color32::from_rgb(0x14, 0x13, 0x10)), StrokeKind::Inside);
+    painter.text(rect.center(), Align2::CENTER_CENTER, text, font_semibold(font_size), SLOT_INK);
+}
+
+/// Small round machined jewel indicator LED (green or ruby).
+pub fn jewel_led(painter: &Painter, center: Pos2, rad: f32, on: bool, ruby: bool) {
+    painter.circle_filled(center, rad + 1.3, Color32::from_rgb(0x3a, 0x36, 0x2a));
+    let fill = match (ruby, on) {
+        (true, true) => Color32::from_rgb(0xff, 0x58, 0x48),
+        (true, false) => Color32::from_rgb(0x6e, 0x30, 0x2b),
+        (false, true) => Color32::from_rgb(0x8c, 0xff, 0x5a),
+        (false, false) => Color32::from_rgb(0x52, 0x63, 0x42),
+    };
+    if on {
+        let glow = if ruby {
+            Color32::from_rgba_unmultiplied(255, 88, 72, 70)
+        } else {
+            Color32::from_rgba_unmultiplied(140, 255, 90, 70)
+        };
+        painter.circle_filled(center, rad + 3.2, glow);
+    }
+    painter.circle_filled(center, rad, fill);
+    painter.circle_filled(center - egui::vec2(rad * 0.28, rad * 0.28), rad * 0.30, Color32::from_white_alpha(if on { 190 } else { 85 }));
+}
+
+// ============================================================================
+// Tactile Console Keycaps & Backlit Translucent Switches
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwitchKind {
+    /// Smoked amber when off -> glowing incandescent amber-gold lamp when on (`SOLO`).
+    Amber,
+    /// Smoked ruby when off -> glowing incandescent ruby lamp when on (`MUTE` / `REC`).
+    Ruby,
+    /// Raised warm putty keycap when off -> glowing translucent mint-teal when on (`L R M S` / Views).
+    PuttyMint,
+    /// Raised warm putty keycap when off -> glowing incandescent amber when on.
+    PuttyAmber,
+    /// Matte dark charcoal rocker/push cap (`DIM`).
+    DarkCap,
+}
+
+/// Paint a recessed hardware switch housing + cap (without text, so callers can
+/// draw multi-line legends, icons, or custom typography).
+pub fn paint_switch_cap(painter: &Painter, rect: Rect, kind: SwitchKind, on: bool, hovered: bool, pressed: bool) {
+    // Soft directional shadow cast down-left onto the sand faceplate.
+    painter.rect_filled(
+        rect.translate(egui::vec2(-1.2, 2.0)),
+        r(4),
+        Color32::from_rgba_unmultiplied(26, 23, 15, 78),
+    );
+    // Outer black molded bezel housing (`#16191A`).
+    painter.rect_filled(rect, r(4), WELL);
+    painter.line_segment(
+        [egui::pos2(rect.left() + 2.0, rect.bottom() + 0.8), egui::pos2(rect.right() - 2.0, rect.bottom() + 0.8)],
+        Stroke::new(1.0, BEVEL_HI),
+    );
+
+    let pad = if rect.height() >= 38.0 { 2.8 } else { 2.0 };
+    let mut cap = rect.shrink(pad);
+    if pressed {
+        cap = cap.translate(egui::vec2(0.0, 0.7));
+    }
+    if cap.width() <= 2.0 || cap.height() <= 2.0 {
+        return;
+    }
+
+    match (kind, on) {
+        (SwitchKind::Amber, true) | (SwitchKind::PuttyAmber, true) => {
+            painter.rect_filled(cap, r(2), AMBER_EDGE);
+            radial_lens(painter, cap.shrink(0.8), AMBER_CORE, AMBER_MID, AMBER_EDGE);
+            let inner_rim = cap.shrink(2.2);
+            if inner_rim.width() > 4.0 && inner_rim.height() > 4.0 {
+                painter.rect_stroke(inner_rim, r(2), Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 252, 210, 175)), StrokeKind::Inside);
+            }
+            painter.rect_stroke(cap, r(2), Stroke::new(1.0, Color32::from_rgb(0x9e, 0x76, 0x1e)), StrokeKind::Inside);
+        }
+        (SwitchKind::Amber, false) => {
+            let mid = if hovered { Color32::from_rgb(0x8d, 0x78, 0x40) } else { AMBER_OFF };
+            let core = if hovered { Color32::from_rgb(0x9c, 0x86, 0x49) } else { Color32::from_rgb(0x89, 0x75, 0x3f) };
+            radial_lens(painter, cap, core, mid, AMBER_OFF_EDGE);
+            let inner_rim = cap.shrink(2.2);
+            if inner_rim.width() > 4.0 && inner_rim.height() > 4.0 {
+                painter.rect_stroke(inner_rim, r(2), Stroke::new(1.0, Color32::from_rgb(0x98, 0x82, 0x48)), StrokeKind::Inside);
+            }
+            painter.rect_stroke(cap, r(2), Stroke::new(1.0, Color32::from_rgb(0x42, 0x36, 0x18)), StrokeKind::Inside);
+        }
+        (SwitchKind::Ruby, true) => {
+            painter.rect_filled(cap, r(2), RUBY_EDGE);
+            radial_lens(painter, cap.shrink(0.8), RUBY_CORE, RUBY_MID, RUBY_EDGE);
+            let inner_rim = cap.shrink(2.2);
+            if inner_rim.width() > 4.0 && inner_rim.height() > 4.0 {
+                painter.rect_stroke(inner_rim, r(2), Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 210, 198, 165)), StrokeKind::Inside);
+            }
+            painter.rect_stroke(cap, r(2), Stroke::new(1.0, Color32::from_rgb(0x7c, 0x1d, 0x16)), StrokeKind::Inside);
+        }
+        (SwitchKind::Ruby, false) => {
+            let mid = if hovered { Color32::from_rgb(0x8c, 0x45, 0x3d) } else { RUBY_OFF };
+            let core = if hovered { Color32::from_rgb(0x9a, 0x4e, 0x45) } else { Color32::from_rgb(0x86, 0x42, 0x3a) };
+            radial_lens(painter, cap, core, mid, RUBY_OFF_EDGE);
+            let inner_rim = cap.shrink(2.2);
+            if inner_rim.width() > 4.0 && inner_rim.height() > 4.0 {
+                painter.rect_stroke(inner_rim, r(2), Stroke::new(1.0, Color32::from_rgb(0x94, 0x4c, 0x44)), StrokeKind::Inside);
+            }
+            painter.rect_stroke(cap, r(2), Stroke::new(1.0, Color32::from_rgb(0x42, 0x1b, 0x17)), StrokeKind::Inside);
+        }
+        (SwitchKind::PuttyMint, true) => {
+            painter.rect_filled(cap, r(2), MINT_EDGE);
+            radial_lens(painter, cap.shrink(0.8), MINT_CORE, MINT_MID, MINT_EDGE);
+            let inner_rim = cap.shrink(2.0);
+            if inner_rim.width() > 4.0 && inner_rim.height() > 4.0 {
+                painter.rect_stroke(inner_rim, r(2), Stroke::new(1.0, Color32::from_rgba_unmultiplied(215, 255, 236, 175)), StrokeKind::Inside);
+            }
+            painter.rect_stroke(cap, r(2), Stroke::new(1.0, Color32::from_rgb(0x28, 0x66, 0x4b)), StrokeKind::Inside);
+        }
+        (SwitchKind::PuttyMint, false) | (SwitchKind::PuttyAmber, false) => {
+            let face = if pressed {
+                Color32::from_rgb(0x9e, 0x99, 0x8c)
+            } else if hovered {
+                G3
+            } else {
+                PUTTY
+            };
+            painter.rect_filled(cap, r(3), PUTTY_LO);
+            let top_cap = Rect::from_min_max(cap.min, egui::pos2(cap.right(), (cap.bottom() - 1.5).max(cap.top() + 2.0)));
+            painter.rect_filled(top_cap, r(3), face);
+            painter.line_segment(
+                [egui::pos2(top_cap.left() + 2.0, top_cap.top() + 0.8), egui::pos2(top_cap.right() - 2.0, top_cap.top() + 0.8)],
+                Stroke::new(1.0, PUTTY_HI),
+            );
+        }
+        (SwitchKind::DarkCap, _) => {
+            let face = if on {
+                Color32::from_rgb(0x34, 0x37, 0x37)
+            } else if hovered {
+                Color32::from_rgb(0x2e, 0x31, 0x31)
+            } else {
+                Color32::from_rgb(0x25, 0x28, 0x28)
+            };
+            painter.rect_filled(cap, r(3), Color32::from_rgb(0x11, 0x13, 0x13));
+            let top_cap = Rect::from_min_max(cap.min, egui::pos2(cap.right(), (cap.bottom() - 1.8).max(cap.top() + 2.0)));
+            painter.rect_filled(top_cap, r(3), face);
+            painter.line_segment(
+                [egui::pos2(top_cap.left() + 2.0, top_cap.top() + 0.8), egui::pos2(top_cap.right() - 2.0, top_cap.top() + 0.8)],
+                Stroke::new(1.0, Color32::from_rgb(0x4b, 0x4f, 0x4f)),
+            );
+        }
+    }
+}
+
+/// Interactive hardware backlit push-button (supports 1-line or `\n` 2-line silkscreened legend).
+pub fn hw_switch(
+    ui: &mut Ui,
+    rect: Rect,
+    id: egui::Id,
+    label: &str,
+    a11y_label: &str,
+    kind: SwitchKind,
+    on: bool,
+    font_size: f32,
+) -> Response {
+    let resp = hit(ui, rect, id, Sense::click(), a11y_label);
+    let p = ui.painter();
+    paint_switch_cap(p, rect, kind, on, resp.hovered(), resp.is_pointer_button_down_on());
+    let fg = match (kind, on) {
+        (SwitchKind::DarkCap, _) => CREAM,
+        (SwitchKind::PuttyMint, true) => Color32::from_rgb(0x13, 0x2e, 0x21),
+        (_, true) => ON_HI,
+        (SwitchKind::Amber, false) => Color32::from_rgb(0x24, 0x1c, 0x09),
+        (SwitchKind::Ruby, false) => Color32::from_rgb(0x24, 0x0f, 0x0c),
+        _ => INK,
+    };
+    if let Some((l1, l2)) = label.split_once('\n') {
+        let dy = (font_size * 0.58).max(5.5);
+        p.text(rect.center() - egui::vec2(0.0, dy), Align2::CENTER_CENTER, l1, font_semibold(font_size), fg);
+        p.text(rect.center() + egui::vec2(0.0, dy), Align2::CENTER_CENTER, l2, font_semibold(font_size), fg);
+    } else {
+        p.text(rect.center(), Align2::CENTER_CENTER, label, font_semibold(font_size), fg);
+    }
+    resp
+}
+
+/// Raised putty keycap surface (`D · Hybrid` compatible helper).
+pub fn raised(painter: &Painter, rect: Rect, radius: u8, fill: Color32) {
+    let rad = radius.min(6);
+    painter.rect_filled(
+        rect.translate(egui::vec2(-0.8, 1.5)),
+        r(rad),
+        Color32::from_rgba_unmultiplied(28, 24, 16, 62),
+    );
+    painter.rect_filled(rect, r(rad), WELL);
+    let cap = rect.shrink(1.6);
+    if cap.width() > 2.0 && cap.height() > 2.0 {
+        painter.rect_filled(cap, r(rad.saturating_sub(1)), PUTTY_LO);
+        let top = Rect::from_min_max(cap.min, egui::pos2(cap.right(), (cap.bottom() - 1.2).max(cap.top() + 1.0)));
+        painter.rect_filled(top, r(rad.saturating_sub(1)), fill);
+        let inset = (rad as f32 * 0.5).max(1.5);
+        painter.line_segment(
+            [egui::pos2(top.left() + inset, top.top() + 0.7), egui::pos2(top.right() - inset, top.top() + 0.7)],
+            Stroke::new(1.0, PUTTY_HI),
+        );
+    }
 }
 
 /// An interactive rect with an accessibility label (so tests and screen
@@ -69,9 +416,7 @@ pub fn hit(ui: &mut Ui, rect: Rect, id: egui::Id, sense: Sense, label: &str) -> 
     resp
 }
 
-/// Press-and-hold detection (touch-first: no right-click needed). True
-/// once, when the pointer has been down on `resp` for `secs` without
-/// dragging; `consumed` then suppresses the click on release.
+/// Press-and-hold detection (touch-first: no right-click needed).
 pub struct Hold {
     pub fired: bool,
     pub held_before: bool,
@@ -96,13 +441,14 @@ pub fn hold(ui: &Ui, resp: &Response, secs: f64) -> Hold {
     } else if !down {
         ui.data_mut(|d| d.insert_temp(id, (None::<f64>, false)));
     } else {
-        ui.data_mut(|d| d.insert_temp(id, (None::<f64>, done)));
+        ui.data_mut(|d| d.insert_temp(resp.id.with("hold"), (None::<f64>, done)));
     }
     out
 }
 
-/// Segmented switch with a sliding highlight thumb. Returns the newly
-/// picked index when tapped.
+/// Segmented hardware console bank: recessed black housing holding side-by-side
+/// putty keycaps that illuminate in incandescent Amber (`thumb_hi = true`) or
+/// glowing Mint-Teal (`thumb_hi = false`) when active!
 #[allow(clippy::too_many_arguments)]
 pub fn segmented(
     ui: &mut Ui,
@@ -131,29 +477,64 @@ pub fn segmented_named(
     thumb_hi: bool,
 ) -> Option<usize> {
     let painter = ui.painter().clone();
-    painter.rect_filled(rect, r(12), G1);
-    painter.rect_stroke(rect, r(12), hair(LINE), StrokeKind::Inside);
+    painter.rect_filled(
+        rect.translate(egui::vec2(-1.0, 1.8)),
+        r(5),
+        Color32::from_rgba_unmultiplied(24, 21, 14, 70),
+    );
+    painter.rect_filled(rect, r(5), WELL);
+    painter.line_segment(
+        [egui::pos2(rect.left() + 3.0, rect.bottom() + 0.8), egui::pos2(rect.right() - 3.0, rect.bottom() + 0.8)],
+        Stroke::new(1.0, BEVEL_HI),
+    );
+
     let n = labels.len().max(1);
-    let inner = rect.shrink(4.0);
-    let w = inner.width() / n as f32;
-    let x = ui.ctx().animate_value_with_time(id.with("thumb"), selected as f32, 0.22);
-    let thumb = Rect::from_min_size(egui::pos2(inner.left() + x * w, inner.top()), egui::vec2(w, inner.height()));
-    if thumb_hi {
-        painter.rect_filled(thumb, r(9), HI);
-    } else {
-        painter.rect_filled(thumb, r(9), G4);
-        painter.rect_stroke(thumb, r(9), hair(LINE2), StrokeKind::Inside);
-    }
+    let inner = rect.shrink(2.5);
+    let gap = 2.0;
+    let w = ((inner.width() - gap * (n.saturating_sub(1) as f32)) / n as f32).max(8.0);
     let mut picked = None;
+    let switch_kind = if thumb_hi { SwitchKind::PuttyAmber } else { SwitchKind::PuttyMint };
+
     for (i, label) in labels.iter().enumerate() {
-        let cell = Rect::from_min_size(egui::pos2(inner.left() + i as f32 * w, inner.top()), egui::vec2(w, inner.height()));
+        let cell = Rect::from_min_size(
+            egui::pos2(inner.left() + i as f32 * (w + gap), inner.top()),
+            egui::vec2(w, inner.height()),
+        );
         let resp = hit(ui, cell, id.with(i), Sense::click(), names.get(i).copied().unwrap_or(label));
         if resp.clicked() {
             picked = Some(i);
         }
         let on = i == selected;
+        let pressed = resp.is_pointer_button_down_on();
+        let mut cap = cell;
+        if pressed {
+            cap = cap.translate(egui::vec2(0.0, 0.6));
+        }
+        match (switch_kind, on) {
+            (SwitchKind::PuttyAmber, true) => {
+                painter.rect_filled(cap, r(3), AMBER_EDGE);
+                radial_lens(&painter, cap.shrink(0.6), AMBER_CORE, AMBER_MID, AMBER_EDGE);
+                painter.rect_stroke(cap, r(3), Stroke::new(1.0, Color32::from_rgb(0x9e, 0x76, 0x1e)), StrokeKind::Inside);
+            }
+            (SwitchKind::PuttyMint, true) => {
+                painter.rect_filled(cap, r(3), MINT_EDGE);
+                radial_lens(&painter, cap.shrink(0.6), MINT_CORE, MINT_MID, MINT_EDGE);
+                painter.rect_stroke(cap, r(3), Stroke::new(1.0, Color32::from_rgb(0x28, 0x66, 0x4b)), StrokeKind::Inside);
+            }
+            _ => {
+                let face = if resp.hovered() { G3 } else { PUTTY };
+                painter.rect_filled(cap, r(3), PUTTY_LO);
+                let top_c = Rect::from_min_max(cap.min, egui::pos2(cap.right(), (cap.bottom() - 1.3).max(cap.top() + 1.0)));
+                painter.rect_filled(top_c, r(3), face);
+                painter.line_segment(
+                    [egui::pos2(top_c.left() + 2.0, top_c.top() + 0.7), egui::pos2(top_c.right() - 2.0, top_c.top() + 0.7)],
+                    Stroke::new(1.0, PUTTY_HI),
+                );
+            }
+        }
+
         let col = if on {
-            if thumb_hi { ON_HI } else { INK }
+            if thumb_hi { ON_HI } else { Color32::from_rgb(0x12, 0x2d, 0x20) }
         } else if resp.hovered() {
             INK
         } else {
@@ -163,7 +544,7 @@ pub fn segmented_named(
         if hint.is_empty() {
             painter.text(cell.center(), Align2::CENTER_CENTER, *label, font.clone(), col);
         } else {
-            let hint_col = if on && thumb_hi { Color32::from_black_alpha(90) } else { INK4 };
+            let hint_col = if on { Color32::from_black_alpha(120) } else { INK4 };
             runs(
                 &painter,
                 cell.center(),
@@ -175,21 +556,21 @@ pub fn segmented_named(
     picked
 }
 
-/// A chip: rounded raised button with free-form content painted by `f`.
+/// Hardware console keycap / backlit chip.
 pub fn chip(ui: &mut Ui, rect: Rect, id: egui::Id, label: &str, ghost: bool, on: bool) -> Response {
     let resp = hit(ui, rect, id, Sense::click_and_drag(), label);
     let p = ui.painter();
     if on {
-        p.rect_filled(rect, r(10), HI);
+        paint_switch_cap(p, rect, SwitchKind::Amber, true, resp.hovered(), resp.is_pointer_button_down_on());
     } else if !ghost {
-        raised(p, rect, 10, if resp.is_pointer_button_down_on() { G3 } else { G2 });
+        paint_switch_cap(p, rect, SwitchKind::PuttyAmber, false, resp.hovered(), resp.is_pointer_button_down_on());
     } else if resp.hovered() || resp.is_pointer_button_down_on() {
-        p.rect_filled(rect, r(10), G2);
+        paint_switch_cap(p, rect, SwitchKind::PuttyAmber, false, true, resp.is_pointer_button_down_on());
     }
     resp
 }
 
-/// Primary / secondary button with an icon painter and a label.
+/// Primary / secondary hardware push-button with an icon painter and a label.
 pub fn button(ui: &mut Ui, rect: Rect, id: egui::Id, label: &str, primary: bool, icon: Option<Icon>, kbd: Option<&str>) -> Response {
     button_named(ui, rect, id, label, label, primary, icon, kbd)
 }
@@ -200,31 +581,34 @@ pub fn button_named(ui: &mut Ui, rect: Rect, id: egui::Id, label: &str, name: &s
     let resp = hit(ui, rect, id, Sense::click(), name);
     let p = ui.painter().clone();
     let pressed = resp.is_pointer_button_down_on();
-    if primary {
-        p.rect_filled(rect, r(10), if pressed { INK2 } else { HI });
-    } else {
-        raised(&p, rect, 10, if pressed { G3 } else { G2 });
-    }
+    paint_switch_cap(
+        &p,
+        rect,
+        if primary { SwitchKind::Amber } else { SwitchKind::PuttyAmber },
+        primary,
+        resp.hovered(),
+        pressed,
+    );
     let fg = if primary { ON_HI } else { INK };
-    let font = font_medium(13.0);
-    let galley = p.layout_no_wrap(label.to_string(), font.clone(), fg);
-    let icon_w = if icon.is_some() { 22.0 } else { 0.0 };
-    let kbd_w = if kbd.is_some() { 18.0 } else { 0.0 };
+    let fnt = font_semibold(12.5);
+    let galley = p.layout_no_wrap(label.to_string(), fnt, fg);
+    let icon_w = if icon.is_some() { 20.0 } else { 0.0 };
+    let kbd_w = if kbd.is_some() { 16.0 } else { 0.0 };
     let total = icon_w + galley.size().x + kbd_w;
     let mut x = rect.center().x - total / 2.0;
     if let Some(ic) = icon {
-        draw_icon(&p, ic, egui::pos2(x + 8.0, rect.center().y), 14.0, fg);
+        draw_icon(&p, ic, egui::pos2(x + 7.5, rect.center().y), 13.5, fg);
         x += icon_w;
     }
     p.galley(egui::pos2(x, rect.center().y - galley.size().y / 2.0), galley.clone(), fg);
     x += galley.size().x;
     if let Some(k) = kbd {
         p.text(
-            egui::pos2(x + 12.0, rect.center().y),
+            egui::pos2(x + 10.0, rect.center().y),
             Align2::CENTER_CENTER,
             k,
             mono(9.0),
-            if primary { Color32::from_black_alpha(110) } else { INK3 },
+            if primary { Color32::from_black_alpha(130) } else { INK3 },
         );
     }
     resp
@@ -330,7 +714,6 @@ pub fn draw_icon(p: &Painter, icon: Icon, c: Pos2, size: f32, col: Color32) {
             p.add(Shape::closed_line(vec![pt(3.5, 7.0), pt(9.5, 7.0), pt(11.5, 9.0), pt(20.5, 9.0), pt(20.5, 18.5), pt(3.5, 18.5)], st));
         }
         Icon::Dig => {
-            // A spade: blade + shaft.
             p.add(Shape::closed_line(vec![pt(8.0, 12.0), pt(16.0, 12.0), pt(16.0, 16.0), pt(12.0, 20.5), pt(8.0, 16.0)], st));
             p.line_segment([pt(12.0, 12.0), pt(12.0, 3.5)], st);
             p.line_segment([pt(9.5, 3.5), pt(14.5, 3.5)], st);
@@ -364,12 +747,11 @@ pub fn draw_icon(p: &Painter, icon: Icon, c: Pos2, size: f32, col: Color32) {
     }
 }
 
-/// Numbered emitter ring. `selected` fills it; `active` adds ripples.
+/// Numbered emitter ring over dark footage tiles (`selected` glows incandescent amber).
 pub fn emitter_ring(p: &Painter, c: Pos2, rad: f32, n: usize, selected: bool, active: bool, t: f64) {
     emitter_ring_pitch(p, c, rad, n, selected, active, t, None);
 }
 
-/// Numbered emitter ring with an optional pitch dot on its outer circumference.
 #[allow(clippy::too_many_arguments)]
 pub fn emitter_ring_pitch(
     p: &Painter,
@@ -385,26 +767,27 @@ pub fn emitter_ring_pitch(
         for k in 0..3 {
             let ph = ((t * 1.6 + k as f64 / 3.0).fract()) as f32;
             let rr = rad + 4.0 + ph * rad * 1.6;
-            let a = ((1.0 - ph) * 110.0) as u8;
-            p.circle_stroke(c, rr, Stroke::new(1.2, Color32::from_white_alpha(a)));
+            let a = ((1.0 - ph) * 140.0) as u8;
+            p.circle_stroke(c, rr, Stroke::new(1.3, Color32::from_rgba_unmultiplied(252, 227, 93, a)));
         }
     }
-    p.circle_filled(c, rad + 6.0, Color32::from_black_alpha(if selected { 68 } else { 46 }));
-    let outer_r = if selected { rad + 4.5 } else { rad };
+    p.circle_filled(c, rad + 5.5, Color32::from_black_alpha(if selected { 125 } else { 95 }));
+    let outer_r = if selected { rad + 4.0 } else { rad };
     if selected {
-        p.circle_stroke(c, outer_r, Stroke::new(1.2, Color32::from_white_alpha(150)));
-        p.circle_filled(c, rad, HI);
+        p.circle_stroke(c, outer_r, Stroke::new(1.3, AMBER_CORE));
+        p.circle_filled(c, rad, AMBER_MID);
+        p.circle_filled(c, rad * 0.55, AMBER_CORE);
         p.text(c, Align2::CENTER_CENTER, n.to_string(), mono_medium(rad * 0.85), ON_HI);
     } else {
-        p.circle_filled(c, rad, Color32::from_black_alpha(75));
-        p.circle_stroke(c, rad, Stroke::new(1.5, HI));
-        p.text(c, Align2::CENTER_CENTER, n.to_string(), mono(rad * 0.85), HI);
+        p.circle_filled(c, rad, Color32::from_black_alpha(150));
+        p.circle_stroke(c, rad, Stroke::new(1.6, CREAM));
+        p.text(c, Align2::CENTER_CENTER, n.to_string(), mono(rad * 0.85), CREAM);
     }
     if let Some(pm) = pitch_macro {
         let ha = ((pm.clamp(0.0, 1.0) - 0.5) * 2.0) * 0.75 * PI;
         let dot = egui::pos2(c.x + ha.sin() * outer_r, c.y - ha.cos() * outer_r);
-        p.circle_filled(dot, 3.3, HI);
-        p.circle_stroke(dot, 3.3, Stroke::new(1.2, G0));
+        p.circle_filled(dot, 3.5, if selected { AMBER_MID } else { CREAM });
+        p.circle_stroke(dot, 3.5, Stroke::new(1.2, WELL));
     }
 }
 
@@ -418,9 +801,10 @@ fn arc_points(c: Pos2, rad: f32, a0: f32, a1: f32) -> Vec<Pos2> {
         .collect()
 }
 
-/// Knob: 270° arc + disc with a vertical gradient + indicator. `detents`
-/// > 0 draws detent dots instead of the arc (the LOOK knob). Vertical drag
-/// changes the value (0..1); double-tap resets to `default`.
+/// Physical machined dark charcoal cylindrical pointer knob (`ISOL8` style):
+/// directional drop shadow onto the sand chassis, silkscreened scale ticks,
+/// dark tapered skirt `#181919`, matte top cap `#333434 -> #212222` with top
+/// rim catchlight, and crisp white painted radial pointer line `#F4F2EC`.
 #[allow(clippy::too_many_arguments)]
 pub fn knob(ui: &mut Ui, center: Pos2, rad: f32, id: egui::Id, label: &str, value: &mut f32, default: f32, detents: usize) -> Response {
     let rect = Rect::from_center_size(center, egui::vec2(rad * 2.0 + 12.0, rad * 2.0 + 12.0));
@@ -439,78 +823,90 @@ pub fn knob(ui: &mut Ui, center: Pos2, rad: f32, id: egui::Id, label: &str, valu
     let p = ui.painter();
     let a0 = PI * 0.75;
     let span = PI * 1.5;
-    let w = (rad * 0.1).clamp(2.8, 5.0);
     let v = if detents > 1 {
         let k = ((*value * detents as f32) as usize).min(detents - 1);
         k as f32 / (detents - 1) as f32
     } else {
         *value
     };
-    let bipolar = (default - 0.5).abs() < 1e-3;
-    if detents > 1 {
-        for k in 0..detents {
-            let a = a0 + span * k as f32 / (detents - 1) as f32;
-            let pos = egui::pos2(center.x + rad * a.cos(), center.y + rad * a.sin());
-            let on = (k as f32 / (detents - 1) as f32 - v).abs() < 1e-3;
-            p.circle_filled(pos, if on { 3.4 } else { 2.0 }, if on { HI } else { G5 });
-        }
-    } else {
-        p.add(Shape::line(arc_points(center, rad, a0, a0 + span), Stroke::new(w, G3)));
-        if bipolar {
-            let mid = a0 + span * 0.5;
-            let cur = a0 + span * v;
-            if (v - 0.5).abs() > 0.005 {
-                let ( lo, hi_a ) = (mid.min(cur), mid.max(cur));
-                p.add(Shape::line(arc_points(center, rad, lo, hi_a), Stroke::new(w, HI)));
-                for a in [lo, hi_a] {
-                    p.circle_filled(egui::pos2(center.x + rad * a.cos(), center.y + rad * a.sin()), w / 2.0, HI);
-                }
-            }
-            let (s, cth) = (mid.sin(), mid.cos());
-            p.line_segment(
-                [egui::pos2(center.x + (rad + 4.0) * cth, center.y + (rad + 4.0) * s), egui::pos2(center.x + (rad + 8.0) * cth, center.y + (rad + 8.0) * s)],
-                Stroke::new(1.2, INK4),
-            );
-        } else if v > 0.001 {
-            p.add(Shape::line(arc_points(center, rad, a0, a0 + span * v), Stroke::new(w, HI)));
-            for a in [a0, a0 + span * v] {
-                p.circle_filled(egui::pos2(center.x + rad * a.cos(), center.y + rad * a.sin()), w / 2.0, HI);
-            }
-        }
+
+    // 1. Silkscreened calibration ticks around the sweep on the metal faceplate.
+    let n_ticks = if detents > 1 { detents } else { 9 };
+    for k in 0..n_ticks {
+        let frac = k as f32 / (n_ticks.saturating_sub(1).max(1)) as f32;
+        let a = a0 + span * frac;
+        let (s, cth) = (a.sin(), a.cos());
+        let major = k == 0 || k + 1 == n_ticks || (n_ticks % 2 == 1 && k == n_ticks / 2);
+        let r0 = rad * 0.90;
+        let r1 = rad * if major { 1.04 } else { 0.98 };
+        p.line_segment(
+            [egui::pos2(center.x + r0 * cth, center.y + r0 * s), egui::pos2(center.x + r1 * cth, center.y + r1 * s)],
+            Stroke::new(if major { 1.3 } else { 1.0 }, INK3),
+        );
     }
-    // Disc: vertical gradient g4 -> g2 via a mesh.
-    let disc = rad * 0.72;
+
+    // 2. Soft directional cast shadow (down-left, matching ISOL8 lighting).
+    let skirt_r = rad * 0.84;
+    p.circle_filled(
+        center + egui::vec2(-2.6, 3.8),
+        skirt_r + 1.2,
+        Color32::from_rgba_unmultiplied(24, 21, 14, 72),
+    );
+    p.circle_filled(
+        center + egui::vec2(-1.1, 1.8),
+        skirt_r + 0.4,
+        Color32::from_rgba_unmultiplied(18, 16, 10, 118),
+    );
+
+    // 3. Outer machined charcoal skirt.
+    p.circle_filled(center, skirt_r, Color32::from_rgb(0x18, 0x19, 0x19));
+    p.circle_stroke(center, skirt_r, Stroke::new(1.0, Color32::from_rgb(0x0c, 0x0d, 0x0d)));
+
+    // 4. Matte charcoal top cap (vertical gradient mesh + top specular rim).
+    let cap_r = rad * 0.70;
     let mut mesh = egui::Mesh::default();
-    let n = 48;
-    let top = G4;
-    let bot = G1;
+    let segs = 40;
+    let top_col = if resp.hovered() || resp.dragged() {
+        Color32::from_rgb(0x3c, 0x3d, 0x3d)
+    } else {
+        Color32::from_rgb(0x34, 0x35, 0x35)
+    };
+    let bot_col = Color32::from_rgb(0x20, 0x21, 0x21);
     let lerp = |t: f32| -> Color32 {
-        let f = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t) as u8;
-        Color32::from_rgb(f(top.r(), bot.r()), f(top.g(), bot.g()), f(top.b(), bot.b()))
+        let f = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t.clamp(0.0, 1.0)) as u8;
+        Color32::from_rgb(f(top_col.r(), bot_col.r()), f(top_col.g(), bot_col.g()), f(top_col.b(), bot_col.b()))
     };
     mesh.colored_vertex(center, lerp(0.5));
-    for i in 0..=n {
-        let a = TAU * i as f32 / n as f32;
-        let pt = egui::pos2(center.x + disc * a.cos(), center.y + disc * a.sin());
-        mesh.colored_vertex(pt, lerp((pt.y - (center.y - disc)) / (2.0 * disc)));
+    for i in 0..=segs {
+        let a = TAU * i as f32 / segs as f32;
+        let pt = egui::pos2(center.x + cap_r * a.cos(), center.y + cap_r * a.sin());
+        mesh.colored_vertex(pt, lerp((pt.y - (center.y - cap_r)) / (2.0 * cap_r)));
     }
-    for i in 0..n as u32 {
+    for i in 0..segs as u32 {
         mesh.add_triangle(0, i + 1, i + 2);
     }
-    p.circle_filled(center, disc + 1.0, Color32::from_black_alpha(120));
     p.add(Shape::mesh(mesh));
-    p.circle_stroke(center, disc, Stroke::new(1.0, Color32::from_white_alpha(10)));
+    p.add(Shape::line(
+        arc_points(center, cap_r, PI * 1.12, PI * 1.88),
+        Stroke::new(1.1, Color32::from_rgb(0x52, 0x53, 0x51)),
+    ));
+    p.circle_stroke(center, cap_r, Stroke::new(0.8, Color32::from_black_alpha(120)));
+
+    // 5. Crisp white painted radial pointer line extending to the cap rim.
     let a = a0 + span * v;
     let (s, cth) = (a.sin(), a.cos());
+    let ptr_w = (rad * 0.125).clamp(2.0, 3.2);
     p.line_segment(
-        [egui::pos2(center.x + disc * 0.3 * cth, center.y + disc * 0.3 * s), egui::pos2(center.x + disc * 0.68 * cth, center.y + disc * 0.68 * s)],
-        Stroke::new(2.4, HI),
+        [
+            egui::pos2(center.x + cap_r * 0.22 * cth, center.y + cap_r * 0.22 * s),
+            egui::pos2(center.x + cap_r * 0.94 * cth, center.y + cap_r * 0.94 * s),
+        ],
+        Stroke::new(ptr_w, Color32::from_rgb(0xf4, 0xf2, 0xec)),
     );
     resp
 }
 
-/// Paint the window background over the corners of `rect` (so square GPU
-/// output looks rounded).
+/// Paint `bg` over the corners of `rect` (so square GPU output looks rounded).
 pub fn mask_corners(p: &Painter, rect: Rect, rad: f32, bg: Color32) {
     for (corner, a0) in [
         (rect.left_top(), PI),
@@ -534,7 +930,7 @@ pub fn mask_corners(p: &Painter, rect: Rect, rad: f32, bg: Color32) {
     }
 }
 
-/// A 2 px slider row value (deep drawer). Returns true when changed.
+/// Hardware fader slot (`slider`).
 pub fn slider(ui: &mut Ui, rect: Rect, id: egui::Id, label: &str, value: &mut f32, lo: f32, hi: f32) -> bool {
     let resp = hit(ui, rect.expand2(Vec2::new(8.0, 10.0)), id, Sense::click_and_drag(), label);
     let mut changed = false;
@@ -552,25 +948,28 @@ pub fn slider(ui: &mut Ui, rect: Rect, id: egui::Id, label: &str, value: &mut f3
     let y = rect.center().y;
     let t = ((*value - lo) / (hi - lo)).clamp(0.0, 1.0);
     let x = rect.left() + rect.width() * t;
-    p.line_segment([egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)], Stroke::new(2.0, LINE3));
-    p.line_segment([egui::pos2(rect.left(), y), egui::pos2(x, y)], Stroke::new(2.0, HI));
-    p.circle_filled(egui::pos2(x, y), 8.0, HI);
+    let track = Rect::from_min_max(egui::pos2(rect.left(), y - 2.0), egui::pos2(rect.right(), y + 2.0));
+    p.rect_filled(track, r(2), WELL);
+    let lit = Rect::from_min_max(egui::pos2(rect.left(), y - 1.5), egui::pos2(x, y + 1.5));
+    p.rect_filled(lit, r(2), AMBER_MID);
+    let cap = Rect::from_center_size(egui::pos2(x, y), egui::vec2(10.0, 16.0));
+    p.rect_filled(cap, r(2), Color32::from_rgb(0x26, 0x28, 0x28));
+    p.line_segment([egui::pos2(x, cap.top() + 2.0), egui::pos2(x, cap.bottom() - 2.0)], Stroke::new(1.5, CREAM));
     changed
 }
 
-/// Compact mini ADSR polyline + cut-threshold dashed guide (drawn on emitter
-/// cards, perform pads and sequence lane headers).
+/// Compact mini ADSR polyline over dark footage tiles / monitor wells.
 pub fn mini_adsr(p: &Painter, rect: Rect, adsr: &chromagrain_core::envelope::Adsr, alpha: f32) {
     if rect.width() < 14.0 || rect.height() < 6.0 {
         return;
     }
     let pts = crate::envelope::points(rect, adsr);
-    let a = (alpha.clamp(0.0, 1.0) * 230.0) as u8;
-    p.add(Shape::line(pts.to_vec(), Stroke::new(1.4, Color32::from_rgba_unmultiplied(243, 242, 238, a))));
+    let a = (alpha.clamp(0.0, 1.0) * 240.0) as u8;
+    p.add(Shape::line(pts.to_vec(), Stroke::new(1.5, Color32::from_rgba_unmultiplied(252, 227, 93, a))));
     if adsr.picture == chromagrain_core::envelope::PictureCut::Cut {
         let ty = rect.bottom() - adsr.cut_threshold.clamp(0.0, 1.0) * rect.height();
         let x_end = pts[4].x.max(rect.left() + 8.0);
-        let da = (alpha.clamp(0.0, 1.0) * 95.0) as u8;
+        let da = (alpha.clamp(0.0, 1.0) * 115.0) as u8;
         let mut x = rect.left();
         while x < x_end {
             let x1 = (x + 2.0).min(x_end);
@@ -597,7 +996,7 @@ impl RingGeo {
         let r_min = (span * 0.11).max(7.0);
         let g = grain.clamp(0.0, 1.0);
         let rr = r_max + (r_min - r_max) * g;
-        let center = egui::pos2(rect.center().x, rect.top() + rect.height() * if small { 0.48 } else { 0.48 });
+        let center = egui::pos2(rect.center().x, rect.top() + rect.height() * 0.48);
         let ha = ((pitch_macro.clamp(0.0, 1.0) - 0.5) * 2.0) * 0.75 * PI;
         let pitch_pos = egui::pos2(center.x + ha.sin() * rr, center.y - ha.cos() * rr);
         Self { center, rr, r_max, r_min, pitch_pos }
@@ -605,7 +1004,7 @@ impl RingGeo {
 }
 
 /// Draw the on-object grain ring + golden-angle cloud dots + pitch dot +
-/// optional smear trail (`objSVG` in `design/v002`).
+/// optional smear trail over dark footage tiles.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_on_object_ring(
     p: &Painter,
@@ -621,14 +1020,14 @@ pub fn draw_on_object_ring(
         return geo;
     }
     let g = grain.clamp(0.0, 1.0);
-    p.circle_stroke(geo.center, geo.rr, Stroke::new(1.5, Color32::from_rgba_unmultiplied(243, 242, 238, 215)));
+    p.circle_stroke(geo.center, geo.rr, Stroke::new(1.5, Color32::from_rgba_unmultiplied(243, 240, 230, 225)));
     let n = (1.0 + 15.0 * g).round() as usize;
     let dot_r = 3.4 + (1.4 - 3.4) * g;
     for k in 0..n {
         let a = k as f32 * 2.39996;
         let rad = geo.rr * 0.74 * ((k as f32 + 0.5) / n as f32).sqrt();
         let pt = egui::pos2(geo.center.x + a.cos() * rad, geo.center.y + a.sin() * rad);
-        p.circle_filled(pt, if small { dot_r * 0.8 } else { dot_r }, Color32::from_rgba_unmultiplied(243, 242, 238, 178));
+        p.circle_filled(pt, if small { dot_r * 0.8 } else { dot_r }, Color32::from_rgba_unmultiplied(252, 227, 93, 195));
     }
     if !small {
         let tl = smear.clamp(0.0, 1.0) * rect.width() * 0.25;
@@ -639,37 +1038,35 @@ pub fn draw_on_object_ring(
                 let dx = (geo.rr * geo.rr - (yy - geo.center.y).powi(2)).max(0.0).sqrt();
                 let x0 = geo.center.x + dx + 4.0;
                 let x1 = x0 + tl * (1.0 - off.abs() * 0.35);
-                let alpha = ((0.55 - off.abs() * 0.2) * 255.0) as u8;
-                p.line_segment([egui::pos2(x0, yy), egui::pos2(x1, yy)], Stroke::new(1.5, Color32::from_rgba_unmultiplied(243, 242, 238, alpha)));
+                let alpha = ((0.60 - off.abs() * 0.2) * 255.0) as u8;
+                p.line_segment([egui::pos2(x0, yy), egui::pos2(x1, yy)], Stroke::new(1.5, Color32::from_rgba_unmultiplied(252, 227, 93, alpha)));
             }
         }
     }
-    // 12 o'clock neutral tick + pitch dot on the ring circumference.
     p.line_segment(
         [egui::pos2(geo.center.x, geo.center.y - geo.rr - 4.5), egui::pos2(geo.center.x, geo.center.y - geo.rr + 2.5)],
-        Stroke::new(1.4, Color32::from_white_alpha(90)),
+        Stroke::new(1.4, Color32::from_white_alpha(120)),
     );
-    let pr = if small { 4.6 } else { 6.2 };
-    p.circle_filled(geo.pitch_pos, pr, HI);
-    p.circle_stroke(geo.pitch_pos, pr, Stroke::new(1.8, G0));
+    let pr = if small { 4.8 } else { 6.2 };
+    p.circle_filled(geo.pitch_pos, pr, AMBER_MID);
+    p.circle_stroke(geo.pitch_pos, pr, Stroke::new(1.8, WELL));
     if !small && pitch_st.abs() >= 0.5 {
         let tag_y = (geo.pitch_pos.y - 12.0).max(rect.top() + 9.0);
-        p.text(egui::pos2(geo.pitch_pos.x, tag_y), Align2::CENTER_CENTER, format!("{pitch_st:+.0}"), mono(10.0), HI);
+        p.text(egui::pos2(geo.pitch_pos.x, tag_y), Align2::CENTER_CENTER, format!("{pitch_st:+.0}"), mono_medium(10.0), AMBER_CORE);
     }
     geo
 }
 
-/// Primary white `Open clip ›` pill used in contextual object bars.
+/// Primary backlit amber `Open clip ›` switch used in contextual object bars.
 pub fn open_clip_pill(ui: &mut Ui, rect: Rect, id: egui::Id, a11y_label: &str) -> Response {
     let resp = hit(ui, rect, id, Sense::click(), a11y_label);
     let p = ui.painter();
-    let rad = (rect.height() * 0.5).min(15.0) as u8;
-    p.rect_filled(rect, r(rad), if resp.is_pointer_button_down_on() { INK2 } else { HI });
-    let text_galley = p.layout_no_wrap("Open clip".into(), font_medium(11.5), ON_HI);
+    paint_switch_cap(p, rect, SwitchKind::Amber, true, resp.hovered(), resp.is_pointer_button_down_on());
+    let text_galley = p.layout_no_wrap("Open clip".into(), font_semibold(11.5), ON_HI);
     let total_w = text_galley.size().x + 14.0;
     let x0 = rect.center().x - total_w * 0.5;
     p.galley(egui::pos2(x0, rect.center().y - text_galley.size().y * 0.5), text_galley.clone(), ON_HI);
-    draw_icon(p, Icon::ChevronRight, egui::pos2(x0 + text_galley.size().x + 9.0, rect.center().y + 0.5), 11.0, ON_HI);
+    draw_icon(p, Icon::ChevronRight, egui::pos2(x0 + text_galley.size().x + 8.5, rect.center().y + 0.5), 11.0, ON_HI);
     resp
 }
 
@@ -678,14 +1075,13 @@ pub fn chev_button(ui: &mut Ui, vis_rect: Rect, hit_rect: Rect, id: egui::Id, a1
     let resp = hit(ui, hit_rect, id, Sense::click(), a11y_label);
     let p = ui.painter();
     let hovered = resp.hovered() || resp.is_pointer_button_down_on();
-    p.rect_filled(vis_rect, r(6), Color32::from_black_alpha(if hovered { 205 } else { 155 }));
-    p.rect_stroke(vis_rect, r(6), hair(if hovered { LINE3 } else { LINE2 }), StrokeKind::Inside);
-    draw_icon(p, Icon::ChevronRight, vis_rect.center(), 12.0, if hovered { HI } else { INK2 });
+    p.rect_filled(vis_rect, r(4), Color32::from_black_alpha(if hovered { 225 } else { 175 }));
+    p.rect_stroke(vis_rect, r(4), hair(if hovered { AMBER_MID } else { WELL_LINE2 }), StrokeKind::Inside);
+    draw_icon(p, Icon::ChevronRight, vis_rect.center(), 12.0, if hovered { AMBER_MID } else { CREAM2 });
     resp
 }
 
-/// Dual-amount pill for AV effects (`♪` audio + `▣` video bars). Click toggles;
-/// horizontal drag adjusts both amounts in `0..1`. Returns true when changed.
+/// Sunken console display switch for AV effects (`♪` amber audio + `▣` mint video LEDs).
 pub fn dual_pill(
     ui: &mut Ui,
     rect: Rect,
@@ -724,36 +1120,35 @@ pub fn dual_pill(
     }
     let on = *audio + *video > 0.02;
     let p = ui.painter();
-    p.rect_filled(rect, r(8), if on { G3 } else if resp.hovered() { G2 } else { Color32::from_rgb(0x16, 0x16, 0x18) });
-    p.rect_stroke(rect, r(8), hair(if on { LINE2 } else { LINE }), StrokeKind::Inside);
+    p.rect_filled(rect, r(4), if on { Color32::from_rgb(0x2e, 0x2b, 0x22) } else if resp.hovered() { Color32::from_rgb(0x2a, 0x28, 0x20) } else { SLOT_BG });
+    p.line_segment(
+        [egui::pos2(rect.left() + 2.0, rect.bottom() + 0.6), egui::pos2(rect.right() - 2.0, rect.bottom() + 0.6)],
+        Stroke::new(1.0, BEVEL_HI),
+    );
+    p.rect_stroke(rect, r(4), Stroke::new(1.0, if on { AMBER_EDGE } else { Color32::from_rgb(0x14, 0x13, 0x10) }), StrokeKind::Inside);
     p.text(
         egui::pos2(rect.left() + 9.0, rect.center().y),
         Align2::LEFT_CENTER,
         label,
-        font(11.0),
-        if on { INK } else { INK3 },
+        font_semibold(11.0),
+        if on { CREAM } else { SLOT_INK },
     );
     let bar_w = (rect.width() * 0.21).clamp(15.0, 36.0);
     let bx0 = rect.right() - 8.0 - bar_w;
     let by_a = rect.center().y - 3.0;
     let by_v = rect.center().y + 3.0;
-    p.line_segment([egui::pos2(bx0, by_a), egui::pos2(bx0 + bar_w, by_a)], Stroke::new(2.0, G4));
-    p.line_segment([egui::pos2(bx0, by_v), egui::pos2(bx0 + bar_w, by_v)], Stroke::new(2.0, G4));
+    p.line_segment([egui::pos2(bx0, by_a), egui::pos2(bx0 + bar_w, by_a)], Stroke::new(2.2, Color32::from_rgb(0x46, 0x42, 0x35)));
+    p.line_segment([egui::pos2(bx0, by_v), egui::pos2(bx0 + bar_w, by_v)], Stroke::new(2.2, Color32::from_rgb(0x46, 0x42, 0x35)));
     if *audio > 0.005 {
-        p.line_segment([egui::pos2(bx0, by_a), egui::pos2(bx0 + bar_w * audio.clamp(0.0, 1.0), by_a)], Stroke::new(2.0, HI));
+        p.line_segment([egui::pos2(bx0, by_a), egui::pos2(bx0 + bar_w * audio.clamp(0.0, 1.0), by_a)], Stroke::new(2.2, AMBER_MID));
     }
     if *video > 0.005 {
-        p.line_segment(
-            [egui::pos2(bx0, by_v), egui::pos2(bx0 + bar_w * video.clamp(0.0, 1.0), by_v)],
-            Stroke::new(2.0, Color32::from_white_alpha(150)),
-        );
+        p.line_segment([egui::pos2(bx0, by_v), egui::pos2(bx0 + bar_w * video.clamp(0.0, 1.0), by_v)], Stroke::new(2.2, MINT_MID));
     }
     changed
 }
 
-/// Single-bar pill for AV correspondence links (`pitch → hue`, etc.). Click
-/// toggles `0 <-> default_on` (unless `discrete`, which snaps `0` or `1`);
-/// horizontal drag sets `0..1`. Returns true when changed.
+/// Sunken console display switch for AV correspondence links (`pitch → hue`, etc.).
 pub fn single_pill(
     ui: &mut Ui,
     rect: Rect,
@@ -788,13 +1183,17 @@ pub fn single_pill(
     }
     let on = *value > 0.02;
     let p = ui.painter();
-    p.rect_filled(rect, r(8), if on { G2 } else { Color32::from_rgb(0x15, 0x15, 0x17) });
-    p.rect_stroke(rect, r(8), hair(if on { LINE2 } else { LINE }), StrokeKind::Inside);
+    p.rect_filled(rect, r(4), if on { Color32::from_rgb(0x2e, 0x2b, 0x22) } else { SLOT_BG });
+    p.line_segment(
+        [egui::pos2(rect.left() + 2.0, rect.bottom() + 0.6), egui::pos2(rect.right() - 2.0, rect.bottom() + 0.6)],
+        Stroke::new(1.0, BEVEL_HI),
+    );
+    p.rect_stroke(rect, r(4), Stroke::new(1.0, if on { AMBER_EDGE } else { Color32::from_rgb(0x14, 0x13, 0x10) }), StrokeKind::Inside);
     let bar_w = (rect.width() * 0.20).clamp(16.0, 28.0);
     let bx0 = rect.right() - 8.0 - bar_w;
     let max_text_w = (bx0 - rect.left() - 13.0).max(20.0);
-    let fg = if on { INK } else { INK3 };
-    let full_g = p.layout_no_wrap(label.to_string(), font(10.5), fg);
+    let fg = if on { CREAM } else { SLOT_INK };
+    let full_g = p.layout_no_wrap(label.to_string(), font_medium(10.5), fg);
     let shown = if full_g.size().x <= max_text_w {
         label.to_string()
     } else {
@@ -802,7 +1201,7 @@ pub fn single_pill(
         while chars.len() > 4 {
             chars.pop();
             let cand: String = chars.iter().collect::<String>() + "…";
-            if p.layout_no_wrap(cand.clone(), font(10.5), fg).size().x <= max_text_w {
+            if p.layout_no_wrap(cand.clone(), font_medium(10.5), fg).size().x <= max_text_w {
                 break;
             }
         }
@@ -812,13 +1211,13 @@ pub fn single_pill(
         egui::pos2(rect.left() + 8.0, rect.center().y),
         Align2::LEFT_CENTER,
         shown,
-        font(10.5),
+        font_medium(10.5),
         fg,
     );
     let by = rect.center().y;
-    p.line_segment([egui::pos2(bx0, by), egui::pos2(bx0 + bar_w, by)], Stroke::new(2.0, G4));
+    p.line_segment([egui::pos2(bx0, by), egui::pos2(bx0 + bar_w, by)], Stroke::new(2.2, Color32::from_rgb(0x46, 0x42, 0x35)));
     if *value > 0.005 {
-        p.line_segment([egui::pos2(bx0, by), egui::pos2(bx0 + bar_w * value.clamp(0.0, 1.0), by)], Stroke::new(2.0, HI));
+        p.line_segment([egui::pos2(bx0, by), egui::pos2(bx0 + bar_w * value.clamp(0.0, 1.0), by)], Stroke::new(2.2, MINT_MID));
     }
     changed
 }

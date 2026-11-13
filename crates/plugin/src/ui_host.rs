@@ -116,8 +116,13 @@ impl PluginHost {
                 p.bpm = bpm;
                 self.doc_rev += 1;
             }
-            let tile = self.layout_override.unwrap_or_else(|| self.params.layout.value() == crate::params::LayoutParam::Tile);
-            let layout = if tile { chromagrain_core::tile::Layout::Tile } else { chromagrain_core::tile::Layout::Stack };
+            let layout = match self.stage_mode_override {
+                Some(m) => m.to_layout(),
+                None => {
+                    let tile = self.layout_override.unwrap_or_else(|| self.params.layout.value() == crate::params::LayoutParam::Tile);
+                    if tile { chromagrain_core::tile::Layout::Tile } else { chromagrain_core::tile::Layout::Stack }
+                }
+            };
             if p.layout != layout || p.layout_pan != self.params.layout_pan.value() {
                 p.layout = layout;
                 p.layout_pan = self.params.layout_pan.value();
@@ -300,7 +305,10 @@ impl Host for PluginHost {
         self.fullscreen = !self.fullscreen;
     }
     fn tile_layout(&self) -> Option<bool> {
-        Some(self.layout_override.unwrap_or_else(|| self.params.layout.value() == crate::params::LayoutParam::Tile))
+        Some(match self.stage_mode_override {
+            Some(m) => m == StageMode::Grid,
+            None => self.layout_override.unwrap_or_else(|| self.params.layout.value() == crate::params::LayoutParam::Tile),
+        })
     }
     fn set_tile_layout(&mut self, tile: bool) {
         let v = if tile { crate::params::LayoutParam::Tile } else { crate::params::LayoutParam::Stack };
@@ -531,6 +539,33 @@ impl PerformHost for PluginHost {
         let slot = self.shared.pad_slots.lock().ok().and_then(|s| s.get(i).copied().flatten());
         if let Some(slot) = slot {
             self.put_pad(i, PadSlot { adsr: Some(adsr), ..slot });
+        }
+    }
+    fn pad_sculpt(&self, i: usize) -> Option<(chromagrain_core::grain::VoiceSculpt, u8)> {
+        self.shared
+            .pad_slots
+            .lock()
+            .ok()
+            .and_then(|s| s.get(i).copied().flatten().map(|x| (x.sculpt, x.choke_group)))
+    }
+    fn set_pad_sculpt(
+        &mut self,
+        i: usize,
+        sculpt: chromagrain_core::grain::VoiceSculpt,
+        choke: u8,
+    ) {
+        if i >= PADS {
+            return;
+        }
+        let slot = self.shared.pad_slots.lock().ok().and_then(|s| s.get(i).copied().flatten());
+        if let Some(mut slot) = slot {
+            slot.sculpt = sculpt;
+            slot.choke_group = choke.min(4);
+            if let Some(free_s) = sculpt.free_loop_secs {
+                let bpm = self.shared.bpm().max(20.0) as f32;
+                slot.len_beats = (free_s.max(0.5) * bpm / 60.0).clamp(0.5, 64.0);
+            }
+            self.put_pad(i, slot);
         }
     }
     fn quantize(&self) -> usize {

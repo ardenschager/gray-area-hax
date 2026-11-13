@@ -231,6 +231,8 @@ pub struct Studio {
     pub(crate) punch_press_t: [Option<f64>; 6],
     pub tape_stop_amt: f32,
     base_master_fx: Option<(Vec<AvEffect>, f32, f32)>,
+    /// Master 5-Band `ISOL8` Frequency Isolator state (`LF · LMF · MF · HMF · HF`).
+    pub isolator: crate::host::IsolatorUi,
     atlases: atlas::Atlases,
     grain_tex: Option<egui::TextureHandle>,
     /// Grid cells lit by sprays: (col, row) -> time.
@@ -299,6 +301,7 @@ impl Default for Studio {
             punch_press_t: [None; 6],
             tape_stop_amt: 0.0,
             base_master_fx: None,
+            isolator: crate::host::IsolatorUi::default(),
             atlases: atlas::Atlases::default(),
             grain_tex: None,
             lit: Vec::new(),
@@ -400,6 +403,9 @@ impl Studio {
                 self.key = k;
                 self.key_changed(host);
             }
+        }
+        if let Some(iso) = host.isolator_ui() {
+            self.isolator = iso;
         }
         self.place_added(host);
         self.sync_columns(host);
@@ -696,13 +702,18 @@ impl Studio {
             let stretch_mul = (1.0 - 0.75 * e.stretch.clamp(0.0, 1.0)).max(0.15) as f64;
             let cap = (!e.caption.trim().is_empty()).then(|| e.caption.trim().to_string());
             let core_sculpt = e.sculpt.to_core();
+            let sculpt_pitch_ratio = if core_sculpt.pitch_semitones.abs() > 1e-4 {
+                chromagrain_core::music::semitones_to_ratio(core_sculpt.pitch_semitones)
+            } else {
+                1.0
+            };
             let core_chord = e.sculpt.chord.to_core();
             let hard_burst = e.adsr.picture == chromagrain_core::envelope::PictureCut::Cut && e.cloud.spray <= 0.08;
             let cap_inline = chromagrain_core::chop::Caption::new(&e.caption);
             while e.next_t <= now && n < 64 {
                 let id = ((i as u64 + 1) << 48) | e.k;
                 let (mut ev, hop) = grain_step(&map, &e.cloud, Some(&key), &mut e.rng, e.head, len, base_note, vel, id);
-                ev.pitch_ratio *= fine_ratio * tape_spin_mul;
+                ev.pitch_ratio *= fine_ratio * sculpt_pitch_ratio * tape_spin_mul;
                 ev.onset = (e.next_t + ev.onset).max(now - 0.02);
                 ev.sculpt = core_sculpt;
                 ev.tag = VoiceTag {
@@ -820,12 +831,16 @@ impl Studio {
         let bar_h = if w < 1100.0 { 52.0 } else { 56.0 };
         egui::TopBottomPanel::top("studio_top")
             .exact_height(bar_h)
-            .frame(egui::Frame::new().fill(G0))
+            .frame(egui::Frame::new().fill(CHASSIS_TOP))
             .show_separator_line(false)
-            .show(ctx, |ui| self.top_bar(host, ui));
+            .show(ctx, |ui| {
+                chassis_plate(ui.painter(), ui.max_rect(), CHASSIS_TOP, G0);
+                self.top_bar(host, ui);
+            });
         egui::CentralPanel::default().frame(egui::Frame::new().fill(G0)).show(ctx, |ui| {
             let full = ui.max_rect();
-            ui.painter().line_segment([full.left_top(), full.right_top()], hair(LINE));
+            chassis_plate(ui.painter(), full, G0, CHASSIS_BOT);
+            chassis_screws(ui.painter(), ctx.screen_rect(), 8.5);
             let pad = if full.width() < 1100.0 { 14.0 } else { 20.0 };
             let area = full.shrink(pad);
             match self.view {
@@ -951,67 +966,74 @@ impl Studio {
     }
 
     fn top_bar(&mut self, host: &mut dyn Host, ui: &mut egui::Ui) {
-        let caps = host.caps();
+        let caps_cfg = host.caps();
         let rect = ui.max_rect();
         let small = rect.width() < 1100.0;
         let p = ui.painter().clone();
         let cy = rect.center().y;
-        let mut x = rect.left() + if small { 14.0 } else { 18.0 };
+        let mut x = rect.left() + if small { 16.0 } else { 22.0 };
         draw_icon(&p, Icon::Brand, egui::pos2(x + 8.0, cy), 18.0, INK);
-        x += 26.0;
+        x += 24.0;
         if !small {
-            let r = p.text(egui::pos2(x, cy), Align2::LEFT_CENTER, "chromagrain", font_semibold(14.0), INK);
-            x = r.right() + 22.0;
+            let r = text_spaced(
+                &p,
+                egui::pos2(x, cy - 5.0),
+                Align2::LEFT_CENTER,
+                "CHROMAGRAIN",
+                font_semibold(13.0),
+                INK,
+                1.0,
+            );
+            p.text(
+                egui::pos2(x, cy + 8.0),
+                Align2::LEFT_CENTER,
+                "AV GRAIN CONSOLE",
+                font_medium(8.0),
+                INK3,
+            );
+            x = r.right() + 18.0;
         } else {
             x += 4.0;
         }
         let playing = host.playing();
-        let b = Rect::from_min_size(egui::pos2(x, cy - 19.0), egui::vec2(44.0, 38.0));
-        if caps.transport {
-            if chip(ui, b, ui.id().with("play"), if playing { "stop" } else { "play" }, false, playing).clicked() {
+        let b = Rect::from_min_size(egui::pos2(x, cy - 18.0), egui::vec2(44.0, 36.0));
+        if caps_cfg.transport {
+            let resp = hit(ui, b, ui.id().with("play"), egui::Sense::click(), if playing { "stop" } else { "play" });
+            paint_switch_cap(&p, b, SwitchKind::Amber, playing, resp.hovered(), resp.is_pointer_button_down_on());
+            if resp.clicked() {
                 host.toggle_play();
             }
-        } else if playing {
-            p.rect_filled(b, r(10), HI);
         } else {
-            raised(&p, b, 10, G2);
+            paint_switch_cap(&p, b, SwitchKind::PuttyAmber, playing, false, false);
         }
-        draw_icon(&p, if playing { Icon::Stop } else { Icon::Play }, b.center(), 16.0, if playing { ON_HI } else { INK });
+        draw_icon(&p, if playing { Icon::Stop } else { Icon::Play }, b.center(), 15.5, if playing { ON_HI } else { INK });
         x = b.right() + 6.0;
-        if caps.rec {
-            let b = Rect::from_min_size(egui::pos2(x, cy - 19.0), egui::vec2(44.0, 38.0));
+        if caps_cfg.rec {
+            let b = Rect::from_min_size(egui::pos2(x, cy - 18.0), egui::vec2(44.0, 36.0));
             let recording = self.rec.is_some();
-            if chip(ui, b, ui.id().with("rec"), "record take", false, false).clicked() {
+            let resp = hit(ui, b, ui.id().with("rec"), egui::Sense::click(), "record take");
+            paint_switch_cap(&p, b, SwitchKind::Ruby, recording, resp.hovered(), resp.is_pointer_button_down_on());
+            if resp.clicked() {
                 self.toggle_rec(host);
             }
             if recording {
-                p.circle_filled(b.center(), 6.0, REC);
+                p.circle_filled(b.center(), 5.5, Color32::from_rgb(0x24, 0x09, 0x07));
             } else {
-                p.circle_stroke(b.center(), 6.0, egui::Stroke::new(1.5, INK2));
+                p.circle_filled(b.center(), 5.0, Color32::from_rgb(0x28, 0x10, 0x0d));
             }
-            x = b.right() + 16.0;
+            x = b.right() + 10.0;
         } else {
-            x += 10.0;
+            x += 8.0;
         }
         let beats = host.playhead_beats().max(0.0);
         let bar = (beats / 4.0).floor() as u32 + 1;
         let beat = (beats % 4.0).floor() as u32 + 1;
         let six = ((beats * 4.0) % 4.0).floor() as u32 + 1;
-        runs(
-            &p,
-            egui::pos2(x, cy),
-            Align2::LEFT_CENTER,
-            &[
-                (&format!("{bar:03}"), mono_medium(13.0), INK),
-                (" ", mono(13.0), INK3),
-                (&beat.to_string(), mono(13.0), INK2),
-                (" ", mono(13.0), INK3),
-                (&six.to_string(), mono(13.0), INK3),
-            ],
-        );
+        let counter_r = Rect::from_min_size(egui::pos2(x, cy - 14.0), egui::vec2(if small { 68.0 } else { 78.0 }, 28.0));
+        sunken_display(&p, counter_r, &format!("{bar:03}.{beat}.{six}"), if small { 11.0 } else { 11.5 });
 
-        // View switch (centre).
-        let names: Vec<&str> = caps
+        // View switch (centre — recessed console keycap bank).
+        let names: Vec<&str> = caps_cfg
             .views
             .iter()
             .map(|v| match v {
@@ -1021,47 +1043,47 @@ impl Studio {
             })
             .collect();
         let n = names.len().max(1) as f32;
-        let sw = if small { 94.0 * n } else { 113.0 * n };
-        let seg = Rect::from_center_size(egui::pos2(rect.center().x, cy), egui::vec2(sw, 42.0));
+        let sw = if small { 92.0 * n } else { 112.0 * n };
+        let seg = Rect::from_center_size(egui::pos2(rect.center().x, cy), egui::vec2(sw, 38.0));
         let hints: Vec<&str> = if small { Vec::new() } else { ["1", "2", "3"].into_iter().take(names.len()).collect() };
-        let cur = caps.views.iter().position(|v| *v == self.view).unwrap_or(0);
-        if let Some(i) = segmented(ui, seg, ui.id().with("views"), &names, &hints, cur, font_medium(13.0), true) {
-            self.set_view(host, caps.views[i]);
+        let cur = caps_cfg.views.iter().position(|v| *v == self.view).unwrap_or(0);
+        if let Some(i) = segmented(ui, seg, ui.id().with("views"), &names, &hints, cur, font_semibold(12.5), true) {
+            self.set_view(host, caps_cfg.views[i]);
         }
 
-        // Right: tempo, key, Project, Export.
-        let mut rx = rect.right() - if small { 14.0 } else { 18.0 };
-        let ghost = |ui: &mut egui::Ui, rx: &mut f32, label: &str, icon: Icon, id: &str, active: bool| -> egui::Response {
-            let w = if small { 40.0 } else { 26.0 + ui.painter().layout_no_wrap(label.into(), font(13.0), INK).size().x + 14.0 };
+        // Right: tempo LCD, key cap, Project, Export.
+        let mut rx = rect.right() - if small { 16.0 } else { 22.0 };
+        let cap_btn = |ui: &mut egui::Ui, rx: &mut f32, label: &str, icon: Icon, id: &str, active: bool| -> egui::Response {
+            let w = if small { 40.0 } else { 26.0 + ui.painter().layout_no_wrap(label.into(), font_semibold(12.0), INK).size().x + 14.0 };
             let r = Rect::from_min_size(egui::pos2(*rx - w, cy - 18.0), egui::vec2(w, 36.0));
             *rx -= w + 6.0;
-            let resp = chip(ui, r, ui.id().with(id), label, !active, false);
+            let resp = hit(ui, r, ui.id().with(id), egui::Sense::click(), label);
             let p = ui.painter();
-            let fg = if active { INK } else { INK2 };
+            paint_switch_cap(p, r, SwitchKind::PuttyAmber, active, resp.hovered(), resp.is_pointer_button_down_on());
+            let fg = if active { ON_HI } else { INK };
             if small {
-                draw_icon(p, icon, r.center(), 16.0, fg);
+                draw_icon(p, icon, r.center(), 15.5, fg);
             } else {
-                draw_icon(p, icon, egui::pos2(r.left() + 16.0, r.center().y), 15.0, fg);
-                p.text(egui::pos2(r.left() + 28.0, r.center().y), Align2::LEFT_CENTER, label, font(13.0), fg);
+                draw_icon(p, icon, egui::pos2(r.left() + 14.5, r.center().y), 14.0, fg);
+                p.text(egui::pos2(r.left() + 26.5, r.center().y), Align2::LEFT_CENTER, label, font_semibold(12.0), fg);
             }
             resp
         };
-        if caps.export && ghost(ui, &mut rx, "Export", Icon::Export, "export", false).clicked() {
+        if caps_cfg.export && cap_btn(ui, &mut rx, "Export", Icon::Export, "export", false).clicked() {
             host.export();
         }
         let proj_open = self.sheet == Some(Sheet::Project);
-        if ghost(ui, &mut rx, "Project", Icon::Grid, "project", proj_open).clicked() {
+        if cap_btn(ui, &mut rx, "Project", Icon::Grid, "project", proj_open).clicked() {
             self.sheet = if proj_open { None } else { Some(Sheet::Project) };
         }
-        rx -= 6.0;
-        p.line_segment([egui::pos2(rx, cy - 11.0), egui::pos2(rx, cy + 11.0)], hair(LINE2));
-        rx -= 12.0;
-        // Key chip: tap cycles the root, vertical drag the scale.
+        rx -= 4.0;
+        // Key sunken slot: tap cycles the root, vertical drag the scale.
         let key = self.key;
         let kl = scale_label(key.scale);
-        let kw = 24.0 + p.layout_no_wrap(kl.into(), font(11.0), INK).size().x + 18.0;
-        let kr = Rect::from_min_size(egui::pos2(rx - kw, cy - 18.0), egui::vec2(kw, 36.0));
-        let kresp = chip(ui, kr, ui.id().with("key"), "global key", false, false);
+        let kw = 24.0 + p.layout_no_wrap(kl.into(), font_medium(10.5), INK).size().x + 18.0;
+        let kr = Rect::from_min_size(egui::pos2(rx - kw, cy - 15.0), egui::vec2(kw, 30.0));
+        let kresp = hit(ui, kr, ui.id().with("key"), egui::Sense::click_and_drag(), "global key");
+        sunken_display(&p, kr, &format!("{} {}", NOTE_NAMES[key.root as usize % 12], kl.to_uppercase()), 10.5);
         if kresp.clicked() {
             self.key = Key::new(key.root + 1, key.scale);
             self.key_changed(host);
@@ -1078,32 +1100,19 @@ impl Studio {
                 ui.data_mut(|dd| dd.insert_temp(kresp.id, d));
             }
         }
-        runs(
-            &p,
-            egui::pos2(kr.left() + 12.0, cy),
-            Align2::LEFT_CENTER,
-            &[(NOTE_NAMES[key.root as usize % 12], mono_medium(13.0), INK), ("  ", font(11.0), INK3), (kl, font(11.0), INK3)],
-        );
         rx = kr.left() - 6.0;
-        // Tempo chip: vertical drag (read-only when the host owns tempo).
+        // Tempo sunken brushed-LCD readout: vertical drag adjusts BPM.
         let bpm = host.project().lock().unwrap().bpm;
-        let tr = Rect::from_min_size(egui::pos2(rx - 80.0, cy - 18.0), egui::vec2(80.0, 36.0));
-        if caps.tempo {
-            let tresp = chip(ui, tr, ui.id().with("tempo"), "tempo", false, false);
+        let tr = Rect::from_min_size(egui::pos2(rx - 76.0, cy - 15.0), egui::vec2(76.0, 30.0));
+        if caps_cfg.tempo {
+            let tresp = hit(ui, tr, ui.id().with("tempo"), egui::Sense::click_and_drag(), "tempo");
             if tresp.dragged() {
                 let nb = (bpm - tresp.drag_delta().y as f64 * 0.25).clamp(20.0, 300.0);
                 host.project().lock().unwrap().bpm = nb;
                 host.mark();
             }
-        } else {
-            raised(&p, tr, 10, G1);
         }
-        runs(
-            &p,
-            egui::pos2(tr.left() + 12.0, cy),
-            Align2::LEFT_CENTER,
-            &[(&format!("{:.0}", bpm), mono_medium(13.0), INK), ("  ", font(11.0), INK3), ("bpm", font(11.0), INK3)],
-        );
+        lcd_readout(&p, tr, &format!("{bpm:.0} BPM"), 11.0);
     }
 
     pub fn key_changed(&mut self, host: &mut dyn Host) {
@@ -1143,7 +1152,7 @@ impl Studio {
         let screen = ctx.screen_rect();
         let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("cg-grain")));
         let uv = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(screen.width() / 160.0, screen.height() / 160.0));
-        p.image(tex.id(), screen, uv, Color32::from_white_alpha(7));
+        p.image(tex.id(), screen, uv, Color32::from_black_alpha(7));
     }
 
     pub fn atlas(&mut self, host: &dyn Host, ctx: &egui::Context, src: usize) -> Option<(egui::TextureId, atlas::AtlasView)> {
@@ -1176,18 +1185,21 @@ impl Studio {
         host.project().lock().unwrap().sources.get(src).map(|s| s.name.clone()).unwrap_or_default()
     }
 
-    /// The live canvas (GPU), letterboxed/pillarboxed to `canvas_size` (`16:9 · 1:1 · 9:16`), rounded.
+    /// The live canvas (GPU), letterboxed/pillarboxed to `canvas_size` (`16:9 · 1:1 · 9:16`),
+    /// recessed inside a dark broadcast bakelite bezel set into the sand-olive metal.
     pub fn stage(&mut self, host: &dyn Host, ui: &mut egui::Ui, rect: Rect, radius: f32) {
         let p = ui.painter().clone();
-        p.rect_filled(rect, r(radius as u8), Color32::from_rgb(0x09, 0x09, 0x0a));
+        let rad_u8 = (radius as u8).min(8);
+        p.rect_filled(rect, r(rad_u8), Color32::from_rgb(0x0a, 0x0c, 0x0d));
+        let inner = rect.shrink(2.5);
         let (cw, ch) = host.canvas_size();
         let canvas_ar = cw.max(1) as f32 / ch.max(1) as f32;
-        let fitted = crate::fit(rect, canvas_ar);
+        let fitted = crate::fit(inner, canvas_ar);
         if let Some(scene) = host.canvas() {
             p.add(crate::gpu::PreviewCallback::shape(scene, fitted));
         }
-        if (fitted.width() - rect.width()).abs() > 2.0 || (fitted.height() - rect.height()).abs() > 2.0 {
-            p.rect_stroke(fitted, 0.0, hair(LINE), egui::StrokeKind::Inside);
+        if (fitted.width() - inner.width()).abs() > 2.0 || (fitted.height() - inner.height()).abs() > 2.0 {
+            p.rect_stroke(fitted, 0.0, hair(WELL_LINE), egui::StrokeKind::Inside);
         }
         // Kinetic spoken-hook caption bar (strictly only when a non-empty user/slice caption is active).
         let now = host.clock();
@@ -1195,20 +1207,20 @@ impl Studio {
             if now < exp && !txt.trim().is_empty() && fitted.width() >= 140.0 && fitted.height() >= 80.0 {
                 let upper = txt.trim().to_uppercase();
                 let font_sz = (fitted.height() * 0.042).clamp(11.0, 16.0);
-                let g = p.layout_no_wrap(play::short(&upper, 44), font_semibold(font_sz), HI);
+                let g = p.layout_no_wrap(play::short(&upper, 44), font_semibold(font_sz), CREAM);
                 let bw = (g.size().x + 24.0).min(fitted.width() - 16.0);
                 let bh = g.size().y + 10.0;
                 let cy = fitted.top() + fitted.height() * 0.84;
                 let box_r = Rect::from_center_size(egui::pos2(fitted.center().x, cy), egui::vec2(bw, bh));
-                p.rect_filled(box_r, r(6), Color32::from_rgba_unmultiplied(11, 11, 12, 224));
-                p.rect_stroke(box_r, r(6), hair(LINE2), egui::StrokeKind::Inside);
+                p.rect_filled(box_r, r(5), Color32::from_rgba_unmultiplied(14, 16, 17, 232));
+                p.rect_stroke(box_r, r(5), hair(WELL_LINE2), egui::StrokeKind::Inside);
                 let accent_r = Rect::from_min_size(egui::pos2(box_r.left() + 3.0, box_r.top() + 4.0), egui::vec2(2.5, bh - 8.0));
-                p.rect_filled(accent_r, r(1), HI);
-                p.galley(egui::pos2(box_r.left() + 13.0, box_r.center().y - g.size().y * 0.5), g, HI);
+                p.rect_filled(accent_r, r(1), AMBER_MID);
+                p.galley(egui::pos2(box_r.left() + 13.0, box_r.center().y - g.size().y * 0.5), g, CREAM);
             }
         }
-        mask_corners(&p, rect, radius, G0);
-        p.rect_stroke(rect, r(radius as u8), hair(LINE), egui::StrokeKind::Inside);
+        mask_corners(&p, rect, rad_u8 as f32, G0);
+        monitor_bezel(&p, rect, rad_u8);
     }
 
     /// Stage overlay pills in top-left corner: `stack | split | grid | bleed` +
@@ -1231,9 +1243,9 @@ impl Studio {
         } else if rem >= 46.0 {
             let cr = Rect::from_min_size(egui::pos2(stage.right() - pad - 42.0, used_r.top()), egui::vec2(42.0, used_r.height()));
             let p = ui.painter().clone();
-            p.rect_filled(cr, r(8), Color32::from_black_alpha(165));
-            p.rect_stroke(cr, r(8), hair(LINE2), egui::StrokeKind::Inside);
-            p.text(cr.center(), Align2::CENTER_CENTER, cur_aspect.label(), mono_medium(10.0), INK);
+            p.rect_filled(cr, r(5), Color32::from_black_alpha(205));
+            p.rect_stroke(cr, r(5), hair(WELL_LINE2), egui::StrokeKind::Inside);
+            p.text(cr.center(), Align2::CENTER_CENTER, cur_aspect.label(), mono_medium(10.0), CREAM);
             if hit(ui, cr.expand2(egui::vec2(2.0, 3.0)), ui.id().with("aspect-cycle"), egui::Sense::click(), "aspect cycle").clicked() {
                 host.set_stage_aspect(StageAspect::from_index((cur_aspect.index() + 1) % 3));
             }
@@ -1276,21 +1288,21 @@ impl Studio {
         };
         let tiny = avail_w < 164.0;
         let w = if tiny { avail_w.clamp(124.0, 144.0) } else { 164.0 };
-        let h = if tiny { 26.0 } else { 30.0 };
+        let h = if tiny { 25.0 } else { 28.0 };
         let r0 = Rect::from_min_size(pos, egui::vec2(w, h));
         let p = ui.painter().clone();
-        p.rect_filled(r0, r(9), Color32::from_black_alpha(172));
-        p.rect_stroke(r0, r(9), hair(LINE2), egui::StrokeKind::Inside);
+        p.rect_filled(r0, r(5), Color32::from_black_alpha(205));
+        p.rect_stroke(r0, r(5), hair(WELL_LINE2), egui::StrokeKind::Inside);
         let cell_w = r0.width() / 4.0;
-        let fsz = if tiny { 9.5 } else { 11.0 };
+        let fsz = if tiny { 9.5 } else { 10.5 };
         for (k, m) in StageMode::ALL.into_iter().enumerate() {
-            let rc = Rect::from_min_size(egui::pos2(r0.left() + k as f32 * cell_w, r0.top()), egui::vec2(cell_w, r0.height())).shrink(2.5);
+            let rc = Rect::from_min_size(egui::pos2(r0.left() + k as f32 * cell_w, r0.top()), egui::vec2(cell_w, r0.height())).shrink(2.2);
             let on = cur == m;
             if on {
-                p.rect_filled(rc, r(6), HI);
+                radial_lens(&p, rc, AMBER_CORE, AMBER_MID, AMBER_EDGE);
             }
-            let col = if on { ON_HI } else { INK2 };
-            p.text(rc.center(), Align2::CENTER_CENTER, m.label(), font_medium(fsz), col);
+            let col = if on { ON_HI } else { CREAM2 };
+            p.text(rc.center(), Align2::CENTER_CENTER, m.label(), font_semibold(fsz), col);
             let hr = Rect::from_min_max(egui::pos2(rc.left(), rc.top() - 3.0), egui::pos2(rc.right(), rc.bottom() + 3.0));
             if hit(ui, hr, ui.id().with((id_salt, k)), egui::Sense::click(), a11y[k]).clicked() && !on {
                 host.set_stage_mode(m);
@@ -1308,22 +1320,249 @@ impl Studio {
         id_salt: &str,
     ) {
         let p = ui.painter().clone();
-        p.rect_filled(r0, r(9), Color32::from_black_alpha(172));
-        p.rect_stroke(r0, r(9), hair(LINE2), egui::StrokeKind::Inside);
+        p.rect_filled(r0, r(5), Color32::from_black_alpha(205));
+        p.rect_stroke(r0, r(5), hair(WELL_LINE2), egui::StrokeKind::Inside);
         let cell_w = r0.width() / 3.0;
         let a11y = ["aspect 16:9", "aspect 1:1", "aspect 9:16"];
         for (k, ar) in StageAspect::ALL.into_iter().enumerate() {
-            let rc = Rect::from_min_size(egui::pos2(r0.left() + k as f32 * cell_w, r0.top()), egui::vec2(cell_w, r0.height())).shrink(2.5);
+            let rc = Rect::from_min_size(egui::pos2(r0.left() + k as f32 * cell_w, r0.top()), egui::vec2(cell_w, r0.height())).shrink(2.2);
             let on = cur == ar;
             if on {
-                p.rect_filled(rc, r(6), HI);
+                radial_lens(&p, rc, MINT_CORE, MINT_MID, MINT_EDGE);
             }
-            let col = if on { ON_HI } else { INK2 };
-            p.text(rc.center(), Align2::CENTER_CENTER, ar.label(), mono_medium(10.0), col);
+            let col = if on { Color32::from_rgb(0x11, 0x2b, 0x1f) } else { CREAM2 };
+            p.text(rc.center(), Align2::CENTER_CENTER, ar.label(), mono_medium(9.5), col);
             let hr = Rect::from_min_max(egui::pos2(rc.left(), rc.top() - 3.0), egui::pos2(rc.right(), rc.bottom() + 3.0));
             if hit(ui, hr, ui.id().with((id_salt, k)), egui::Sense::click(), a11y[k]).clicked() && !on {
                 host.set_stage_aspect(ar);
             }
+        }
+    }
+
+    /// Signature `ISOL8 · 5-BAND FREQUENCY MONITOR` hardware rack unit:
+    /// `X1..X4` (`200 · 700 · 2500 · 8000 Hz`) pointer knobs + sunken LCDs,
+    /// `5×2` backlit `LF · LMF · MF · HMF · HF` Ruby `MUTE` / Glowing Amber `SOLO`
+    /// switch matrix, `L · R · M · S` Mint/Putty monitor switches, `STEREO` &
+    /// `24 dB/Oct` sunken slots, `ATTEN. DIM -18.0` putty plate, and `BYPASS`!
+    pub fn isolator_rack_ui(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, rect: Rect, id_salt: &str) {
+        let p = ui.painter().clone();
+        let id = ui.id().with(id_salt);
+        chassis_plate(&p, rect, CHASSIS_TOP, CHASSIS_BOT);
+        p.rect_stroke(rect, r(6), egui::Stroke::new(1.2, BEVEL_LO), egui::StrokeKind::Inside);
+        if rect.height() >= 108.0 {
+            chassis_screws(&p, rect, 6.5);
+        }
+
+        let mut iso = host.isolator_ui().unwrap_or(self.isolator);
+        let before = iso;
+        let compact = rect.width() < 1040.0 || rect.height() < 126.0;
+        let inner = rect.shrink2(egui::vec2(if compact { 12.0 } else { 16.0 }, if compact { 6.0 } else { 9.0 }));
+
+        // Three horizontal sections:
+        // [Left: ISOL8 nameplate + X1..X4 knobs & LCDs] | [Center: 5×2 LF..HF MUTE/SOLO] | [Right: CH.MODE + L/R/M/S + OUTPUT/DIM/BYPASS]
+        let left_w = (inner.width() * if compact { 0.34 } else { 0.33 }).clamp(250.0, 440.0);
+        let right_w = (inner.width() * if compact { 0.25 } else { 0.28 }).clamp(196.0, 370.0);
+        let gap = if compact { 8.0 } else { 14.0 };
+        let center_w = (inner.width() - left_w - right_w - gap * 2.0).max(220.0);
+
+        let left_r = Rect::from_min_size(inner.min, egui::vec2(left_w, inner.height()));
+        let center_r = Rect::from_min_size(egui::pos2(left_r.right() + gap, inner.top()), egui::vec2(center_w, inner.height()));
+        let right_r = Rect::from_min_max(egui::pos2(center_r.right() + gap, inner.top()), inner.max);
+
+        // --- 1. Left: Nameplate + 4 Crossover Knobs (`X1..X4`) + Sunken LCDs ---
+        let title_y = left_r.top() + if compact { 8.0 } else { 11.0 };
+        let r_iso = text_spaced(
+            &p,
+            egui::pos2(left_r.left() + 2.0, title_y),
+            Align2::LEFT_CENTER,
+            "ISOL8",
+            font_semibold(if compact { 13.0 } else { 15.5 }),
+            INK,
+            0.8,
+        );
+        if !compact {
+            p.text(
+                egui::pos2(r_iso.right() + 8.0, title_y + 0.5),
+                Align2::LEFT_CENTER,
+                "5-BAND FREQUENCY MONITOR",
+                font_semibold(8.5),
+                INK3,
+            );
+        }
+
+        // Filter Bypass round red button + ruby jewel LED at top-right of left section.
+        let byp_x = left_r.right() - 18.0;
+        let byp_led_y = left_r.top() + 8.0;
+        jewel_led(&p, egui::pos2(byp_x, byp_led_y), 3.4, !iso.bypass, true);
+        let byp_btn = Rect::from_center_size(egui::pos2(byp_x, byp_led_y + 16.0), egui::vec2(18.0, 18.0));
+        let byp_resp = hit(ui, byp_btn.expand(4.0), id.with("bypass"), egui::Sense::click(), "isol8 bypass");
+        p.circle_filled(byp_btn.center() + egui::vec2(-1.0, 1.5), 9.0, Color32::from_black_alpha(75));
+        p.circle_filled(byp_btn.center(), 8.8, Color32::from_rgb(0xc8, 0xc3, 0xb2));
+        p.circle_stroke(byp_btn.center(), 8.8, egui::Stroke::new(1.0, Color32::from_rgb(0x52, 0x4e, 0x40)));
+        p.circle_filled(
+            byp_btn.center(),
+            5.8,
+            if iso.bypass { Color32::from_rgb(0x6e, 0x35, 0x30) } else { Color32::from_rgb(0xc8, 0x38, 0x2e) },
+        );
+        if !compact {
+            p.text(egui::pos2(byp_x - 12.0, byp_led_y + 15.5), Align2::RIGHT_CENTER, "BYP", font_semibold(8.0), INK3);
+        }
+        if byp_resp.clicked() {
+            iso.bypass = !iso.bypass;
+        }
+
+        let xover_ranges: [(f32, f32, f32, &str, &str); 4] = [
+            (40.0, 500.0, 200.0, "X1", "isol8 x1"),
+            (250.0, 2000.0, 700.0, "X2", "isol8 x2"),
+            (1000.0, 6000.0, 2500.0, "X3", "isol8 x3"),
+            (3500.0, 16000.0, 8000.0, "X4", "isol8 x4"),
+        ];
+        let knobs_top = left_r.top() + if compact { 20.0 } else { 26.0 };
+        let knobs_area = Rect::from_min_max(egui::pos2(left_r.left(), knobs_top), egui::pos2(left_r.right() - if compact { 24.0 } else { 30.0 }, left_r.bottom()));
+        let kw = knobs_area.width() / 4.0;
+        let krad = ((knobs_area.height() - 24.0) * 0.42).clamp(12.5, 20.0);
+        let ky = knobs_area.top() + krad + 2.0;
+
+        for (k, &(lo, hi, def_hz, tag, a11y)) in xover_ranges.iter().enumerate() {
+            let cx = knobs_area.left() + (k as f32 + 0.5) * kw;
+            let mut norm = ((iso.crossovers[k].clamp(lo, hi) - lo) / (hi - lo)).clamp(0.0, 1.0);
+            let def_n = ((def_hz - lo) / (hi - lo)).clamp(0.0, 1.0);
+            let prev_n = norm;
+            knob(ui, egui::pos2(cx, ky), krad, id.with(("xover", k)), a11y, &mut norm, def_n, 0);
+            if (norm - prev_n).abs() > 1e-5 {
+                let raw = lo + norm * (hi - lo);
+                let step = if raw >= 1000.0 { 50.0 } else { 10.0 };
+                iso.crossovers[k] = (raw / step).round() * step;
+            }
+            p.text(egui::pos2(cx + krad * 0.85, ky - krad * 0.65), Align2::LEFT_CENTER, tag, font_semibold(8.5), INK2);
+            let lcd_w = (kw - 6.0).clamp(40.0, 62.0);
+            let lcd_r = Rect::from_center_size(egui::pos2(cx, knobs_area.bottom() - 10.0), egui::vec2(lcd_w, 18.0));
+            lcd_readout(&p, lcd_r, &format!("{:.0}", iso.crossovers[k]), if compact { 9.5 } else { 10.5 });
+        }
+        // Keep crossovers strictly monotonic.
+        for k in 1..4 {
+            if iso.crossovers[k] <= iso.crossovers[k - 1] + 40.0 {
+                iso.crossovers[k] = iso.crossovers[k - 1] + 40.0;
+            }
+        }
+
+        // --- 2. Center HERO: `5×2` Backlit Switch Bank (`LF · LMF · MF · HMF · HF`) ---
+        let bands: [(&str, &str, &str); 5] = [
+            ("LF", "isol8 mute lf", "isol8 solo lf"),
+            ("LMF", "isol8 mute lmf", "isol8 solo lmf"),
+            ("MF", "isol8 mute mf", "isol8 solo mf"),
+            ("HMF", "isol8 mute hmf", "isol8 solo hmf"),
+            ("HF", "isol8 mute hf", "isol8 solo hf"),
+        ];
+        let bgap = if compact { 4.0 } else { 6.0 };
+        let bw = (center_r.width() - bgap * 4.0) / 5.0;
+        let bh = (center_r.height() - bgap) * 0.5;
+        let sw_fsz = if bw < 52.0 || bh < 42.0 { 9.5 } else { 11.0 };
+        for (bi, &(bname, mute_a11y, solo_a11y)) in bands.iter().enumerate() {
+            let bx = center_r.left() + bi as f32 * (bw + bgap);
+            let r_mute = Rect::from_min_size(egui::pos2(bx, center_r.top()), egui::vec2(bw, bh));
+            let r_solo = Rect::from_min_size(egui::pos2(bx, center_r.top() + bh + bgap), egui::vec2(bw, bh));
+            if hw_switch(
+                ui,
+                r_mute,
+                id.with(("mute", bi)),
+                &format!("{bname}\nMUTE"),
+                mute_a11y,
+                SwitchKind::Ruby,
+                iso.mute[bi],
+                sw_fsz,
+            )
+            .clicked()
+            {
+                iso.mute[bi] = !iso.mute[bi];
+            }
+            if hw_switch(
+                ui,
+                r_solo,
+                id.with(("solo", bi)),
+                &format!("{bname}\nSOLO"),
+                solo_a11y,
+                SwitchKind::Amber,
+                iso.solo[bi],
+                sw_fsz,
+            )
+            .clicked()
+            {
+                iso.solo[bi] = !iso.solo[bi];
+            }
+        }
+
+        // --- 3. Right: `CH. MODE` / `SLOPE` + `L R M S` Putty-Mint Keycaps + `ATTEN. DIM -18.0` ---
+        let show_displays = right_r.width() >= 275.0 && !compact;
+        let mut rx = right_r.left();
+        if show_displays {
+            let disp_w = 82.0;
+            caps(&p, egui::pos2(rx + disp_w * 0.5, right_r.top() + 8.0), Align2::CENTER_CENTER, "CH. MODE", 8.5);
+            let ch_r = Rect::from_min_size(egui::pos2(rx, right_r.top() + 17.0), egui::vec2(disp_w, 24.0));
+            sunken_display(&p, ch_r, iso.monitor.ch_mode_label(), 10.0);
+            if hit(ui, ch_r, id.with("ch-mode"), egui::Sense::click(), "isol8 ch mode").clicked() {
+                iso.monitor = match iso.monitor {
+                    crate::host::IsolatorMonitor::Stereo => crate::host::IsolatorMonitor::Mid,
+                    crate::host::IsolatorMonitor::Mid => crate::host::IsolatorMonitor::Side,
+                    _ => crate::host::IsolatorMonitor::Stereo,
+                };
+            }
+            caps(&p, egui::pos2(rx + disp_w * 0.5, ch_r.bottom() + 12.0), Align2::CENTER_CENTER, "SLOPE", 8.5);
+            let sl_r = Rect::from_min_size(egui::pos2(rx, ch_r.bottom() + 21.0), egui::vec2(disp_w, 24.0));
+            sunken_display(&p, sl_r, "24 dB/Oct", 10.0);
+            rx = ch_r.right() + 10.0;
+        }
+
+        // `MONITOR` 2×2 `L · R · M · S` putty/mint switches.
+        let atten_w = ((right_r.right() - rx) * 0.48).clamp(72.0, 96.0);
+        let mon_w = (right_r.right() - rx - atten_w - 8.0).max(66.0);
+        let mon_r = Rect::from_min_size(egui::pos2(rx, right_r.top()), egui::vec2(mon_w, right_r.height()));
+        caps(&p, egui::pos2(mon_r.center().x, mon_r.top() + 7.0), Align2::CENTER_CENTER, "MONITOR", 8.0);
+        let m_top = mon_r.top() + 16.0;
+        let mg = 4.0;
+        let mw = ((mon_r.width() - mg) * 0.5).min(38.0);
+        let mh = ((mon_r.bottom() - m_top - mg) * 0.5).min(36.0);
+        let mx0 = mon_r.center().x - (mw * 2.0 + mg) * 0.5;
+        let mons = [
+            ("L", "isol8 mon l", crate::host::IsolatorMonitor::Left),
+            ("R", "isol8 mon r", crate::host::IsolatorMonitor::Right),
+            ("M", "isol8 mon m", crate::host::IsolatorMonitor::Mid),
+            ("S", "isol8 mon s", crate::host::IsolatorMonitor::Side),
+        ];
+        for (mi, &(mlbl, ma11y, mval)) in mons.iter().enumerate() {
+            let mr = Rect::from_min_size(
+                egui::pos2(mx0 + (mi % 2) as f32 * (mw + mg), m_top + (mi / 2) as f32 * (mh + mg)),
+                egui::vec2(mw, mh),
+            );
+            let on = iso.monitor == mval;
+            if hw_switch(ui, mr, id.with(("mon", mi)), mlbl, ma11y, SwitchKind::PuttyMint, on, 11.5).clicked() {
+                iso.monitor = if on { crate::host::IsolatorMonitor::Stereo } else { mval };
+            }
+        }
+
+        // `ATTEN.` lighter putty inset plate (`jewel_led` + dark `DIM` cap + `-18.0` LCD).
+        let att_outer = Rect::from_min_max(egui::pos2(right_r.right() - atten_w, right_r.top()), right_r.max);
+        caps(&p, egui::pos2(att_outer.center().x, att_outer.top() + 7.0), Align2::CENTER_CENTER, "ATTEN.", 8.0);
+        let plate = Rect::from_min_max(egui::pos2(att_outer.left(), att_outer.top() + 15.0), att_outer.max);
+        putty_panel(&p, plate, 5);
+        jewel_led(&p, egui::pos2(plate.center().x, plate.top() + 9.0), 3.3, iso.dim, false);
+        let dim_h = (plate.height() - 40.0).clamp(22.0, 30.0);
+        let dim_r = Rect::from_center_size(
+            egui::pos2(plate.center().x, plate.top() + 16.0 + dim_h * 0.5),
+            egui::vec2((plate.width() - 12.0).max(46.0), dim_h),
+        );
+        if hw_switch(ui, dim_r, id.with("dim"), "DIM", "isol8 dim", SwitchKind::DarkCap, iso.dim, 10.5).clicked() {
+            iso.dim = !iso.dim;
+        }
+        let att_lcd = Rect::from_center_size(
+            egui::pos2(plate.center().x, plate.bottom() - 11.0),
+            egui::vec2((plate.width() - 14.0).max(44.0), 16.5),
+        );
+        lcd_readout(&p, att_lcd, if iso.dim { "-18.0" } else { "0.0" }, 9.5);
+
+        if iso != before {
+            self.isolator = iso;
+            host.set_isolator_ui(iso);
         }
     }
 }

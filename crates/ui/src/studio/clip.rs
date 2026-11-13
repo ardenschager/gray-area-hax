@@ -291,24 +291,28 @@ impl Studio {
             EnvTarget::Pad(pi) => {
                 let pi = pi.min(15);
                 self.pad_sculpt[pi] = sp;
-                let mut pp = host.project().lock().unwrap();
-                let bpm = pp.bpm.max(20.0);
-                if let Some(t) = pp.tracks.get_mut(pi) {
-                    t.sculpt = core_sc;
-                    t.choke_group = sp.choke.min(4);
-                    t.tape.wow = sp.wow;
-                    t.tape.age = sp.wear * 0.8;
-                    for c in &mut t.clips {
-                        c.grains.sculpt = core_sc;
-                        c.grains.choke_group = sp.choke.min(4);
-                        if let Some(free_s) = sp.free_loop_secs {
-                            let beats = (free_s.max(0.5) as f64 * bpm / 60.0).clamp(0.5, 64.0);
-                            c.length_beats = beats;
+                if let Some(perf) = host.perform() {
+                    perf.set_pad_sculpt(pi, core_sc, sp.choke.min(4));
+                } else {
+                    let mut pp = host.project().lock().unwrap();
+                    let bpm = pp.bpm.max(20.0);
+                    if let Some(t) = pp.tracks.get_mut(pi) {
+                        t.sculpt = core_sc;
+                        t.choke_group = sp.choke.min(4);
+                        t.tape.wow = sp.wow;
+                        t.tape.age = sp.wear * 0.8;
+                        for c in &mut t.clips {
+                            c.grains.sculpt = core_sc;
+                            c.grains.choke_group = sp.choke.min(4);
+                            if let Some(free_s) = sp.free_loop_secs {
+                                let beats = (free_s.max(0.5) as f64 * bpm / 60.0).clamp(0.5, 64.0);
+                                c.length_beats = beats;
+                            }
                         }
                     }
+                    drop(pp);
+                    host.mark();
                 }
-                drop(pp);
-                host.mark();
             }
         }
     }
@@ -438,24 +442,32 @@ impl Studio {
             let min_title_w = if wide_sheet { 210.0 } else { 130.0 };
             if rx - total_owners_w >= title_x + min_title_w {
                 let box_r = Rect::from_min_size(egui::pos2(rx - total_owners_w, inner.top() + 3.0), egui::vec2(total_owners_w, 34.0));
-                p.rect_filled(box_r, r(10), G0);
-                p.rect_stroke(box_r, r(10), hair(LINE2), StrokeKind::Inside);
-                let mut ox = box_r.left() + 4.0;
+                p.rect_filled(box_r, r(5), WELL);
+                p.line_segment(
+                    [egui::pos2(box_r.left() + 3.0, box_r.bottom() + 0.7), egui::pos2(box_r.right() - 3.0, box_r.bottom() + 0.7)],
+                    Stroke::new(1.0, BEVEL_HI),
+                );
+                let mut ox = box_r.left() + 3.0;
                 for ((ot, label, a11y, active), pw) in owners.iter().zip(pill_widths.iter()) {
-                    let pr = Rect::from_min_size(egui::pos2(ox, box_r.top() + 3.0), egui::vec2(*pw, 28.0));
+                    let pr = Rect::from_min_size(egui::pos2(ox, box_r.top() + 2.5), egui::vec2(*pw - 2.0, 29.0));
                     let resp = hit(ui, pr, id.with(("owner", &a11y)), Sense::click(), a11y);
                     if *active {
-                        p.rect_filled(pr, r(7), G4);
-                        p.rect_stroke(pr, r(7), hair(LINE2), StrokeKind::Inside);
-                    } else if resp.hovered() {
-                        p.rect_filled(pr, r(7), G2);
+                        radial_lens(&p, pr, MINT_CORE, MINT_MID, MINT_EDGE);
+                        p.rect_stroke(pr, r(3), Stroke::new(1.0, Color32::from_rgb(0x28, 0x66, 0x4b)), StrokeKind::Inside);
+                    } else {
+                        let face = if resp.hovered() { G3 } else { PUTTY };
+                        p.rect_filled(pr, r(3), face);
+                        p.line_segment(
+                            [egui::pos2(pr.left() + 2.0, pr.top() + 0.7), egui::pos2(pr.right() - 2.0, pr.top() + 0.7)],
+                            Stroke::new(1.0, PUTTY_HI),
+                        );
                     }
                     p.text(
                         pr.center(),
                         Align2::CENTER_CENTER,
                         label,
-                        font_medium(11.5),
-                        if *active || resp.hovered() { INK } else { INK2 },
+                        font_semibold(11.0),
+                        if *active { Color32::from_rgb(0x11, 0x2b, 0x1f) } else { INK },
                     );
                     if resp.clicked() && !*active {
                         switch_target = Some(*ot);
@@ -640,12 +652,13 @@ impl Studio {
                 _ => 0.25,
             }
         };
+        monitor_well(&p, stage, 8);
         if let Some((tex, a)) = self.atlas(host, &ctx, src) {
-            tile(&p, stage, 12, tex, a.uv_cover(atlas::frame_at(norm_pos), stage.width() / stage.height()), gray(0.95));
+            tile(&p, stage.shrink(1.8), 6, tex, a.uv_cover(atlas::frame_at(norm_pos), stage.width() / stage.height()), gray(0.95));
         } else {
-            p.rect_filled(stage, r(12), G0);
+            p.rect_filled(stage.shrink(1.8), r(6), WELL2);
         }
-        p.rect_stroke(stage, r(12), hair(LINE2), StrokeKind::Inside);
+        monitor_bezel(&p, stage, 8);
 
         // Top-left stage mode pill (`stack | split | grid | bleed`).
         let pill_r = self.stage_mode_pill(
@@ -733,22 +746,18 @@ impl Studio {
         let sy = inner.top();
         for st in SculptStamp::ALL {
             let lbl = if compact_stamps { st.short_label() } else { st.label() };
-            let tw = p.layout_no_wrap(lbl.into(), font_medium(11.0), INK).size().x;
+            let tw = p.layout_no_wrap(lbl.into(), font_semibold(10.5), INK).size().x;
             let pw = (tw + if compact_stamps { 14.0 } else { 18.0 }).max(34.0);
             let pr = Rect::from_min_size(egui::pos2(sx, sy), egui::vec2(pw, row1_h));
             let on = sp.stamp == st;
             let resp = hit(ui, pr, id.with(("stamp", st.label())), Sense::click(), &format!("sculpt {}", st.label()));
-            if on {
-                p.rect_filled(pr, r(7), HI);
-            } else {
-                raised(&p, pr, 7, if resp.hovered() { G3 } else { G2 });
-            }
+            paint_switch_cap(&p, pr, SwitchKind::Amber, on, resp.hovered(), resp.is_pointer_button_down_on());
             p.text(
                 pr.center(),
                 Align2::CENTER_CENTER,
                 lbl,
-                font_medium(11.0),
-                if on { ON_HI } else if resp.hovered() { INK } else { INK2 },
+                font_semibold(10.5),
+                if on { ON_HI } else { Color32::from_rgb(0x24, 0x1c, 0x09) },
             );
             if resp.clicked() {
                 sp = SculptParams::preset(st);
@@ -864,23 +873,26 @@ impl Studio {
         ];
         for (k, (&(name, _, _), vs)) in dials.iter().zip(val_strs.iter()).enumerate() {
             let cx = row2.left() + (k as f32 + 0.5) * kw;
-            caps(&p, egui::pos2(cx, ky + rad + 9.0), Align2::CENTER_CENTER, name, 8.5);
-            p.text(egui::pos2(cx, ky + rad + 20.0), Align2::CENTER_CENTER, vs, mono(9.5), INK);
+            caps(&p, egui::pos2(cx, ky + rad + 7.5), Align2::CENTER_CENTER, name, 8.0);
+            let lcd_w = (kw - 6.0).clamp(38.0, 56.0);
+            lcd_readout(&p, Rect::from_center_size(egui::pos2(cx, ky + rad + 20.5), egui::vec2(lcd_w, 15.5)), vs, 9.0);
         }
 
-        // Right 3 selector pills: `Chord`, `Choke`, `Sync | Free Loop (s)`.
+        // Right 3 selector switches: `Chord`, `Choke`, `Sync | Free Loop (s)`.
         let sel_area = Rect::from_min_max(egui::pos2(row2.right() - right_w, row2.top() + 4.0), egui::pos2(row2.right(), row2.bottom() - 2.0));
         let sg = 6.0;
         let sw = (sel_area.width() - sg * 2.0) / 3.0;
-        let sh = sel_area.height().min(56.0);
+        let sh = sel_area.height().min(54.0);
         let sy2 = sel_area.center().y - sh * 0.5;
 
         // 1. Chord Voicing
         let r_chord = Rect::from_min_size(egui::pos2(sel_area.left(), sy2), egui::vec2(sw, sh));
         let c_resp = hit(ui, r_chord, id.with("chord"), Sense::click_and_drag(), "sculpt chord");
-        raised(&p, r_chord, 9, if sp.chord != crate::host::ChordChoice::Off { G3 } else if c_resp.hovered() { G3 } else { G2 });
-        p.text(r_chord.center() - egui::vec2(0.0, 7.0), Align2::CENTER_CENTER, sp.chord.label(), mono_medium(12.5), INK);
-        caps(&p, r_chord.center() + egui::vec2(0.0, 10.0), Align2::CENTER_CENTER, "Chord", 8.5);
+        let c_on = sp.chord != crate::host::ChordChoice::Off;
+        paint_switch_cap(&p, r_chord, SwitchKind::PuttyMint, c_on, c_resp.hovered(), c_resp.is_pointer_button_down_on());
+        let c_fg = if c_on { Color32::from_rgb(0x11, 0x2b, 0x1f) } else { INK };
+        p.text(r_chord.center() - egui::vec2(0.0, 6.5), Align2::CENTER_CENTER, sp.chord.label(), mono_medium(12.0), c_fg);
+        p.text(r_chord.center() + egui::vec2(0.0, 9.5), Align2::CENTER_CENTER, "CHORD", font_semibold(8.0), c_fg);
         if c_resp.clicked() && !c_resp.dragged() {
             sp.chord = sp.chord.next();
         } else if c_resp.dragged() {
@@ -897,24 +909,28 @@ impl Studio {
         // 2. Choke Group (`Off · 1 · 2 · 3 · 4`)
         let r_choke = Rect::from_min_size(egui::pos2(r_chord.right() + sg, sy2), egui::vec2(sw, sh));
         let k_resp = hit(ui, r_choke, id.with("choke"), Sense::click_and_drag(), "sculpt choke");
-        raised(&p, r_choke, 9, if sp.choke > 0 { G3 } else if k_resp.hovered() { G3 } else { G2 });
+        let k_on = sp.choke > 0;
+        paint_switch_cap(&p, r_choke, SwitchKind::PuttyMint, k_on, k_resp.hovered(), k_resp.is_pointer_button_down_on());
+        let k_fg = if k_on { Color32::from_rgb(0x11, 0x2b, 0x1f) } else { INK };
         let chk_lbl = if sp.choke == 0 { "Off".to_string() } else { format!("Grp {}", sp.choke) };
-        p.text(r_choke.center() - egui::vec2(0.0, 7.0), Align2::CENTER_CENTER, chk_lbl, mono_medium(12.5), INK);
-        caps(&p, r_choke.center() + egui::vec2(0.0, 10.0), Align2::CENTER_CENTER, "Choke", 8.5);
+        p.text(r_choke.center() - egui::vec2(0.0, 6.5), Align2::CENTER_CENTER, chk_lbl, mono_medium(12.0), k_fg);
+        p.text(r_choke.center() + egui::vec2(0.0, 9.5), Align2::CENTER_CENTER, "CHOKE", font_semibold(8.0), k_fg);
         if k_resp.clicked() && !k_resp.dragged() {
             sp.choke = (sp.choke + 1) % 5;
         }
 
-        // 3. `Sync | Free Loop (s)` (click toggles Sync <-> Free 6.8s; drag adjusts seconds `1.5..24.0s`)
+        // 3. `Sync | Free Loop (s)`
         let r_loop = Rect::from_min_size(egui::pos2(r_choke.right() + sg, sy2), egui::vec2(sw, sh));
         let l_resp = hit(ui, r_loop, id.with("freeloop"), Sense::click_and_drag(), "sculpt free loop");
-        raised(&p, r_loop, 9, if sp.free_loop_secs.is_some() { G3 } else if l_resp.hovered() { G3 } else { G2 });
+        let l_on = sp.free_loop_secs.is_some();
+        paint_switch_cap(&p, r_loop, SwitchKind::PuttyAmber, l_on, l_resp.hovered(), l_resp.is_pointer_button_down_on());
         let loop_lbl = match sp.free_loop_secs {
             Some(s) => format!("{s:.1}s"),
             None => "Sync".into(),
         };
-        p.text(r_loop.center() - egui::vec2(0.0, 7.0), Align2::CENTER_CENTER, loop_lbl, mono_medium(12.5), if sp.free_loop_secs.is_some() { HI } else { INK });
-        caps(&p, r_loop.center() + egui::vec2(0.0, 10.0), Align2::CENTER_CENTER, "Tape loop", 8.5);
+        let l_fg = if l_on { ON_HI } else { INK };
+        p.text(r_loop.center() - egui::vec2(0.0, 6.5), Align2::CENTER_CENTER, loop_lbl, mono_medium(12.0), l_fg);
+        p.text(r_loop.center() + egui::vec2(0.0, 9.5), Align2::CENTER_CENTER, "TAPE LOOP", font_semibold(8.0), l_fg);
         if l_resp.dragged() {
             let cur_s = sp.free_loop_secs.unwrap_or(6.8);
             let ds = -l_resp.drag_delta().y * 0.08 + l_resp.drag_delta().x * 0.06;
@@ -1125,12 +1141,11 @@ impl Studio {
 
     fn clip_macros_card(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, rect: Rect, owner: EnvTarget) {
         let p = ui.painter().clone();
-        p.rect_filled(rect, r(12), Color32::from_rgb(0x10, 0x10, 0x12));
-        p.rect_stroke(rect, r(12), hair(LINE), StrokeKind::Inside);
+        putty_panel(&p, rect, 7);
         let inner = rect.shrink2(egui::vec2(16.0, 6.0));
         let col_w = inner.width() / 3.0;
         let row_h = inner.height() / 2.0;
-        let rad = (row_h * 0.24).clamp(15.5, 21.0);
+        let rad = (row_h * 0.22).clamp(14.0, 19.0);
         let id = ui.id().with(("clip-macros", owner));
 
         let mut op = self.read_owner_params(host, owner);
@@ -1148,7 +1163,7 @@ impl Studio {
         let key = self.key;
         for (k, &(name, a11y, def, detents)) in slots.iter().enumerate() {
             let cx = inner.left() + ((k % 3) as f32 + 0.5) * col_w;
-            let cy = inner.top() + (k / 3) as f32 * row_h + rad + 4.0;
+            let cy = inner.top() + (k / 3) as f32 * row_h + rad + 3.0;
             let c = egui::pos2(cx, cy);
             let val_ref = match k {
                 0 => &mut op.grain,
@@ -1177,8 +1192,8 @@ impl Studio {
                     }
                 }
             };
-            caps(&p, egui::pos2(cx, cy + rad + 9.0), Align2::CENTER_CENTER, name, 9.0);
-            p.text(egui::pos2(cx, cy + rad + 20.5), Align2::CENTER_CENTER, shown, mono(10.5), INK);
+            caps(&p, egui::pos2(cx, cy + rad + 7.0), Align2::CENTER_CENTER, name, 8.5);
+            lcd_readout(&p, Rect::from_center_size(egui::pos2(cx, cy + rad + 20.0), egui::vec2((col_w - 28.0).clamp(48.0, 74.0), 16.0)), &shown, 9.5);
         }
 
         if (op.grain, op.pitch_m, op.smear, op.look_m, op.level, op.pan_m) != before {
@@ -1305,8 +1320,8 @@ impl Studio {
         for (k, (&(name, _, _), val_s)) in items.iter().zip(texts.iter()).enumerate() {
             let cx = inner.left() + ((k % 2) as f32 + 0.5) * col_w;
             let cy = inner.top() + (k / 2) as f32 * row_h + rad + 6.0;
-            caps(&p, egui::pos2(cx, cy + rad + 9.5), Align2::CENTER_CENTER, name, 8.5);
-            p.text(egui::pos2(cx, cy + rad + 21.0), Align2::CENTER_CENTER, val_s, mono(10.0), INK);
+            caps(&p, egui::pos2(cx, cy + rad + 8.0), Align2::CENTER_CENTER, name, 8.0);
+            lcd_readout(&p, Rect::from_center_size(egui::pos2(cx, cy + rad + 21.0), egui::vec2((col_w - 16.0).clamp(42.0, 62.0), 15.5)), val_s, 9.5);
         }
 
         if (op.density, op.duration, op.spray, op.reverse) != before {
@@ -1364,8 +1379,8 @@ impl Studio {
         for (k, (&(name, _, _, _), val_s)) in items.iter().zip(texts.iter()).enumerate() {
             let cx = inner.left() + ((k % 2) as f32 + 0.5) * col_w;
             let cy = inner.top() + (k / 2) as f32 * row_h + rad + 6.0;
-            caps(&p, egui::pos2(cx, cy + rad + 9.5), Align2::CENTER_CENTER, name, 8.5);
-            p.text(egui::pos2(cx, cy + rad + 21.0), Align2::CENTER_CENTER, val_s, mono(10.0), INK);
+            caps(&p, egui::pos2(cx, cy + rad + 8.0), Align2::CENTER_CENTER, name, 8.0);
+            lcd_readout(&p, Rect::from_center_size(egui::pos2(cx, cy + rad + 21.0), egui::vec2((col_w - 16.0).clamp(42.0, 62.0), 15.5)), val_s, 9.5);
         }
 
         if (op.fine_cents, op.octave, op.wobble, op.spread) != before {
@@ -1688,10 +1703,10 @@ impl Studio {
                 p.rect_filled(band, 0.0, Color32::from_black_alpha(65));
             }
         }
-        mask_corners(&p, film, 8.0, Color32::from_rgb(0x10, 0x10, 0x12));
+        mask_corners(&p, film, 6.0, PANEL);
 
-        // 2. Waveform + slice bands + subtle unopinionated acoustic badges.
-        p.rect_filled(wave, r(9), G0);
+        // 2. Waveform + slice bands + subtle unopinionated acoustic badges inside dark CRT well.
+        p.rect_filled(wave, r(6), WELL);
         let playing = self.chop.playing.filter(|(s, _, t)| *s == src && now - t < 3.0).map(|(_, i, _)| i);
         let selected = self.chop.selected_slice.filter(|(s, _)| *s == src).map(|(_, i)| i);
         let badges: Vec<String> = {
@@ -1716,13 +1731,13 @@ impl Studio {
             let is_play = playing == Some(i);
             let is_sel = selected == Some(i);
             let fill = if is_play {
-                G4
+                Color32::from_rgb(0x3a, 0x35, 0x1e)
             } else if is_sel {
-                G3
+                WELL3
             } else if i % 2 == 0 {
-                G1
+                WELL
             } else {
-                G2
+                WELL2
             };
             p.rect_filled(band, 0.0, fill);
             let num_r = p.text(
@@ -1730,7 +1745,7 @@ impl Studio {
                 Align2::LEFT_TOP,
                 (i + 1).to_string(),
                 mono(9.5),
-                if is_play || is_sel { INK } else { INK3 },
+                if is_play || is_sel { AMBER_MID } else { CREAM2 },
             );
             let badge = badges.get(i).map(String::as_str).unwrap_or("");
             if !badge.is_empty() && band.width() >= 42.0 {
@@ -1738,8 +1753,8 @@ impl Studio {
                     egui::pos2(num_r.right() + 5.0, band.top() + 4.5),
                     Align2::LEFT_TOP,
                     badge,
-                    mono(8.5),
-                    if is_play || is_sel { INK2 } else { INK4 },
+                    mono_medium(8.5),
+                    if is_play || is_sel { AMBER_CORE } else { MINT_MID },
                 );
             }
             let cap_s = self
@@ -1754,8 +1769,8 @@ impl Studio {
                         band.left_bottom() + egui::vec2(5.0, -4.0),
                         Align2::LEFT_BOTTOM,
                         short(cap.trim(), ((band.width() - 10.0) / 5.5).max(3.0) as usize),
-                        font(9.0),
-                        INK2,
+                        font_medium(9.0),
+                        CREAM,
                     );
                 }
             }
@@ -1765,7 +1780,7 @@ impl Studio {
             self.waves.get(&pp.sources, src)
         };
         if let Some(pk) = peaks {
-            pk.draw(&p, wave.shrink2(egui::vec2(0.0, 10.0)), 0.0, len, INK2);
+            pk.draw(&p, wave.shrink2(egui::vec2(0.0, 10.0)), 0.0, len, Color32::from_rgb(0xe8, 0xd8, 0x98));
         }
 
         let mut edges: Vec<(usize, bool, f64)> = Vec::new();
@@ -1778,32 +1793,32 @@ impl Studio {
         }
         for (_, _, t) in &edges {
             let x = x_of(*t);
-            p.line_segment([egui::pos2(x, span_top), egui::pos2(x, span_bot)], Stroke::new(1.0, Color32::from_white_alpha(65)));
+            p.line_segment([egui::pos2(x, span_top), egui::pos2(x, span_bot)], Stroke::new(1.0, Color32::from_white_alpha(85)));
         }
 
         if let Some(tc) = self.chop.tap.as_ref().filter(|tc| tc.source == src) {
             let x = x_of((now - tc.t0).clamp(0.0, len));
-            p.line_segment([egui::pos2(x, span_top), egui::pos2(x, span_bot)], Stroke::new(2.0, HI));
+            p.line_segment([egui::pos2(x, span_top), egui::pos2(x, span_bot)], Stroke::new(2.0, AMBER_MID));
         } else if let Some((s, i, t)) = self.chop.playing {
             if s == src {
                 if let Some(sl) = slices.get(i) {
                     let at = sl.start + (now - t);
                     if at < sl.end {
                         let x = x_of(at);
-                        p.line_segment([egui::pos2(x, span_top), egui::pos2(x, span_bot)], Stroke::new(1.5, HI));
+                        p.line_segment([egui::pos2(x, span_top), egui::pos2(x, span_bot)], Stroke::new(1.8, AMBER_MID));
                     }
                 }
             }
         }
-        mask_corners(&p, wave, 9.0, Color32::from_rgb(0x10, 0x10, 0x12));
-        p.rect_stroke(wave, r(9), hair(LINE2), StrokeKind::Inside);
+        mask_corners(&p, wave, 6.0, PANEL);
+        monitor_bezel(&p, wave, 6);
 
         let mut new_slices: Option<Vec<Slice>> = None;
         let mut on_edge = false;
         for (k, (i, end, t)) in edges.iter().enumerate() {
             let x = x_of(*t);
             let grip = Rect::from_center_size(egui::pos2(x, wave.bottom() - 8.0), egui::vec2(5.0, 14.0));
-            p.rect_filled(grip, r(2), INK2);
+            p.rect_filled(grip, r(2), AMBER_MID);
             let resp = hit(
                 ui,
                 Rect::from_center_size(grip.center(), egui::vec2(26.0, 30.0)),
@@ -1947,6 +1962,25 @@ impl Studio {
                 if button_named(ui, kb, ui.id().with("kit-to-pads"), "Kit → pads", "kit to pads", false, None, None).clicked() {
                     let k = host.build_kit_to_pads();
                     if k > 0 {
+                        let specs = {
+                            let pp = host.project().lock().unwrap();
+                            chromagrain_core::chop::build_kit_across_sources_opt(&pp.sources, Some(self.key))
+                        };
+                        for spc in &specs {
+                            let pad = spc.pad_index.min(15);
+                            self.pad_sculpt[pad] = crate::host::SculptParams::from_core(spc.stamp, spc.sculpt, spc.choke_group);
+                            if !spc.slice.caption.is_empty() {
+                                self.pad_captions[pad] = spc.slice.caption.as_str().to_string();
+                            } else {
+                                self.pad_captions[pad].clear();
+                            }
+                            let focus = spc.slice.focus;
+                            if !self.source_focus.contains_key(&spc.source)
+                                && ((focus.0 - 0.5).abs() > 0.02 || (focus.1 - 0.5).abs() > 0.02)
+                            {
+                                self.source_focus.insert(spc.source, focus);
+                            }
+                        }
                         host.status(format!("harvested {k}-pad kit across loaded clips"));
                         self.finish_tap(host);
                         host.stop_audition();
@@ -1964,6 +1998,15 @@ impl Studio {
                 if button_named(ui, lb, ui.id().with("loops-to-pads"), "Loops → pads", "loops to pads", false, None, None).clicked() {
                     let k = host.build_loops_to_pads();
                     if k > 0 {
+                        let specs = {
+                            let pp = host.project().lock().unwrap();
+                            chromagrain_core::chop::build_tape_loops_across_sources(&pp.sources, Some(self.key))
+                        };
+                        for spc in &specs {
+                            let pad = spc.pad_index.min(15);
+                            self.pad_sculpt[pad] = crate::host::SculptParams::from_core(spc.stamp, spc.sculpt, 0);
+                            self.pad_captions[pad].clear();
+                        }
                         host.status(format!("dealt {k} unsynced tape loops onto pads"));
                         self.finish_tap(host);
                         host.stop_audition();
