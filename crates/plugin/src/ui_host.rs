@@ -34,7 +34,7 @@ use chromagrain_core::render::{plan_project, ClipPlan};
 use chromagrain_core::timeline::{Clip, Project, Track};
 use chromagrain_core::video::{AvLink, VisualGrainStyle};
 use chromagrain_ui::gpu::{LiveBus, Scene};
-use chromagrain_ui::{Caps, DeepTab, Host, Pad, PadKind, PerformHost, Studio, View};
+use chromagrain_ui::{Caps, DeepTab, Host, Pad, PadKind, PerformHost, StageMode, Studio, View};
 use nih_plug::prelude::{Enum, GuiContext, ParamSetter};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -55,6 +55,7 @@ pub struct PluginHost {
     key_override: Option<Key>,
     launch_override: Option<Launch>,
     layout_override: Option<bool>,
+    stage_mode_override: Option<StageMode>,
     /// The canvas fills the editor window (Perform's Fullscreen).
     pub fullscreen: bool,
     pub scene: Arc<Mutex<Option<Scene>>>,
@@ -80,6 +81,7 @@ impl PluginHost {
             key_override: None,
             launch_override: None,
             layout_override: None,
+            stage_mode_override: None,
             fullscreen: false,
             scene: Arc::new(Mutex::new(None)),
             gpu: true,
@@ -200,6 +202,9 @@ impl PluginHost {
             backdrop: studio.backdrop(self),
             parked: !self.playing(),
             frame: self.frame,
+            mode_override: self.stage_mode(),
+            focus_overrides: studio.source_focus.clone(),
+            tape_stop: studio.tape_stop_amt,
             project: doc,
         };
         *self.scene.lock().unwrap() = Some(scene);
@@ -309,8 +314,66 @@ impl Host for PluginHost {
         } else {
             self.layout_override = Some(tile);
         }
+        self.stage_mode_override = Some(if tile { StageMode::Grid } else { StageMode::Stack });
         self.project.lock().unwrap().layout = v.layout();
         self.doc_rev += 1;
+    }
+    fn stage_mode(&self) -> Option<StageMode> {
+        Some(self.stage_mode_override.unwrap_or_else(|| {
+            if self.tile_layout() == Some(true) {
+                StageMode::Grid
+            } else {
+                StageMode::Stack
+            }
+        }))
+    }
+    fn set_stage_mode(&mut self, mode: StageMode) {
+        self.set_tile_layout(mode == StageMode::Grid);
+        self.stage_mode_override = Some(mode);
+    }
+    fn build_kit_to_pads(&mut self) -> usize {
+        let sources: Vec<(usize, f64, Vec<chromagrain_core::chop::Slice>)> = {
+            let mut p = self.project.lock().unwrap();
+            let mut out = Vec::new();
+            for (sid, s) in p.sources.iter_mut().enumerate() {
+                if s.slices.is_empty() {
+                    if let Some(a) = &s.audio {
+                        s.slices = chromagrain_core::chop::auto_slices(a, 16);
+                    }
+                    if s.slices.is_empty() {
+                        s.slices = chromagrain_core::chop::equal_slices(s.duration(), 8);
+                    }
+                }
+                out.push((sid, s.duration(), s.slices.clone()));
+            }
+            out
+        };
+        let mut count = 0usize;
+        for pad in 0..PADS {
+            if sources.is_empty() {
+                break;
+            }
+            let (sid, _dur, ref slices) = sources[pad % sources.len()];
+            if slices.is_empty() {
+                continue;
+            }
+            let sl = slices[(pad / sources.len()) % slices.len()];
+            self.load_pad_slice(sid, sl.start, sl.end, pad);
+            count += 1;
+        }
+        count
+    }
+    fn build_loops_to_pads(&mut self) -> usize {
+        let n_src = self.project.lock().unwrap().sources.len();
+        if n_src == 0 {
+            return 0;
+        }
+        let n = PADS.min(n_src * 4).min(PADS);
+        for pad in 0..n {
+            let sid = pad % n_src;
+            self.load_pad(sid, pad);
+        }
+        n
     }
     fn slices_changed(&mut self, source: usize) {
         let v = self.project.lock().unwrap().sources.get(source).map(|s| s.slices.clone());

@@ -1,17 +1,8 @@
-//! The play-first studio UI (design v001): three views — Play (Tempera
-//! grid + emitters), Sequence (nanoloop lanes + scenes), Perform (pads +
-//! output) — one Deep drawer, and a tiny top bar. Hosts (the standalone
-//! app, the plugin) implement [`crate::host::Host`].
-//!
-//! Engine mapping:
-//! * Emitters fire live grains through per-emitter effect buses
-//!   (playback + GPU), using the core `instrument::grain_step` /
-//!   `MacroMap` — the same macro definition the plugin uses.
-//! * Sequence lanes are rows of one `StepPattern` per scene; the song
-//!   chain lays scene pattern clips out on a "sequence" arrangement track.
-//! * Perform pads are the existing perform-mode pad tracks.
-//! * Rec captures the emitters' grains and bounces them (core `take`) into
-//!   a new source placed on a "takes" track.
+//! The play-first studio UI (`D · Hybrid` + VGS Stage/Sculpt/Set upgrade):
+//! three views — Play (Tempera grid + emitters), Sequence (nanoloop lanes +
+//! VJ set cues + step ratchets/chords), Perform (pads + punch-in FX + output) —
+//! calm modal sheets (`Add`, `Clip`, `Project`), and a minimal top bar.
+//! Hosts (the standalone app, the plugin) implement [`crate::host::Host`].
 
 pub mod add;
 pub mod clip;
@@ -21,20 +12,19 @@ mod play;
 pub mod sequence;
 
 use crate::atlas;
-use crate::host::Host;
-use crate::theme;
+use crate::host::{ChordChoice, Host, SculptParams, StageAspect, StageMode};
+use crate::theme::{self, *};
+use crate::widgets::*;
 use chromagrain_core::dsp::Rng;
-use chromagrain_core::fx::{AvEffect, EffectKind};
-use chromagrain_core::grain::GrainEvent;
 use chromagrain_core::envelope::{Adsr, VoiceEnv};
-use chromagrain_core::grain::VoiceTag;
+use chromagrain_core::fx::{AvEffect, EffectKind};
+use chromagrain_core::grain::{GrainEvent, VoiceTag};
 use chromagrain_core::instrument::{grain_step, Cloud, MacroMap, LOOKS};
-use chromagrain_core::tile::{layout_pan, TileAssigner};
 use chromagrain_core::music::{Key, ScaleKind};
+use chromagrain_core::tile::{layout_pan, TileAssigner};
 use chromagrain_core::video::{AvLink, VisualGrainStyle};
 use egui::{self, Align2, Color32, Rect};
-use crate::theme::*;
-use crate::widgets::*;
+use std::collections::HashMap;
 
 pub use clip::ClipTarget;
 pub use deep::{DeepTab, DeepTarget};
@@ -51,8 +41,27 @@ pub const COLUMNS: usize = 8;
 pub const ROWS: usize = 8;
 pub const LANES: usize = 8;
 pub const STEPS: usize = 16;
-pub const SCENES: usize = 8;
+pub const SCENES: usize = 12;
 pub const EMITTERS: usize = 4;
+
+/// Names of the 6 Perform VJ Punch-In FX pills.
+pub const PUNCH_FX_LABELS: [&str; 6] = [
+    "Stutter",
+    "Tape Stop",
+    "Comb",
+    "Dub",
+    "Shimmer",
+    "Wear",
+];
+
+pub const PUNCH_FX_A11Y: [&str; 6] = [
+    "punch stutter",
+    "punch tape stop",
+    "punch comb",
+    "punch dub",
+    "punch shimmer",
+    "punch wear",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
@@ -68,7 +77,7 @@ impl View {
     }
 }
 
-/// A brush on the Play grid with its own grain settings.
+/// A brush on the Play grid with its own grain and sculpt settings.
 pub struct Emitter {
     pub col: usize,
     /// Vertical position in grid rows, 0..8 (which part of the clip).
@@ -89,6 +98,9 @@ pub struct Emitter {
     pub stretch: f32,
     pub lowpass: f32,
     pub highpass: f32,
+    pub sculpt: SculptParams,
+    pub caption: String,
+    pub focus: (f32, f32),
     pub cloud: Cloud,
     pub link: AvLink,
     /// Held by a finger / the pointer: spraying.
@@ -118,6 +130,9 @@ impl Emitter {
             stretch: 0.0,
             lowpass: 0.0,
             highpass: 0.0,
+            sculpt: SculptParams::default(),
+            caption: String::new(),
+            focus: (0.5, 0.5),
             cloud: Cloud::default(),
             link: AvLink::default(),
             held: false,
@@ -161,17 +176,25 @@ pub struct Rec {
     pub events: Vec<(usize, GrainEvent)>,
 }
 
-/// Sequence state: one pattern per scene; lane i is row i of each.
+/// Sequence & VJ Set Arranger state: up to 12 named scenes, repeat counts
+/// (`1..=16` bars or `0` = `∞` hold), and live `∞ hold` improv lock.
 pub struct SeqState {
     pub scene_pats: [Option<usize>; SCENES],
+    pub scene_names: [String; SCENES],
     pub scene: usize,
     pub queued: Option<usize>,
-    /// Song chain: (scene, repeats of one bar).
+    /// Song / VJ set chain: `(scene_index, repeats_of_one_bar; 0 = ∞ hold)`.
     pub chain: Vec<(usize, u32)>,
+    /// Live improv lock: holds the active scene endlessly until another is queued.
+    pub hold_scene: bool,
+    /// Scene whose name is currently being edited inline.
+    pub editing_name: Option<usize>,
     /// Lane -> source (lane N = column N by default).
     pub lanes: [Option<usize>; LANES],
     /// Step whose hold sheet is open: (lane, step).
     pub hold: Option<(usize, usize)>,
+    /// Per-(scene, lane, step) ratchet & chord metadata: `(ratchet 1..=8, slope_st, chord)`.
+    pub step_ext: HashMap<(usize, usize, usize), (u8, f32, ChordChoice)>,
     /// Revision the arrangement was last rebuilt for.
     pub(crate) built_rev: u64,
 }
@@ -192,7 +215,22 @@ pub struct Studio {
     pub gesture_hud: Option<(usize, String, f64)>,
     pub(crate) lane_links: [AvLink; LANES],
     pub(crate) lane_fx: [Vec<AvEffect>; LANES],
+    pub lane_sculpt: [SculptParams; LANES],
+    pub lane_captions: [String; LANES],
     pub(crate) pad_links: [AvLink; 16],
+    pub pad_sculpt: [SculptParams; 16],
+    pub pad_captions: [String; 16],
+    /// Per-source smart crop focus `(cx, cy)` in `0.15..=0.85`.
+    pub source_focus: HashMap<usize, (f32, f32)>,
+    /// Per-(source, slice_index) user caption.
+    pub slice_captions: HashMap<(usize, usize), String>,
+    /// Active kinetic caption shown on stage: `(text, until_clock)`.
+    pub active_caption: Option<(String, f64)>,
+    /// Perform VJ Punch-In FX states (`Stutter`, `Tape Stop`, `Comb`, `Dub`, `Shimmer`, `Wear`).
+    pub punch_fx: [bool; 6],
+    pub(crate) punch_press_t: [Option<f64>; 6],
+    pub tape_stop_amt: f32,
+    base_master_fx: Option<(Vec<AvEffect>, f32, f32)>,
     atlases: atlas::Atlases,
     grain_tex: Option<egui::TextureHandle>,
     /// Grid cells lit by sprays: (col, row) -> time.
@@ -210,7 +248,7 @@ pub struct Studio {
     pub add: add::AddState,
     pub chop: clip::ChopState,
     pub(crate) waves: crate::wave::WaveCache,
-    /// Tile slots for emitter gestures and live one-shot pad hits (tile layout).
+    /// Tile slots for emitter gestures and live one-shot pad hits (tile/split layout).
     pub tiles: TileAssigner,
     gestures: u64,
 }
@@ -220,18 +258,27 @@ impl Default for Studio {
         Studio {
             view: View::Play,
             columns: [None; COLUMNS],
-            emitters: [Emitter::new(0, 0, 6.5), Emitter::new(1, 2, 5.5), Emitter::new(2, 5, 1.5), Emitter::new(3, 4, 6.4)],
+            emitters: [
+                Emitter::new(0, 0, 6.5),
+                Emitter::new(1, 2, 5.5),
+                Emitter::new(2, 5, 1.5),
+                Emitter::new(3, 4, 6.4),
+            ],
             sel_emitter: 0,
             sel_lane: 0,
             sel_pad: 0,
             key: Key::new(9, ScaleKind::Minor),
             seq: SeqState {
                 scene_pats: [None; SCENES],
+                scene_names: std::array::from_fn(|_| String::new()),
                 scene: 0,
                 queued: None,
                 chain: vec![(0, 2)],
+                hold_scene: false,
+                editing_name: None,
                 lanes: [None; LANES],
                 hold: None,
+                step_ext: HashMap::new(),
                 built_rev: 0,
             },
             deep: None,
@@ -240,7 +287,18 @@ impl Default for Studio {
             gesture_hud: None,
             lane_links: [AvLink::default(); LANES],
             lane_fx: std::array::from_fn(|_| Vec::new()),
+            lane_sculpt: [SculptParams::default(); LANES],
+            lane_captions: std::array::from_fn(|_| String::new()),
             pad_links: [AvLink::default(); 16],
+            pad_sculpt: [SculptParams::default(); 16],
+            pad_captions: std::array::from_fn(|_| String::new()),
+            source_focus: HashMap::new(),
+            slice_captions: HashMap::new(),
+            active_caption: None,
+            punch_fx: [false; 6],
+            punch_press_t: [None; 6],
+            tape_stop_amt: 0.0,
+            base_master_fx: None,
             atlases: atlas::Atlases::default(),
             grain_tex: None,
             lit: Vec::new(),
@@ -323,7 +381,7 @@ impl Studio {
         }
     }
 
-    /// Per-frame engine work: emitters, buses, rec, sequence arrangement.
+    /// Per-frame engine work: emitters, buses, punch-in FX, rec, sequence arrangement.
     pub fn update(&mut self, host: &mut dyn Host, ctx: &egui::Context) {
         self.route_deep();
         if !self.fonts_installed {
@@ -348,9 +406,166 @@ impl Studio {
         self.seq_ensure(host);
         self.seq_build_arrangement(host);
         self.seq_tick(host);
+        self.sync_punch_fx(host, ctx);
         self.fire_emitters(host, ctx);
         let now = host.clock();
         self.lit.retain(|(_, t)| now - *t < 0.4);
+        if self.active_caption.as_ref().is_some_and(|(_, exp)| now >= *exp) {
+            self.active_caption = None;
+        }
+    }
+
+    /// Apply Perform VJ Punch-In FX (`Stutter`, `Tape Stop`, `Comb`, `Dub`, `Shimmer`, `Wear`)
+    /// onto the master effect chain & tape processor while preserving the user's base FX.
+    fn sync_punch_fx(&mut self, host: &mut dyn Host, ctx: &egui::Context) {
+        let dt = ctx.input(|i| i.stable_dt.clamp(0.001, 0.1));
+        if self.punch_fx[1] {
+            self.tape_stop_amt = (self.tape_stop_amt + dt * 1.65).clamp(0.0, 1.0);
+            ctx.request_repaint();
+        } else if self.tape_stop_amt > 0.0 {
+            self.tape_stop_amt = (self.tape_stop_amt - dt * 3.2).max(0.0);
+            ctx.request_repaint();
+        }
+
+        let any = self.punch_fx.iter().any(|&on| on) || self.tape_stop_amt > 0.005;
+        if !any {
+            if let Some((base_fx, base_age, base_wow)) = self.base_master_fx.take() {
+                {
+                    let mut p = host.project().lock().unwrap();
+                    p.master_effects = base_fx;
+                    p.master_tape.age = base_age;
+                    p.master_tape.wow = base_wow;
+                }
+                host.mark_now();
+            }
+            return;
+        }
+
+        let bpm = host.project().lock().unwrap().bpm.max(40.0) as f32;
+        if self.base_master_fx.is_none() {
+            let p = host.project().lock().unwrap();
+            self.base_master_fx = Some((p.master_effects.clone(), p.master_tape.age, p.master_tape.wow));
+        }
+        let Some((ref base_fx, base_age, base_wow)) = self.base_master_fx else { return };
+        let mut chain = base_fx.clone();
+        let mut age = base_age;
+        let mut wow = base_wow;
+
+        // 0: Stutter — beat-locked 16th echo + 2×2 / 4×4 mirrored tile cut.
+        if self.punch_fx[0] {
+            let sixteenth = (60.0 / bpm / 4.0).clamp(0.05, 0.35);
+            chain.push(AvEffect {
+                kind: EffectKind::Delay {
+                    time: sixteenth,
+                    feedback: 0.76,
+                    mix: 0.78,
+                    shift_x: 0.035,
+                    shift_y: 0.0,
+                },
+                audio: 0.92,
+                video: 0.85,
+            });
+            chain.push(AvEffect {
+                kind: EffectKind::Tile { count: 2.0, mirror: 1.0, spin: 0.0 },
+                audio: 0.85,
+                video: 0.90,
+            });
+        }
+        // 1: Tape Stop — varispeed wow/age spin-down + VHS vertical roll.
+        if self.tape_stop_amt > 0.005 {
+            let a = self.tape_stop_amt;
+            wow = wow.max(0.85 * a);
+            age = age.max(0.75 * a);
+            chain.push(AvEffect {
+                kind: EffectKind::Delay {
+                    time: (0.04 + 0.24 * a).clamp(0.04, 0.35),
+                    feedback: 0.45 * a,
+                    mix: 0.65 * a,
+                    shift_x: 0.015 * a,
+                    shift_y: 0.08 * a,
+                },
+                audio: a,
+                video: a,
+            });
+        }
+        // 2: Comb — scale-locked Karplus/Tune resonator wash.
+        if self.punch_fx[2] {
+            chain.push(AvEffect {
+                kind: EffectKind::Tune {
+                    root: self.key.root as f32,
+                    scale: self.key.scale,
+                    amount: 0.88,
+                    focus: 0.82,
+                },
+                audio: 0.92,
+                video: 0.80,
+            });
+        }
+        // 3: Dub — dotted-8th ping-pong echo + frame ghosting.
+        if self.punch_fx[3] {
+            let dotted_8th = (60.0 / bpm * 0.75).clamp(0.12, 0.9);
+            chain.push(AvEffect {
+                kind: EffectKind::Delay {
+                    time: dotted_8th,
+                    feedback: 0.68,
+                    mix: 0.62,
+                    shift_x: 0.04,
+                    shift_y: -0.015,
+                },
+                audio: 0.88,
+                video: 0.82,
+            });
+        }
+        // 4: Shimmer — lush octave/prism kaleidoscope + cathedral tail.
+        if self.punch_fx[4] {
+            if let Some(k) = EffectKind::parse("kaleido") {
+                chain.push(AvEffect { kind: k, audio: 0.72, video: 0.78 });
+            }
+            chain.push(AvEffect {
+                kind: EffectKind::Reverb { size: 0.94, damp: 0.22, mix: 0.62 },
+                audio: 0.88,
+                video: 0.80,
+            });
+        }
+        // 5: Wear — Basinski oxide disintegration + warm crush/codec decay.
+        if self.punch_fx[5] {
+            age = age.max(0.82);
+            wow = wow.max(0.58);
+            chain.push(AvEffect {
+                kind: EffectKind::Compress { quality: 0.32 },
+                audio: 0.68,
+                video: 0.72,
+            });
+            chain.push(AvEffect {
+                kind: EffectKind::Reverb { size: 0.88, damp: 0.65, mix: 0.42 },
+                audio: 0.65,
+                video: 0.55,
+            });
+        }
+
+        let changed = {
+            let mut p = host.project().lock().unwrap();
+            let diff = p.master_effects != chain
+                || (p.master_tape.age - age).abs() > 1e-3
+                || (p.master_tape.wow - wow).abs() > 1e-3;
+            if diff {
+                p.master_effects = chain;
+                p.master_tape.age = age;
+                p.master_tape.wow = wow;
+            }
+            diff
+        };
+        if changed {
+            host.mark_now();
+        }
+    }
+
+    /// Toggle or momentarily engage Punch-In FX `idx` (`0..6`).
+    pub fn set_punch_fx(&mut self, host: &mut dyn Host, idx: usize, on: bool, ctx: &egui::Context) {
+        if idx < 6 && self.punch_fx[idx] != on {
+            self.punch_fx[idx] = on;
+            self.sync_punch_fx(host, ctx);
+        }
     }
 
     /// The four emitter buses: grain style + SMEAR + LOOK + Clip-sheet FX, sound and picture.
@@ -370,11 +585,14 @@ impl Studio {
                         }
                     }
                 }
+                let hard_burst = e.adsr.picture == chromagrain_core::envelope::PictureCut::Cut && e.cloud.spray <= 0.08;
+                let style = if hard_burst {
+                    VisualGrainStyle::full_frame(0.0)
+                } else {
+                    VisualGrainStyle::morph(0.0, &VisualGrainStyle { additive: 0.3, feather: 0.7, ..Default::default() }, map.texture)
+                };
                 crate::gpu::LiveBus {
-                    // Sample end: the footage itself (over, not glow); the
-                    // cloud end glows like classic grain clouds.
-                    // grain end: soft-edged patches that glow, never hard blocks.
-                    style: VisualGrainStyle::morph(0.0, &VisualGrainStyle { additive: 0.3, feather: 0.7, ..Default::default() }, map.texture),
+                    style,
                     effects,
                     link: e.link,
                 }
@@ -421,18 +639,17 @@ impl Studio {
         let now = host.clock();
         let key = self.key;
         let sources: Vec<f64> = host.project().lock().unwrap().sources.iter().map(|s| s.duration()).collect();
-        // Bus effects follow the knobs.
         for (i, b) in self.buses().into_iter().enumerate() {
             host.set_bus(i as u8 + 1, b.effects);
         }
-        let mut fired: Vec<(usize, u8, GrainEvent, (usize, usize))> = Vec::new();
-        let tile = host.tile_layout() == Some(true);
-        let pan_by_tile = tile && host.project().lock().unwrap().layout_pan;
+        let mut fired: Vec<(usize, u8, GrainEvent, (usize, usize), Option<String>)> = Vec::new();
+        let mode = host.stage_mode().unwrap_or(StageMode::Stack);
+        let assign_slot = matches!(mode, StageMode::Grid | StageMode::Split);
+        let pan_by_tile = mode == StageMode::Grid && host.project().lock().unwrap().layout_pan;
+        let tape_spin_mul = (1.0 - 0.72 * self.tape_stop_amt).clamp(0.18, 1.0);
         self.tiles.expire(now);
         let mut released = Vec::new();
         for (i, e) in self.emitters.iter_mut().enumerate() {
-            // Gestures: press = note-on, release = note-off; grains keep
-            // coming through the release so sound and picture end together.
             match (e.held, e.gesture) {
                 (true, None) | (true, Some((_, _, Some(_)))) => {
                     self.gestures += 1;
@@ -458,7 +675,7 @@ impl Studio {
             }
             let (voice, on, off) = e.gesture.unwrap_or((0, now, None));
             let env = VoiceEnv { adsr: e.adsr, on, off: off.unwrap_or(f64::INFINITY) };
-            let slot = if tile { self.tiles.slot_of(voice).map(|s| s as u8) } else { None };
+            let slot = if assign_slot { self.tiles.slot_of(voice).map(|s| s as u8) } else { None };
             let (cols, rows) = self.tiles.grid_at(now);
             let map = MacroMap::resolve(&e.macros, Some(&key));
             let mut n = 0;
@@ -470,12 +687,13 @@ impl Studio {
                 1.0
             };
             let stretch_mul = (1.0 - 0.75 * e.stretch.clamp(0.0, 1.0)).max(0.15) as f64;
+            let cap = (!e.caption.trim().is_empty()).then(|| e.caption.trim().to_string());
             while e.next_t <= now && n < 64 {
                 let id = ((i as u64 + 1) << 48) | e.k;
                 let (mut ev, hop) = grain_step(&map, &e.cloud, Some(&key), &mut e.rng, e.head, len, base_note, vel, id);
-                ev.pitch_ratio *= fine_ratio;
+                ev.pitch_ratio *= fine_ratio * tape_spin_mul;
                 ev.onset = (e.next_t + ev.onset).max(now - 0.02);
-                ev.tag = VoiceTag { voice, env: Some(env), tile: slot };
+                ev.tag = VoiceTag { voice, env: Some(env), tile: slot, ..Default::default() };
                 if let (Some(sl), true) = (slot, pan_by_tile) {
                     let (pan, gain) = layout_pan(sl as usize, cols, rows);
                     ev.pan = pan;
@@ -483,12 +701,18 @@ impl Studio {
                 } else if e.pan.abs() > 1e-4 {
                     ev.pan = (ev.pan + e.pan).clamp(-1.0, 1.0);
                 }
-                e.head += hop * map.speed as f64 * stretch_mul;
+                if let Some(loop_s) = e.sculpt.free_loop_secs {
+                    let span = (loop_s as f64).clamp(0.5, len);
+                    let start = (e.pos() as f64 * len).min((len - span).max(0.0));
+                    e.head = start + (e.head - start + hop * map.speed as f64 * stretch_mul).rem_euclid(span.max(0.1));
+                } else {
+                    e.head += hop * map.speed as f64 * stretch_mul;
+                }
                 e.next_t += hop;
                 e.k += 1;
                 n += 1;
                 let cell_row = ((ev.source_pos / len) * ROWS as f64) as usize;
-                fired.push((src, i as u8 + 1, ev, (e.col, cell_row.min(ROWS - 1))));
+                fired.push((src, i as u8 + 1, ev, (e.col, cell_row.min(ROWS - 1)), cap.clone()));
                 e.last_fire = now;
             }
             if e.next_t < now - 0.5 {
@@ -498,7 +722,10 @@ impl Studio {
         for v in released {
             host.release_voice(v);
         }
-        for (src, bus, ev, cell) in fired {
+        for (src, bus, ev, cell, cap) in fired {
+            if let Some(c) = cap {
+                self.active_caption = Some((c, now + ev.duration.max(0.45) as f64));
+            }
             if let Some(rec) = self.rec.as_mut() {
                 let mut r = ev.clone();
                 r.onset -= rec.t0;
@@ -588,6 +815,7 @@ impl Studio {
             return;
         }
         self.seq.hold = None;
+        self.seq.editing_name = None;
         for e in self.emitters.iter_mut() {
             e.held = false;
         }
@@ -600,7 +828,6 @@ impl Studio {
             return;
         }
         if self.sheet.is_some() {
-            // Sheets are modal: only Esc (close) and Space (transport).
             let (esc, space) = ctx.input(|i| (i.key_pressed(egui::Key::Escape), i.key_pressed(egui::Key::Space)));
             if space && self.chop.tap.is_none() {
                 host.toggle_play();
@@ -667,6 +894,8 @@ impl Studio {
                 self.sheet = None;
             } else if self.seq.hold.is_some() {
                 self.seq.hold = None;
+            } else if self.seq.editing_name.is_some() {
+                self.seq.editing_name = None;
             } else {
                 self.deep = None;
             }
@@ -678,9 +907,14 @@ impl Studio {
                 }
                 PAD_KEYS.iter().enumerate().filter(|(_, k)| i.key_pressed(**k)).map(|(n, _)| n).collect()
             });
+            let pad_caps = self.pad_captions.clone();
+            let now = host.clock();
             if let Some(perf) = host.perform() {
                 for pad in hit {
                     perf.toggle_pad(pad);
+                    if let Some(c) = pad_caps.get(pad).filter(|s| !s.trim().is_empty()) {
+                        self.active_caption = Some((c.trim().to_string(), now + 1.2));
+                    }
                 }
             }
         }
@@ -701,7 +935,6 @@ impl Studio {
         } else {
             x += 4.0;
         }
-        // Transport (a plugin shows the host's state, read-only).
         let playing = host.playing();
         let b = Rect::from_min_size(egui::pos2(x, cy - 19.0), egui::vec2(44.0, 38.0));
         if caps.transport {
@@ -889,7 +1122,7 @@ impl Studio {
         Some((a.tex.id(), atlas::AtlasView::of(a)))
     }
 
-    /// "uploader · 2014-03-02 · 212 views · CC" for dug / linked media.
+    /// "uploader · 2014 · 212 views · CC" for dug / linked media.
     pub fn provenance_line(&self, host: &dyn Host, src: usize) -> String {
         let p = host.project().lock().unwrap();
         let Some(pv) = p.sources.get(src).and_then(|s| s.provenance.as_ref()) else { return String::new() };
@@ -913,29 +1146,71 @@ impl Studio {
         host.project().lock().unwrap().sources.get(src).map(|s| s.name.clone()).unwrap_or_default()
     }
 
-    /// The live canvas (GPU), rounded.
+    /// The live canvas (GPU), letterboxed/pillarboxed to `canvas_size` (`16:9 · 1:1 · 9:16`), rounded.
     pub fn stage(&mut self, host: &dyn Host, ui: &mut egui::Ui, rect: Rect, radius: f32) {
         let p = ui.painter().clone();
-        p.rect_filled(rect, r(radius as u8), G1);
+        p.rect_filled(rect, r(radius as u8), Color32::from_rgb(0x09, 0x09, 0x0a));
+        let (cw, ch) = host.canvas_size();
+        let canvas_ar = cw.max(1) as f32 / ch.max(1) as f32;
+        let fitted = crate::fit(rect, canvas_ar);
         if let Some(scene) = host.canvas() {
-            p.add(crate::gpu::PreviewCallback::shape(scene, rect));
+            p.add(crate::gpu::PreviewCallback::shape(scene, fitted));
+        }
+        if (fitted.width() - rect.width()).abs() > 2.0 || (fitted.height() - rect.height()).abs() > 2.0 {
+            p.rect_stroke(fitted, 0.0, hair(LINE), egui::StrokeKind::Inside);
+        }
+        // Kinetic spoken-hook caption bar (strictly only when a non-empty user/slice caption is active).
+        let now = host.clock();
+        if let Some((ref txt, exp)) = self.active_caption {
+            if now < exp && !txt.trim().is_empty() && fitted.width() >= 140.0 && fitted.height() >= 80.0 {
+                let upper = txt.trim().to_uppercase();
+                let font_sz = (fitted.height() * 0.042).clamp(11.0, 16.0);
+                let g = p.layout_no_wrap(play::short(&upper, 44), font_semibold(font_sz), HI);
+                let bw = (g.size().x + 24.0).min(fitted.width() - 16.0);
+                let bh = g.size().y + 10.0;
+                let cy = fitted.top() + fitted.height() * 0.84;
+                let box_r = Rect::from_center_size(egui::pos2(fitted.center().x, cy), egui::vec2(bw, bh));
+                p.rect_filled(box_r, r(6), Color32::from_rgba_unmultiplied(11, 11, 12, 224));
+                p.rect_stroke(box_r, r(6), hair(LINE2), egui::StrokeKind::Inside);
+                let accent_r = Rect::from_min_size(egui::pos2(box_r.left() + 3.0, box_r.top() + 4.0), egui::vec2(2.5, bh - 8.0));
+                p.rect_filled(accent_r, r(1), HI);
+                p.galley(egui::pos2(box_r.left() + 13.0, box_r.center().y - g.size().y * 0.5), g, HI);
+            }
         }
         mask_corners(&p, rect, radius, G0);
         p.rect_stroke(rect, r(radius as u8), hair(LINE), egui::StrokeKind::Inside);
     }
 
-    /// The small `stack | tile` switch in a stage's top-left corner.
+    /// Stage overlay pills in top-left corner: `stack | split | grid | bleed` +
+    /// compact `16:9 · 1:1 · 9:16` aspect switch (standalone).
     pub fn layout_switch(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, stage: Rect) {
-        self.layout_switch_named(
+        let pad = if stage.width() < 180.0 { 6.0 } else { 10.0 };
+        let used_r = self.stage_mode_pill(
             host,
             ui,
-            egui::pos2(stage.left() + 10.0, stage.top() + 10.0),
+            egui::pos2(stage.left() + pad, stage.top() + pad),
+            stage.width() - pad * 2.0,
             "layout",
-            ("layout stack", "layout tile"),
+            ["layout stack", "layout split", "layout tile", "layout bleed"],
         );
+        let Some(cur_aspect) = host.stage_aspect() else { return };
+        let rem = stage.right() - pad - used_r.right();
+        if rem >= 112.0 {
+            let ar_rect = Rect::from_min_size(egui::pos2(used_r.right() + 6.0, used_r.top()), egui::vec2(106.0, used_r.height()));
+            self.aspect_pill_bar(host, ui, ar_rect, cur_aspect, "aspect");
+        } else if rem >= 46.0 {
+            let cr = Rect::from_min_size(egui::pos2(stage.right() - pad - 42.0, used_r.top()), egui::vec2(42.0, used_r.height()));
+            let p = ui.painter().clone();
+            p.rect_filled(cr, r(8), Color32::from_black_alpha(165));
+            p.rect_stroke(cr, r(8), hair(LINE2), egui::StrokeKind::Inside);
+            p.text(cr.center(), Align2::CENTER_CENTER, cur_aspect.label(), mono_medium(10.0), INK);
+            if hit(ui, cr.expand2(egui::vec2(2.0, 3.0)), ui.id().with("aspect-cycle"), egui::Sense::click(), "aspect cycle").clicked() {
+                host.set_stage_aspect(StageAspect::from_index((cur_aspect.index() + 1) % 3));
+            }
+        }
     }
 
-    /// `stack | tile` switch at `pos` with explicit id salt and accessibility names.
+    /// Backwards-compatible named stage mode pill (e.g. inside `Sheet::Clip`).
     pub fn layout_switch_named(
         &mut self,
         host: &mut dyn Host,
@@ -944,24 +1219,80 @@ impl Studio {
         id_salt: &str,
         names: (&str, &str),
     ) {
-        let Some(tile) = host.tile_layout() else { return };
-        let r0 = Rect::from_min_size(pos, egui::vec2(118.0, 34.0));
+        let prefix = names.0.strip_suffix(" stack").unwrap_or("layout");
+        let split_a11y = format!("{prefix} split");
+        let bleed_a11y = format!("{prefix} bleed");
+        self.stage_mode_pill(
+            host,
+            ui,
+            pos,
+            240.0,
+            id_salt,
+            [names.0, split_a11y.as_str(), names.1, bleed_a11y.as_str()],
+        );
+    }
+
+    pub(crate) fn stage_mode_pill(
+        &mut self,
+        host: &mut dyn Host,
+        ui: &mut egui::Ui,
+        pos: egui::Pos2,
+        avail_w: f32,
+        id_salt: &str,
+        a11y: [&str; 4],
+    ) -> Rect {
+        let Some(cur) = host.stage_mode() else {
+            return Rect::from_min_size(pos, egui::Vec2::ZERO);
+        };
+        let tiny = avail_w < 164.0;
+        let w = if tiny { avail_w.clamp(124.0, 144.0) } else { 164.0 };
+        let h = if tiny { 26.0 } else { 30.0 };
+        let r0 = Rect::from_min_size(pos, egui::vec2(w, h));
         let p = ui.painter().clone();
-        p.rect_filled(r0, r(10), Color32::from_black_alpha(165));
-        p.rect_stroke(r0, r(10), hair(LINE2), egui::StrokeKind::Inside);
-        let half = r0.width() / 2.0;
-        let a11y = [names.0, names.1];
-        for (k, name) in ["stack", "tile"].into_iter().enumerate() {
-            let rc = Rect::from_min_size(egui::pos2(r0.left() + k as f32 * half, r0.top()), egui::vec2(half, r0.height())).shrink(3.0);
-            let on = tile == (k == 1);
+        p.rect_filled(r0, r(9), Color32::from_black_alpha(172));
+        p.rect_stroke(r0, r(9), hair(LINE2), egui::StrokeKind::Inside);
+        let cell_w = r0.width() / 4.0;
+        let fsz = if tiny { 9.5 } else { 11.0 };
+        for (k, m) in StageMode::ALL.into_iter().enumerate() {
+            let rc = Rect::from_min_size(egui::pos2(r0.left() + k as f32 * cell_w, r0.top()), egui::vec2(cell_w, r0.height())).shrink(2.5);
+            let on = cur == m;
             if on {
-                p.rect_filled(rc, r(7), HI);
+                p.rect_filled(rc, r(6), HI);
             }
             let col = if on { ON_HI } else { INK2 };
-            p.text(rc.center(), Align2::CENTER_CENTER, name, font_medium(11.5), col);
-            let hr = Rect::from_min_max(egui::pos2(rc.left(), rc.top() - 4.0), egui::pos2(rc.right(), rc.bottom() + 4.0));
+            p.text(rc.center(), Align2::CENTER_CENTER, m.label(), font_medium(fsz), col);
+            let hr = Rect::from_min_max(egui::pos2(rc.left(), rc.top() - 3.0), egui::pos2(rc.right(), rc.bottom() + 3.0));
             if hit(ui, hr, ui.id().with((id_salt, k)), egui::Sense::click(), a11y[k]).clicked() && !on {
-                host.set_tile_layout(k == 1);
+                host.set_stage_mode(m);
+            }
+        }
+        r0
+    }
+
+    pub(crate) fn aspect_pill_bar(
+        &mut self,
+        host: &mut dyn Host,
+        ui: &mut egui::Ui,
+        r0: Rect,
+        cur: StageAspect,
+        id_salt: &str,
+    ) {
+        let p = ui.painter().clone();
+        p.rect_filled(r0, r(9), Color32::from_black_alpha(172));
+        p.rect_stroke(r0, r(9), hair(LINE2), egui::StrokeKind::Inside);
+        let cell_w = r0.width() / 3.0;
+        let a11y = ["aspect 16:9", "aspect 1:1", "aspect 9:16"];
+        for (k, ar) in StageAspect::ALL.into_iter().enumerate() {
+            let rc = Rect::from_min_size(egui::pos2(r0.left() + k as f32 * cell_w, r0.top()), egui::vec2(cell_w, r0.height())).shrink(2.5);
+            let on = cur == ar;
+            if on {
+                p.rect_filled(rc, r(6), HI);
+            }
+            let col = if on { ON_HI } else { INK2 };
+            p.text(rc.center(), Align2::CENTER_CENTER, ar.label(), mono_medium(10.0), col);
+            let hr = Rect::from_min_max(egui::pos2(rc.left(), rc.top() - 3.0), egui::pos2(rc.right(), rc.bottom() + 3.0));
+            if hit(ui, hr, ui.id().with((id_salt, k)), egui::Sense::click(), a11y[k]).clicked() && !on {
+                host.set_stage_aspect(ar);
             }
         }
     }
@@ -971,7 +1302,13 @@ impl Studio {
 pub fn emitter_effects(map: &MacroMap, key: &Key) -> Vec<AvEffect> {
     let mut out = Vec::new();
     if map.echo_mix > 0.001 || map.reverb_mix > 0.001 {
-        out.push(AvEffect::new(EffectKind::Delay { time: 0.33, feedback: map.echo_feedback, mix: map.echo_mix, shift_x: 0.02, shift_y: 0.0 }));
+        out.push(AvEffect::new(EffectKind::Delay {
+            time: 0.33,
+            feedback: map.echo_feedback,
+            mix: map.echo_mix,
+            shift_x: 0.02,
+            shift_y: 0.0,
+        }));
         out.push(AvEffect::new(EffectKind::Reverb { size: 0.85, damp: 0.4, mix: map.reverb_mix }));
     }
     if let Some(name) = LOOKS.get(map.look).copied().flatten() {

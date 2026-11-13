@@ -36,6 +36,8 @@ mod studio_host;
 mod studio_tests;
 #[cfg(test)]
 mod studio_tests_v003;
+#[cfg(test)]
+mod studio_tests_vgs;
 mod theme;
 mod ui_browse;
 mod ui_inspector;
@@ -354,6 +356,8 @@ pub struct App {
     classic: bool,
     /// The play-first studio UI state.
     studio: chromagrain_ui::Studio,
+    /// Stage mode override (`Stack | Split | Grid | Bleed`).
+    pub(crate) stage_mode_override: Option<chromagrain_ui::StageMode>,
 
     busy: Option<String>,
     jobs: VecDeque<Job>,
@@ -501,6 +505,7 @@ impl App {
             pending_fullscreen: false,
             classic: opts.classic,
             studio: chromagrain_ui::Studio::default(),
+            stage_mode_override: None,
             busy: None,
             jobs: VecDeque::new(),
             rx,
@@ -1404,6 +1409,9 @@ impl App {
             backdrop: if self.classic { None } else { self.studio.backdrop(self) },
             parked: !self.playback.is_playing(),
             frame: self.frame_no,
+            mode_override: self.stage_mode_override,
+            focus_overrides: if self.classic { HashMap::new() } else { self.studio.source_focus.clone() },
+            tape_stop: if self.classic { 0.0 } else { self.studio.tape_stop_amt },
         });
     }
 
@@ -1560,6 +1568,12 @@ impl eframe::App for App {
         bg += self.project_rev - r;
         self.browser.poll(ctx);
         if self.adds.poll(&self.project, &mut self.imported) {
+            if std::mem::take(&mut self.adds.auto_kit_ready) {
+                let n = <Self as chromagrain_ui::Host>::build_kit_to_pads(self);
+                if n > 0 {
+                    self.status = format!("dug & built {n}-pad collage kit on Perform pads");
+                }
+            }
             self.mark_now();
         }
         if self.classic {

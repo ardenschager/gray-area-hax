@@ -1,11 +1,9 @@
-//! Browse: every video on this machine as one big sample library.
+//! Browse: Google Drive and local folders on this machine as one sample library.
 //!
-//! * Folders of videos under your home (Projects, Movies, Downloads, …)
+//! * Google Drive mounts (`~/Library/CloudStorage/GoogleDrive-*`, `/Volumes/GoogleDrive*`)
+//!   and local video folders (`Documents`, `Movies`, `Downloads`, `Desktop`, …)
 //!   are discovered in the background and grouped into collections.
-//! * Projects that ship a semantic corpus (`public/corpus.json` +
-//!   `public/vectors.bin`, e.g. video-grid) become searchable *by meaning*:
-//!   the query is embedded with the same model the corpus was built with
-//!   (read from corpus.json) and ranked by cosine similarity.
+//! * Strictly 100% deterministic local & Drive discovery — zero AI or cloud API calls.
 //! * Thumbnails are grabbed with ffmpeg by a small worker pool and cached
 //!   on disk, so the second visit is instant.
 
@@ -32,21 +30,13 @@ pub struct BrowseClip {
     pub desc: String,
     pub dur: f32,
     /// Lowercased haystack for word filtering.
-    hay: String,
+    pub(crate) hay: String,
 }
 
 pub struct Collection {
     pub name: String,
     pub clips: Vec<BrowseClip>,
-    pub semantic: Option<Semantic>,
-}
-
-pub struct Semantic {
-    pub model: String,
-    pub dim: usize,
-    /// Row-major, one normalized vector per clip (same order as `clips`).
-    pub vectors: Vec<f32>,
-    pub project_dir: PathBuf,
+    pub is_drive: bool,
 }
 
 enum ScanMsg {
@@ -73,12 +63,7 @@ pub struct Browser {
     pub query: String,
     /// Indices into the current collection, in display order.
     pub results: Vec<usize>,
-    results_key: Option<(usize, String, bool)>,
-    /// Semantic ranking for (collection, query), best first.
-    ranked: Option<(usize, String, Vec<usize>)>,
-    pub semantic_busy: bool,
-    sem_rx: Option<Receiver<(usize, String, Result<Vec<f32>, String>)>>,
-    pub last_error: Option<String>,
+    results_key: Option<(usize, String)>,
     pub selected: Option<PathBuf>,
     thumbs: HashMap<PathBuf, Thumb>,
     queue: Arc<ThumbQueue>,
@@ -103,10 +88,6 @@ impl Browser {
             query: String::new(),
             results: Vec::new(),
             results_key: None,
-            ranked: None,
-            semantic_busy: false,
-            sem_rx: None,
-            last_error: None,
             selected: None,
             thumbs: HashMap::new(),
             queue,
@@ -143,9 +124,9 @@ impl Browser {
                     ScanMsg::Collection(c) => {
                         let cur_name = self.current().map(|c| c.name.clone());
                         self.collections.push(c);
-                        // Semantic corpora first, then biggest folders.
+                        // Google Drive collections first, then biggest folders.
                         self.collections.sort_by(|a, b| {
-                            b.semantic.is_some().cmp(&a.semantic.is_some()).then(b.clips.len().cmp(&a.clips.len()))
+                            b.is_drive.cmp(&a.is_drive).then(b.clips.len().cmp(&a.clips.len()))
                         });
                         if let Some(n) = cur_name {
                             self.current = self.collections.iter().position(|c| c.name == n).unwrap_or(0);
@@ -153,29 +134,6 @@ impl Browser {
                         self.results_key = None;
                     }
                     ScanMsg::Done => self.scanning = false,
-                }
-            }
-        }
-        if let Some(rx) = &self.sem_rx {
-            if let Ok((ci, q, res)) = rx.try_recv() {
-                self.semantic_busy = false;
-                match res {
-                    Ok(qv) => {
-                        if let Some(sem) = self.collections.get(ci).and_then(|c| c.semantic.as_ref()) {
-                            let mut scored: Vec<(usize, f32)> = sem
-                                .vectors
-                                .chunks_exact(sem.dim)
-                                .enumerate()
-                                .map(|(i, v)| (i, v.iter().zip(&qv).map(|(a, b)| a * b).sum()))
-                                .collect();
-                            scored.sort_by(|a, b| b.1.total_cmp(&a.1));
-                            let top = scored.into_iter().take(300).map(|(i, _)| i).collect();
-                            self.ranked = Some((ci, q, top));
-                            self.results_key = None;
-                            self.last_error = None;
-                        }
-                    }
-                    Err(e) => self.last_error = Some(e),
                 }
             }
         }
@@ -195,19 +153,13 @@ impl Browser {
             };
             self.thumbs.insert(path, t);
         }
-        if got || self.scanning || self.semantic_busy {
+        if got || self.scanning {
             ctx.request_repaint_after(std::time::Duration::from_millis(120));
         }
     }
 
-    /// Is the current query ranked by meaning (vs. word filtered)?
-    pub fn is_semantic_view(&self) -> bool {
-        matches!(&self.ranked, Some((ci, q, _)) if *ci == self.current && *q == self.query)
-    }
-
     pub fn refresh_results(&mut self) {
-        let sem = self.is_semantic_view();
-        let key = (self.current, self.query.clone(), sem);
+        let key = (self.current, self.query.clone());
         if self.results_key.as_ref() == Some(&key) {
             return;
         }
@@ -216,10 +168,6 @@ impl Browser {
             self.results.clear();
             return;
         };
-        if sem {
-            self.results = self.ranked.as_ref().map(|r| r.2.clone()).unwrap_or_default();
-            return;
-        }
         let words: Vec<String> =
             self.query.to_lowercase().split_whitespace().map(|s| s.to_string()).collect();
         self.results = col
@@ -250,27 +198,6 @@ impl Browser {
     /// Find a clip in the current collection by path.
     pub fn clip_by_path(&self, path: &Path) -> Option<&BrowseClip> {
         self.current()?.clips.iter().find(|c| c.path == path)
-    }
-
-    /// Embed the query with the corpus' own model and rank by meaning.
-    pub fn search_by_meaning(&mut self) {
-        let Some(col) = self.collections.get(self.current) else { return };
-        let Some(sem) = &col.semantic else { return };
-        if self.query.trim().is_empty() || self.semantic_busy {
-            return;
-        }
-        let Some(key) = api_key(&sem.project_dir) else {
-            self.last_error = Some("no GEMINI_API_KEY found — word search still works".into());
-            return;
-        };
-        self.semantic_busy = true;
-        let (tx, rx) = mpsc::channel();
-        self.sem_rx = Some(rx);
-        let (model, dim, q, ci) = (sem.model.clone(), sem.dim, self.query.clone(), self.current);
-        std::thread::spawn(move || {
-            let res = embed_query(&key, &model, dim, &q);
-            let _ = tx.send((ci, q, res));
-        });
     }
 
     /// Texture for a clip thumbnail, queueing generation if needed.
@@ -392,74 +319,140 @@ fn prettify(s: &str) -> String {
 /// showcase's fixture library) instead of the home folders.
 pub const BROWSE_ROOT_ENV: &str = "CHROMAGRAIN_BROWSE_ROOT";
 
+/// `CHROMAGRAIN_DRIVE_ROOT=/dir` adds a Google Drive fixture folder in tests.
+pub const DRIVE_ROOT_ENV: &str = "CHROMAGRAIN_DRIVE_ROOT";
+
+/// Discover mounted Google Drive roots on macOS (`~/Library/CloudStorage/GoogleDrive-*`
+/// and `/Volumes/GoogleDrive*`).
+pub fn drive_roots() -> Vec<PathBuf> {
+    if let Some(override_root) = std::env::var_os(DRIVE_ROOT_ENV).map(PathBuf::from) {
+        if override_root.exists() {
+            return vec![override_root];
+        }
+    }
+    let mut out = Vec::new();
+    let cloud = home().join("Library/CloudStorage");
+    if let Ok(rd) = std::fs::read_dir(&cloud) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with("GoogleDrive") {
+                let p = e.path();
+                let my_drive = p.join("My Drive");
+                if my_drive.is_dir() {
+                    out.push(my_drive);
+                } else if p.is_dir() {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    if let Ok(rd) = std::fs::read_dir("/Volumes") {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with("GoogleDrive") || name == "Google Drive" {
+                let p = e.path();
+                if p.is_dir() && !out.contains(&p) {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn build_collection(name: String, mut files: Vec<PathBuf>, is_drive: bool) -> Collection {
+    files.sort();
+    let clips = files
+        .into_iter()
+        .map(|p| {
+            let stem = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            let reel = prettify(&reel_of(&stem));
+            let title = prettify(&stem);
+            let drive_tag = if is_drive { "drive google" } else { "local" };
+            let hay = format!("{title} {reel} {name} {drive_tag}").to_lowercase();
+            BrowseClip { path: p, title, reel, desc: String::new(), dur: 0.0, hay }
+        })
+        .collect();
+    Collection { name, clips, is_drive }
+}
+
 fn scan(tx: Sender<ScanMsg>) {
     let home = home();
     let projects = home.join("Documents/Projects");
     let mut covered: HashSet<PathBuf> = HashSet::new();
+
     if let Some(root) = std::env::var_os(BROWSE_ROOT_ENV).map(PathBuf::from) {
+        // Also scan explicit test Drive root if set alongside BROWSE_ROOT_ENV.
+        if let Some(droot) = std::env::var_os(DRIVE_ROOT_ENV).map(PathBuf::from) {
+            let mut by_dir: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+            walk(&droot, 0, &covered, &mut by_dir, true);
+            let mut dirs: Vec<(PathBuf, Vec<PathBuf>)> = by_dir.into_iter().collect();
+            dirs.sort();
+            for (dir, files) in dirs {
+                let sub = dir.strip_prefix(&droot).ok().filter(|r| !r.as_os_str().is_empty());
+                let name = match sub {
+                    Some(r) => format!("Drive · {}", r.display()),
+                    None => "Drive".into(),
+                };
+                let _ = tx.send(ScanMsg::Collection(build_collection(name, files, true)));
+            }
+            covered.insert(droot);
+        }
         let mut by_dir: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
-        walk(&root, 0, &covered, &mut by_dir);
+        walk(&root, 0, &covered, &mut by_dir, false);
         let mut dirs: Vec<(PathBuf, Vec<PathBuf>)> = by_dir.into_iter().collect();
         dirs.sort();
-        for (dir, mut files) in dirs {
-            files.sort();
+        for (dir, files) in dirs {
             let name = dir.strip_prefix(&root).ok().filter(|r| !r.as_os_str().is_empty()).unwrap_or(&dir).display().to_string();
-            let clips = files
-                .into_iter()
-                .map(|p| {
-                    let stem = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-                    let reel = prettify(&reel_of(&stem));
-                    let title = prettify(&stem);
-                    let hay = format!("{title} {reel} {name}").to_lowercase();
-                    BrowseClip { path: p, title, reel, desc: String::new(), dur: 0.0, hay }
-                })
-                .collect();
-            let _ = tx.send(ScanMsg::Collection(Collection { name, clips, semantic: None }));
+            let _ = tx.send(ScanMsg::Collection(build_collection(name, files, false)));
         }
         let _ = tx.send(ScanMsg::Done);
         return;
     }
 
-    // 1. Semantic corpora (video-grid style).
-    if let Ok(rd) = std::fs::read_dir(&projects) {
-        for e in rd.flatten() {
-            let dir = e.path();
-            if let Some(c) = load_corpus(&dir) {
-                covered.insert(dir.join("public/clips"));
-                let _ = tx.send(ScanMsg::Collection(c));
-            }
+    // 1. Google Drive roots (`~/Library/CloudStorage/GoogleDrive-*`, `/Volumes/GoogleDrive*`).
+    for droot in drive_roots() {
+        let mut by_dir: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+        walk(&droot, 0, &covered, &mut by_dir, true);
+        covered.insert(droot.clone());
+        let mut dirs: Vec<(PathBuf, Vec<PathBuf>)> = by_dir.into_iter().collect();
+        dirs.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+        for (dir, files) in dirs {
+            let sub = dir.strip_prefix(&droot).ok().filter(|r| !r.as_os_str().is_empty());
+            let name = match sub {
+                Some(r) => format!("Drive · {}", r.display()),
+                None => "Drive".into(),
+            };
+            let _ = tx.send(ScanMsg::Collection(build_collection(name, files, true)));
         }
     }
 
-    // 2. Every other folder that has videos in it.
+    // 2. Local folders under `$HOME` (`Sync` included for Cloudtop<->Mac synced clips).
     let roots = ["Documents", "Movies", "Downloads", "Desktop", "Pictures", "Screencaps"];
     let mut by_dir: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
     for r in roots {
-        walk(&home.join(r), 0, &covered, &mut by_dir);
+        walk(&home.join(r), 0, &covered, &mut by_dir, false);
     }
     let mut dirs: Vec<(PathBuf, Vec<PathBuf>)> = by_dir.into_iter().collect();
     dirs.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
-    for (dir, mut files) in dirs {
-        files.sort();
+    for (dir, files) in dirs {
         let rel = dir.strip_prefix(&projects).or_else(|_| dir.strip_prefix(&home)).unwrap_or(&dir);
         let name = rel.display().to_string();
-        let clips = files
-            .into_iter()
-            .map(|p| {
-                let stem = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-                let reel = prettify(&reel_of(&stem));
-                let title = prettify(&stem);
-                let hay = format!("{title} {reel} {name}").to_lowercase();
-                BrowseClip { path: p, title, reel, desc: String::new(), dur: 0.0, hay }
-            })
-            .collect();
-        let _ = tx.send(ScanMsg::Collection(Collection { name, clips, semantic: None }));
+        let _ = tx.send(ScanMsg::Collection(build_collection(name, files, false)));
     }
     let _ = tx.send(ScanMsg::Done);
 }
 
-fn walk(dir: &Path, depth: usize, covered: &HashSet<PathBuf>, out: &mut HashMap<PathBuf, Vec<PathBuf>>) {
-    if depth > 9 || covered.contains(dir) {
+fn walk(
+    dir: &Path,
+    depth: usize,
+    covered: &HashSet<PathBuf>,
+    out: &mut HashMap<PathBuf, Vec<PathBuf>>,
+    allow_library: bool,
+) {
+    if depth > 7 || covered.contains(dir) {
         return;
     }
     let Ok(rd) = std::fs::read_dir(dir) else { return };
@@ -471,146 +464,15 @@ fn walk(dir: &Path, depth: usize, covered: &HashSet<PathBuf>, out: &mut HashMap<
         }
         let Ok(ft) = e.file_type() else { continue };
         if ft.is_dir() {
-            if SKIP_DIRS.iter().any(|s| name == *s) || name.ends_with(".app") || name.ends_with(".photoslibrary") {
+            let skip = SKIP_DIRS.iter().any(|s| name == *s && !(allow_library && *s == "Library"));
+            if skip || name.ends_with(".app") || name.ends_with(".photoslibrary") {
                 continue;
             }
-            walk(&p, depth + 1, covered, out);
+            walk(&p, depth + 1, covered, out, allow_library);
         } else if ft.is_file() && is_video(&p) {
             out.entry(dir.to_path_buf()).or_default().push(p);
         }
     }
-}
-
-/// A project with `public/corpus.json` + `public/vectors.bin` (+ optional
-/// `data/corpus.json` with titles/descriptions).
-fn load_corpus(dir: &Path) -> Option<Collection> {
-    let meta: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(dir.join("public/corpus.json")).ok()?).ok()?;
-    let dim = meta.get("dim")?.as_u64()? as usize;
-    let model = meta.get("model")?.as_str()?.to_string();
-    let moments = meta.get("moments")?.as_array()?;
-    let bytes = std::fs::read(dir.join("public/vectors.bin")).ok()?;
-    if bytes.len() != moments.len() * dim * 4 {
-        return None;
-    }
-    let all: Vec<f32> = bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
-
-    // Rich text, if present.
-    let mut info: HashMap<String, (String, String)> = HashMap::new();
-    if let Some(v) = std::fs::read(dir.join("data/corpus.json"))
-        .ok()
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-    {
-        if let Some(ms) = v.get("moments").and_then(|m| m.as_array()) {
-            for m in ms {
-                if let Some(id) = m.get("id").and_then(|x| x.as_str()) {
-                    let title = m.get("title").and_then(|x| x.as_str()).unwrap_or("").to_string();
-                    let text = m.get("text").and_then(|x| x.as_str()).unwrap_or("").to_string();
-                    info.insert(id.to_string(), (title, text));
-                }
-            }
-        }
-    }
-
-    let clips_dir = dir.join("public/clips");
-    let mut clips = Vec::with_capacity(moments.len());
-    let mut vectors = Vec::with_capacity(all.len());
-    for (i, m) in moments.iter().enumerate() {
-        let Some(id) = m.get("id").and_then(|x| x.as_str()) else { continue };
-        let path = clips_dir.join(format!("{id}.mp4"));
-        if !path.exists() {
-            continue;
-        }
-        let src = m.get("src").and_then(|x| x.as_str()).unwrap_or("");
-        let (title, desc) = info.get(id).cloned().unwrap_or_default();
-        let reel = if title.is_empty() { prettify(src) } else { title.clone() };
-        let first_line = desc.lines().next().unwrap_or("").to_string();
-        let title = if first_line.is_empty() { prettify(id) } else { first_line };
-        let hay = format!("{title} {reel} {desc} {id}").to_lowercase();
-        clips.push(BrowseClip {
-            path,
-            title,
-            reel,
-            desc,
-            dur: m.get("d").and_then(|x| x.as_f64()).unwrap_or(0.0) as f32,
-            hay,
-        });
-        vectors.extend_from_slice(&all[i * dim..(i + 1) * dim]);
-    }
-    if clips.is_empty() {
-        return None;
-    }
-    let project = dir.file_name()?.to_string_lossy().to_string();
-    Some(Collection {
-        name: format!("{project} · search by meaning"),
-        clips,
-        semantic: Some(Semantic { model, dim, vectors, project_dir: dir.to_path_buf() }),
-    })
-}
-
-// ------------------------------------------------------------ embeddings
-
-fn api_key(project_dir: &Path) -> Option<String> {
-    let clean = |s: &str| s.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
-    for var in ["GEMINI_API_KEY", "GEMINI_API_KEYS"] {
-        if let Ok(v) = std::env::var(var) {
-            if let Some(k) = v.split(',').map(clean).find(|k| !k.is_empty()) {
-                return Some(k);
-            }
-        }
-    }
-    // Same fallbacks the corpus' own tooling uses.
-    for f in [project_dir.join(".env"), home().join("Documents/Projects/vibecut/.env")] {
-        if let Ok(env) = std::fs::read_to_string(f) {
-            for line in env.lines() {
-                for var in ["GEMINI_API_KEY=", "GEMINI_API_KEYS="] {
-                    if let Some(v) = line.trim().strip_prefix(var) {
-                        if let Some(k) = v.split(',').map(clean).find(|k| !k.is_empty()) {
-                            return Some(k);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-fn embed_query(key: &str, model: &str, dim: usize, text: &str) -> Result<Vec<f32>, String> {
-    let url = format!("https://generativelanguage.googleapis.com/v1beta/models/{model}:embedContent");
-    let body = serde_json::json!({
-        "model": format!("models/{model}"),
-        "content": { "parts": [ { "text": text } ] },
-        "taskType": "RETRIEVAL_QUERY",
-        "outputDimensionality": dim,
-    });
-    let resp: serde_json::Value = ureq::post(&url)
-        .set("x-goog-api-key", key)
-        .timeout(std::time::Duration::from_secs(20))
-        .send_json(body)
-        .map_err(|e| match e {
-            ureq::Error::Status(code, r) => {
-                format!("embedding failed ({code}): {}", r.into_string().unwrap_or_default().chars().take(160).collect::<String>())
-            }
-            other => format!("embedding failed: {other}"),
-        })?
-        .into_json()
-        .map_err(|e| e.to_string())?;
-    let vals = resp
-        .get("embedding")
-        .and_then(|e| e.get("values"))
-        .and_then(|v| v.as_array())
-        .ok_or("embedding response had no values")?;
-    let mut v: Vec<f32> = vals.iter().filter_map(|x| x.as_f64()).map(|x| x as f32).collect();
-    if v.len() != dim {
-        return Err(format!("embedding has {} dims, corpus has {dim}", v.len()));
-    }
-    // Truncated embeddings aren't unit length; normalize so dot = cosine.
-    let n = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
-    for x in &mut v {
-        *x /= n;
-    }
-    Ok(v)
 }
 
 #[cfg(test)]

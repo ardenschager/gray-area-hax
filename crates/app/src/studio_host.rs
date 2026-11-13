@@ -7,7 +7,10 @@ use chromagrain_core::grain::GrainEvent;
 use chromagrain_core::timeline::{Clip, ClipKind, Project, Source, Track};
 use chromagrain_core::video::VisualGrainStyle;
 use chromagrain_ui::gpu::Scene;
-use chromagrain_ui::{AddTarget, Added, BrowseItem, DeepTab, DeepTarget, Host, Pad, PadKind, Pending, PerformHost, Studio, View};
+use chromagrain_ui::{
+    AddTarget, Added, BrowseItem, DeepTab, DeepTarget, Host, Pad, PadKind, Pending, PerformHost,
+    StageAspect, StageMode, Studio, View, YoutubeHit,
+};
 use std::path::PathBuf;
 use eframe::egui;
 use std::sync::atomic::Ordering;
@@ -203,27 +206,45 @@ impl Host for App {
     fn browse(&mut self, _ctx: &egui::Context, query: &str) -> Vec<BrowseItem> {
         self.browser.ensure_started();
         let words: Vec<String> = query.to_lowercase().split_whitespace().map(str::to_string).collect();
-        let list: Vec<(PathBuf, String, String, f32)> = self
+        let list: Vec<(PathBuf, String, String, f32, bool)> = self
             .browser
             .collections
             .iter()
-            .flat_map(|c| c.clips.iter().map(move |k| (k.path.clone(), k.title.clone(), c.name.clone(), k.dur)))
-            .filter(|(_, t, c, _)| {
-                let hay = format!("{t} {c}").to_lowercase();
+            .flat_map(|c| {
+                let is_drive = c.is_drive;
+                c.clips
+                    .iter()
+                    .map(move |k| (k.path.clone(), k.title.clone(), c.name.clone(), k.dur, is_drive))
+            })
+            .filter(|(_, t, c, _, is_drive)| {
+                let tag = if *is_drive { "drive google" } else { "local" };
+                let hay = format!("{t} {c} {tag}").to_lowercase();
                 words.iter().all(|w| hay.contains(w.as_str()))
             })
             .take(240)
             .collect();
         self.browse_last.clear();
         let mut out = Vec::with_capacity(list.len());
-        for (path, title, coll, dur) in list {
+        for (path, title, coll, dur, is_drive) in list {
             let thumb = self.browser.thumb(&path);
             let folder = coll.rsplit('/').next().unwrap_or(&coll).to_string();
-            let detail = if dur > 0.0 { format!("{}:{:02}", dur as u32 / 60, dur as u32 % 60) } else { folder };
+            let base_detail = if dur > 0.0 {
+                format!("{}:{:02}", dur as u32 / 60, dur as u32 % 60)
+            } else {
+                folder
+            };
+            let detail = if is_drive && !base_detail.eq_ignore_ascii_case("drive") {
+                format!("Drive · {base_detail}")
+            } else {
+                base_detail
+            };
             out.push(BrowseItem { name: title, detail, thumb });
             self.browse_last.push(path);
         }
         out
+    }
+    fn browse_has_drive(&self) -> bool {
+        self.browser.collections.iter().any(|c| c.is_drive)
     }
     fn browse_add(&mut self, index: usize, target: AddTarget) {
         if let Some(path) = self.browse_last.get(index).cloned() {
@@ -234,9 +255,96 @@ impl Host for App {
         let sr = self.project.lock().unwrap().sample_rate;
         self.adds.link(url.to_string(), target, sr);
     }
+    fn search_youtube(&mut self, query: &str, under_500_views: bool) {
+        self.adds.search_youtube(query, under_500_views);
+    }
+    fn youtube_state(&self) -> (bool, Option<String>, Vec<YoutubeHit>) {
+        (self.adds.yt_searching, self.adds.yt_error.clone(), self.adds.yt_hits.clone())
+    }
     fn dig(&mut self, n: usize, cc_only: bool, target: AddTarget) {
         let sr = self.project.lock().unwrap().sample_rate;
         self.adds.dig(n, cc_only, target, sr);
+    }
+    fn dig_to_kit(&mut self, n: usize, cc_only: bool) {
+        let sr = self.project.lock().unwrap().sample_rate;
+        self.adds.dig_to_kit(n, cc_only, AddTarget::Any, sr);
+    }
+    fn build_kit_to_pads(&mut self) -> usize {
+        self.studio_seed_pads();
+        let sources: Vec<(usize, Vec<chromagrain_core::chop::Slice>)> = {
+            let mut p = self.project.lock().unwrap();
+            let mut out = Vec::new();
+            for (sid, s) in p.sources.iter_mut().enumerate() {
+                if s.slices.is_empty() {
+                    if let Some(a) = &s.audio {
+                        s.slices = chromagrain_core::chop::auto_slices(a, 16);
+                    }
+                    if s.slices.is_empty() {
+                        s.slices = chromagrain_core::chop::equal_slices(s.duration(), 8);
+                    }
+                }
+                out.push((sid, s.slices.clone()));
+            }
+            out
+        };
+        if sources.is_empty() {
+            return 0;
+        }
+        let mut count = 0usize;
+        for pad in 0..PADS {
+            let (sid, ref slices) = sources[pad % sources.len()];
+            if slices.is_empty() {
+                continue;
+            }
+            let sl = slices[(pad / sources.len()) % slices.len()];
+            <Self as PerformHost>::load_pad_slice(self, sid, sl.start, sl.end, pad);
+            count += 1;
+        }
+        count
+    }
+    fn build_loops_to_pads(&mut self) -> usize {
+        self.studio_seed_pads();
+        let perform = self.mode == AppMode::Perform;
+        let mut p = self.project.lock().unwrap();
+        let n_src = p.sources.len();
+        if n_src == 0 {
+            return 0;
+        }
+        // Unsynced irrational-feeling tape loop lengths (Basinski / Caretaker phase drift)
+        const LOOP_BEATS: [f64; 8] = [6.5, 9.25, 11.0, 13.5, 7.75, 10.5, 14.25, 15.75];
+        let mut clips = Vec::new();
+        let count = PADS.min(n_src * 4).min(PADS);
+        for pad in 0..count {
+            let sid = pad % n_src;
+            let len_b = LOOP_BEATS[pad % LOOP_BEATS.len()];
+            let mut c = build_clip(&mut p, sid, 0.0, PlayMode::Snippet);
+            c.length_beats = len_b;
+            c.grains.position = ((pad / n_src) as f32 * 0.23) % 0.85;
+            c.grains.adsr = Some(chromagrain_core::envelope::Adsr {
+                attack: 0.35,
+                decay: 0.25,
+                sustain: 0.92,
+                release: 0.85,
+                picture: chromagrain_core::envelope::PictureCut::Fade,
+                ..Default::default()
+            });
+            let src_name = p.sources[sid].name.clone();
+            clips.push((pad, c, format!("{src_name} ~ loop {}", pad + 1)));
+        }
+        let tracks = if perform { &mut p.tracks } else { &mut self.other_tracks };
+        while tracks.len() < PADS {
+            let k = tracks.len();
+            tracks.push(Track { name: format!("pad {}", k + 1), muted: true, ..Default::default() });
+        }
+        for (pad, clip, label) in clips {
+            tracks[pad].clips = vec![clip];
+            tracks[pad].name = label;
+            tracks[pad].tape.wow = 0.25;
+            tracks[pad].tape.age = 0.20 + (pad as f32 * 0.04).min(0.45);
+        }
+        drop(p);
+        self.mark_now();
+        count
     }
     fn pending(&self) -> Vec<Pending> {
         self.adds.jobs.clone()
@@ -304,6 +412,37 @@ impl Host for App {
     }
     fn set_tile_layout(&mut self, tile: bool) {
         self.project.lock().unwrap().layout = if tile { chromagrain_core::tile::Layout::Tile } else { chromagrain_core::tile::Layout::Stack };
+        self.stage_mode_override = Some(if tile { StageMode::Grid } else { StageMode::Stack });
+        self.mark_now();
+    }
+    fn stage_mode(&self) -> Option<StageMode> {
+        Some(self.stage_mode_override.unwrap_or_else(|| {
+            if self.project.lock().unwrap().layout == chromagrain_core::tile::Layout::Tile {
+                StageMode::Grid
+            } else {
+                StageMode::Stack
+            }
+        }))
+    }
+    fn set_stage_mode(&mut self, mode: StageMode) {
+        self.project.lock().unwrap().layout = match mode {
+            StageMode::Grid => chromagrain_core::tile::Layout::Tile,
+            StageMode::Stack | StageMode::Split | StageMode::Bleed => chromagrain_core::tile::Layout::Stack,
+        };
+        self.stage_mode_override = Some(mode);
+        self.mark_now();
+    }
+    fn stage_aspect(&self) -> Option<StageAspect> {
+        let p = self.project.lock().unwrap();
+        Some(StageAspect::from_dimensions(p.width, p.height))
+    }
+    fn set_stage_aspect(&mut self, aspect: StageAspect) {
+        {
+            let mut p = self.project.lock().unwrap();
+            let (w, h) = aspect.dimensions();
+            p.width = w;
+            p.height = h;
+        }
         self.mark_now();
     }
 }

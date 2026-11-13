@@ -509,3 +509,43 @@ fn plugin_ui_hybrid_snapshots() {
         shot(&mut h, &format!("261112_chromagrain_ui-hybrid_plugin-clip-sheet_{}x{}_{version}", size.0, size.1));
     }
 }
+
+
+#[test]
+fn plugin_vgs_snapshots() {
+    use chromagrain_ui::studio::{ClipTarget, Sheet};
+    use chromagrain_ui::{Host, SculptStamp, StageMode};
+    let version = std::env::var("CHROMAGRAIN_UI_VERSION").unwrap_or_else(|_| "v001".into());
+    let p = plugin_with(clips());
+    let size = (960.0f32, 600.0f32);
+    let mut h = harness(size, editor_ui(&p));
+    h.run_steps(2);
+    {
+        let ui = h.state_mut();
+        lanes(ui);
+        ui.studio.set_view(&mut ui.host, View::Play);
+        ui.host.set_stage_mode(StageMode::Split);
+        ui.studio.emitters[0].held = true;
+        ui.studio.emitters[1].held = true;
+        ui.studio.emitters[0].sculpt = chromagrain_ui::SculptParams::preset(SculptStamp::Pluck);
+    }
+    h.run_steps(8);
+    shot(&mut h, &format!("261113_chromagrain_vgs_plugin-play_960x600_{version}"));
+
+    h.get_by_label("open clip").click();
+    h.run_steps(3);
+    assert_eq!(h.state().studio.sheet, Some(Sheet::Clip(ClipTarget::Emitter(0))));
+    shot(&mut h, &format!("261113_chromagrain_vgs_plugin-clip_960x600_{version}"));
+
+    h.get_by_label("close sheet").click();
+    h.run_steps(2);
+    {
+        let ui = h.state_mut();
+        ui.host.build_kit_to_pads();
+        ui.studio.set_view(&mut ui.host, View::Perform);
+        ui.studio.punch_fx[0] = true;
+        ui.studio.punch_fx[4] = true;
+    }
+    h.run_steps(6);
+    shot(&mut h, &format!("261113_chromagrain_vgs_plugin-perform_960x600_{version}"));
+}

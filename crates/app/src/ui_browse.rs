@@ -1,6 +1,6 @@
-//! Browse tab: every video on this Mac as a thumbnail grid. Drag a tile
-//! onto a track (it's imported on drop), double-click to drop it at the
-//! playhead. Collections with a semantic corpus can be searched by meaning.
+//! Browse tab: every video on Google Drive and this Mac as a thumbnail grid.
+//! Drag a tile onto a track (it's imported on drop), double-click to drop it
+//! at the playhead.
 
 use crate::browser::BrowseClip;
 use crate::theme::{self, ACCENT, BG, RAISED, TEXT, TEXT_DIM, TEXT_FAINT};
@@ -16,20 +16,20 @@ impl App {
 
     pub(crate) fn browse_ui(&mut self, ui: &mut egui::Ui) {
         self.browser.ensure_started();
-        let cols: Vec<(String, usize, bool)> = self
+        let cols: Vec<(String, usize)> = self
             .browser
             .collections
             .iter()
-            .map(|c| (c.name.clone(), c.clips.len(), c.semantic.is_some()))
+            .map(|c| (c.name.clone(), c.clips.len()))
             .collect();
         if cols.is_empty() {
             ui.add_space(24.0);
             ui.vertical_centered(|ui| {
                 if self.browser.scanning {
                     ui.spinner();
-                    theme::hint(ui, "looking for videos on this Mac…");
+                    theme::hint(ui, "looking for videos on Google Drive and this Mac…");
                 } else {
-                    theme::hint(ui, "no videos found under ~/Documents, ~/Movies, ~/Downloads…");
+                    theme::hint(ui, "no videos found under Google Drive, ~/Documents, ~/Movies, ~/Downloads…");
                 }
             });
             return;
@@ -43,38 +43,25 @@ impl App {
             .height(460.0)
             .selected_text(format!("{}   {}", cols[cur].0, cols[cur].1))
             .show_ui(ui, |ui| {
-                for (i, (name, n, _)) in cols.iter().enumerate() {
+                for (i, (name, n)) in cols.iter().enumerate() {
                     ui.selectable_value(&mut pick, i, format!("{name}   {n}"));
                 }
             });
         if pick != cur {
             self.browser.current = pick;
         }
-        let semantic = cols[pick].2;
 
-        // Search.
+        // Filter.
         ui.add_space(4.0);
-        let r = ui.add(
+        ui.add(
             egui::TextEdit::singleline(&mut self.browser.query)
-                .hint_text(if semantic { "describe a moment, press enter…" } else { "filter by name…" })
+                .hint_text("filter by name or folder…")
                 .desired_width(f32::INFINITY),
         );
-        if semantic && r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-            self.browser.search_by_meaning();
-        }
         self.browser.refresh_results();
         let n = self.browser.results.len();
         ui.horizontal(|ui| {
-            if self.browser.semantic_busy {
-                ui.spinner();
-                theme::hint(ui, "searching by meaning…");
-            } else if self.browser.is_semantic_view() {
-                theme::hint(ui, &format!("top {n} by meaning"));
-            } else if semantic && !self.browser.query.is_empty() {
-                theme::hint(ui, &format!("{n} word matches · enter = by meaning"));
-            } else {
-                theme::hint(ui, &format!("{n} clips"));
-            }
+            theme::hint(ui, &format!("{n} clips"));
             if self.browser.scanning {
                 ui.spinner();
             }
@@ -84,9 +71,6 @@ impl App {
                 }
             });
         });
-        if let Some(e) = self.browser.last_error.clone() {
-            ui.colored_label(Color32::from_rgb(230, 120, 100), e);
-        }
         ui.add_space(4.0);
 
         // Grid.

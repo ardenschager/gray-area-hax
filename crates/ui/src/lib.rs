@@ -18,7 +18,10 @@ pub mod theme;
 pub mod wave;
 pub mod widgets;
 
-pub use host::{AddRoute, AddTarget, Added, BrowseItem, Caps, Host, Pad, PadKind, Pending, PerformHost};
+pub use host::{
+    AddRoute, AddTarget, Added, BrowseItem, Caps, ChordChoice, Host, Pad, PadKind, Pending,
+    PerformHost, SculptParams, SculptStamp, StageAspect, StageMode, YoutubeHit,
+};
 pub use studio::{ClipTarget, DeepTab, DeepTarget, Sheet, Studio, View};
 
 /// Largest rect of `aspect` (w/h) centered inside `outer` (letterbox /

@@ -23,16 +23,6 @@ midir = "0.10"
 rfd = "0.15"
 serde_json = "1"
 
-# HTTPS for the browser's embedding queries. rustls pulls `ring`, whose C
-# build needs a target sysroot (breaks cross-checking for Windows from a
-# Mac); Windows uses the OS TLS (SChannel via native-tls) instead, which
-# ureq picks by default when it is the only TLS feature.
-[target.'cfg(not(windows))'.dependencies]
-ureq = { version = "2", features = ["json"] }
-
-[target.'cfg(windows)'.dependencies]
-ureq = { version = "2", default-features = false, features = ["json", "native-tls", "gzip"] }
-
 [dev-dependencies]
 pollster = "0.4"
 egui_kittest = { version = "0.32", features = ["wgpu", "snapshot", "eframe"] }

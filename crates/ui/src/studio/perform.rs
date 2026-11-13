@@ -1,8 +1,10 @@
-//! Perform: 4×4 clip pads (one global bank) next to the output, launch
-//! quantize, output routing (this screen / Display 2), contextual object
-//! bar (`Open clip ›`), and fullscreen.
+//! Perform: 4×4 clip pads next to the live visual stage, shared Set / Cue
+//! Arranger strip (standalone), 6 tactile momentary/latching VJ Punch-In FX
+//! pills (`Stutter`, `Tape Stop`, `Comb`, `Dub`, `Shimmer`, `Wear`), launch
+//! quantize, output routing, contextual object bar (`Open clip ›`), and
+//! chromeless fullscreen.
 
-use super::{ClipTarget, Studio};
+use super::{ClipTarget, Studio, PUNCH_FX_A11Y, PUNCH_FX_LABELS};
 use crate::atlas;
 use crate::host::{Host, Pad, PadKind};
 use crate::studio::play::short;
@@ -14,18 +16,32 @@ use egui::{Align2, Color32, CornerRadius, Rect, Sense, Stroke, StrokeKind};
 impl Studio {
     pub fn perform_view(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, area: Rect) {
         let narrow = area.width() < 1100.0;
-        let bar_h = 44.0;
+        let has_set_bar = host.caps().scenes;
+        let set_h = if has_set_bar { 32.0 } else { 0.0 };
+        let set_gap = if has_set_bar { 10.0 } else { 0.0 };
+        let bar_h = if narrow { 40.0 } else { 44.0 };
+        let bot_gap = if narrow { 12.0 } else { 18.0 };
+        let fx_h = 34.0;
+        let fx_gap = 8.0;
         let gap = if narrow { 14.0 } else { 20.0 };
+
         let pads_w = if narrow { area.width() * 0.42 } else { (area.width() * 0.37).min(640.0) };
         let stage_w = area.width() - pads_w - gap;
-        let mut stage_h = stage_w * 9.0 / 16.0;
-        let max_h = area.height() - bar_h - 22.0;
-        if stage_h > max_h {
-            stage_h = max_h;
+        let max_main_h = (area.height() - set_h - set_gap - bot_gap - bar_h).max(220.0);
+        let ideal_stage_h = (stage_w * 9.0 / 16.0).floor();
+        let main_h = (ideal_stage_h + fx_gap + fx_h).min(max_main_h);
+        let stage_h = (main_h - fx_gap - fx_h).max(160.0);
+
+        let block_h = set_h + set_gap + main_h + bot_gap + bar_h;
+        let mut y = area.top() + ((area.height() - block_h) * 0.5).max(0.0);
+
+        if has_set_bar {
+            let set_rect = Rect::from_min_size(egui::pos2(area.left(), y), egui::vec2(area.width(), set_h));
+            self.set_arranger_bar(host, ui, set_rect, "perf-set");
+            y = set_rect.bottom() + set_gap;
         }
-        let block_h = stage_h + 22.0 + bar_h;
-        let top = area.top() + ((area.height() - block_h) / 2.0).max(0.0);
-        let stage = Rect::from_min_size(egui::pos2(area.left(), top), egui::vec2(stage_w, stage_h));
+
+        let stage = Rect::from_min_size(egui::pos2(area.left(), y), egui::vec2(stage_w, stage_h));
         self.stage(host, ui, stage, 14.0);
         self.layout_switch(host, ui, stage);
         if let Some(sub) = host.perform().and_then(|p| p.output()) {
@@ -35,10 +51,65 @@ impl Studio {
             p.text(stage.center() + egui::vec2(0.0, 10.0), Align2::CENTER_CENTER, "Live on Display 2", font_medium(15.0), INK);
             p.text(stage.center() + egui::vec2(0.0, 32.0), Align2::CENTER_CENTER, sub, mono(11.0), INK3);
         }
-        let pads = Rect::from_min_size(egui::pos2(stage.right() + gap, top), egui::vec2(pads_w, stage_h));
+
+        // 6 Tactile VJ Punch-In FX Pills right under the stage (`Stutter`, `Tape Stop`, `Comb`, `Dub`, `Shimmer`, `Wear`).
+        let fx_rect = Rect::from_min_size(egui::pos2(area.left(), stage.bottom() + fx_gap), egui::vec2(stage_w, fx_h));
+        self.perform_punch_fx_bar(host, ui, fx_rect);
+
+        let pads = Rect::from_min_size(egui::pos2(stage.right() + gap, y), egui::vec2(pads_w, main_h));
         self.pads(host, ui, pads);
-        let bar = Rect::from_min_size(egui::pos2(area.left(), stage.bottom() + 22.0), egui::vec2(area.width(), bar_h));
+
+        let bar = Rect::from_min_size(egui::pos2(area.left(), y + main_h + bot_gap), egui::vec2(area.width(), bar_h));
         self.perform_bar(host, ui, bar);
+    }
+
+    fn perform_punch_fx_bar(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, bar: Rect) {
+        let ctx = ui.ctx().clone();
+        let p = ui.painter().clone();
+        let g = 6.0;
+        let pw = (bar.width() - g * 5.0) / 6.0;
+        let t_now = ui.input(|i| i.time);
+        for k in 0..6 {
+            let rc = Rect::from_min_size(egui::pos2(bar.left() + k as f32 * (pw + g), bar.top()), egui::vec2(pw, bar.height()));
+            let resp = hit(ui, rc, ui.id().with(("punch-fx", k)), Sense::click_and_drag(), PUNCH_FX_A11Y[k]);
+            let down = resp.is_pointer_button_down_on();
+            if down && self.punch_press_t[k].is_none() {
+                self.punch_press_t[k] = Some(t_now);
+                // Momentary hold (>0.28s) turns FX on immediately while held; quick tap latches/toggles on click.
+            }
+            if down {
+                if let Some(t0) = self.punch_press_t[k] {
+                    if t_now - t0 >= 0.28 && !self.punch_fx[k] {
+                        self.set_punch_fx(host, k, true, &ctx);
+                    }
+                }
+            } else if let Some(t0) = self.punch_press_t[k].take() {
+                if resp.clicked() && t_now - t0 < 0.28 {
+                    let next = !self.punch_fx[k];
+                    self.set_punch_fx(host, k, next, &ctx);
+                } else if t_now - t0 >= 0.28 {
+                    self.set_punch_fx(host, k, false, &ctx);
+                }
+            } else if resp.clicked() {
+                let next = !self.punch_fx[k];
+                self.set_punch_fx(host, k, next, &ctx);
+            }
+
+            let on = self.punch_fx[k];
+            if on {
+                p.rect_filled(rc, r(9), HI);
+            } else {
+                raised(&p, rc, 9, if resp.hovered() || down { G3 } else { G2 });
+            }
+            let fsz = if pw < 76.0 { 10.5 } else { 11.5 };
+            p.text(
+                rc.center(),
+                Align2::CENTER_CENTER,
+                PUNCH_FX_LABELS[k],
+                font_medium(fsz),
+                if on { ON_HI } else if resp.hovered() { INK } else { INK2 },
+            );
+        }
     }
 
     fn pads(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, area: Rect) {
@@ -99,6 +170,10 @@ impl Studio {
                                 let sl = so.slices.get(n.checked_sub(1)?)?;
                                 Some(atlas::frame_at((sl.start / so.duration().max(1e-6)) as f32))
                             })
+                            .or_else(|| {
+                                let c = pp.tracks.get(i)?.clips.first()?;
+                                (c.grains.position > 0.001).then(|| atlas::frame_at(c.grains.position))
+                            })
                             .unwrap_or(5);
                         let (gr, pm, pst) = pp
                             .tracks
@@ -119,30 +194,37 @@ impl Studio {
                     } else {
                         p.rect_filled(rc, r(10), G2);
                     }
-                    // Top + bottom soft scrims for overlays and label readability.
                     let top_scrim = Rect::from_min_size(rc.min, egui::vec2(pw, 24.0_f32.min(ph * 0.4)));
                     p.rect_filled(top_scrim, CornerRadius { nw: 10, ne: 10, sw: 0, se: 0 }, Color32::from_black_alpha(75));
                     let scrim = Rect::from_min_max(egui::pos2(rc.left(), (rc.bottom() - 28.0).max(rc.top())), rc.max);
                     p.rect_filled(scrim, CornerRadius { nw: 0, ne: 0, sw: 10, se: 10 }, Color32::from_black_alpha(125));
 
-                    // Top-left mini ADSR curve.
                     let env_w = (pw * 0.30).clamp(18.0, 34.0);
                     let env_r = Rect::from_min_size(egui::pos2(rc.left() + 8.0, rc.top() + 7.0), egui::vec2(env_w, 11.0));
                     mini_adsr(&p, env_r, &pad_envs[i], if on || is_sel { 0.92 } else { 0.65 });
 
-                    // Center on-object grain ring + cloud dots + pitch dot on selected pad.
                     if is_sel {
                         draw_on_object_ring(&p, rc, pad_grain, pad_pitch_m, pad_pitch_st, 0.0, true);
                     }
 
-                    // Bottom label + mode glyph.
-                    let room = ((pw - 26.0) / 5.5).max(6.0) as usize;
+                    let room = ((pw - 34.0) / 6.2).max(5.0) as usize;
                     let raw_label = pad.name.clone().unwrap_or_else(|| self.source_name(host, src));
                     let label = super::strip_media_ext(&raw_label);
-                    let cap = room.min(20);
-                    let name = match label.rsplit_once(" · ") {
-                        Some((head, tail)) if tail.len() + 3 < cap => format!("{} · {tail}", short(head, cap - tail.len() - 3)),
-                        _ => short(label, cap),
+                    let cap = room.min(17);
+                    let name = if let Some((head, tail)) = label.rsplit_once(" · ") {
+                        if tail.len() + 3 < cap {
+                            format!("{} · {tail}", short(head, cap - tail.len() - 3))
+                        } else {
+                            short(label, cap)
+                        }
+                    } else if let Some((head, tail)) = label.rsplit_once(" ~ ") {
+                        if tail.len() + 3 < cap {
+                            format!("{} ~ {tail}", short(head, cap - tail.len() - 3))
+                        } else {
+                            short(label, cap)
+                        }
+                    } else {
+                        short(label, cap)
                     };
                     p.text(
                         egui::pos2(rc.left() + 9.0, rc.bottom() - 8.0),
@@ -160,8 +242,12 @@ impl Studio {
 
                     if on {
                         p.rect_stroke(rc, r(10), Stroke::new(2.0, HI), StrokeKind::Inside);
-                        let len = pad.len_beats.max(1.0);
-                        let prog = (((beat - loop_start).rem_euclid(len)) / len) as f32;
+                        let prog = if let Some(free_s) = self.pad_sculpt[i].free_loop_secs {
+                            ((now.rem_euclid(free_s.max(0.5) as f64)) / free_s.max(0.5) as f64) as f32
+                        } else {
+                            let len = pad.len_beats.max(1.0);
+                            (((beat - loop_start).rem_euclid(len)) / len) as f32
+                        };
                         let y = rc.bottom() - 3.0;
                         p.line_segment(
                             [egui::pos2(rc.left() + 8.0, y), egui::pos2(rc.left() + 8.0 + (rc.width() - 16.0) * prog, y)],
@@ -186,7 +272,6 @@ impl Studio {
                         ctx.request_repaint();
                     }
 
-                    // Top-right `›` button (opens Clip sheet without toggling pad).
                     let chev_vis = Rect::from_min_size(egui::pos2(rc.right() - 26.0, rc.top() + 5.0), egui::vec2(21.0, 21.0));
                     let chev_hit = Rect::from_center_size(chev_vis.center(), egui::vec2(26.0, 26.0));
                     let chev_resp = chev_button(ui, chev_vis, chev_hit, ui.id().with(("pad-clip", i)), &format!("clip pad {}", i + 1));
@@ -213,9 +298,12 @@ impl Studio {
                 }
             }
         }
-        if let Some(perf) = host.perform() {
-            if let Some(i) = toggle {
+        if let Some(i) = toggle {
+            if let Some(perf) = host.perform() {
                 perf.toggle_pad(i);
+            }
+            if !self.pad_captions[i].trim().is_empty() {
+                self.active_caption = Some((self.pad_captions[i].trim().to_string(), now + 1.2));
             }
         }
         if let Some(i) = load {
@@ -232,6 +320,7 @@ impl Studio {
     fn perform_bar(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, bar: Rect) {
         let p = ui.painter().clone();
         let narrow = bar.width() < 1100.0;
+        let bh = bar.height();
         let cy = bar.center().y;
         let beat_i = (host.playhead_beats().max(0.0) % 4.0).floor() as usize;
         let playing = host.playing();
@@ -251,8 +340,8 @@ impl Studio {
             let r = caps(&p, egui::pos2(x, cy), Align2::LEFT_CENTER, "Launch", 10.5);
             x = r.right() + 12.0;
         }
-        let qw = if narrow { 168.0 } else { 172.0 };
-        let q = Rect::from_min_size(egui::pos2(x, cy - 22.0), egui::vec2(qw, 44.0));
+        let qw = if narrow { 164.0 } else { 172.0 };
+        let q = Rect::from_min_size(egui::pos2(x, cy - bh * 0.5), egui::vec2(qw, bh));
         if let Some(i) = segmented(ui, q, ui.id().with("launch"), &["Now", "Beat", "Bar"], &[], quant, font(13.0), false) {
             set_q = Some(i);
         }
@@ -261,27 +350,25 @@ impl Studio {
             let on = playing && k == beat_i;
             p.circle_filled(egui::pos2(x + k as f32 * 10.0, cy), 2.6, if on { HI } else { G5 });
         }
-        x += 52.0;
+        x += 50.0;
         if routing {
             if !narrow {
                 let r = caps(&p, egui::pos2(x, cy), Align2::LEFT_CENTER, "Output", 10.5);
                 x = r.right() + 12.0;
             }
-            let ow = if narrow { 180.0 } else { 184.0 };
-            let o = Rect::from_min_size(egui::pos2(x, cy - 22.0), egui::vec2(ow, 44.0));
+            let ow = if narrow { 176.0 } else { 184.0 };
+            let o = Rect::from_min_size(egui::pos2(x, cy - bh * 0.5), egui::vec2(ow, bh));
             if let Some(i) = segmented(ui, o, ui.id().with("out"), &["This screen", "Display 2"], &[], out_open as usize, font(13.0), false) {
                 set_out = Some(i);
             }
-            x = o.right() + 20.0;
+            x = o.right() + 18.0;
         }
 
-        // Right: stop all, fullscreen.
-        let fw = if narrow { 128.0 } else { 140.0 };
-        let fr = Rect::from_min_size(egui::pos2(bar.right() - fw, cy - 22.0), egui::vec2(fw, 44.0));
-        let sr = Rect::from_min_size(egui::pos2(fr.left() - 10.0 - 104.0, cy - 22.0), egui::vec2(104.0, 44.0));
+        let fw = if narrow { 126.0 } else { 140.0 };
+        let fr = Rect::from_min_size(egui::pos2(bar.right() - fw, cy - bh * 0.5), egui::vec2(fw, bh));
+        let sr = Rect::from_min_size(egui::pos2(fr.left() - 10.0 - 102.0, cy - bh * 0.5), egui::vec2(102.0, bh));
 
-        // Middle contextual object bar (`Pad N · name` + `Open clip ›`) when wide.
-        if !narrow && sr.left() - x >= 190.0 {
+        if !narrow && sr.left() - x >= 180.0 {
             let sp = self.sel_pad.min(15);
             if let Some(pd) = pads.get(sp).filter(|pd| pd.source.is_some()) {
                 let src = pd.source.unwrap();
@@ -289,7 +376,7 @@ impl Studio {
                 let clean = super::strip_media_ext(&raw);
                 let label = format!("Pad {} · {}", sp + 1, short(clean, 16));
                 let tr = p.text(egui::pos2(x, cy), Align2::LEFT_CENTER, label, font_medium(12.0), INK2);
-                let pill_x = (tr.right() + 10.0).min(sr.left() - 106.0);
+                let pill_x = (tr.right() + 10.0).min(sr.left() - 104.0);
                 if pill_x >= x + 36.0 {
                     let pill = Rect::from_min_size(egui::pos2(pill_x, cy - 14.0), egui::vec2(94.0, 28.0));
                     if open_clip_pill(ui, pill, ui.id().with("perf-open-clip"), "open clip").clicked() {
@@ -354,7 +441,6 @@ impl Studio {
             }
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
             let p = ui.painter().clone();
-            // Top: position + exit.
             let top = Rect::from_min_size(full.min + egui::vec2(20.0, 20.0), egui::vec2(full.width() - 40.0, 40.0));
             let beats = host.playhead_beats().max(0.0);
             let pos = format!("{:03}.{}", (beats / 4.0).floor() as u32 + 1, (beats % 4.0).floor() as u32 + 1);
@@ -367,7 +453,6 @@ impl Studio {
                 host.toggle_fullscreen(ui.ctx());
             }
             runs(&p, xr.center(), Align2::CENTER_CENTER, &[("Exit  ", font_medium(13.0), INK), ("F", mono(10.0), INK3)]);
-            // Bottom left: tempo, beat dots, and what's playing.
             let bpm = host.project().lock().unwrap().bpm;
             let playing = host.playing();
             let pads: Vec<Pad> = host.perform().map(|perf| perf.pads()).unwrap_or_default();
@@ -398,7 +483,6 @@ impl Studio {
             if !names.is_empty() {
                 p.text(egui::pos2(info.left() + 206.0, info.center().y), Align2::LEFT_CENTER, &names, font(12.0), INK2);
             }
-            // Bottom right: the pads, as small thumbnails.
             let (mw, mh, mg) = (52.0, 32.0, 5.0);
             let gsize = egui::vec2(4.0 * mw + 3.0 * mg, 4.0 * mh + 3.0 * mg);
             let grid = Rect::from_min_size(egui::pos2(full.right() - 28.0 - gsize.x, full.bottom() - 28.0 - gsize.y), gsize);

@@ -1,10 +1,11 @@
-//! The calm `Project` modal sheet (`D · Hybrid` / `B · Clip`), replacing the
-//! old cramped right-hand `Deep` sidebar drawer. Keeps [`DeepTarget`] and
-//! [`DeepTab`] for host backwards compatibility.
+//! The calm `Project` modal sheet (`D · Hybrid`), replacing the old right-hand
+//! `Deep` sidebar drawer. Includes `30 fps | 60 fps` export rate, `Time & key`,
+//! `Set · scenes` (12 named scenes + cue chain), `Library`, `Master effects ♪ ▣`
+//! (including `Kaleido`), and `Script`.
 
 use super::add::modal;
 use super::{ClipTarget, Sheet, Studio, View, EMITTERS, LANES, SCENES};
-use crate::host::{AddRoute, AddTarget, Host};
+use crate::host::{AddRoute, AddTarget, Host, StageMode};
 use crate::studio::play::short;
 use crate::theme::*;
 use crate::widgets::*;
@@ -51,11 +52,11 @@ pub const FX_SLOTS: [(&str, &str); 8] = [
     ("crush", "Crush"),
     ("delay", "Echo"),
     ("reverb", "Reverb"),
+    ("kaleido", "Kaleido"),
     ("compress", "Codec"),
     ("tint", "Tint"),
     ("stretch", "Stretch"),
-    ("lowpass", "Low-pass"),
-    ("highpass", "High-pass"),
+    ("lowpass", "Filter"),
 ];
 
 pub fn view_back_name(v: View) -> &'static str {
@@ -91,10 +92,10 @@ pub fn sheet_back_button(ui: &mut egui::Ui, pos: egui::Pos2, view: View, id: egu
 pub fn sheet_card(p: &egui::Painter, rect: Rect, title: &str) -> Rect {
     p.rect_filled(rect, r(12), Color32::from_rgb(0x10, 0x10, 0x12));
     p.rect_stroke(rect, r(12), hair(LINE), StrokeKind::Inside);
-    caps(p, egui::pos2(rect.left() + 14.0, rect.top() + 16.0), Align2::LEFT_CENTER, title, 10.0);
+    caps(p, egui::pos2(rect.left() + 14.0, rect.top() + 14.0), Align2::LEFT_CENTER, title, 10.0);
     Rect::from_min_max(
-        egui::pos2(rect.left() + 14.0, rect.top() + 30.0),
-        egui::pos2(rect.right() - 14.0, rect.bottom() - 12.0),
+        egui::pos2(rect.left() + 14.0, rect.top() + 27.0),
+        egui::pos2(rect.right() - 14.0, rect.bottom() - 10.0),
     )
 }
 
@@ -105,8 +106,9 @@ pub fn fx_kind_matches(kind: &EffectKind, slot_key: &str) -> bool {
         "reverb" => matches!(kind, EffectKind::Reverb { .. }),
         "compress" => matches!(kind, EffectKind::Compress { .. }),
         "tint" => matches!(kind, EffectKind::Tint { .. }),
-        "stretch" => matches!(kind, EffectKind::Tile { .. }),
-        "highpass" => matches!(kind, EffectKind::Tune { .. }),
+        "kaleido" => kind.name() == "kaleido" || matches!(kind, EffectKind::Tile { mirror, .. } if *mirror >= 0.5),
+        "stretch" => matches!(kind, EffectKind::Tile { mirror, .. } if *mirror < 0.5),
+        "highpass" | "tune" => matches!(kind, EffectKind::Tune { .. }),
         _ => false,
     }
 }
@@ -118,8 +120,9 @@ pub fn fx_default_kind(slot_key: &str, key: Key) -> Option<EffectKind> {
         "reverb" => EffectKind::parse("reverb"),
         "compress" => EffectKind::parse("compress"),
         "tint" => EffectKind::parse("tint"),
+        "kaleido" => EffectKind::parse("kaleido"),
         "stretch" => EffectKind::parse("tile"),
-        "highpass" => Some(EffectKind::Tune {
+        "highpass" | "tune" => Some(EffectKind::Tune {
             root: key.root as f32,
             scale: key.scale,
             amount: 0.8,
@@ -201,10 +204,13 @@ impl Studio {
             if clicked_back {
                 close = true;
             }
-            let n_clips = host.project().lock().unwrap().sources.len();
+            let (n_clips, cur_fps) = {
+                let pp = host.project().lock().unwrap();
+                (pp.sources.len(), pp.fps)
+            };
             let n_scenes = self.seq.scene_pats.iter().filter(|s| s.is_some()).count().max(1);
             let sub = if caps_cfg.scenes {
-                format!("{n_clips} clips · {n_scenes} scenes")
+                format!("{n_clips} clips · {n_scenes} scenes · {:.0} fps", cur_fps)
             } else {
                 format!("{n_clips} clips")
             };
@@ -213,9 +219,26 @@ impl Studio {
             p.text(egui::pos2(tx, inner.top() + 30.0), Align2::LEFT_CENTER, &sub, mono(11.5), INK3);
 
             if caps_cfg.export {
-                let exp_r = Rect::from_min_size(egui::pos2(inner.right() - 94.0, inner.top() + 2.0), egui::vec2(94.0, 36.0));
-                if button_named(ui, exp_r, id.with("export"), "Export", "project export", false, Some(Icon::Export), None).clicked() {
+                let exp_r = Rect::from_min_size(egui::pos2(inner.right() - 96.0, inner.top() + 2.0), egui::vec2(96.0, 36.0));
+                if button_named(ui, exp_r, id.with("export"), "Export", "project export", true, Some(Icon::Export), None).clicked() {
                     host.export();
+                }
+                // `30 fps | 60 fps` export rate selector right beside Export!
+                let fps_r = Rect::from_min_size(egui::pos2(exp_r.left() - 118.0, inner.top() + 2.0), egui::vec2(110.0, 36.0));
+                let is_60 = cur_fps >= 50.0;
+                if let Some(pick) = segmented_named(
+                    ui,
+                    fps_r,
+                    id.with("export-fps"),
+                    &["30 fps", "60 fps"],
+                    &["fps 30", "fps 60"],
+                    &[],
+                    usize::from(is_60),
+                    mono(11.0),
+                    false,
+                ) {
+                    host.project().lock().unwrap().fps = if pick == 1 { 60.0 } else { 30.0 };
+                    host.mark();
                 }
             }
 
@@ -236,9 +259,9 @@ impl Studio {
                     let total_lib_tiles = n_sources + 1 + usize::from(has_dig);
 
                     if wide {
-                        let left_w = (avail_w * 0.36).floor();
+                        let left_w = (avail_w * 0.40).floor();
                         let right_w = avail_w - left_w - gap;
-                        let row1_h = 192.0;
+                        let row1_h = 196.0;
                         let lib_cols = ((avail_w * 0.63 - 28.0) / 106.0).floor().max(4.0) as usize;
                         let lib_rows = total_lib_tiles.div_ceil(lib_cols).max(1);
                         let lib_h = 44.0 + lib_rows as f32 * 84.0;
@@ -278,9 +301,8 @@ impl Studio {
                         );
                         self.project_fx_card(host, ui, c_fx, 1);
                     } else {
-                        // Compact 960×600 vertical layout: generous cards, scrollable, zero overlap.
-                        let time_h = 190.0;
-                        let song_h = if caps_cfg.scenes { 166.0 } else { 0.0 };
+                        let time_h = 192.0;
+                        let song_h = if caps_cfg.scenes { 176.0 } else { 0.0 };
                         let lib_cols = ((avail_w - 28.0) / 112.0).floor().max(4.0) as usize;
                         let lib_rows = total_lib_tiles.div_ceil(lib_cols).max(1);
                         let lib_h = 44.0 + lib_rows as f32 * 84.0;
@@ -347,7 +369,7 @@ impl Studio {
         let ky = top_r.top() + 34.0;
         let krad = 24.0;
 
-        // 1. Tempo knob (or read-only host BPM in plugin).
+        // 1. Tempo knob.
         let mut bpm = host.project().lock().unwrap().bpm as f32;
         let tc = egui::pos2(top_r.left() + col_w * 0.5, ky);
         if caps_cfg.tempo {
@@ -367,7 +389,7 @@ impl Studio {
         caps(&p, egui::pos2(tc.x, ky + krad + 14.0), Align2::CENTER_CENTER, "Tempo", 9.5);
         p.text(egui::pos2(tc.x, ky + krad + 28.0), Align2::CENTER_CENTER, format!("{bpm:.0}"), mono(11.5), INK);
 
-        // 2. Key tile (click = next root, Shift-click / vertical drag = scale).
+        // 2. Key tile.
         let kc = egui::pos2(top_r.left() + col_w * 1.5, ky + 8.0);
         let kr = Rect::from_center_size(kc, egui::vec2((col_w - 10.0).clamp(56.0, 74.0), 66.0));
         let kresp = hit(ui, kr, id.with("key"), Sense::click_and_drag(), "project key");
@@ -404,7 +426,7 @@ impl Studio {
             }
         }
 
-        // 3. Swing knob (0..50%, mapped to pattern.swing 0.50..0.75).
+        // 3. Swing knob.
         let (scene, _) = self.seq_current(host);
         let pid = self.seq_pattern(scene);
         let mut swing_pct = {
@@ -436,7 +458,7 @@ impl Studio {
             INK,
         );
 
-        // 4. Master Level knob (-24..+6 dB, 0.8 = 0 dB).
+        // 4. Master Level knob.
         let mut lvl = {
             let db = host.project().lock().unwrap().master_gain_db;
             ((db + 24.0) / 30.0).clamp(0.0, 1.0)
@@ -457,30 +479,31 @@ impl Studio {
             INK,
         );
 
-        // Bottom row: `stack | tile` + `now | beat | bar`.
+        // Bottom row: `stack | split | grid | bleed` + `now | beat | bar`.
         let bot_y = inner.bottom() - 34.0;
         let mut bx = inner.left();
-        if let Some(tile_on) = host.tile_layout() {
-            let lay_r = Rect::from_min_size(egui::pos2(bx, bot_y), egui::vec2(118.0, 34.0));
+        if let Some(cur_mode) = host.stage_mode() {
+            let lay_w = 186.0f32.min((inner.width() * 0.54).max(150.0));
+            let lay_r = Rect::from_min_size(egui::pos2(bx, bot_y), egui::vec2(lay_w, 34.0));
             if let Some(pick) = segmented_named(
                 ui,
                 lay_r,
                 id.with("layout"),
-                &["stack", "tile"],
-                &["project layout stack", "project layout tile"],
+                &["stack", "split", "grid", "bleed"],
+                &["project layout stack", "project layout split", "project layout tile", "project layout bleed"],
                 &[],
-                usize::from(tile_on),
-                font(12.0),
+                cur_mode.index(),
+                font(11.5),
                 false,
             ) {
-                host.set_tile_layout(pick == 1);
+                host.set_stage_mode(StageMode::from_index(pick));
             }
-            bx = lay_r.right() + 10.0;
+            bx = lay_r.right() + 8.0;
         }
         let cur_q = host.perform().map(|pf| pf.quantize());
         if let Some(q) = cur_q {
-            let q_w = (inner.right() - bx).min(168.0);
-            if q_w >= 120.0 {
+            let q_w = (inner.right() - bx).min(156.0);
+            if q_w >= 108.0 {
                 let qr = Rect::from_min_size(egui::pos2(bx, bot_y), egui::vec2(q_w, 34.0));
                 if let Some(nq) = segmented_named(
                     ui,
@@ -490,7 +513,7 @@ impl Studio {
                     &["project launch now", "project launch beat", "project launch bar"],
                     &[],
                     q,
-                    font(12.0),
+                    font(11.5),
                     false,
                 ) {
                     if let Some(pf) = host.perform() {
@@ -503,116 +526,41 @@ impl Studio {
 
     fn project_song_card(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, card: Rect) {
         let p = ui.painter().clone();
-        let inner = sheet_card(&p, card, "Song · scenes");
+        let inner = sheet_card(&p, card, "Set · scenes");
         let id = ui.id().with("proj-song");
-        let (cur_scene, playing_at) = self.seq_current(host);
+        let (cur_scene, _) = self.seq_current(host);
 
-        // Top row: Song chain entries + `+ scene`.
-        let chain_h = (inner.height() - 52.0).clamp(54.0, 74.0);
-        let mut cx = inner.left();
-        let tile_w = 56.0;
-        let mut cycle_idx = None;
-        for (i, &(s, reps)) in self.seq.chain.iter().enumerate() {
-            if cx + tile_w + 62.0 > inner.right() {
-                break;
-            }
-            let cr = Rect::from_min_size(egui::pos2(cx, inner.top() + 2.0), egui::vec2(tile_w, chain_h));
-            let is_cur = playing_at.map(|(ci, _)| ci == i).unwrap_or(i == 0 && s == cur_scene);
-            let resp = hit(ui, cr, id.with(("chain-ed", i)), Sense::click(), &format!("project chain {}", i + 1));
-            if is_cur {
-                p.rect_filled(cr, r(10), HI);
-            } else {
-                raised(&p, cr, 10, if resp.hovered() { G3 } else { G2 });
-            }
-            p.text(
-                cr.center() - egui::vec2(0.0, 8.0),
-                Align2::CENTER_CENTER,
-                (s + 1).to_string(),
-                mono_medium(15.0),
-                if is_cur { ON_HI } else { INK },
-            );
-            p.text(
-                cr.center() + egui::vec2(0.0, 11.0),
-                Align2::CENTER_CENTER,
-                format!("×{reps}"),
-                mono(11.0),
-                if is_cur { Color32::from_black_alpha(150) } else { INK3 },
-            );
-            if resp.clicked() {
-                cycle_idx = Some(i);
-            }
-            cx = cr.right() + 6.0;
-        }
-        if let Some(k) = cycle_idx {
-            if let Some((_, reps)) = self.seq.chain.get_mut(k) {
-                *reps = match *reps {
-                    1 => 2,
-                    2 => 4,
-                    4 => 8,
-                    _ => 1,
-                };
-                self.rev += 1;
-            }
-        }
-        // `+ scene` button.
-        let add_r = Rect::from_min_size(egui::pos2(cx, inner.top() + 2.0), egui::vec2(tile_w, chain_h));
-        if add_r.right() <= inner.right() {
-            let resp = hit(ui, add_r, id.with("add-scene"), Sense::click(), "add scene");
-            p.rect_filled(add_r, r(10), if resp.hovered() { G2 } else { G1 });
-            p.rect_stroke(add_r, r(10), hair(LINE2), StrokeKind::Inside);
-            p.text(add_r.center() - egui::vec2(0.0, 8.0), Align2::CENTER_CENTER, "+", mono_medium(15.0), INK2);
-            p.text(add_r.center() + egui::vec2(0.0, 11.0), Align2::CENTER_CENTER, "scene", font(10.5), INK3);
-            if resp.clicked() {
-                let active_scenes = self.seq.scene_pats.iter().filter(|s| s.is_some()).count().max(1);
-                let next_s = self.seq.chain.last().map(|(s, _)| (s + 1) % active_scenes).unwrap_or(0);
-                self.seq.chain.push((next_s, 2));
-                self.rev += 1;
-            }
-        }
+        // Top row: Set / Cue Arranger Bar.
+        let set_r = Rect::from_min_size(inner.min, egui::vec2(inner.width(), 36.0));
+        self.set_arranger_bar(host, ui, set_r, "proj-set");
 
-        // Bottom row: Scenes 1..8.
-        let scn_h = 40.0;
-        let scn_y = inner.bottom() - scn_h;
+        // Bottom 2 rows: Scenes 1..12 (`6×2`).
+        let grid_top = set_r.bottom() + 10.0;
+        let grid_h = (inner.bottom() - grid_top).max(68.0);
         let sg = 6.0;
-        let sw = (inner.width() - sg * (SCENES as f32 - 1.0)) / SCENES as f32;
+        let cols = 6usize;
+        let rows = 2usize;
+        let sw = (inner.width() - sg * (cols as f32 - 1.0)) / cols as f32;
+        let sh = (grid_h - sg) / rows as f32;
         for s in 0..SCENES {
-            let sr = Rect::from_min_size(egui::pos2(inner.left() + s as f32 * (sw + sg), scn_y), egui::vec2(sw, scn_h));
+            let sr = Rect::from_min_size(
+                egui::pos2(inner.left() + (s % cols) as f32 * (sw + sg), grid_top + (s / cols) as f32 * (sh + sg)),
+                egui::vec2(sw, sh),
+            );
             let exists = self.seq_pattern(s).is_some();
             let on = s == cur_scene;
             let resp = hit(ui, sr, id.with(("proj-scn", s)), Sense::click(), &format!("project scene {}", s + 1));
             if on {
-                p.rect_filled(sr, r(9), HI);
+                p.rect_filled(sr, r(8), HI);
             } else if exists {
-                raised(&p, sr, 9, if resp.hovered() { G3 } else { G2 });
+                raised(&p, sr, 8, if resp.hovered() { G3 } else { G2 });
             } else {
-                p.rect_filled(sr, r(9), G1);
-                p.rect_stroke(sr, r(9), hair(LINE), StrokeKind::Inside);
+                p.rect_filled(sr, r(8), G1);
+                p.rect_stroke(sr, r(8), hair(LINE), StrokeKind::Inside);
             }
             let fg = if on { ON_HI } else if exists { INK } else { INK4 };
-            p.text(sr.center() - egui::vec2(0.0, if exists { 3.0 } else { 0.0 }), Align2::CENTER_CENTER, (s + 1).to_string(), mono(13.0), fg);
-            if exists {
-                let pid = self.seq_pattern(s).unwrap();
-                let rows: Vec<bool> = {
-                    let pp = host.project().lock().unwrap();
-                    pp.patterns
-                        .get(pid)
-                        .map(|pat| pat.rows.iter().map(|r| r.steps.iter().any(|st| st.on) && !r.muted).collect())
-                        .unwrap_or_default()
-                };
-                let n = rows.len().max(1);
-                let bw = ((sr.width() - 16.0) / n as f32 - 2.0).max(2.0);
-                for (ri, active_lane) in rows.iter().enumerate() {
-                    let bx = sr.left() + 8.0 + ri as f32 * (bw + 2.0);
-                    let bc = if *active_lane {
-                        if on { Color32::from_black_alpha(150) } else { INK3 }
-                    } else if on {
-                        Color32::from_black_alpha(40)
-                    } else {
-                        G4
-                    };
-                    p.rect_filled(Rect::from_min_size(egui::pos2(bx, sr.bottom() - 7.0), egui::vec2(bw, 2.0)), r(1), bc);
-                }
-            }
+            let lbl = self.scene_display_label(s, 7);
+            p.text(sr.center(), Align2::CENTER_CENTER, lbl, mono(11.5), fg);
             if resp.clicked() {
                 self.seq_scene_tap(host, s);
             }
@@ -672,7 +620,6 @@ impl Studio {
             *next_sheet = Some(Sheet::Clip(ct));
         }
 
-        // `+ add` tile.
         let k_add = names.len();
         let add_pos = egui::pos2(
             inner.left() + (k_add % cols) as f32 * (tw + g),
@@ -685,10 +632,9 @@ impl Studio {
         p.text(add_r.center() - egui::vec2(0.0, 7.0), Align2::CENTER_CENTER, "+", font_semibold(16.0), INK);
         p.text(add_r.center() + egui::vec2(0.0, 10.0), Align2::CENTER_CENTER, "add", font(10.5), INK3);
         if add_resp.clicked() {
-            *open_add_route = Some(AddRoute::Files);
+            *open_add_route = Some(AddRoute::Link);
         }
 
-        // `Dig unseen` tile.
         if has_dig {
             let k_dig = k_add + 1;
             let dig_pos = egui::pos2(

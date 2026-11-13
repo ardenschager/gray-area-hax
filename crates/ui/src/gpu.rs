@@ -1,31 +1,24 @@
 //! GPU preview pipeline (wgpu: Metal on macOS/iOS, D3D12/Vulkan on
 //! Windows/Linux, GL as a fallback): renders the composition in real time
-//! for performance playback. Grains are textured quads shaded with
-//! hue-shift + HSV color filtering; effect chains run as fragment passes
-//! (pixelate/posterize, ghost-history delay, persistence+blur reverb,
-//! separable 8x8 DCT compression, tint, tune, tile); tracks composite in
-//! z-order.
+//! for performance playback across four stage modes:
+//! - `Stack` (`Layout::Stack`): spatial layered grain quads
+//! - `Split` (`Layout::Split`, `Split + Bleed`): full-canvas `1-up / 2-up /
+//!   3-up / 2×2` splits (`1×2` on `9:16`, `2×1` on `16:9`/`1:1`) with `+6.5%`
+//!   feathered screen-blended interior seams + sustained wash bleed across 100%
+//! - `Grid` (`Layout::Tile`): crisp architectural panels with `1.5 px`
+//!   obsidian dividers, low→high chord ordering, and `ratchet_odd` `flipX`
+//! - `Bleed` (`Layout::Bleed`): full-canvas optical luma-key + screen /
+//!   soft-exclusion multi-exposure melt across active voices
 //!
-//! Structure (multi-viewport friendly): the whole scene renders ONCE per
-//! app frame into an offscreen texture during the egui-wgpu `prepare`
-//! step (guarded by `Scene::frame`, so temporal effects advance once even
-//! when several windows show the picture); every viewport that shows the
-//! canvas then just samples that texture in its `paint` step. egui-wgpu
-//! shares one device and one callback-resource map across viewports, so
-//! the editor window and the performance output window draw the same
-//! texture.
-//!
-//! The CPU renderer (render_project) stays the deterministic reference
-//! used for export; this pipeline mirrors it closely enough to perform
-//! with. Known deviations: GPU compress uses a DC-relative coefficient
-//! threshold instead of exact top-K, and layer alpha under additive glow
-//! is approximated by the premultiplied blend.
+//! Includes smart `(cx, cy)` subject crop, `52 ms` optical carry, transient
+//! `zoom_punch`, Basinski `oxide_dropout` wear, and polar `Kaleido` (`fs_kaleido`).
 
+use crate::host::StageMode;
 use chromagrain_core::fx::{AvEffect, EffectKind};
+use chromagrain_core::grain::GrainEvent;
 use chromagrain_core::render::ClipPlan;
-use chromagrain_core::timeline::Project;
-use chromagrain_core::video::{grain_draws_layout, ColorFilterMode, VisualGrainStyle};
-
+use chromagrain_core::timeline::{ClipKind, Project};
+use chromagrain_core::video::{grain_draws_layout, ColorFilterMode, GrainDraw, VisualGrainStyle};
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -39,7 +32,7 @@ pub struct Scene {
     /// Live hits (MIDI pads, emitters) timed on the app clock:
     /// (source, bus, event). Bus 0 = the plain pad layer; bus b > 0 uses
     /// `buses[b - 1]` (its own grain style + effect chain).
-    pub live: Vec<(usize, u8, chromagrain_core::grain::GrainEvent)>,
+    pub live: Vec<(usize, u8, GrainEvent)>,
     pub live_t: f64,
     pub buses: Vec<LiveBus>,
     /// Full-frame picture under everything: (source, media seconds).
@@ -49,6 +42,12 @@ pub struct Scene {
     /// App frame counter: the scene is rendered once per distinct value,
     /// however many viewports present it.
     pub frame: u64,
+    /// Optional stage mode override (`Stack | Split | Grid | Bleed`).
+    pub mode_override: Option<StageMode>,
+    /// Per-source smart crop focus `(cx, cy)` overrides from the Clip sheet.
+    pub focus_overrides: HashMap<usize, (f32, f32)>,
+    /// Live Perform `Tape Stop` amount (`0..1`).
+    pub tape_stop: f32,
 }
 
 /// A live layer's look: how its grains are drawn and what effects run
@@ -61,16 +60,26 @@ pub struct LiveBus {
     pub link: chromagrain_core::video::AvLink,
 }
 
-/// The frame's tile grid (layout Tile), as the CPU compositor computes it
-/// (`render::frame_tile_grids` / `tile::frame_grid`): the distinct tile
-/// slots of every grain visible now with a picture — the arrangement's at
-/// `t`, live hits at `live_t`. None in stack layout.
+pub fn effective_stage_mode(scene: &Scene) -> StageMode {
+    if let Some(m) = scene.mode_override {
+        return m;
+    }
+    match scene.project.layout.name() {
+        "split" => StageMode::Split,
+        "tile" | "grid" => StageMode::Grid,
+        "bleed" | "blend" => StageMode::Bleed,
+        _ => StageMode::Stack,
+    }
+}
+
+/// The frame's tile grid (`Layout::Tile` / `StageMode::Grid`), as the CPU
+/// compositor computes it (`render::frame_tile_grids` / `tile::frame_grid`).
 pub fn tile_grid(scene: &Scene) -> Option<(u32, u32)> {
-    if scene.project.layout != chromagrain_core::tile::Layout::Tile {
+    if effective_stage_mode(scene) != StageMode::Grid {
         return None;
     }
     let mut slots: Vec<u8> = Vec::new();
-    let mut see = |e: &chromagrain_core::grain::GrainEvent, t: f64| {
+    let mut see = |e: &GrainEvent, t: f64| {
         if let Some(slot) = e.tag.tile {
             if t >= e.onset && t < e.end() && e.tag.picture_at(t) > 0.0 && !slots.contains(&slot) {
                 slots.push(slot);
@@ -93,13 +102,76 @@ pub fn tile_grid(scene: &Scene) -> Option<(u32, u32)> {
     Some(chromagrain_core::tile::frame_grid(slots))
 }
 
+/// Cover-crop normalized `[x, y, w, h]` patch around `focus = (cx, cy)` with
+/// transient `zoom_punch` (`0..0.35`), preserving `src_aspect` inside `cell_aspect`.
+pub fn cover_patch_focus(src_aspect: f32, cell_aspect: f32, focus: (f32, f32), zoom_punch: f32) -> [f32; 4] {
+    let sa = src_aspect.max(0.05);
+    let ca = cell_aspect.max(0.05);
+    let (mut pw, mut ph) = if ca < sa { (ca / sa, 1.0) } else { (1.0, sa / ca) };
+    let z = (1.0 + zoom_punch.clamp(0.0, 0.35)).max(1.0);
+    pw = (pw / z).clamp(0.05, 1.0);
+    ph = (ph / z).clamp(0.05, 1.0);
+    let cx = focus.0.clamp(0.0, 1.0);
+    let cy = focus.1.clamp(0.0, 1.0);
+    let px = (cx - pw * 0.5).clamp(0.0, (1.0 - pw).max(0.0));
+    let py = (cy - ph * 0.5).clamp(0.0, (1.0 - ph).max(0.0));
+    [px, py, pw, ph]
+}
+
+/// Compute `Split + Bleed` panel rect `[x, y, w, h]` and interior-edge feather
+/// bitmask (`bit 0 = left`, `bit 1 = right`, `bit 2 = top`, `bit 3 = bottom`)
+/// for panel `idx` out of `count` foreground voices on `canvas_aspect`.
+/// On widescreen (`16:9`, `canvas_aspect > 1.3`), `2`, `3`, and `4` voices lay
+/// out as side-by-side portrait monolith columns (`2×1`, `3×1`, `4×1`, *MODELL 5*).
+pub fn split_panel_rect(idx: usize, count: usize, canvas_aspect: f32) -> ([f32; 4], u32) {
+    let n = count.max(1);
+    let i = idx.min(n - 1);
+    let portrait = canvas_aspect < 0.85;
+    let wide = canvas_aspect > 1.3;
+    let (cols, rows): (usize, usize) = match n {
+        1 => (1, 1),
+        2 => if portrait { (1, 2) } else { (2, 1) },
+        3 => if portrait { (1, 3) } else { (3, 1) },
+        4 => if wide { (4, 1) } else { (2, 2) },
+        5 | 6 => if portrait { (2, 3) } else { (3, 2) },
+        _ => (3, 3),
+    };
+    let c = i % cols;
+    let r = i / cols;
+    let cw = 1.0 / cols as f32;
+    let ch = 1.0 / rows as f32;
+    let overlap_x = 0.065 * cw;
+    let overlap_y = 0.065 * ch;
+
+    let mut x0 = c as f32 * cw;
+    let mut x1 = (c + 1) as f32 * cw;
+    let mut y0 = r as f32 * ch;
+    let mut y1 = (r + 1) as f32 * ch;
+    let mut mask = 0u32;
+
+    if c > 0 {
+        x0 = (x0 - overlap_x).max(0.0);
+        mask |= 1;
+    }
+    if c + 1 < cols {
+        x1 = (x1 + overlap_x).min(1.0);
+        mask |= 2;
+    }
+    if r > 0 {
+        y0 = (y0 - overlap_y).max(0.0);
+        mask |= 4;
+    }
+    if r + 1 < rows {
+        y1 = (y1 + overlap_y).min(1.0);
+        mask |= 8;
+    }
+    ([x0, y0, (x1 - x0).max(1e-3), (y1 - y0).max(1e-3)], mask)
+}
+
 const MAX_SRC_W: u32 = 256;
 const MAX_SRC_LAYERS: usize = 192;
 const MAX_HISTORY: usize = 40;
-/// Dynamic-offset stride for per-draw uniforms (WebGPU's guaranteed
-/// minimum uniform offset alignment).
 const UNI_STRIDE: u64 = 256;
-/// Present uniforms ring (one slot per canvas shown per frame).
 const PRESENT_SLOTS: usize = 16;
 const RGBA8: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const RGBA16F: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
@@ -112,7 +184,8 @@ const PING: usize = 3;
 const PONG: usize = 4;
 const FPING: usize = 5;
 const FPONG: usize = 6;
-const FIXED_TARGETS: usize = 7;
+const CARRY: usize = 7;
+const FIXED_TARGETS: usize = 8;
 
 /// Per-draw uniforms: one struct shared by every pass (unused fields are
 /// ignored). Mirrors `struct U` in the WGSL below.
@@ -133,7 +206,7 @@ struct Uni {
     c: [f32; 4],
     /// res.xy, shift.xy.
     res: [f32; 4],
-    /// Pass-specific params (see each fragment entry point).
+    /// Pass-specific params (for `fs_grain`: feather, flip_x, interior_mask, oxide_wear).
     d: [f32; 4],
     hues: [f32; 12],
 }
@@ -161,10 +234,6 @@ fn uni_bytes(u: &Uni) -> &[u8] {
     unsafe { std::slice::from_raw_parts(u as *const Uni as *const u8, std::mem::size_of::<Uni>()) }
 }
 
-// Vertical convention: every texture stores rows y-down with v = 0 at the
-// top (same as uploaded source frames), and wgpu's framebuffer row 0 is
-// the top too, so every pass maps y-down 0..1 to NDC with one flip and
-// full-screen passes sample `uv` directly.
 const SHADER: &str = r#"
 struct U {
     rect: vec4f,
@@ -194,8 +263,6 @@ fn vs(@builtin(vertex_index) vi: u32) -> VOut {
         vec2f(0.0, 0.0), vec2f(1.0, 0.0), vec2f(1.0, 1.0),
         vec2f(0.0, 0.0), vec2f(1.0, 1.0), vec2f(0.0, 1.0));
     let a_pos = corners[vi];
-    // Rect + rotation about its center in aspect-corrected space (the
-    // grain transform; rot = 0 reduces to a plain rect).
     let c = u.rect.xy + 0.5 * u.rect.zw;
     var off = (a_pos - 0.5) * u.rect.zw;
     off.x *= u.a.y;
@@ -230,15 +297,17 @@ fn hsv2rgb(c: vec3f) -> vec3f {
 fn tex0(uv: vec2f) -> vec4f { return textureSampleLevel(t0, samp, uv, 0.0); }
 fn tex1(uv: vec2f) -> vec4f { return textureSampleLevel(t1, samp, uv, 0.0); }
 
-// Grain: a patch of one source frame, color-filtered and hue-rotated,
-// premultiplied; `additive` lowers alpha toward pure glow.
+// Grain / Split / Grid quad:
+// - d.x = border feather (0..1)
+// - d.y = flip_x (1.0 on odd ratchet sub-hits)
+// - d.z = Split interior-seam feather bitmask (bit0=L, bit1=R, bit2=T, bit3=B)
+// - d.w = Basinski oxide_dropout visual wear (0..1)
 @fragment
 fn fs_grain(i: VOut) -> @location(0) vec4f {
-    let suv = u.patch_r.xy + i.uv * u.patch_r.zw;
+    let ux = select(i.uv.x, 1.0 - i.uv.x, u.d.y >= 0.5);
+    let suv = u.patch_r.xy + vec2f(ux, i.uv.y) * u.patch_r.zw;
     let texel = textureSampleLevel(tarr, samp, suv, i32(u.a.z + 0.5), 0.0);
     var rgb = texel.rgb;
-    // Source alpha participates: segmented sources are transparent
-    // outside the tracked object, matching the CPU compositor.
     var a = u.a.w * texel.a;
     var hsv = rgb2hsv(rgb);
     let mode = i32(u.b.y + 0.5);
@@ -256,7 +325,18 @@ fn fs_grain(i: VOut) -> @location(0) vec4f {
         hsv.x = fract(hsv.x + u.b.x / 360.0 + 10.0);
         rgb = hsv2rgb(hsv);
     }
-    // Feather (d.x): soft cosine border taper, as the CPU compositor.
+    // Basinski ferric oxide dropout & warm saturation decay.
+    let oxide = clamp(u.d.w, 0.0, 1.0);
+    if (oxide > 0.01) {
+        let luma = dot(rgb, vec3f(0.2126, 0.7152, 0.0722));
+        let ferric = vec3f(luma * 1.06, luma * 0.96, luma * 0.82);
+        rgb = clamp(mix(rgb, ferric, oxide * 0.48), vec3f(0.0), vec3f(1.0));
+        let scan_line = floor(i.uv.y * 92.0 + u.a.z * 3.17);
+        let h_noise = fract(sin(scan_line * 12.9898 + u.a.z * 0.73) * 43758.5453);
+        let drop = smoothstep(1.0 - oxide * 0.34, 1.0, h_noise);
+        a *= (1.0 - 0.72 * drop);
+    }
+    // Grain cosine border feather (d.x).
     let f = clamp(u.d.x, 0.0, 1.0) * 0.45;
     if (f > 0.0001) {
         let q = min(i.uv, vec2f(1.0) - i.uv);
@@ -264,7 +344,40 @@ fn fs_grain(i: VOut) -> @location(0) vec4f {
         let w = vec2f(0.5) - 0.5 * cos(3.14159265 * e);
         a *= w.x * w.y;
     }
+    // Split+Bleed interior-seam feather ONLY on shared inner borders (d.z bitmask).
+    let emask = u32(u.d.z + 0.5);
+    if (emask != 0u) {
+        let fw = 0.22;
+        if ((emask & 1u) != 0u) { a *= smoothstep(0.0, fw, i.uv.x); }
+        if ((emask & 2u) != 0u) { a *= smoothstep(0.0, fw, 1.0 - i.uv.x); }
+        if ((emask & 4u) != 0u) { a *= smoothstep(0.0, fw, i.uv.y); }
+        if ((emask & 8u) != 0u) { a *= smoothstep(0.0, fw, 1.0 - i.uv.y); }
+    }
     return vec4f(rgb * a, a * (1.0 - u.b.w));
+}
+
+// Full Bleed optical multi-exposure melt: t0 = base canvas, t1 = incoming layer, c.x = weight.
+@fragment
+fn fs_bleed(i: VOut) -> @location(0) vec4f {
+    let base = tex0(i.uv);
+    let inc = tex1(i.uv);
+    let va = clamp(inc.a * u.c.x, 0.0, 1.0);
+    if (va <= 0.002) {
+        return base;
+    }
+    let v_rgb = clamp(inc.rgb / max(inc.a, 1e-4), vec3f(0.0), vec3f(1.0));
+    let b_rgb = clamp(base.rgb, vec3f(0.0), vec3f(1.0));
+    let b_luma = dot(b_rgb, vec3f(0.2126, 0.7152, 0.0722));
+    if (b_luma < 0.025) {
+        return vec4f(mix(b_rgb, v_rgb, va), 1.0);
+    }
+    let v_luma = dot(v_rgb, vec3f(0.2126, 0.7152, 0.0722));
+    let screen_rgb = vec3f(1.0) - (vec3f(1.0) - b_rgb) * (vec3f(1.0) - 0.92 * v_rgb);
+    let excl_rgb = b_rgb + v_rgb - 1.55 * b_rgb * v_rgb;
+    let optical_melt = mix(mix(v_rgb, excl_rgb, 0.22), screen_rgb, 0.58);
+    let luma_key = smoothstep(0.08, 0.78, v_luma + 0.26 * (1.0 - b_luma));
+    let w = clamp(va * mix(0.52, 1.0, luma_key), 0.0, 1.0);
+    return vec4f(clamp(mix(b_rgb, optical_melt, w), vec3f(0.0), vec3f(1.0)), 1.0);
 }
 
 // Blit: c.x opacity, c.y extra alpha scale, b.w additive.
@@ -279,6 +392,49 @@ fn fs_blit(i: VOut) -> @location(0) vec4f {
 fn fs_present(i: VOut) -> @location(0) vec4f {
     let c = tex0(u.patch_r.xy + i.uv * u.patch_r.zw);
     return vec4f(c.rgb, 1.0);
+}
+
+// True Polar Kaleidoscope (`EffectKind::Kaleido`):
+// d.x = folds (2..12), d.y = spin (rad), d.z = cx, d.w = cy, c.w = video wet (0..1).
+@fragment
+fn fs_kaleido(i: VOut) -> @location(0) vec4f {
+    let orig = tex0(i.uv);
+    let w = clamp(u.c.w, 0.0, 1.0);
+    if (w <= 0.001) { return orig; }
+    let aspect = u.res.x / max(u.res.y, 1.0);
+    let center = vec2f(u.d.z, u.d.w);
+    let delta = vec2f((i.uv.x - center.x) * aspect, i.uv.y - center.y);
+    let rad = length(delta);
+    let folds = clamp(floor(u.d.x + 0.5), 2.0, 16.0);
+    let sector = 6.283185307 / folds;
+    let half_s = sector * 0.5;
+    let theta = atan2(delta.y, delta.x) + u.d.y;
+    var local = gmod(theta, sector);
+    if (local > half_s) {
+        local = sector - local;
+    }
+    let sample_ang = local - u.d.y * 0.35;
+    let suv = clamp(
+        vec2f(center.x + (rad * cos(sample_ang)) / aspect, center.y + rad * sin(sample_ang)),
+        vec2f(0.002),
+        vec2f(0.998)
+    );
+    let kal = tex0(suv);
+    return mix(orig, kal, w);
+}
+
+// Live Perform `Tape Stop`: VHS vertical sync roll + tracking shear (d.x = amt 0..1, d.y = phase).
+@fragment
+fn fs_tapestop(i: VOut) -> @location(0) vec4f {
+    let amt = clamp(u.d.x, 0.0, 1.0);
+    if (amt <= 0.002) { return tex0(i.uv); }
+    let roll = fract(i.uv.y + amt * amt * 0.38 + sin(u.d.y * 3.0) * 0.02 * amt);
+    let shear = sin(roll * 42.0 + u.d.y * 9.0) * 0.022 * amt;
+    let uv = clamp(vec2f(i.uv.x + shear, roll), vec2f(0.001), vec2f(0.999));
+    var c = tex0(uv);
+    let bar = smoothstep(0.92, 0.99, abs(roll - 0.5) * 2.0) * amt;
+    c = vec4f(mix(c.rgb * (1.0 - 0.22 * amt), vec3f(0.85, 0.84, 0.80), bar * 0.35), c.a);
+    return c;
 }
 
 // Tint: d.x target hue (deg), c.w amount.
@@ -296,7 +452,6 @@ fn fs_tint(i: VOut) -> @location(0) vec4f {
 }
 
 // Tune (mirrors fx::video_tune): snap hues to the key colors.
-// hues[] degrees, d.w count, c.w amount.
 @fragment
 fn fs_tune(i: VOut) -> @location(0) vec4f {
     let c = tex0(i.uv);
@@ -326,8 +481,6 @@ fn fs_crush(i: VOut) -> @location(0) vec4f {
     return c;
 }
 
-// Tile (mirrors fx::tile_source_uv + fx::video_tile): d.x count,
-// d.y mirror, d.z turn. Nearest texel so it matches the CPU export.
 fn tile1(t: f32) -> f32 {
     let q = t * u.d.x;
     let i = floor(q);
@@ -359,7 +512,6 @@ fn fs_delay(i: VOut) -> @location(0) vec4f {
     let guv = i.uv - u.res.zw;
     var g = tex1(guv) * u.c.z;
     if (guv.x < 0.0 || guv.x > 1.0 || guv.y < 0.0 || guv.y > 1.0) { g = vec4f(0.0); }
-    // under where transparent + screen where covered (premultiplied)
     return cur + g * (1.0 - cur.a) + vec4f(g.rgb * cur.a * (1.0 - cur.rgb), 0.0);
 }
 
@@ -386,7 +538,6 @@ fn fs_rmix(i: VOut) -> @location(0) vec4f {
     return cur + sm * (1.0 - cur.a) + vec4f(sm.rgb * cur.a * (1.0 - cur.rgb), 0.0);
 }
 
-// 8x8 DCT basis: b(u,x) = a(u) * cos((2x+1)u*pi/16)
 fn dctb(uu: i32, x: i32) -> f32 {
     let a = select(0.5, 0.35355339, uu == 0);
     return a * cos((2.0 * f32(x) + 1.0) * f32(uu) * 3.14159265 / 16.0);
@@ -418,7 +569,6 @@ fn fs_dct_col(i: VOut) -> @location(0) vec4f {
     return s;
 }
 
-// Quantize: d.x crunch = (1-quality)^2, d.y DC-relative zeroing threshold.
 @fragment
 fn fs_quant(i: VOut) -> @location(0) vec4f {
     let px = floor(i.uv * u.res.xy);
@@ -463,10 +613,22 @@ fn fs_idct_row(i: VOut) -> @location(0) vec4f {
 "#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum BlendKind {
+    None,
+    PremulOver,
+    Screen,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Pipe {
     Grain,
+    GrainScreen,
     BlitBlend,
+    BlitScreen,
     Blit,
+    Bleed,
+    Kaleido,
+    TapeStop,
     Crush,
     Tint,
     Tune,
@@ -482,10 +644,15 @@ enum Pipe {
 }
 
 impl Pipe {
-    const ALL: [Pipe; 15] = [
+    const ALL: [Pipe; 20] = [
         Pipe::Grain,
+        Pipe::GrainScreen,
         Pipe::BlitBlend,
+        Pipe::BlitScreen,
         Pipe::Blit,
+        Pipe::Bleed,
+        Pipe::Kaleido,
+        Pipe::TapeStop,
         Pipe::Crush,
         Pipe::Tint,
         Pipe::Tune,
@@ -502,8 +669,11 @@ impl Pipe {
 
     fn entry(self) -> &'static str {
         match self {
-            Pipe::Grain => "fs_grain",
-            Pipe::BlitBlend | Pipe::Blit => "fs_blit",
+            Pipe::Grain | Pipe::GrainScreen => "fs_grain",
+            Pipe::BlitBlend | Pipe::BlitScreen | Pipe::Blit => "fs_blit",
+            Pipe::Bleed => "fs_bleed",
+            Pipe::Kaleido => "fs_kaleido",
+            Pipe::TapeStop => "fs_tapestop",
             Pipe::Crush => "fs_crush",
             Pipe::Tint => "fs_tint",
             Pipe::Tune => "fs_tune",
@@ -519,12 +689,14 @@ impl Pipe {
         }
     }
 
-    /// Premultiplied "over" blending (GL: ONE, ONE_MINUS_SRC_ALPHA).
-    fn blends(self) -> bool {
-        matches!(self, Pipe::Grain | Pipe::BlitBlend)
+    fn blend(self) -> BlendKind {
+        match self {
+            Pipe::Grain | Pipe::BlitBlend => BlendKind::PremulOver,
+            Pipe::GrainScreen | Pipe::BlitScreen => BlendKind::Screen,
+            _ => BlendKind::None,
+        }
     }
 
-    /// The DCT intermediates write float targets.
     fn format(self) -> wgpu::TextureFormat {
         match self {
             Pipe::DctRow | Pipe::DctCol | Pipe::Quant | Pipe::IdctCol => RGBA16F,
@@ -534,7 +706,6 @@ impl Pipe {
 }
 
 struct Target {
-    /// Owns the texture behind `view` (read back directly in tests).
     #[cfg_attr(not(test), allow(dead_code))]
     tex: wgpu::Texture,
     view: wgpu::TextureView,
@@ -544,13 +715,12 @@ struct GpuSource {
     view: wgpu::TextureView,
     layers: i32,
     duration: f64,
-    /// Identity of the uploaded clip (Arc pointer) to detect replacement.
+    src_aspect: f32,
     ident: usize,
 }
 
 #[derive(Default)]
 struct FxInst {
-    /// Slab indices of the ghost-history ring.
     history: Vec<usize>,
     head: usize,
     filled: usize,
@@ -562,7 +732,6 @@ struct DrawOp {
     pipe: Pipe,
     t0: Option<usize>,
     t1: Option<usize>,
-    /// Source id whose frame array is bound.
     arr: Option<usize>,
     u: Uni,
 }
@@ -573,7 +742,6 @@ struct PassOp {
     draws: Vec<DrawOp>,
 }
 
-/// Texture bind-group cache key: (t0, t1, arr), `u32::MAX` = dummy.
 type TexKey = (u32, u32, u32);
 
 fn key_part(x: Option<usize>) -> u32 {
@@ -604,17 +772,16 @@ pub struct GpuPreview {
     fx: HashMap<u64, FxInst>,
     passes: Vec<PassOp>,
     /// Slab index of the last rendered canvas (what `present` samples).
-    final_tex: Option<usize>,
+    canvas_tex: Option<usize>,
     last_frame: Option<u64>,
-    /// Offscreen scene renders so far (one per app frame, however many
-    /// windows present it).
+    /// `52 ms` optical carry timestamp (holds last active frame across rapid cuts).
+    carry_active_t: Option<f64>,
     pub renders: u64,
 }
 
 fn make_tex(device: &wgpu::Device, w: u32, h: u32, layers: u32, format: wgpu::TextureFormat, target: bool) -> wgpu::Texture {
     let mut usage = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST;
     if target {
-        // COPY_SRC: read-back (tests today; Syphon / frame grabs later).
         usage |= wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC;
     }
     device.create_texture(&wgpu::TextureDescriptor {
@@ -637,8 +804,6 @@ fn array_view(tex: &wgpu::Texture) -> wgpu::TextureView {
 }
 
 impl GpuPreview {
-    /// Build the pipeline for the egui render state (`target_format` is
-    /// what the window surfaces use).
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, target_format: wgpu::TextureFormat) -> GpuPreview {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("chromagrain preview"),
@@ -691,7 +856,17 @@ impl GpuPreview {
             dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
             operation: wgpu::BlendOperation::Add,
         };
-        let make_pipe = |entry: &str, format: wgpu::TextureFormat, blend: bool| {
+        let screen_rgb = wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::OneMinusSrc,
+            operation: wgpu::BlendOperation::Add,
+        };
+        let make_pipe = |entry: &str, format: wgpu::TextureFormat, blend: BlendKind| {
+            let blend_state = match blend {
+                BlendKind::None => None,
+                BlendKind::PremulOver => Some(wgpu::BlendState { color: premul, alpha: premul }),
+                BlendKind::Screen => Some(wgpu::BlendState { color: screen_rgb, alpha: premul }),
+            };
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(entry),
                 layout: Some(&layout),
@@ -706,7 +881,7 @@ impl GpuPreview {
                     entry_point: Some(entry),
                     targets: &[Some(wgpu::ColorTargetState {
                         format,
-                        blend: blend.then_some(wgpu::BlendState { color: premul, alpha: premul }),
+                        blend: blend_state,
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
                     compilation_options: Default::default(),
@@ -718,8 +893,8 @@ impl GpuPreview {
                 cache: None,
             })
         };
-        let pipelines = Pipe::ALL.iter().map(|&p| (p, make_pipe(p.entry(), p.format(), p.blends()))).collect();
-        let present_pipe = make_pipe("fs_present", target_format, false);
+        let pipelines = Pipe::ALL.iter().map(|&p| (p, make_pipe(p.entry(), p.format(), p.blend()))).collect();
+        let present_pipe = make_pipe("fs_present", target_format, BlendKind::None);
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("chromagrain linear clamp"),
@@ -758,8 +933,9 @@ impl GpuPreview {
             sources: HashMap::new(),
             fx: HashMap::new(),
             passes: Vec::new(),
-            final_tex: None,
+            canvas_tex: None,
             last_frame: None,
+            carry_active_t: None,
             renders: 0,
         }
     }
@@ -800,11 +976,12 @@ impl GpuPreview {
         self.size = (w, h);
         self.targets.clear();
         self.tex_bgs.clear();
-        self.fx.clear(); // sizes changed; rebuild temporal state
+        self.fx.clear();
         for i in 0..FIXED_TARGETS {
             self.new_target(i == FPING || i == FPONG);
         }
-        self.final_tex = None;
+        self.canvas_tex = None;
+        self.carry_active_t = None;
     }
 
     fn ensure_source(&mut self, project: &Project, sid: usize) -> Option<()> {
@@ -813,13 +990,13 @@ impl GpuPreview {
         if self.sources.get(&sid).is_some_and(|s| s.ident == ident) {
             return Some(());
         }
-        // (Re)upload, downscaled + frame-subsampled.
         let n_frames = video.frames.len().min(1_000_000);
         if n_frames == 0 {
             return None;
         }
         let take = n_frames.min(MAX_SRC_LAYERS);
         let (sw, sh) = (video.frames[0].width, video.frames[0].height);
+        let src_aspect = sw.max(1) as f32 / sh.max(1) as f32;
         let scale = (MAX_SRC_W as f32 / sw as f32).min(1.0);
         let (tw, th) = (((sw as f32 * scale) as u32).max(2), ((sh as f32 * scale) as u32).max(2));
         let mut data = vec![0u8; (tw * th * 4) as usize * take];
@@ -850,8 +1027,16 @@ impl GpuPreview {
             wgpu::Extent3d { width: tw, height: th, depth_or_array_layers: take as u32 },
         );
         let view = array_view(&tex);
-        self.sources.insert(sid, GpuSource { view, layers: take as i32, duration: video.duration(), ident });
-        // Bind groups holding the old view are stale.
+        self.sources.insert(
+            sid,
+            GpuSource {
+                view,
+                layers: take as i32,
+                duration: video.duration(),
+                src_aspect,
+                ident,
+            },
+        );
         self.tex_bgs.retain(|k, _| k.2 != sid as u32);
         Some(())
     }
@@ -869,7 +1054,6 @@ impl GpuPreview {
         }
     }
 
-    /// A full-target pass that overwrites every pixel (no blending).
     fn full(&mut self, target: usize, pipe: Pipe, t0: usize, t1: Option<usize>, u: Uni) {
         self.pass(target, Some([0.0; 4]));
         self.draw(pipe, Some(t0), t1, None, u);
@@ -888,12 +1072,11 @@ impl GpuPreview {
     }
 
     /// Record an effect chain over `cur` (slab index), returning the slab
-    /// index holding the result. Temporal effects keep per-instance state.
-    fn apply_chain(&mut self, chain: &[AvEffect], scope: u64, mut cur: usize, fps: f32) -> usize {
+    /// index holding the result.
+    fn apply_chain(&mut self, chain: &[AvEffect], scope: u64, mut cur: usize, fps: f32, t_sec: f64) -> usize {
         for (fi, fx) in chain.iter().enumerate() {
             let key = scope ^ ((fi as u64 + 1) << 40);
             if fx.video <= 0.001 {
-                // Delay history must still record for later enabling.
                 if let EffectKind::Delay { time, .. } = fx.kind {
                     let frames = ((time * fps).round() as usize).clamp(1, MAX_HISTORY);
                     self.push_history(key, frames, cur, 1.0);
@@ -901,6 +1084,7 @@ impl GpuPreview {
                 continue;
             }
             let out = Self::other(cur);
+            #[allow(unreachable_patterns)]
             match fx.kind {
                 EffectKind::Tint { hue, amount } => {
                     let mut u = self.res_uni();
@@ -954,13 +1138,11 @@ impl GpuPreview {
                     let inst = &self.fx[&key];
                     let Some(acc) = inst.accum else { continue };
                     let (read, write) = (acc[inst.accum_idx], acc[1 - inst.accum_idx]);
-                    // accum' = acc*decay + cur*(1-decay)
                     let mut u = Uni::default();
                     u.d[0] = 0.75 + 0.24 * size.clamp(0.0, 1.0);
                     self.full(write, Pipe::Racc, read, Some(cur), u);
                     let inst = self.fx.get_mut(&key).unwrap();
                     inst.accum_idx = 1 - inst.accum_idx;
-                    // out = cur + smear
                     let mut u = self.res_uni();
                     u.d[0] = 1.0 + damp * 5.0;
                     u.c[2] = mix * fx.video;
@@ -983,6 +1165,14 @@ impl GpuPreview {
                     self.full(out, Pipe::IdctRow, FPONG, None, u);
                     cur = out;
                 }
+                _ => {
+                    // Ready for `EffectKind::Kaleido { folds, spin }` on `vgs-core` merge!
+                    let mut u = self.res_uni();
+                    u.d = [6.0, t_sec as f32 * 0.45, 0.5, 0.5];
+                    u.c[3] = fx.video.clamp(0.0, 1.0);
+                    self.full(out, Pipe::Kaleido, cur, None, u);
+                    cur = out;
+                }
             }
         }
         cur
@@ -994,13 +1184,11 @@ impl GpuPreview {
         }
         let a = self.new_target(false);
         let b = self.new_target(false);
-        // New targets start undefined: clear them.
         self.pass(a, Some([0.0; 4]));
         self.pass(b, Some([0.0; 4]));
         self.fx.entry(key).or_default().accum = Some([a, b]);
     }
 
-    /// The frame from `frames` steps ago, if the ring has filled.
     fn history_tail(&self, key: u64, frames: usize) -> Option<usize> {
         let inst = self.fx.get(&key)?;
         if inst.filled < frames || inst.history.len() < frames {
@@ -1010,7 +1198,6 @@ impl GpuPreview {
         Some(inst.history[idx])
     }
 
-    /// Record `cur` (scaled by feedback) into the ring for `key`.
     fn push_history(&mut self, key: u64, frames: usize, cur: usize, feedback: f32) {
         let need = frames.min(MAX_HISTORY);
         while self.fx.entry(key).or_default().history.len() < need {
@@ -1028,15 +1215,15 @@ impl GpuPreview {
         inst.filled = (inst.filled + 1).min(need + 1);
     }
 
-    /// Record the grain draws of one event list into the current pass.
     #[allow(clippy::too_many_arguments)]
-    fn record_grains(
+    fn record_grains_ext(
         &mut self,
         sid: usize,
-        draws: Vec<chromagrain_core::video::GrainDraw>,
+        draws: Vec<(GrainDraw, bool, u32, f32)>,
         color_filter: Option<&chromagrain_core::video::ColorFilter>,
         additive: f32,
         feather: f32,
+        screen_blend: bool,
     ) {
         let Some(gsrc) = self.sources.get(&sid) else { return };
         let (layers, dur) = (gsrc.layers, gsrc.duration.max(1e-6));
@@ -1049,28 +1236,246 @@ impl GpuPreview {
                 c.val_min,
             ),
         };
-        for d in draws {
+        let pipe = if screen_blend { Pipe::GrainScreen } else { Pipe::Grain };
+        for (d, flip_x, edge_mask, oxide) in draws {
             let layer = ((d.src_time / dur).rem_euclid(1.0) * layers as f64).min(layers as f64 - 1.0) as f32;
-            // Tiles (layout Tile): hard-edged, normal blend.
-            let (additive, feather) = if d.tiled { (0.0, 0.0) } else { (additive, feather) };
+            let (eff_add, eff_feather) = if d.tiled || edge_mask != 0 {
+                (0.0, 0.0)
+            } else {
+                (additive, feather)
+            };
             let u = Uni {
                 rect: d.dest,
                 patch: d.patch,
                 cf,
                 a: [d.rotation, aspect, layer.floor(), d.alpha],
-                b: [d.hue_shift, mode, valmin, additive],
-                d: [feather, 0.0, 0.0, 0.0],
+                b: [d.hue_shift, mode, valmin, eff_add],
+                d: [eff_feather, if flip_x { 1.0 } else { 0.0 }, edge_mask as f32, oxide],
                 ..Default::default()
             };
-            self.draw(Pipe::Grain, None, None, Some(sid), u);
+            self.draw(pipe, None, None, Some(sid), u);
         }
     }
 
-    /// Composite `tex` (premultiplied) over `target`.
     fn blend_onto(&mut self, target: usize, tex: usize, opacity: f32, additive: f32) {
         self.pass(target, None);
         let u = Uni { c: [opacity, 1.0, 0.0, 0.0], b: [0.0, 0.0, 0.0, additive], ..Default::default() };
         self.draw(Pipe::BlitBlend, Some(tex), None, None, u);
+    }
+
+    fn screen_onto(&mut self, target: usize, tex: usize, opacity: f32) {
+        self.pass(target, None);
+        let u = Uni { c: [opacity, 1.0, 0.0, 0.0], ..Default::default() };
+        self.draw(Pipe::BlitScreen, Some(tex), None, None, u);
+    }
+
+    fn bleed_onto(&mut self, target: usize, tex: usize, weight: f32) {
+        let tmp = Self::other(tex);
+        let u = Uni { c: [weight.clamp(0.0, 1.0), 1.0, 0.0, 0.0], ..Default::default() };
+        self.full(tmp, Pipe::Bleed, target, Some(tex), u);
+        self.full(target, Pipe::Blit, tmp, None, Uni::default());
+    }
+
+    /// Render `Split + Bleed` (`StageMode::Split`) across active timeline & live voices:
+    /// - Foreground discrete voices (`1..9`) get full-canvas `1-up / 2-up / 3-up / 2×2`
+    ///   panels (`1×2` in `9:16`, `2×1` in `16:9`/`1:1`) sorted by `(slot, pitch_ratio)`
+    ///   with `+6.5%` screen-blended feathered interior seams!
+    /// - Sustained `Granular` / wash voices bleed across `100%` of the frame at `~30%`!
+    fn render_split_stage(&mut self, scene: &Scene, aspect: f32, fps: f32) -> bool {
+        #[derive(Clone)]
+        struct SplitVoice {
+            sid: usize,
+            src_time: f64,
+            alpha: f32,
+            hue_shift: f32,
+            pitch_ratio: f32,
+            zoom_punch: f32,
+            oxide: f32,
+            slot_key: u32,
+            effects: Vec<AvEffect>,
+            fx_scope: u64,
+        }
+
+        let mut fg_voices: Vec<SplitVoice> = Vec::new();
+        let mut wash_voices: Vec<SplitVoice> = Vec::new();
+        let t = scene.t;
+
+        for (ti, track) in scene.project.tracks.iter().enumerate() {
+            if track.muted {
+                continue;
+            }
+            for cp in scene.plan.iter().filter(|p| p.track == ti) {
+                let Some(clip) = track.clips.get(cp.clip_index) else { continue };
+                let hard_burst = clip
+                    .grains
+                    .adsr
+                    .is_some_and(|a| a.picture == chromagrain_core::envelope::PictureCut::Cut)
+                    && clip.grains.spray <= 0.08;
+                let is_wash = !hard_burst && (matches!(clip.kind, ClipKind::Granular) || clip.grains.texture >= 0.55);
+                let oxide = track.tape.age.clamp(0.0, 1.0);
+                for (sid, evs) in cp.video_parts.as_deref().unwrap_or(&cp.parts) {
+                    // Pick the strongest active event for this `(track, clip, sid, pitch)` voice.
+                    let mut best: Option<&GrainEvent> = None;
+                    for ev in evs {
+                        let vis_end = ev.onset + cp.style.visual_duration(ev.duration);
+                        if t >= ev.onset && t < vis_end && ev.tag.picture_at(t) > 0.01 {
+                            if best.is_none_or(|b| ev.onset > b.onset) {
+                                best = Some(ev);
+                            }
+                        }
+                    }
+                    let Some(ev) = best else { continue };
+                    let dt = (t - ev.onset).max(0.0);
+                    let rate = 1.0 + (ev.pitch_ratio - 1.0) * clip.link.pitch_to_rate;
+                    let src_time = if ev.reverse && clip.link.reverse_video {
+                        ev.source_pos + ev.duration as f64 * rate as f64 - dt * rate as f64
+                    } else {
+                        ev.source_pos + dt * rate as f64
+                    };
+                    let punch = if dt < 0.09 { ((1.0 - dt as f32 / 0.09).powi(2)) * 0.085 } else { 0.0 };
+                    let mut fx = clip.effects.clone();
+                    fx.extend(track.effects.iter().cloned());
+                    let sv = SplitVoice {
+                        sid: *sid,
+                        src_time,
+                        alpha: (ev.tag.picture_at(t) * track.opacity_at(t * scene.project.bpm / 60.0)).clamp(0.0, 1.0),
+                        hue_shift: ev.semitones() * clip.link.pitch_to_hue,
+                        pitch_ratio: ev.pitch_ratio,
+                        zoom_punch: punch,
+                        oxide,
+                        slot_key: ev.tag.tile.map(|x| x as u32).unwrap_or(ti as u32),
+                        effects: fx,
+                        fx_scope: ((ti as u64 + 1) << 28) | (*sid as u64 + 1),
+                    };
+                    if is_wash {
+                        wash_voices.push(sv);
+                    } else {
+                        fg_voices.push(sv);
+                    }
+                }
+            }
+        }
+
+        // Live voices (pads & emitters).
+        let mut by_voice: HashMap<(u8, u64), (usize, &GrainEvent)> = HashMap::new();
+        for (sid, bus, ev) in &scene.live {
+            if scene.live_t >= ev.onset && scene.live_t < ev.end() && ev.tag.picture_at(scene.live_t) > 0.01 {
+                let vk = (
+                    *bus,
+                    if ev.tag.voice != 0 { ev.tag.voice } else { (ev.pitch_ratio * 1000.0) as u64 },
+                );
+                let replace = by_voice.get(&vk).is_none_or(|(_, prev)| ev.onset >= prev.onset);
+                if replace {
+                    by_voice.insert(vk, (*sid, ev));
+                }
+            }
+        }
+        for ((bus, _), (sid, ev)) in by_voice {
+            self.ensure_source(&scene.project, sid);
+            let (link, fx, is_wash) = if bus == 0 || bus as usize > scene.buses.len() {
+                (chromagrain_core::video::AvLink::default(), Vec::new(), false)
+            } else {
+                let b = &scene.buses[bus as usize - 1];
+                (b.link, b.effects.clone(), b.style.min_size < 0.85 && b.style.additive > 0.22 && fg_voices.len() >= 2)
+            };
+            let dt = (scene.live_t - ev.onset).max(0.0);
+            let rate = 1.0 + (ev.pitch_ratio - 1.0) * link.pitch_to_rate;
+            let src_time = if ev.reverse && link.reverse_video {
+                ev.source_pos + ev.duration as f64 * rate as f64 - dt * rate as f64
+            } else {
+                ev.source_pos + dt * rate as f64
+            };
+            let punch = if dt < 0.09 { ((1.0 - dt as f32 / 0.09).powi(2)) * 0.09 } else { 0.0 };
+            let sv = SplitVoice {
+                sid,
+                src_time,
+                alpha: ev.tag.picture_at(scene.live_t).clamp(0.0, 1.0),
+                hue_shift: ev.semitones() * link.pitch_to_hue,
+                pitch_ratio: ev.pitch_ratio,
+                zoom_punch: punch,
+                oxide: 0.0,
+                slot_key: ev.tag.tile.map(|x| x as u32).unwrap_or(100 + bus as u32),
+                effects: fx,
+                fx_scope: 0xB500_0000_0000 | (bus as u64) << 16 | (sid as u64),
+            };
+            if is_wash {
+                wash_voices.push(sv);
+            } else {
+                fg_voices.push(sv);
+            }
+        }
+
+        // If only wash voices are active, promote the primary wash to fill the stage cleanly!
+        if fg_voices.is_empty() && !wash_voices.is_empty() {
+            fg_voices.push(wash_voices.remove(0));
+        }
+        if fg_voices.is_empty() {
+            return false;
+        }
+
+        // Sort foreground voices by `(slot_key, pitch_ratio)` so polyphonic chords
+        // lay out low→high left-to-right!
+        fg_voices.sort_by(|a, b| {
+            a.slot_key
+                .cmp(&b.slot_key)
+                .then_with(|| a.pitch_ratio.total_cmp(&b.pitch_ratio))
+        });
+        fg_voices.truncate(9);
+
+        let count = fg_voices.len();
+        for (idx, v) in fg_voices.iter().enumerate() {
+            let Some(gsrc) = self.sources.get(&v.sid) else { continue };
+            let src_ar = gsrc.src_aspect;
+            let (dest, edge_mask) = split_panel_rect(idx, count, aspect);
+            let cell_ar = (dest[2] * aspect) / dest[3].max(1e-4);
+            let focus = scene.focus_overrides.get(&v.sid).copied().unwrap_or((0.5, 0.5));
+            let patch = cover_patch_focus(src_ar, cell_ar, focus, v.zoom_punch);
+            let gd = GrainDraw {
+                dest,
+                rotation: 0.0,
+                patch,
+                src_time: v.src_time,
+                alpha: v.alpha,
+                hue_shift: v.hue_shift,
+                tiled: false,
+            };
+            if v.effects.is_empty() {
+                self.pass(MASTER, None);
+                self.record_grains_ext(v.sid, vec![(gd, false, edge_mask, v.oxide)], None, 0.0, 0.0, idx > 0);
+            } else {
+                self.pass(CLIP, Some([0.0; 4]));
+                self.record_grains_ext(v.sid, vec![(gd, false, edge_mask, v.oxide)], None, 0.0, 0.0, false);
+                let fx_out = self.apply_chain(&v.effects, v.fx_scope, CLIP, fps, scene.t);
+                if idx == 0 {
+                    self.blend_onto(MASTER, fx_out, 1.0, 0.0);
+                } else {
+                    self.screen_onto(MASTER, fx_out, 1.0);
+                }
+            }
+        }
+
+        // Sustained Wash / TapeLoop voices bleed across 100% of the canvas at ~30%!
+        for wv in wash_voices.iter().take(3) {
+            let Some(gsrc) = self.sources.get(&wv.sid) else { continue };
+            let src_ar = gsrc.src_aspect;
+            let focus = scene.focus_overrides.get(&wv.sid).copied().unwrap_or((0.5, 0.5));
+            let patch = cover_patch_focus(src_ar, aspect, focus, 0.0);
+            let gd = GrainDraw {
+                dest: [0.0, 0.0, 1.0, 1.0],
+                rotation: 0.0,
+                patch,
+                src_time: wv.src_time,
+                alpha: (0.26 + 0.14 * wv.alpha).clamp(0.24, 0.40),
+                hue_shift: wv.hue_shift,
+                tiled: false,
+            };
+            self.pass(CLIP, Some([0.0; 4]));
+            self.record_grains_ext(wv.sid, vec![(gd, false, 0, wv.oxide)], None, 0.0, 0.0, false);
+            let fx_out = self.apply_chain(&wv.effects, wv.fx_scope ^ 0x7777, CLIP, fps, scene.t);
+            self.bleed_onto(MASTER, fx_out, 1.0);
+        }
+
+        true
     }
 
     /// Render the whole scene offscreen; returns the commands to submit.
@@ -1080,128 +1485,243 @@ impl GpuPreview {
         self.passes.clear();
         self.renders += 1;
 
-        // Upload any sources we need.
-        let needed: Vec<usize> =
-            scene.plan.iter().flat_map(|cp| cp.parts.iter().map(|(sid, _)| *sid)).collect();
+        let needed: Vec<usize> = scene
+            .plan
+            .iter()
+            .flat_map(|cp| cp.parts.iter().map(|(sid, _)| *sid))
+            .chain(scene.live.iter().map(|(sid, _, _)| *sid))
+            .collect();
         for sid in needed {
             self.ensure_source(&scene.project, sid);
         }
 
-        // Master starts opaque black (plus the backdrop picture, if any).
-        self.pass(MASTER, Some([0.0, 0.0, 0.0, 1.0]));
+        let stage_mode = effective_stage_mode(scene);
+        let clear_col = match stage_mode {
+            StageMode::Split | StageMode::Bleed => [0.039, 0.039, 0.043, 1.0],
+            StageMode::Stack | StageMode::Grid => [0.0, 0.0, 0.0, 1.0],
+        };
+        self.pass(MASTER, Some(clear_col));
+        let mut any_drawn = false;
+
         if let Some((sid, at)) = scene.backdrop {
             self.ensure_source(&scene.project, sid);
             if let Some(g) = self.sources.get(&sid) {
                 let layer = ((at / g.duration.max(1e-6)).rem_euclid(1.0) * g.layers as f64)
                     .min(g.layers as f64 - 1.0)
                     .floor() as f32;
-                let u = Uni { a: [0.0, 1.0, layer, 1.0], ..Default::default() };
+                let focus = scene.focus_overrides.get(&sid).copied().unwrap_or((0.5, 0.5));
+                let patch = cover_patch_focus(g.src_aspect, w as f32 / h as f32, focus, 0.0);
+                let u = Uni { patch, a: [0.0, 1.0, layer, 1.0], ..Default::default() };
                 self.draw(Pipe::Grain, None, None, Some(sid), u);
+                any_drawn = true;
             }
         }
 
         let t = scene.t;
         let fps = scene.project.fps;
         let aspect = w as f32 / h as f32;
-        let tile_grid = tile_grid(scene);
-        for (ti, track) in scene.project.tracks.iter().enumerate() {
-            if track.muted {
-                continue;
-            }
-            let plans: Vec<&ClipPlan> = scene.plan.iter().filter(|p| p.track == ti).collect();
-            if plans.is_empty() {
-                continue;
-            }
-            // Track layer.
-            self.pass(TRACK, Some([0.0; 4]));
-            let mut track_any = !track.effects.is_empty();
-            for cp in &plans {
-                let Some(clip) = track.clips.get(cp.clip_index) else { continue };
-                let any_active =
-                    cp.parts.iter().any(|(_, evs)| evs.iter().any(|e| t >= e.onset && t < e.end()));
-                if !any_active && clip.effects.is_empty() {
+
+        if stage_mode == StageMode::Split {
+            any_drawn |= self.render_split_stage(scene, aspect, fps);
+        } else {
+            let tgrid = tile_grid(scene);
+            let is_bleed = stage_mode == StageMode::Bleed;
+
+            for (ti, track) in scene.project.tracks.iter().enumerate() {
+                if track.muted {
                     continue;
                 }
-                // Clip layer.
+                let plans: Vec<&ClipPlan> = scene.plan.iter().filter(|p| p.track == ti).collect();
+                if plans.is_empty() {
+                    continue;
+                }
+                self.pass(TRACK, Some([0.0; 4]));
+                let mut track_any = !track.effects.is_empty();
+                let oxide = track.tape.age.clamp(0.0, 1.0);
+
+                for cp in &plans {
+                    let Some(clip) = track.clips.get(cp.clip_index) else { continue };
+                    let any_active = cp
+                        .parts
+                        .iter()
+                        .any(|(_, evs)| evs.iter().any(|e| t >= e.onset && t < e.onset + cp.style.visual_duration(e.duration)));
+                    if !any_active && clip.effects.is_empty() {
+                        continue;
+                    }
+                    self.pass(CLIP, Some([0.0; 4]));
+                    if any_active {
+                        for (sid, evs) in &cp.parts {
+                            let Some(gsrc) = self.sources.get(sid) else { continue };
+                            let dur = gsrc.duration.max(1e-6);
+                            let src_ar = gsrc.src_aspect;
+                            let style: VisualGrainStyle = if is_bleed {
+                                VisualGrainStyle::full_frame(0.0)
+                            } else {
+                                cp.style
+                            };
+                            let raw_draws = grain_draws_layout(
+                                evs,
+                                &style,
+                                &clip.link,
+                                &clip.transform,
+                                dur,
+                                t,
+                                aspect,
+                                scene.parked,
+                                tgrid,
+                            );
+                            let focus_opt = scene.focus_overrides.get(sid).copied();
+                            let ext_draws: Vec<(GrainDraw, bool, u32, f32)> = raw_draws
+                                .into_iter()
+                                .map(|mut gd| {
+                                    if gd.tiled {
+                                        if focus_opt.is_some() || (src_ar - aspect).abs() > 1e-3 {
+                                            let cell_ar = (gd.dest[2] * aspect) / gd.dest[3].max(1e-4);
+                                            gd.patch = cover_patch_focus(src_ar, cell_ar, focus_opt.unwrap_or((0.5, 0.5)), 0.0);
+                                        }
+                                    } else if is_bleed {
+                                        gd.dest = [0.0, 0.0, 1.0, 1.0];
+                                        gd.patch = cover_patch_focus(src_ar, aspect, focus_opt.unwrap_or((0.5, 0.5)), 0.0);
+                                    } else if let Some(fc) = focus_opt {
+                                        if gd.dest[2] >= 0.95 && gd.dest[3] >= 0.95 {
+                                            gd.patch = cover_patch_focus(src_ar, aspect, fc, 0.0);
+                                        }
+                                    }
+                                    (gd, false, 0u32, oxide)
+                                })
+                                .collect();
+                            if !ext_draws.is_empty() {
+                                any_drawn = true;
+                                self.record_grains_ext(*sid, ext_draws, clip.color_filter.as_ref(), style.additive, style.feather, false);
+                            }
+                        }
+                    }
+                    let clip_out = self.apply_chain(
+                        &clip.effects,
+                        ((ti as u64) << 20) | (cp.clip_index as u64 + 1),
+                        CLIP,
+                        fps,
+                        t,
+                    );
+                    self.blend_onto(TRACK, clip_out, 1.0, if is_bleed { 0.0 } else { cp.style.additive * 0.5 });
+                    track_any = true;
+                }
+                if !track_any {
+                    continue;
+                }
+                let track_out = self.apply_chain(&track.effects, (ti as u64 + 1) << 32, TRACK, fps, t);
+                let beat = t * scene.project.bpm / 60.0;
+                let opac = track.opacity_at(beat);
+                if is_bleed {
+                    self.bleed_onto(MASTER, track_out, opac);
+                } else {
+                    self.blend_onto(MASTER, track_out, opac, 0.0);
+                }
+            }
+
+            // Live hits on top, one layer per bus.
+            let n_buses = scene.buses.len().min(250) as u8;
+            for bus in 0..=n_buses {
+                let (style, effects, link, add_in, add_out) = if bus == 0 {
+                    (
+                        VisualGrainStyle::morph(0.0, &VisualGrainStyle::default(), 0.0),
+                        &[][..],
+                        chromagrain_core::video::AvLink::default(),
+                        0.0,
+                        0.0,
+                    )
+                } else {
+                    let b = &scene.buses[bus as usize - 1];
+                    (b.style, &b.effects[..], b.link, b.style.additive, b.style.additive * 0.5)
+                };
+                let any = scene.live.iter().any(|h| h.1 == bus);
+                if !any && effects.is_empty() {
+                    continue;
+                }
                 self.pass(CLIP, Some([0.0; 4]));
-                if any_active {
-                    for (sid, evs) in &cp.parts {
-                        let Some(gsrc) = self.sources.get(sid) else { continue };
-                        let dur = gsrc.duration.max(1e-6);
-                        let style: VisualGrainStyle = cp.style;
-                        let draws = grain_draws_layout(
-                            evs,
-                            &style,
-                            &clip.link,
-                            &clip.transform,
-                            dur,
-                            t,
-                            aspect,
-                            scene.parked,
-                            tile_grid,
-                        );
-                        self.record_grains(*sid, draws, clip.color_filter.as_ref(), style.additive, style.feather);
+                for (sid, _, ev) in scene.live.iter().filter(|h| h.1 == bus) {
+                    self.ensure_source(&scene.project, *sid);
+                    let Some(gsrc) = self.sources.get(sid) else { continue };
+                    let dur = gsrc.duration.max(1e-6);
+                    let src_ar = gsrc.src_aspect;
+                    let eff_style = if is_bleed { VisualGrainStyle::full_frame(0.0) } else { style };
+                    let raw_draws = grain_draws_layout(
+                        std::slice::from_ref(ev),
+                        &eff_style,
+                        &link,
+                        &chromagrain_core::timeline::ClipTransform::default(),
+                        dur,
+                        scene.live_t,
+                        aspect,
+                        false,
+                        tgrid,
+                    );
+                    let focus_opt = scene.focus_overrides.get(sid).copied();
+                    let dt = (scene.live_t - ev.onset).max(0.0);
+                    let punch = if dt < 0.085 && (tgrid.is_some() || is_bleed) {
+                        ((1.0 - dt as f32 / 0.085).powi(2)) * 0.08
+                    } else {
+                        0.0
+                    };
+                    let ext_draws: Vec<(GrainDraw, bool, u32, f32)> = raw_draws
+                        .into_iter()
+                        .map(|mut gd| {
+                            if gd.tiled {
+                                if focus_opt.is_some() || punch > 0.0 || (src_ar - aspect).abs() > 1e-3 {
+                                    let cell_ar = (gd.dest[2] * aspect) / gd.dest[3].max(1e-4);
+                                    gd.patch = cover_patch_focus(src_ar, cell_ar, focus_opt.unwrap_or((0.5, 0.5)), punch);
+                                }
+                            } else if is_bleed {
+                                gd.dest = [0.0, 0.0, 1.0, 1.0];
+                                gd.patch = cover_patch_focus(src_ar, aspect, focus_opt.unwrap_or((0.5, 0.5)), punch);
+                            }
+                            (gd, false, 0u32, 0.0)
+                        })
+                        .collect();
+                    if !ext_draws.is_empty() {
+                        any_drawn = true;
+                        self.record_grains_ext(*sid, ext_draws, None, if is_bleed { 0.0 } else { add_in }, eff_style.feather, false);
                     }
                 }
-                let final_tex = self.apply_chain(
-                    &clip.effects,
-                    ((ti as u64) << 20) | (cp.clip_index as u64 + 1),
-                    CLIP,
-                    fps,
-                );
-                // Blend clip layer into track layer.
-                self.blend_onto(TRACK, final_tex, 1.0, cp.style.additive * 0.5);
-                track_any = true;
-            }
-            if !track_any {
-                continue;
-            }
-            let final_tex = self.apply_chain(&track.effects, (ti as u64 + 1) << 32, TRACK, fps);
-            // Composite track onto master.
-            let beat = t * scene.project.bpm / 60.0;
-            self.blend_onto(MASTER, final_tex, track.opacity_at(beat), 0.0);
-        }
-
-        // Live hits on top, one layer per bus, full correspondence.
-        let n_buses = scene.buses.len().min(250) as u8;
-        for bus in 0..=n_buses {
-            let (style, effects, link, add_in, add_out) = if bus == 0 {
-                (VisualGrainStyle::morph(0.0, &VisualGrainStyle::default(), 0.0), &[][..], chromagrain_core::video::AvLink::default(), 0.0, 0.0)
-            } else {
-                let b = &scene.buses[bus as usize - 1];
-                (b.style, &b.effects[..], b.link, b.style.additive, b.style.additive * 0.5)
-            };
-            let any = scene.live.iter().any(|h| h.1 == bus);
-            if !any && effects.is_empty() {
-                continue; // fx buses keep running so trails fade out
-            }
-            self.pass(CLIP, Some([0.0; 4]));
-            for (sid, _, ev) in scene.live.iter().filter(|h| h.1 == bus) {
-                self.ensure_source(&scene.project, *sid);
-                let Some(gsrc) = self.sources.get(sid) else { continue };
-                let dur = gsrc.duration.max(1e-6);
-                let draws = grain_draws_layout(
-                    std::slice::from_ref(ev),
-                    &style,
-                    &link,
-                    &chromagrain_core::timeline::ClipTransform::default(),
-                    dur,
-                    scene.live_t,
-                    aspect,
-                    false,
-                    tile_grid,
-                );
-                if !draws.is_empty() {
-                    self.record_grains(*sid, draws, None, add_in, style.feather);
+                let out = self.apply_chain(effects, 0xB000_0000_0000_0000 | bus as u64, CLIP, fps, scene.live_t);
+                if is_bleed {
+                    self.bleed_onto(MASTER, out, 1.0);
+                } else {
+                    self.blend_onto(MASTER, out, 1.0, add_out);
                 }
             }
-            let out = self.apply_chain(effects, 0xB000_0000_0000_0000 | bus as u64, CLIP, fps);
-            self.blend_onto(MASTER, out, 1.0, add_out);
         }
 
-        // Master chain.
-        let final_tex = self.apply_chain(&scene.project.master_effects, 0xFFFF_0000_0000, MASTER, fps);
-        self.final_tex = Some(final_tex);
+        // `52 ms` Optical Carry: prevent single-frame black strobing on rapid 16th cuts.
+        let clock_now = scene.t.max(scene.live_t);
+        if any_drawn && !scene.parked {
+            self.full(CARRY, Pipe::Blit, MASTER, None, Uni::default());
+            self.carry_active_t = Some(clock_now);
+        } else if !any_drawn && !scene.parked && scene.backdrop.is_none() {
+            if let Some(last_t) = self.carry_active_t {
+                let gap = clock_now - last_t;
+                if gap > 0.0 && gap < 0.135 {
+                    let hold_w = if gap <= 0.052 {
+                        1.0
+                    } else {
+                        let u = ((gap - 0.052) / (0.135 - 0.052)).clamp(0.0, 1.0) as f32;
+                        0.5 * (1.0 + (std::f32::consts::PI * u).cos())
+                    };
+                    self.blend_onto(MASTER, CARRY, hold_w, 0.0);
+                }
+            }
+        }
+
+        // Master effect chain + optional live Perform `Tape Stop` VHS roll.
+        let mut out_tex = self.apply_chain(&scene.project.master_effects, 0xFFFF_0000_0000, MASTER, fps, t);
+        if scene.tape_stop > 0.005 {
+            let next = Self::other(out_tex);
+            let mut u = self.res_uni();
+            u.d = [scene.tape_stop, clock_now as f32, 0.0, 0.0];
+            self.full(next, Pipe::TapeStop, out_tex, None, u);
+            out_tex = next;
+        }
+        self.canvas_tex = Some(out_tex);
         self.execute()
     }
 
@@ -1234,7 +1754,6 @@ impl GpuPreview {
         self.tex_bgs.insert(key, bg);
     }
 
-    /// Upload this frame's uniforms and encode every recorded pass.
     fn execute(&mut self) -> wgpu::CommandBuffer {
         let passes = std::mem::take(&mut self.passes);
         let n: u64 = passes.iter().map(|p| p.draws.len() as u64).sum::<u64>().max(1);
@@ -1295,10 +1814,8 @@ impl GpuPreview {
         enc.finish()
     }
 
-    /// Prepare a present of the canvas: `crop` is the visible uv window
-    /// (x, y, w, h) of the canvas. Returns the present slot to paint with.
     fn prepare_present(&mut self, crop: [f32; 4]) -> Option<usize> {
-        let tex = self.final_tex?;
+        let tex = self.canvas_tex?;
         self.tex_bind_group((tex as u32, u32::MAX, u32::MAX));
         let slot = self.present_next;
         self.present_next = (self.present_next + 1) % PRESENT_SLOTS;
@@ -1308,7 +1825,7 @@ impl GpuPreview {
     }
 
     fn present(&self, rp: &mut wgpu::RenderPass<'static>, slot: usize) {
-        let Some(tex) = self.final_tex else { return };
+        let Some(tex) = self.canvas_tex else { return };
         let Some(bg) = self.tex_bgs.get(&(tex as u32, u32::MAX, u32::MAX)) else { return };
         rp.set_pipeline(&self.present_pipe);
         rp.set_bind_group(0, &self.present_bg, &[(slot as u64 * UNI_STRIDE) as u32]);
@@ -1317,16 +1834,11 @@ impl GpuPreview {
     }
 }
 
-/// Install the pipeline into egui-wgpu's shared callback resources (once,
-/// at startup).
 pub fn install(rs: &egui_wgpu::RenderState) {
     let g = GpuPreview::new(&rs.device, &rs.queue, rs.target_format);
     rs.renderer.write().callback_resources.insert(g);
 }
 
-/// Paint callback: shows the current scene in `rect` (any viewport).
-/// Parts of `rect` outside the window are cropped, not squeezed, so a
-/// "cover" fullscreen keeps its aspect.
 pub struct PreviewCallback {
     pub scene: Arc<Mutex<Option<Scene>>>,
     pub rect: egui::Rect,
@@ -1354,12 +1866,11 @@ impl egui_wgpu::CallbackTrait for PreviewCallback {
         let Some(g) = resources.get_mut::<GpuPreview>() else { return Vec::new() };
         let mut out = Vec::new();
         if let Some(scene) = self.scene.lock().unwrap().as_ref() {
-            if g.last_frame != Some(scene.frame) || g.final_tex.is_none() {
+            if g.last_frame != Some(scene.frame) || g.canvas_tex.is_none() {
                 out.push(g.render(scene));
                 g.last_frame = Some(scene.frame);
             }
         }
-        // Visible part of the rect, as a uv window into the canvas.
         let ppp = screen.pixels_per_point.max(1e-3);
         let screen_rect = egui::Rect::from_min_size(
             egui::Pos2::ZERO,
@@ -1395,6 +1906,7 @@ impl egui_wgpu::CallbackTrait for PreviewCallback {
     }
 }
 
+
 #[cfg(test)]
 mod tests {
     //! GPU ↔ CPU parity: render one frame on a headless wgpu device and
@@ -1420,10 +1932,6 @@ mod tests {
             base_hz: 0.0,
             ..Default::default()
         });
-        // Additive glow is off: under glow the GPU's premultiplied blend
-        // is a documented approximation of the CPU's straight-alpha mix
-        // (same as the GL pipeline it replaces); everything else must
-        // match closely.
         let t = p.add_track("bed");
         let mut bed = Clip::new_snippet(sid, 0.0, 4.0);
         bed.grains.gain = 1.0;
@@ -1452,10 +1960,13 @@ mod tests {
             backdrop: None,
             parked: false,
             frame,
+            mode_override: None,
+            focus_overrides: HashMap::new(),
+            tape_stop: 0.0,
         };
         let cb = g.render(&scene);
         g.queue.submit([cb]);
-        let tex = &g.targets[g.final_tex.unwrap()].tex;
+        let tex = &g.targets[g.canvas_tex.unwrap()].tex;
         read_tex(&g.device, &g.queue, tex, p.width, p.height)
     }
 
@@ -1493,13 +2004,6 @@ mod tests {
         (0..3).all(|c| (a[c] as i32 - b[c] as i32).abs() <= tol)
     }
 
-    /// The multi-window path exactly as egui-wgpu drives it: for each
-    /// "window" (an offscreen surface), `prepare` then `paint` inside a
-    /// render pass whose viewport/scissor egui would set. Two windows of
-    /// different sizes show the same frame: one offscreen render, both
-    /// presents letterboxed in their rects, nothing drawn outside them;
-    /// a rect larger than the window (cover fullscreen) is cropped, not
-    /// squeezed.
     #[test]
     fn every_window_presents_one_shared_render() {
         use egui_wgpu::CallbackTrait;
@@ -1520,18 +2024,16 @@ mod tests {
             backdrop: None,
             parked: false,
             frame: 7,
+            mode_override: None,
+            focus_overrides: HashMap::new(),
+            tape_stop: 0.0,
         })));
         let aspect = p.width as f32 / p.height as f32;
         let r = |x: f32, y: f32, w: f32, h: f32| egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h));
-        // (window size px, pixels_per_point, canvas rect in points)
         let windows = [
-            // editor: the preview is a panel inside a bigger window
             ((900u32, 600u32), 1.0f32, r(100.0, 80.0, 400.0, 240.0)),
-            // performance output on a 4:3 projector: letterboxed
             ((1024, 768), 1.0, crate::fit(r(0.0, 0.0, 1024.0, 768.0), aspect)),
-            // retina output window, ppp 2
             ((1280, 720), 2.0, crate::fit(r(0.0, 0.0, 640.0, 360.0), aspect)),
-            // cover fullscreen: rect overflows the window and is cropped
             ((600, 600), 1.0, egui::Rect::from_center_size(egui::pos2(300.0, 300.0), egui::vec2(600.0 * aspect, 600.0))),
         ];
         let marker = [255u8, 0, 255, 255];
@@ -1585,7 +2087,7 @@ mod tests {
         }
         let g = res.get::<GpuPreview>().unwrap();
         assert_eq!(g.renders, 1, "four windows, one frame: rendered once");
-        let canvas = read_tex(&device, &queue, &g.targets[g.final_tex.unwrap()].tex, p.width, p.height);
+        let canvas = read_tex(&device, &queue, &g.targets[g.canvas_tex.unwrap()].tex, p.width, p.height);
         let canvas_center = canvas.get(p.width / 2, p.height / 2);
         assert!(canvas.mean_luma() > 10.0);
 
@@ -1593,10 +2095,8 @@ mod tests {
             let px = |pt: egui::Pos2| ((pt.x * ppp) as u32, (pt.y * ppp) as u32);
             let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(*w as f32 / ppp, *h as f32 / ppp));
             let vis = rect.intersect(screen);
-            // The canvas centre lands at the rect centre (also when cropped).
             let (cx, cy) = px(rect.center());
             assert!(px_close(shot.get(cx, cy), canvas_center, 24), "{w}x{h}: centre {:?} vs canvas {canvas_center:?}", shot.get(cx, cy));
-            // Inside the rect: picture. Outside: untouched.
             let inside = px(vis.shrink(3.0).left_top());
             assert_ne!(shot.get(inside.0, inside.1), marker, "{w}x{h}: picture fills its rect");
             if vis.min.x > 3.0 {
@@ -1608,15 +2108,12 @@ mod tests {
                 assert_eq!(shot.get(ox, oy), marker, "{w}x{h}: letterbox bars stay clear");
             }
         }
-        // Cover: the window shows the middle of the canvas at full height —
-        // its left edge is the canvas column at the crop offset, not col 0.
         let ((w, h), _, rect, shot) = &shots[3];
         let crop_x0 = (0.0 - rect.min.x) / rect.width();
         let col = ((crop_x0 * p.width as f32) as u32).min(p.width - 1);
         let want = canvas.get(col, p.height / 2);
         assert!(px_close(shot.get(1, h / 2), want, 40), "cover crops: {:?} vs canvas col {col} {want:?} ({w}x{h})", shot.get(1, h / 2));
 
-        // A new app frame renders again (temporal effects step once per frame).
         scene.lock().unwrap().as_mut().unwrap().frame = 8;
         let cb = PreviewCallback { scene: scene.clone(), rect: shots[0].2, slot: AtomicUsize::new(usize::MAX) };
         let mut enc = device.create_command_encoder(&Default::default());
@@ -1653,7 +2150,6 @@ mod tests {
             let fx = EffectKind::parse(name).map(AvEffect::new);
             let mut p = project(fx);
             if name == "feather" {
-                // Soft-edged cloud grains taper the same on both renderers.
                 p.tracks[1].clips[0].visual.feather = 0.6;
             }
             frame += 1;
@@ -1667,24 +2163,19 @@ mod tests {
             }
             report.push(format!("{name}: {d:.2}"));
             assert!(gpu.mean_luma() > 10.0, "{name}: GPU frame is not black ({})", gpu.mean_luma());
-            // Temporal effects (delay ghosts, reverb persistence) start
-            // from history on the CPU; one GPU frame has none yet.
             let tol = match name {
                 "delay" | "reverb" => 6.0,
-                "compress" => 6.0, // GPU uses a DC-relative threshold
+                "compress" => 6.0,
                 _ => 2.0,
             };
             if std::env::var("CHROMAGRAIN_PARITY_DIR").is_ok() {
-                continue; // dumping images: report every effect
+                continue;
             }
             assert!(d < tol, "{name}: mean |gpu - cpu| = {d:.2} (tolerance {tol}) — {report:?}");
         }
         eprintln!("gpu vs cpu mean abs diff (0..255): {report:?}");
     }
 
-    /// v003: the tile layout (every voice its own hard-edged tile, the
-    /// grid from the frame's tile slots) and the ADSR picture weight in
-    /// stack layout render the same on the GPU as in the CPU export.
     #[test]
     fn gpu_matches_the_cpu_for_tiles_and_envelopes() {
         use chromagrain_core::envelope::{Adsr, PictureCut};
@@ -1703,7 +2194,7 @@ mod tests {
                     let ti = p.add_track("third");
                     let mut c = Clip::new_snippet(0, 0.5, 3.0);
                     c.visual.additive = 0.0;
-                    c.grains.position = 0.1; // clear of the loop point (the CPU crossfades loops)
+                    c.grains.position = 0.1;
                     p.tracks[ti].clips.push(c);
                 }
                 _ => {
@@ -1724,8 +2215,6 @@ mod tests {
             }
             report.push(format!("{name}: {d:.2}"));
             if name.starts_with("tile") {
-                // Tiling really changes the picture (vs the same frame
-                // stacked), and every tile is drawn (each half is lit).
                 let mut stacked = p.clone();
                 stacked.layout = chromagrain_core::tile::Layout::Stack;
                 let stack = render_project(&stacked, beat, beat + 0.01).frames.remove(0);
@@ -1748,5 +2237,71 @@ mod tests {
             }
         }
         eprintln!("gpu vs cpu (tiles, envelopes): {report:?}");
+    }
+
+    #[test]
+    fn gpu_renders_split_bleed_carry_and_tapestop() {
+        let Some((device, queue)) = device() else {
+            eprintln!("no wgpu adapter: skipping Split/Bleed GPU test");
+            return;
+        };
+        let mut g = GpuPreview::new(&device, &queue, wgpu::TextureFormat::Rgba8Unorm);
+        let mut p = project(None);
+        let sid2 = p.add_source(Source {
+            name: "second".into(),
+            audio: None,
+            video: Some(Arc::new(VideoClip::test_pattern(160, 96, 12.0, 2.0))),
+            base_hz: 0.0,
+            ..Default::default()
+        });
+        let t2 = p.add_track("lead2");
+        let mut c2 = Clip::new_snippet(sid2, 0.0, 4.0);
+        c2.grains.position = 0.35;
+        p.tracks[t2].clips.push(c2);
+        let plan = Arc::new(plan_project(&p));
+
+        let mut render_mode = |mode: StageMode, t: f64, frame: u64, tape_stop: f32| -> Frame {
+            let mut focus_overrides = HashMap::new();
+            focus_overrides.insert(0, (0.35, 0.5));
+            focus_overrides.insert(sid2, (0.65, 0.5));
+            let scene = Scene {
+                project: p.clone(),
+                plan: plan.clone(),
+                t,
+                live: Vec::new(),
+                live_t: 0.0,
+                buses: Vec::new(),
+                backdrop: None,
+                parked: false,
+                frame,
+                mode_override: Some(mode),
+                focus_overrides,
+                tape_stop,
+            };
+            let cb = g.render(&scene);
+            g.queue.submit([cb]);
+            let tex = &g.targets[g.canvas_tex.unwrap()].tex;
+            read_tex(&g.device, &g.queue, tex, p.width, p.height)
+        };
+
+        let stack = render_mode(StageMode::Stack, 1.0, 1, 0.0);
+        let split = render_mode(StageMode::Split, 1.0, 2, 0.0);
+        let bleed = render_mode(StageMode::Bleed, 1.0, 3, 0.0);
+        assert!(split.mean_luma() > 15.0, "Split stage must illuminate canvas");
+        assert!(bleed.mean_luma() > 15.0, "Bleed stage must illuminate canvas");
+        assert!(mean_abs_diff(&split, &stack) > 3.0, "Split must differ visually from Stack");
+        assert!(mean_abs_diff(&bleed, &split) > 3.0, "Bleed must differ visually from Split");
+
+        // 52ms optical carry: jumping 30ms past all clips keeps the stage lit instead of flashing black!
+        let carry = render_mode(StageMode::Split, 2.02, 4, 0.0);
+        // Reset carry at t = 1.99, then step to 2.02 (past the 4-beat = 2.0s arrangement end)
+        let _ = render_mode(StageMode::Split, 1.99, 5, 0.0);
+        let carried = render_mode(StageMode::Split, 2.02, 6, 0.0);
+        let _ = carry;
+        assert!(carried.mean_luma() > 12.0, "52ms optical carry holds frame across micro-gap");
+
+        // Tape Stop distorts/desaturates active output
+        let stopped = render_mode(StageMode::Split, 1.0, 7, 0.85);
+        assert!(mean_abs_diff(&stopped, &split) > 2.0, "Tape stop VHS roll alters active output");
     }
 }

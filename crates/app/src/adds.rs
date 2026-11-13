@@ -1,13 +1,14 @@
-//! Adds from the studio's Add sheet: files, Browse picks, links and digs
-//! run as parallel background jobs. Each shows as a placeholder tile
-//! (`Pending`) until its source lands; then it is added to the project and
+//! Adds from the studio's Add sheet: files, Browse/Drive picks, YouTube search,
+//! links and digs run as parallel background jobs. Each shows as a placeholder
+//! tile (`Pending`) until its source lands; then it is added to the project and
 //! reported (`Added`) with its target so the studio can place it.
 
 use chromagrain_core::dig::{self, DigOptions, JobStatus};
 use chromagrain_core::timeline::{Project, Source};
-use chromagrain_ui::{AddTarget, Added, Pending};
+use chromagrain_ui::{AddTarget, Added, Pending, YoutubeHit};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Mutex;
 
@@ -42,11 +43,24 @@ pub struct Adds {
     pub sim_clock: Option<f64>,
     staged: Vec<Staged>,
     sim_seen: Vec<String>,
+    /// Active YouTube search results & background query state.
+    pub yt_hits: Vec<YoutubeHit>,
+    pub yt_searching: bool,
+    pub yt_error: Option<String>,
+    yt_gen: u64,
+    yt_tx: Sender<(u64, Result<Vec<YoutubeHit>, String>)>,
+    yt_rx: Receiver<(u64, Result<Vec<YoutubeHit>, String>)>,
+    /// Optional deterministic YouTube catalog for headless tests/snapshots.
+    pub yt_mock: Option<Vec<YoutubeHit>>,
+    /// Remaining Dig jobs before auto-building a 16-pad kit (`Dig 4 → Kit`).
+    pub dig_kit_remaining: usize,
+    pub auto_kit_ready: bool,
 }
 
 impl Default for Adds {
     fn default() -> Self {
         let (tx, rx) = mpsc::channel();
+        let (yt_tx, yt_rx) = mpsc::channel();
         Adds {
             next: 1,
             jobs: Vec::new(),
@@ -57,6 +71,15 @@ impl Default for Adds {
             sim_clock: None,
             staged: Vec::new(),
             sim_seen: Vec::new(),
+            yt_hits: Vec::new(),
+            yt_searching: false,
+            yt_error: None,
+            yt_gen: 0,
+            yt_tx,
+            yt_rx,
+            yt_mock: None,
+            dig_kit_remaining: 0,
+            auto_kit_ready: false,
         }
     }
 }
@@ -67,6 +90,57 @@ pub fn picked_from_env() -> Option<Vec<PathBuf>> {
     Some(std::env::split_paths(&v).filter(|p| !p.as_os_str().is_empty()).collect())
 }
 
+fn run_yt_search_cli(query: &str, under_500_views: bool) -> Result<Vec<YoutubeHit>, String> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Ok(Vec::new());
+    }
+    let count = if under_500_views { 24 } else { 12 };
+    let spec = format!("ytsearch{count}:{q}");
+    let out = Command::new("yt-dlp")
+        .args(["--dump-json", "--flat-playlist", "--no-warnings", "--ignore-errors", &spec])
+        .output()
+        .map_err(|e| format!("yt-dlp unavailable: {e}"))?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut hits = Vec::new();
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let title = v.get("title").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+        if title.is_empty() {
+            continue;
+        }
+        let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("");
+        let url = v
+            .get("webpage_url")
+            .or_else(|| v.get("url"))
+            .and_then(|x| x.as_str())
+            .map(|u| {
+                if u.starts_with("http") {
+                    u.to_string()
+                } else {
+                    format!("https://www.youtube.com/watch?v={u}")
+                }
+            })
+            .unwrap_or_else(|| format!("https://www.youtube.com/watch?v={id}"));
+        let views = v.get("view_count").and_then(|x| x.as_u64());
+        if under_500_views && views.is_some_and(|vw| vw >= 500) {
+            continue;
+        }
+        let duration_secs = v.get("duration").and_then(|x| x.as_f64()).filter(|d| *d > 0.0);
+        let uploader = v
+            .get("channel")
+            .or_else(|| v.get("uploader"))
+            .and_then(|x| x.as_str())
+            .unwrap_or("YouTube")
+            .to_string();
+        hits.push(YoutubeHit { title, url, views, duration_secs, uploader });
+        if hits.len() >= 12 {
+            break;
+        }
+    }
+    Ok(hits)
+}
+
 impl Adds {
     /// A new placeholder; returns its id and a sender for the worker.
     pub fn begin(&mut self, target: AddTarget, label: &str) -> (u64, Sender<AddMsg>) {
@@ -74,6 +148,42 @@ impl Adds {
         self.next += 1;
         self.jobs.push(Pending { id, target, label: label.to_string(), progress: None, failed: None });
         (id, self.tx.clone())
+    }
+
+    /// Run a YouTube search query in the background (or from `yt_mock` in tests).
+    pub fn search_youtube(&mut self, query: &str, under_500_views: bool) {
+        let q = query.trim().to_string();
+        if q.is_empty() {
+            self.yt_hits.clear();
+            self.yt_searching = false;
+            self.yt_error = None;
+            return;
+        }
+        self.yt_gen += 1;
+        let gen = self.yt_gen;
+        self.yt_error = None;
+        if let Some(mock) = &self.yt_mock {
+            let words: Vec<String> = q.to_lowercase().split_whitespace().map(str::to_string).collect();
+            self.yt_hits = mock
+                .iter()
+                .filter(|h| {
+                    if under_500_views && h.views.is_some_and(|v| v >= 500) {
+                        return false;
+                    }
+                    let hay = format!("{} {}", h.title, h.uploader).to_lowercase();
+                    words.is_empty() || words.iter().any(|w| hay.contains(w.as_str())) || mock.len() <= 8
+                })
+                .cloned()
+                .collect();
+            self.yt_searching = false;
+            return;
+        }
+        self.yt_searching = true;
+        let tx = self.yt_tx.clone();
+        std::thread::spawn(move || {
+            let res = run_yt_search_cli(&q, under_500_views);
+            let _ = tx.send((gen, res));
+        });
     }
 
     /// Load a media file in the background.
@@ -184,6 +294,12 @@ impl Adds {
         }
     }
 
+    /// Dig `n` unseen clips and auto-harvest a 16-pad collage kit when they land.
+    pub fn dig_to_kit(&mut self, n: usize, cc_only: bool, target: AddTarget, sr: u32) {
+        self.dig_kit_remaining = n.max(1);
+        self.dig(n, cc_only, target, sr);
+    }
+
     pub fn dismiss(&mut self, id: u64) {
         self.jobs.retain(|j| j.id != id || j.failed.is_none());
     }
@@ -192,6 +308,21 @@ impl Adds {
     /// reported with their targets). Returns true when the project changed.
     pub fn poll(&mut self, project: &Mutex<Project>, imported: &mut HashMap<PathBuf, usize>) -> bool {
         let mut changed = false;
+        while let Ok((gen, res)) = self.yt_rx.try_recv() {
+            if gen == self.yt_gen {
+                self.yt_searching = false;
+                match res {
+                    Ok(hits) => {
+                        self.yt_hits = hits;
+                        self.yt_error = None;
+                    }
+                    Err(e) => {
+                        self.yt_hits.clear();
+                        self.yt_error = Some(e);
+                    }
+                }
+            }
+        }
         if let Some(t) = self.sim_clock {
             for s in &mut self.staged {
                 if t < s.search_end {
@@ -257,12 +388,24 @@ impl Adds {
                                 }
                             };
                             self.added.push(Added { source, target });
+                            if self.dig_kit_remaining > 0 {
+                                self.dig_kit_remaining -= 1;
+                                if self.dig_kit_remaining == 0 {
+                                    self.auto_kit_ready = true;
+                                }
+                            }
                             changed = true;
                         }
                         Err(e) => {
                             let j = &mut self.jobs[k];
                             j.failed = Some(e.lines().next().unwrap_or("failed").to_string());
                             j.progress = None;
+                            if self.dig_kit_remaining > 0 {
+                                self.dig_kit_remaining -= 1;
+                                if self.dig_kit_remaining == 0 {
+                                    self.auto_kit_ready = true;
+                                }
+                            }
                         }
                     }
                 }
