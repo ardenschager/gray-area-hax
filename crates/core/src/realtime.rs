@@ -4,7 +4,8 @@
 //! Supports a beat-quantized loop region for live use.
 
 use crate::audio::{
-    render_grains_audio, render_grains_audio_spatial, MasterConditioner, StereoBuffer, TapeState,
+    render_grains_audio, render_grains_audio_spatial, MasterConditioner, StereoBuffer,
+    StudioBusState, TapeState,
 };
 use crate::fx::{self, AudioFxState};
 use crate::grain::GrainEvent;
@@ -43,6 +44,7 @@ pub struct RealtimeAudio {
     master_states: Vec<AudioFxState>,
     master_tape_state: TapeState,
     master_cond: MasterConditioner,
+    studio_bus_state: StudioBusState,
     /// Absolute playhead in samples from beat 0.
     sample_pos: u64,
     /// Loop region in beats (start, end), if looping.
@@ -121,6 +123,7 @@ impl RealtimeAudio {
         let master_states = fx::audio_chain_states(&project.master_effects, sr);
         let master_tape_state = TapeState::new(0x4D41_5354);
         let master_cond = MasterConditioner::default();
+        let studio_bus_state = StudioBusState::new(sr);
         let tilt_states = plan.iter().map(|_| crate::dsp::TiltState::default()).collect();
         let sample_pos = (project.beats_to_secs(start_beat) * sr as f64).round() as u64;
         RealtimeAudio {
@@ -138,6 +141,7 @@ impl RealtimeAudio {
             master_states,
             master_tape_state,
             master_cond,
+            studio_bus_state,
             sample_pos,
             loop_region,
             transport: true,
@@ -187,12 +191,35 @@ impl RealtimeAudio {
     /// Fire a one-shot live grain (a MIDI pad hit). The event's `onset`
     /// is on the live clock; pass `live_now_secs()` for "immediately".
     pub fn trigger_live(&mut self, source: usize, event: GrainEvent) {
-        self.live.push((0, source, event));
+        self.trigger_live_bus(0, source, event);
     }
 
     /// [`RealtimeAudio::trigger_live`] on effect bus `bus` (0 = dry).
     pub fn trigger_live_bus(&mut self, bus: u8, source: usize, event: GrainEvent) {
-        self.live.push((bus, source, event));
+        let g = event.tag.choke_group;
+        if (1..=4).contains(&g) {
+            let t_cut = event.onset;
+            for (_, _, e) in &mut self.live {
+                if e.tag.choke_group == g && e.onset < t_cut - 0.002 {
+                    e.tag.choke_at = Some(e.tag.choke_at.map_or(t_cut, |c| c.min(t_cut)));
+                }
+            }
+            self.live.retain(|(_, _, e)| !(e.tag.choke_group == g && e.onset >= t_cut + 0.002));
+        }
+        if event.sculpt.chord != crate::grain::ChordVoicing::Off {
+            let base_hz = self.project.sources.get(source).map_or(440.0, |s| s.effective_base_hz());
+            let (chord_evs, n_evs) = crate::grain::expand_chord_grain_inline(
+                &event,
+                event.sculpt.chord,
+                base_hz,
+                None,
+            );
+            for cev in chord_evs.iter().copied().take(n_evs) {
+                self.live.push((bus, source, cev));
+            }
+        } else {
+            self.live.push((bus, source, event));
+        }
     }
 
     /// Release a live voice (its `GrainEvent::tag.voice`) at `off`, on the
@@ -506,16 +533,21 @@ impl RealtimeAudio {
                 right[at + i] += self.scratch_clip.right[i];
             }
         }
-        // Prune finished hits.
+        // Prune finished hits (including sculpted ring-out tails).
         let done_before = t_live + n as f64 / sr;
-        self.live.retain(|(_, _, ev)| ev.end() > done_before);
+        self.live.retain(|(_, _, ev)| ev.audio_end() > done_before);
         self.live_pos += n as u64;
 
-        fx::process_audio_chain(
+        if self.project.studio_bus {
+            self.studio_bus_state
+                .process_eq(&mut left[at..at + n], &mut right[at..at + n]);
+        }
+        fx::process_audio_chain_opts(
             &mut left[at..at + n],
             &mut right[at..at + n],
             &self.project.master_effects,
             &mut self.master_states,
+            self.project.studio_bus,
         );
         if self.project.master_tape.is_active() {
             self.master_tape_state.process_block(
@@ -534,11 +566,15 @@ impl RealtimeAudio {
                 *s *= g;
             }
         }
-        self.master_cond.process_block(
-            &mut left[at..at + n],
-            &mut right[at..at + n],
-            self.project.sample_rate,
-        );
+        if self.project.studio_bus {
+            StudioBusState::process_ceiling(&mut left[at..at + n], &mut right[at..at + n]);
+        } else {
+            self.master_cond.process_block(
+                &mut left[at..at + n],
+                &mut right[at..at + n],
+                self.project.sample_rate,
+            );
+        }
     }
 }
 
@@ -920,7 +956,7 @@ mod tests {
         let voice = 0xE000_0000_0000_0042u64;
         for k in 0..8 {
             let mut ev = crate::grain::grain_from_note(&crate::grain::GrainSettings { gain: 1.0, duration: 0.3, ..Default::default() }, 60, 100, 3.0, now + k as f64 * 0.25, 10 + k);
-            ev.tag = crate::grain::VoiceTag { voice, env: Some(crate::envelope::VoiceEnv::held(adsr, now)), tile: None };
+            ev.tag = crate::grain::VoiceTag { voice, env: Some(crate::envelope::VoiceEnv::held(adsr, now)), tile: None, ..Default::default() };
             rt.trigger_live(0, ev);
         }
         let (mut l, mut r) = (vec![0.0f32; sr / 4], vec![0.0f32; sr / 4]);

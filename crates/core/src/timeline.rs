@@ -7,6 +7,9 @@ use crate::grain::GrainSettings;
 use crate::music::Key;
 use crate::video::{AvLink, ColorFilter, VideoClip, VisualGrainStyle};
 
+pub use crate::chop::{build_kit_across_sources, build_tape_loops_across_sources, KitPadSpec};
+pub use crate::tile::AspectRatio;
+
 pub type SourceId = usize;
 
 /// An imported piece of media (file, YouTube rip, or procedural source).
@@ -45,14 +48,20 @@ pub struct Provenance {
 }
 
 impl Source {
-    /// Transient slices (at most `max`) from the audio.
+    /// Rich transient slices (at most `max`) from audio + video frames
+    /// (5-band flux + zero-crossing consonant pre-roll + NSDF pitch + `(cx, cy)` focus).
     pub fn auto_slices(&self, max: usize) -> Vec<crate::chop::Slice> {
-        self.audio.as_ref().map(|a| crate::chop::auto_slices(a, max)).unwrap_or_default()
+        if self.audio.is_none() && self.video.is_none() {
+            return Vec::new();
+        }
+        crate::chop::analyze_source_slices(self, max)
     }
 
-    /// `n` equal slices over the whole source.
+    /// `n` equal slices over the whole source, enriched with spectral/pitch/focus metadata.
     pub fn equal_slices(&self, n: usize) -> Vec<crate::chop::Slice> {
-        crate::chop::equal_slices(self.duration(), n)
+        let mut sls = crate::chop::equal_slices(self.duration(), n);
+        crate::chop::enrich_slices(&mut sls, self.audio.as_deref(), self.video.as_deref());
+        sls
     }
 
     /// Longest media duration available in this source, seconds.
@@ -465,6 +474,10 @@ pub struct Track {
     /// track's visual layer directly from its smoothed audio envelope so swells
     /// and hits visibly breathe on screen (`0` = static fader opacity only).
     pub rms_to_opacity: f32,
+    /// Monophonic choke group (`0 = off`, `1..=4`).
+    pub choke_group: u8,
+    /// Optional track-wide voice sculptor / tape-loop preset.
+    pub sculpt: crate::grain::VoiceSculpt,
 }
 
 impl Default for Track {
@@ -483,6 +496,8 @@ impl Default for Track {
             tape: crate::audio::TapeSettings::default(),
             eq: Vec::new(),
             rms_to_opacity: 0.0,
+            choke_group: 0,
+            sculpt: crate::grain::VoiceSculpt::default(),
         }
     }
 }
@@ -556,12 +571,20 @@ pub struct Project {
     /// couples master broadband log-energy transients into subtle, non-strobing
     /// whole-frame light breathing (`corr(onset_flux, frame_diff) >= 0.30`).
     pub master_bloom: f32,
-    /// Compositing: layered (`Stack`) or one tile per sounding voice
-    /// (`Tile`); see [`crate::tile`].
+    /// Compositing: `Stack`, `Split` (`Split + Bleed`), `Tile` (`Grid`), or `Bleed`.
     pub layout: crate::tile::Layout,
-    /// In tile mode, a voice's tile column drives its pan and its row a
+    /// In tile/split mode, a voice's column drives its pan and its row a
     /// subtle elevation cue (on by default).
     pub layout_pan: bool,
+    /// Stage aspect ratio (`16:9`, `1:1`, `9:16`).
+    pub aspect: crate::tile::AspectRatio,
+    /// Studio clarity master bus (`285 Hz` mud control, `HPF >= 240 Hz` on master
+    /// delay/reverb tails, `56 Hz` warm sub shelf, `-1.4 dBTP` ceiling; `true` by default).
+    pub studio_bus: bool,
+    /// Render kinetic stage captions when triggered slices carry a non-empty `caption`.
+    pub captions_on: bool,
+    /// Prefer *MODELL 5* vertical portrait columns (`2×1` / `3×1` / `4×1`) on wide `16:9` canvases in `Layout::Tile`.
+    pub portrait_columns: bool,
 }
 
 impl Default for Project {
@@ -583,11 +606,31 @@ impl Default for Project {
             master_bloom: 0.0,
             layout: crate::tile::Layout::Stack,
             layout_pan: true,
+            aspect: crate::tile::AspectRatio::Wide16x9,
+            studio_bus: true,
+            captions_on: true,
+            portrait_columns: false,
         }
     }
 }
 
 impl Project {
+    /// Switch output aspect ratio (`16:9`, `1:1`, `9:16`), preserving the current long-edge resolution.
+    pub fn set_aspect(&mut self, aspect: crate::tile::AspectRatio) {
+        self.aspect = aspect;
+        let long_edge = self.width.max(self.height).max(16);
+        let (w, h) = aspect.dimensions_for_long_edge(long_edge);
+        self.width = w;
+        self.height = h;
+    }
+
+    /// Switch output aspect ratio to full-HD export dimensions (`1920x1080`, `1080x1080`, `1080x1920`).
+    pub fn set_aspect_hd(&mut self, aspect: crate::tile::AspectRatio) {
+        self.aspect = aspect;
+        let (w, h) = aspect.hd_dimensions();
+        self.width = w;
+        self.height = h;
+    }
     pub fn beats_to_secs(&self, beats: f64) -> f64 {
         beats * 60.0 / self.bpm
     }

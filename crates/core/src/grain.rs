@@ -81,10 +81,458 @@ pub struct GrainSettings {
     /// None = the classic grain windows only.
     #[serde(default)]
     pub adsr: Option<crate::envelope::Adsr>,
+    /// Unopinionated pure-sample voice sculptor & tape-loop physics.
+    #[serde(default)]
+    pub sculpt: VoiceSculpt,
+    /// Optional monophonic choke group (`0` = off, `1..=4`).
+    #[serde(default)]
+    pub choke_group: u8,
 }
 
 fn default_swing() -> f32 {
     0.5
+}
+
+fn default_pitch_env_ms() -> f32 {
+    42.0
+}
+
+fn default_hpf_hz() -> f32 {
+    20.0
+}
+
+fn default_lpf_hz() -> f32 {
+    20_000.0
+}
+
+fn default_resonance_q() -> f32 {
+    0.707
+}
+
+fn default_comb_feedback() -> f32 {
+    0.84
+}
+
+pub(crate) fn default_focus() -> (f32, f32) {
+    (0.5, 0.5)
+}
+
+/// Polyphonic resampled chord voicings (`1/sqrt(N)` gain-compensated,
+/// stereo-fanned, `HPF >= 210 Hz`, varispeed-coupled to stage panels).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ChordVoicing {
+    #[default]
+    Off,
+    Octaves,
+    Fifths,
+    Min7,
+    Min9,
+    Maj7,
+    Sus4,
+    Cluster,
+}
+
+impl ChordVoicing {
+    pub const ALL: [ChordVoicing; 8] = [
+        ChordVoicing::Off,
+        ChordVoicing::Octaves,
+        ChordVoicing::Fifths,
+        ChordVoicing::Min7,
+        ChordVoicing::Min9,
+        ChordVoicing::Maj7,
+        ChordVoicing::Sus4,
+        ChordVoicing::Cluster,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            ChordVoicing::Off => "off",
+            ChordVoicing::Octaves => "oct",
+            ChordVoicing::Fifths => "5ths",
+            ChordVoicing::Min7 => "min7",
+            ChordVoicing::Min9 => "min9",
+            ChordVoicing::Maj7 => "maj7",
+            ChordVoicing::Sus4 => "sus4",
+            ChordVoicing::Cluster => "cluster",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<ChordVoicing> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" | "mono" => Some(ChordVoicing::Off),
+            "oct" | "octave" | "octaves" => Some(ChordVoicing::Octaves),
+            "5ths" | "fifths" | "fifth" | "power" => Some(ChordVoicing::Fifths),
+            "min7" | "m7" => Some(ChordVoicing::Min7),
+            "min9" | "m9" => Some(ChordVoicing::Min9),
+            "maj7" | "M7" => Some(ChordVoicing::Maj7),
+            "sus4" | "sus" => Some(ChordVoicing::Sus4),
+            "cluster" | "add9" => Some(ChordVoicing::Cluster),
+            _ => None,
+        }
+    }
+
+    pub fn intervals(self) -> &'static [f32] {
+        match self {
+            ChordVoicing::Off => &[0.0],
+            ChordVoicing::Octaves => &[0.0, 12.0],
+            ChordVoicing::Fifths => &[0.0, 7.0, 12.0],
+            ChordVoicing::Min7 => &[0.0, 3.0, 7.0, 10.0],
+            ChordVoicing::Min9 => &[0.0, 3.0, 7.0, 10.0, 14.0],
+            ChordVoicing::Maj7 => &[0.0, 4.0, 7.0, 11.0],
+            ChordVoicing::Sus4 => &[0.0, 5.0, 7.0, 12.0],
+            ChordVoicing::Cluster => &[0.0, 2.0, 7.0, 9.0],
+        }
+    }
+}
+
+/// One-tap musical sculptor stamps — each populates the continuous dials of
+/// [`VoiceSculpt`] transparently (never a black box).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Stamp {
+    #[default]
+    Raw,
+    Kick,
+    Snare,
+    Hat,
+    Pluck,
+    Chord,
+    Phrase,
+    Wash,
+    TapeLoop,
+    Disintegrate,
+}
+
+/// Alias for UI callers.
+pub type SculptStamp = Stamp;
+
+impl Stamp {
+    pub const ALL: [Stamp; 10] = [
+        Stamp::Raw,
+        Stamp::Kick,
+        Stamp::Snare,
+        Stamp::Hat,
+        Stamp::Pluck,
+        Stamp::Chord,
+        Stamp::Phrase,
+        Stamp::Wash,
+        Stamp::TapeLoop,
+        Stamp::Disintegrate,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Stamp::Raw => "raw",
+            Stamp::Kick => "kick",
+            Stamp::Snare => "snare",
+            Stamp::Hat => "hat",
+            Stamp::Pluck => "pluck",
+            Stamp::Chord => "chord",
+            Stamp::Phrase => "phrase",
+            Stamp::Wash => "wash",
+            Stamp::TapeLoop => "tapeloop",
+            Stamp::Disintegrate => "disintegrate",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Stamp::Raw => "Raw",
+            Stamp::Kick => "Kick",
+            Stamp::Snare => "Snare",
+            Stamp::Hat => "Hat",
+            Stamp::Pluck => "Pluck",
+            Stamp::Chord => "Chord",
+            Stamp::Phrase => "Phrase",
+            Stamp::Wash => "Wash",
+            Stamp::TapeLoop => "Tape Loop",
+            Stamp::Disintegrate => "Disintegrate",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Stamp> {
+        match s.trim().to_ascii_lowercase().replace([' ', '-', '_'], "").as_str() {
+            "raw" | "clean" | "off" => Some(Stamp::Raw),
+            "kick" | "sub" | "808" => Some(Stamp::Kick),
+            "snare" | "clap" | "snap" => Some(Stamp::Snare),
+            "hat" | "hihat" | "air" => Some(Stamp::Hat),
+            "pluck" | "comb" | "karplus" => Some(Stamp::Pluck),
+            "chord" | "pads" => Some(Stamp::Chord),
+            "phrase" | "vox" | "speech" => Some(Stamp::Phrase),
+            "wash" | "shimmer" => Some(Stamp::Wash),
+            "tapeloop" | "tape" | "loop" => Some(Stamp::TapeLoop),
+            "disintegrate" | "wear" | "basinski" | "caretaker" => Some(Stamp::Disintegrate),
+            _ => None,
+        }
+    }
+}
+
+/// Pure-sample continuous voice sculptor & Basinski/Caretaker tape-loop physics.
+/// Zero oscillators: every sound is excited strictly by the real media slice.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct VoiceSculpt {
+    /// Static transposition offset populated by stamps (e.g. `-14` Kick, `+10` Hat).
+    #[serde(default)]
+    pub pitch_semitones: f32,
+    /// Exponential pitch-drop transient envelope in semitones (`-24..+24`).
+    #[serde(default)]
+    pub pitch_env_semitones: f32,
+    /// Pitch envelope time constant in milliseconds (`10..250`).
+    #[serde(default = "default_pitch_env_ms")]
+    pub pitch_env_ms: f32,
+    /// `68 ms`-transient-gated Cytomic ZDF swept SVF (`155 -> 50 Hz`, `Q = 8.2`), `0..1`.
+    #[serde(default)]
+    pub sub_exciter: f32,
+    /// 3-grain micro-flam (`0 / 6.5 / 14 ms`) + `220 Hz` & `2.6 kHz` presence +
+    /// `85 ms` 5-tap stereo gated room + `130 ms` speech-spill tail gate, `0..1`.
+    #[serde(default)]
+    pub snare_snap: f32,
+    /// Pre-filter loudness-compensated `tanh` saturation in dB (`0..18`).
+    #[serde(default)]
+    pub drive_db: f32,
+    /// Post-drive high-pass cutoff in Hz (`20..12000`).
+    #[serde(default = "default_hpf_hz")]
+    pub hpf_hz: f32,
+    /// Post-drive low-pass cutoff in Hz (`60..20000`; `<200 Hz` engages steep `24 dB/oct` kick sub crossover).
+    #[serde(default = "default_lpf_hz")]
+    pub lpf_hz: f32,
+    /// Filter resonance `Q` (`0.5..8.0`).
+    #[serde(default = "default_resonance_q")]
+    pub resonance_q: f32,
+    /// Surgical `-4.0 dB @ 290 Hz` low-mid mud carve on non-sub voices.
+    #[serde(default)]
+    pub pocket_carve: bool,
+    /// Scale-locked fractional-delay Karplus-Strong comb resonator wet mix (`0..1`).
+    #[serde(default)]
+    pub comb_mix: f32,
+    /// Karplus-Strong comb feedback (`0.60..0.93`).
+    #[serde(default = "default_comb_feedback")]
+    pub comb_feedback: f32,
+    /// Polyphonic chord stack voicing.
+    #[serde(default)]
+    pub chord: ChordVoicing,
+    /// Dual-ratio (`+12 st` & `+7 st`) windowed grain halo (`380 Hz–11.5 kHz`), `0..1`.
+    #[serde(default)]
+    pub shimmer: f32,
+    /// Asynchronous real-seconds tape loop period (independent of BPM grid, `80 ms` equal-power seam).
+    #[serde(default)]
+    pub free_loop_secs: Option<f32>,
+    /// Analog capstan `0.82 Hz` wow + `4.25 Hz` flutter + stereo Haas chorus (`0..1`).
+    #[serde(default)]
+    pub wow_flutter: f32,
+    /// Basinski per-pass / over-time tape wear: progressive LPF darkening, wow deepening,
+    /// deterministic organic oxide dropouts (audio + video), and ghostly dark reverb (`0..1`).
+    #[serde(default)]
+    pub disintegrate: f32,
+    /// Slow asynchronous breathing swell LFO across passes (`0..1`).
+    #[serde(default)]
+    pub ebb_flow: f32,
+}
+
+impl Default for VoiceSculpt {
+    fn default() -> Self {
+        VoiceSculpt {
+            pitch_semitones: 0.0,
+            pitch_env_semitones: 0.0,
+            pitch_env_ms: default_pitch_env_ms(),
+            sub_exciter: 0.0,
+            snare_snap: 0.0,
+            drive_db: 0.0,
+            hpf_hz: default_hpf_hz(),
+            lpf_hz: default_lpf_hz(),
+            resonance_q: default_resonance_q(),
+            pocket_carve: false,
+            comb_mix: 0.0,
+            comb_feedback: default_comb_feedback(),
+            chord: ChordVoicing::Off,
+            shimmer: 0.0,
+            free_loop_secs: None,
+            wow_flutter: 0.0,
+            disintegrate: 0.0,
+            ebb_flow: 0.0,
+        }
+    }
+}
+
+impl VoiceSculpt {
+    /// Populate continuous sculptor parameters from a musical [`Stamp`].
+    pub fn preset(stamp: Stamp) -> VoiceSculpt {
+        let base = VoiceSculpt::default();
+        match stamp {
+            Stamp::Raw => base,
+            Stamp::Kick => VoiceSculpt {
+                pitch_semitones: -14.0,
+                pitch_env_semitones: 16.0,
+                pitch_env_ms: 42.0,
+                sub_exciter: 0.72,
+                drive_db: 7.5,
+                hpf_hz: 28.0,
+                lpf_hz: 155.0,
+                resonance_q: 0.85,
+                ..base
+            },
+            Stamp::Snare => VoiceSculpt {
+                snare_snap: 0.85,
+                drive_db: 8.5,
+                hpf_hz: 170.0,
+                lpf_hz: 8200.0,
+                resonance_q: 0.80,
+                ..base
+            },
+            Stamp::Hat => VoiceSculpt {
+                pitch_semitones: 10.0,
+                drive_db: 3.5,
+                hpf_hz: 5400.0,
+                lpf_hz: 18_500.0,
+                resonance_q: 0.90,
+                ..base
+            },
+            Stamp::Pluck => VoiceSculpt {
+                comb_mix: 0.78,
+                comb_feedback: 0.945,
+                hpf_hz: 140.0,
+                lpf_hz: 9500.0,
+                pocket_carve: true,
+                ..base
+            },
+            Stamp::Chord => VoiceSculpt {
+                comb_mix: 0.42,
+                comb_feedback: 0.91,
+                chord: ChordVoicing::Min7,
+                shimmer: 0.25,
+                hpf_hz: 215.0,
+                lpf_hz: 11_000.0,
+                pocket_carve: true,
+                ..base
+            },
+            Stamp::Phrase => VoiceSculpt {
+                drive_db: 2.0,
+                hpf_hz: 165.0,
+                lpf_hz: 14_500.0,
+                pocket_carve: true,
+                ..base
+            },
+            Stamp::Wash => VoiceSculpt {
+                shimmer: 0.55,
+                wow_flutter: 0.22,
+                ebb_flow: 0.45,
+                hpf_hz: 220.0,
+                lpf_hz: 8500.0,
+                pocket_carve: true,
+                ..base
+            },
+            Stamp::TapeLoop => VoiceSculpt {
+                free_loop_secs: Some(6.4),
+                wow_flutter: 0.38,
+                disintegrate: 0.18,
+                ebb_flow: 0.50,
+                drive_db: 2.5,
+                hpf_hz: 115.0,
+                lpf_hz: 7200.0,
+                pocket_carve: true,
+                ..base
+            },
+            Stamp::Disintegrate => VoiceSculpt {
+                free_loop_secs: Some(7.8),
+                wow_flutter: 0.55,
+                disintegrate: 0.72,
+                ebb_flow: 0.65,
+                shimmer: 0.32,
+                drive_db: 3.5,
+                hpf_hz: 135.0,
+                lpf_hz: 5400.0,
+                pocket_carve: true,
+                ..base
+            },
+        }
+    }
+
+    /// True when any per-voice audio DSP stage deviates from clean bypass.
+    #[inline]
+    pub fn has_audio_dsp(&self) -> bool {
+        self.pitch_env_semitones.abs() > 1e-3
+            || self.sub_exciter > 1e-3
+            || self.snare_snap > 1e-3
+            || self.drive_db > 1e-3
+            || self.hpf_hz > 22.0
+            || self.lpf_hz < 19_800.0
+            || (self.resonance_q - 0.707).abs() > 0.05
+            || self.pocket_carve
+            || self.comb_mix > 1e-3
+            || self.shimmer > 1e-3
+            || self.wow_flutter > 1e-3
+            || self.disintegrate > 1e-3
+            || self.ebb_flow > 1e-3
+    }
+
+    #[inline]
+    pub fn is_active(&self) -> bool {
+        self.has_audio_dsp()
+            || self.pitch_semitones.abs() > 1e-3
+            || self.chord != ChordVoicing::Off
+            || self.free_loop_secs.is_some()
+    }
+
+    /// True for sustained ambient/tape washes that bleed full-screen in [`crate::tile::Layout::Split`].
+    #[inline]
+    pub fn is_wash(&self) -> bool {
+        self.free_loop_secs.is_some()
+            || self.disintegrate > 0.05
+            || self.ebb_flow > 0.15
+            || self.shimmer > 0.35
+    }
+
+    /// Extra ring-out seconds past the nominal slice/grain duration (e.g. `+140 ms` Karplus-Strong comb tail).
+    #[inline]
+    pub fn tail_secs(&self) -> f32 {
+        let mut tail = 0.0f32;
+        if self.comb_mix > 0.01 {
+            tail = tail.max(0.14);
+        }
+        if self.shimmer > 0.02 || self.disintegrate > 0.15 {
+            tail = tail.max(0.18);
+        }
+        if self.sub_exciter > 0.02 {
+            tail = tail.max(0.08);
+        }
+        tail
+    }
+}
+
+/// Deterministic Basinski tape-oxide dropout (`0..1`) at `elapsed_secs` on loop pass `pass_index`.
+/// Progressively deepens as `pass_index` advances so loops crumble organically into silence & ghost reverb.
+#[inline]
+pub fn oxide_dropout_at(disintegrate: f32, pass_index: u32, elapsed_secs: f64, seed: u64) -> f32 {
+    let d = disintegrate.clamp(0.0, 1.0);
+    if d <= 1e-4 {
+        return 0.0;
+    }
+    let wear = (d * (0.12 + 0.22 * pass_index as f32 + 0.018 * elapsed_secs.max(0.0) as f32)).clamp(0.0, 0.96);
+    let p0 = ((seed & 0xFFFF) as f64) * 0.000_095;
+    let p1 = (((seed >> 16) & 0xFFFF) as f64) * 0.000_095;
+    let p2 = (((seed >> 32) & 0xFFFF) as f64) * 0.000_095;
+    let t = elapsed_secs + pass_index as f64 * 3.17;
+    // Multi-scale irregular tape-flake contour in [0, 1].
+    let w = 0.45 * (0.5 + 0.5 * (t * 1.73 + p0).sin())
+        + 0.35 * (0.5 + 0.5 * (t * 4.31 + p1).sin())
+        + 0.20 * (0.5 + 0.5 * (t * 11.17 + p2).sin());
+    let thresh = (1.02 - 0.88 * wear as f64).clamp(0.08, 1.0);
+    let flake = ((w - thresh) / (1.0 - thresh).max(0.08)).clamp(0.0, 1.0) as f32;
+    // Combine baseline progressive oxide loss + localized tape-flake dropouts.
+    (wear * 0.38 + flake * (0.35 + 0.60 * wear)).clamp(0.0, 0.96)
+}
+
+/// Slow asynchronous Caretaker/Eno breathing swell multiplier (`0.35..1.0`).
+#[inline]
+pub fn ebb_flow_gain_at(ebb_flow: f32, pass_index: u32, elapsed_secs: f64, seed: u64) -> f32 {
+    let amt = ebb_flow.clamp(0.0, 1.0);
+    if amt <= 1e-4 {
+        return 1.0;
+    }
+    let phase_off = ((seed.wrapping_mul(0x9E37_79B9) & 0xFFFF) as f64 / 65535.0) * std::f64::consts::TAU;
+    let rate_hz = 0.068 + ((seed >> 20) & 0xFF) as f64 / 255.0 * 0.045; // ~9s..15s cycle
+    let t = elapsed_secs + pass_index as f64 * 4.7;
+    let lfo = 0.5 + 0.5 * (std::f64::consts::TAU * rate_hz * t + phase_off).cos();
+    (1.0 - 0.52 * amt * (1.0 - lfo as f32)).clamp(0.25, 1.0)
 }
 
 impl GrainSettings {
@@ -118,6 +566,21 @@ impl GrainSettings {
             "texture" | "grain" | "grainy" => self.texture = x.clamp(0.0, 1.0),
             "swing" | "shuffle" => self.swing = x.clamp(0.25, 0.75),
             "varispeed" | "tape_pitch" => self.varispeed = x >= 0.5,
+            "pitch_env_semitones" | "pitch_drop" => self.sculpt.pitch_env_semitones = x.clamp(-24.0, 24.0),
+            "pitch_env_ms" => self.sculpt.pitch_env_ms = x.clamp(10.0, 250.0),
+            "sub_exciter" | "sub" => self.sculpt.sub_exciter = x.clamp(0.0, 1.0),
+            "snare_snap" | "snap" => self.sculpt.snare_snap = x.clamp(0.0, 1.0),
+            "drive_db" | "drive" => self.sculpt.drive_db = x.clamp(0.0, 18.0),
+            "hpf_hz" | "hpf" => self.sculpt.hpf_hz = x.clamp(20.0, 12_000.0),
+            "lpf_hz" | "lpf" => self.sculpt.lpf_hz = x.clamp(60.0, 20_000.0),
+            "resonance_q" | "q" => self.sculpt.resonance_q = x.clamp(0.3, 12.0),
+            "comb_mix" | "comb" => self.sculpt.comb_mix = x.clamp(0.0, 1.0),
+            "comb_feedback" => self.sculpt.comb_feedback = x.clamp(0.60, 0.93),
+            "shimmer" => self.sculpt.shimmer = x.clamp(0.0, 1.0),
+            "wow_flutter" | "wow" => self.sculpt.wow_flutter = x.clamp(0.0, 1.0),
+            "disintegrate" | "wear" => self.sculpt.disintegrate = x.clamp(0.0, 1.0),
+            "ebb_flow" => self.sculpt.ebb_flow = x.clamp(0.0, 1.0),
+            "choke_group" | "choke" => self.choke_group = (value as i64).clamp(0, 4) as u8,
             _ => return Err(()),
         }
         Ok(())
@@ -153,37 +616,109 @@ impl Default for GrainSettings {
             swing: 0.5,
             varispeed: false,
             adsr: None,
+            sculpt: VoiceSculpt::default(),
+            choke_group: 0,
         }
     }
 }
 
-/// Which voice a grain belongs to, for ADSR and tiling. Default = no
-/// voice (classic behaviour).
-#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+/// Duration of the click-free cosine mute when a choke group cuts an earlier voice (`3 ms`).
+pub const CHOKE_RELEASE_SECS: f64 = 0.003;
+
+/// Raised-cosine choke multiplier (`1.0` before `choke_at`, `0.0` at `choke_at + 3 ms`).
+#[inline]
+pub fn choke_gain_at(choke_at: Option<f64>, t: f64) -> f32 {
+    let Some(t_cut) = choke_at else { return 1.0 };
+    if t <= t_cut {
+        1.0
+    } else if t >= t_cut + CHOKE_RELEASE_SECS {
+        0.0
+    } else {
+        let u = ((t - t_cut) / CHOKE_RELEASE_SECS) as f32;
+        0.5 * (1.0 + (std::f32::consts::PI * u).cos())
+    }
+}
+
+/// Which voice a grain belongs to, for ADSR, choke groups, and stage layout.
+/// Compact `Copy` struct shared between the audio engine and GPU/CPU stage compositors.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct VoiceTag {
     /// Stable voice id (0 = none): a held note, a pad loop, a step hit,
     /// a clip, an emitter gesture.
+    #[serde(default)]
     pub voice: u64,
     /// The voice's envelope; scales audio per sample and picture opacity.
+    #[serde(default)]
     pub env: Option<crate::envelope::VoiceEnv>,
-    /// Tile slot in [`Layout::Tile`](crate::tile::Layout) (see [`crate::tile`]).
+    /// Tile slot in [`Layout::Tile`](crate::tile::Layout) / [`Layout::Split`](crate::tile::Layout).
+    #[serde(default)]
     pub tile: Option<u8>,
+    /// Normalized motion/subject center `(cx, cy)` in `0..1` (`(0.5, 0.5)` default).
+    #[serde(default = "default_focus")]
+    pub focus: (f32, f32),
+    /// True on odd ratchet sub-hits (`r % 2 == 1`) so the stage mirrors `flipX`.
+    #[serde(default)]
+    pub ratchet_odd: bool,
+    /// Transient zoom impulse (`0..0.25`) decaying from note onset.
+    #[serde(default)]
+    pub zoom_punch: f32,
+    /// Basinski tape-oxide dropout wear (`0..1`) coupling audio dropouts to visual alpha/chroma wear.
+    #[serde(default)]
+    pub oxide_dropout: f32,
+    /// Monophonic choke group (`0 = off`, `1..=4`).
+    #[serde(default)]
+    pub choke_group: u8,
+    /// True for sustained granular/tape wash layers that bleed full-screen at `30%` in `Layout::Split`.
+    #[serde(default)]
+    pub is_wash: bool,
+    /// Absolute choke cut timestamp (`None` = unchoked; ramps to 0 over `3 ms` cosine).
+    #[serde(default)]
+    pub choke_at: Option<f64>,
+    /// Optional spoken-hook stage caption carried from [`crate::chop::Slice::caption`].
+    #[serde(default)]
+    pub caption: crate::chop::Caption,
+    /// *MODELL 5* full-cell hard-frame micro-burst (`true` when `PictureCut::Cut` +
+    /// tight `spray <= 0.08` + micro-grain `duration <= 95 ms`): renders 100%
+    /// full-cell / full-frame (`size = 1.0`, `feather = 0.0`, sharp cut).
+    #[serde(default)]
+    pub hard_burst: bool,
+}
+
+impl Default for VoiceTag {
+    fn default() -> Self {
+        VoiceTag {
+            voice: 0,
+            env: None,
+            tile: None,
+            focus: (0.5, 0.5),
+            ratchet_odd: false,
+            zoom_punch: 0.0,
+            oxide_dropout: 0.0,
+            choke_group: 0,
+            is_wash: false,
+            choke_at: None,
+            caption: crate::chop::Caption::default(),
+            hard_burst: false,
+        }
+    }
 }
 
 impl VoiceTag {
-    /// Envelope gain at absolute time `t` (1 without an envelope).
+    /// Envelope + choke gain at absolute time `t` (1 without an envelope or choke).
+    #[inline]
     pub fn level_at(&self, t: f64) -> f32 {
-        self.env.map_or(1.0, |e| e.level_at(t))
+        self.env.map_or(1.0, |e| e.level_at(t)) * choke_gain_at(self.choke_at, t)
     }
 
-    /// Picture weight at absolute time `t` (1 without an envelope).
+    /// Picture weight at absolute time `t` (1 without an envelope or choke).
+    #[inline]
     pub fn picture_at(&self, t: f64) -> f32 {
-        self.env.map_or(1.0, |e| e.picture_at(t))
+        self.env.map_or(1.0, |e| e.picture_at(t)) * choke_gain_at(self.choke_at, t)
     }
 }
 
 /// One scheduled grain, shared by the audio and video renderers.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub struct GrainEvent {
     /// Absolute onset on the timeline, seconds.
     pub onset: f64,
@@ -205,20 +740,120 @@ pub struct GrainEvent {
     pub reverse: bool,
     /// Stable per-grain id for deterministic visual scatter.
     pub id: u64,
-    /// Voice (ADSR envelope, tile slot).
+    /// Voice (ADSR envelope, tile slot, focus, choke, wear).
     #[serde(default)]
     pub tag: VoiceTag,
+    /// Per-voice pure-sample sculptor & tape-loop physics (`Raw` default = zero overhead).
+    #[serde(default)]
+    pub sculpt: VoiceSculpt,
+    /// Target fundamental frequency (Hz) for the scale-locked Karplus-Strong comb resonator (`0 = auto`).
+    #[serde(default)]
+    pub comb_hz: f32,
+    /// Loop pass index (`0, 1, 2, ...`) for progressive Basinski `disintegrate` wear.
+    #[serde(default)]
+    pub loop_pass: u32,
 }
 
 impl GrainEvent {
+    /// Effective audio end time in seconds (including sculptor tail ring-out, bounded by choke cut).
+    #[inline]
+    pub fn audio_end(&self) -> f64 {
+        let raw_end = self.onset + (self.duration + self.sculpt.tail_secs()) as f64;
+        match self.tag.choke_at {
+            Some(tc) => raw_end.min(tc + CHOKE_RELEASE_SECS),
+            None => raw_end,
+        }
+    }
+
     pub fn end(&self) -> f64 {
-        self.onset + self.duration as f64
+        let raw_end = self.onset + self.duration as f64;
+        match self.tag.choke_at {
+            Some(tc) => raw_end.min(tc + CHOKE_RELEASE_SECS),
+            None => raw_end,
+        }
     }
 
     /// Pitch offset of this grain in semitones (drives visual hue shift).
     pub fn semitones(&self) -> f32 {
         crate::music::ratio_to_semitones(self.pitch_ratio)
     }
+}
+
+/// Snap a frequency `hz` onto the nearest note of `key` inside `[65.0, 1046.5] Hz` (`C2..C6`).
+#[inline]
+pub fn quantize_comb_hz(hz: f32, key: Option<&Key>) -> f32 {
+    let hz = if hz.is_finite() && hz > 20.0 { hz } else { 130.8128 };
+    let mut midi = crate::music::hz_to_midi(hz);
+    while midi < 36.0 {
+        midi += 12.0;
+    }
+    while midi > 84.0 {
+        midi -= 12.0;
+    }
+    let snapped = match key {
+        Some(k) => k.quantize_midi(midi),
+        None => midi.round(),
+    };
+    crate::music::midi_to_hz(snapped).clamp(55.0, 1100.0)
+}
+
+/// Allocation-free polyphonic chord expansion (`1/sqrt(N)` gain, stereo fan,
+/// `HPF >= 210 Hz`, and per-voice varispeed `2^(semi/12)` for multi-panel video harmony).
+pub fn expand_chord_grain_inline(
+    base: &GrainEvent,
+    chord: ChordVoicing,
+    base_hz: f32,
+    key: Option<&Key>,
+) -> ([GrainEvent; 5], usize) {
+    let ivs = chord.intervals();
+    let n = ivs.len().clamp(1, 5);
+    let mut out = [*base; 5];
+    if n == 1 {
+        if out[0].sculpt.comb_mix > 0.001 && out[0].comb_hz <= 0.0 {
+            out[0].comb_hz = quantize_comb_hz(base_hz.max(65.4) * out[0].pitch_ratio, key);
+        }
+        return (out, 1);
+    }
+    let gain_norm = 1.0 / (n as f32).sqrt();
+    for (c, &semi) in ivs.iter().take(n).enumerate() {
+        let mut ev = *base;
+        let ratio_mult = crate::music::semitones_to_ratio(semi);
+        ev.pitch_ratio = (base.pitch_ratio * ratio_mult).clamp(0.0625, 8.0);
+        ev.gain = base.gain * gain_norm;
+        let spread = ((c as f32 / (n - 1) as f32) - 0.5) * 0.75;
+        ev.pan = (base.pan + spread).clamp(-1.0, 1.0);
+        ev.sculpt.chord = ChordVoicing::Off;
+        // Chord-root HPF law: keep chord stacks >= 210 Hz so stacked room tone never muddies 180-400 Hz.
+        ev.sculpt.hpf_hz = ev.sculpt.hpf_hz.max(210.0);
+        ev.id = base.id.wrapping_mul(31).wrapping_add(c as u64);
+        if base.tag.voice != 0 {
+            if c > 0 {
+                ev.tag.voice = base.tag.voice ^ ((c as u64 + 1) * 0x0001_0000_0000_0007);
+            }
+        } else {
+            ev.tag.voice = 0xD000_0000_0000_0000
+                | ((base.id & 0x0FFF_FFFF_FFFF) << 4)
+                | (c as u64 & 0xF);
+        }
+        if ev.sculpt.comb_mix > 0.001 || base.comb_hz > 0.0 {
+            let root_hz = if base.comb_hz > 0.0 { base.comb_hz } else { base_hz.max(65.4) * base.pitch_ratio };
+            ev.comb_hz = quantize_comb_hz(root_hz * ratio_mult, key);
+        }
+        out[c] = ev;
+    }
+    (out, n)
+}
+
+/// Convenience `Vec`-appending wrapper around [`expand_chord_grain_inline`].
+pub fn expand_chord_grain(
+    base: &GrainEvent,
+    chord: ChordVoicing,
+    base_hz: f32,
+    key: Option<&Key>,
+    out: &mut Vec<GrainEvent>,
+) {
+    let (arr, n) = expand_chord_grain_inline(base, chord, base_hz, key);
+    out.extend_from_slice(&arr[..n]);
 }
 
 /// Schedule the grain cloud for a clip.
@@ -297,7 +932,7 @@ pub fn schedule_grains_auto(
         let vgain = s.gain * overlap_norm / (n_voices as f32).sqrt();
         for v in 0..n_voices {
             let detune = if v == 0 { 0.0 } else { s.voice_detune * rng.bipolar() };
-            let st = s.pitch + v as f32 * s.voice_interval + pitch_j + detune;
+            let st = s.pitch + s.sculpt.pitch_semitones + v as f32 * s.voice_interval + pitch_j + detune;
             let ratio = crate::music::effective_ratio(
                 st,
                 key,
@@ -311,19 +946,43 @@ pub fn schedule_grains_auto(
             let pitch_warmth = if ratio > 1.0 { ratio.powf(-0.35) } else { 1.0 };
             let pan = (s.pan + s.pan_spread.clamp(0.0, 1.0) * rng.bipolar())
                 .clamp(-1.0, 1.0);
-            events.push(GrainEvent {
+            let comb_hz = if s.sculpt.comb_mix > 1e-3 {
+                quantize_comb_hz(base_hz.max(65.4) * ratio, key)
+            } else {
+                0.0
+            };
+            let hard_burst = s.spray <= 0.08
+                && dur <= 0.095
+                && s.adsr.is_some_and(|a| a.picture == crate::envelope::PictureCut::Cut);
+            let is_wash = !hard_burst
+                && (s.sculpt.is_wash() || (s.adsr.is_none() && s.spray > 0.08));
+            let base_ev = GrainEvent {
                 onset: clip_start + t,
                 source_pos: pos,
                 duration: dur,
                 pitch_ratio: ratio,
-                gain: vgain * pitch_warmth,
+                gain: vgain * pitch_warmth * ebb_flow_gain_at(s.sculpt.ebb_flow, 0, t, s.seed),
                 pan,
                 envelope: s.envelope,
                 env_skew: s.env_skew,
                 reverse,
                 id: *id,
-                ..Default::default()
-            });
+                tag: VoiceTag {
+                    choke_group: s.choke_group,
+                    is_wash,
+                    oxide_dropout: oxide_dropout_at(s.sculpt.disintegrate, 0, t, s.seed),
+                    hard_burst,
+                    ..Default::default()
+                },
+                sculpt: s.sculpt,
+                comb_hz,
+                loop_pass: 0,
+            };
+            if s.sculpt.chord != ChordVoicing::Off {
+                expand_chord_grain(&base_ev, s.sculpt.chord, base_hz, key, events);
+            } else {
+                events.push(base_ev);
+            }
             *id += 1;
         }
     }
@@ -389,7 +1048,12 @@ pub fn grain_from_note(
     onset: f64,
     id: u64,
 ) -> GrainEvent {
-    let st = settings.pitch + (note as f32 - 60.0);
+    let st = settings.pitch + settings.sculpt.pitch_semitones + (note as f32 - 60.0);
+    let comb_hz = if settings.sculpt.comb_mix > 1e-3 {
+        crate::music::midi_to_hz(note as f32).clamp(55.0, 1100.0)
+    } else {
+        0.0
+    };
     GrainEvent {
         onset,
         source_pos: (settings.position as f64 * source_len).min(source_len),
@@ -403,7 +1067,14 @@ pub fn grain_from_note(
         env_skew: settings.env_skew,
         reverse: settings.reverse_prob >= 0.5,
         id,
-        ..Default::default()
+        tag: VoiceTag {
+            choke_group: settings.choke_group,
+            is_wash: settings.sculpt.is_wash(),
+            ..Default::default()
+        },
+        sculpt: settings.sculpt,
+        comb_hz,
+        loop_pass: 0,
     }
 }
 

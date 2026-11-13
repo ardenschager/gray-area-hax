@@ -321,6 +321,472 @@ pub fn detect_pitch(samples: &[f32], sample_rate: u32) -> Option<f32> {
     Some(440.0 * 2.0f32.powf((eff_midi - 69.0) / 12.0))
 }
 
+/// McLeod Normalized Square Difference Function (NSDF) pitch & confidence
+/// detector on the loudest `75 ms` window (`15 ms` hop, skipping the initial
+/// `<= 12 ms` transient click), searching `60..=1100 Hz`.
+///
+/// Picks the first positive-lobe key maximum `>= 0.88 * max_peak` (preventing
+/// sub-octave errors) with 3-point parabolic lag refinement. Returns
+/// `(Some(f0_hz), confidence)` when `confidence >= 0.45`, else `(None, confidence)`.
+pub fn detect_pitch_nsdf(samples: &[f32], sample_rate: u32) -> (Option<f32>, f32) {
+    if sample_rate == 0 || samples.len() < 128 {
+        return (None, 0.0);
+    }
+    let sr = sample_rate as f32;
+    let dur_s = samples.len() as f32 / sr;
+    let skip = ((0.012f32.min(dur_s * 0.10)) * sr) as usize;
+    let body = if skip + 64 < samples.len() { &samples[skip..] } else { samples };
+
+    let win_len = ((0.075 * sr) as usize).clamp(64, body.len());
+    let hop_len = ((0.015 * sr) as usize).max(16);
+
+    // Locate loudest 75 ms window.
+    let mut best_start = 0usize;
+    let mut best_e = 0.0f32;
+    let mut st = 0usize;
+    loop {
+        let end = (st + win_len).min(body.len());
+        if end <= st {
+            break;
+        }
+        let e: f32 = body[st..end].iter().map(|v| v * v).sum::<f32>() / (end - st) as f32;
+        if e > best_e {
+            best_e = e;
+            best_start = st;
+        }
+        if end >= body.len() {
+            break;
+        }
+        st += hop_len;
+    }
+    if best_e < 1e-7 {
+        return (None, 0.0);
+    }
+    let raw_win = &body[best_start..(best_start + win_len).min(body.len())];
+
+    // Decimate 3:1 with 3-tap [0.25, 0.5, 0.25] smoothing when SR >= 36 kHz.
+    let (dec_buf, eff_sr): (Vec<f32>, f32) = if sample_rate >= 36_000 && raw_win.len() >= 192 {
+        let m = raw_win.len() / 3;
+        let mut d = Vec::with_capacity(m);
+        for k in 0..m {
+            let j = k * 3;
+            let a = raw_win[j];
+            let b = raw_win.get(j + 1).copied().unwrap_or(a);
+            let c = raw_win.get(j + 2).copied().unwrap_or(b);
+            d.push(0.25 * a + 0.50 * b + 0.25 * c);
+        }
+        (d, sr / 3.0)
+    } else {
+        (raw_win.to_vec(), sr)
+    };
+
+    let w = dec_buf.len();
+    let min_lag = (eff_sr / 1100.0).floor().max(2.0) as usize;
+    let max_lag = ((eff_sr / 60.0).ceil() as usize).min(w.saturating_sub(4));
+    if min_lag >= max_lag {
+        return (None, 0.0);
+    }
+
+    // Zero-mean the analysis window so DC never inflates NSDF.
+    let mean = dec_buf.iter().sum::<f32>() / w as f32;
+    let x: Vec<f32> = dec_buf.iter().map(|v| v - mean).collect();
+
+    let mut nsdf = vec![0.0f32; max_lag + 1];
+    for tau in 1..=max_lag {
+        let limit = w - tau;
+        let mut acf = 0.0f32;
+        let mut m_term = 0.0f32;
+        for j in 0..limit {
+            let a = x[j];
+            let b = x[j + tau];
+            acf += a * b;
+            m_term += a * a + b * b;
+        }
+        if m_term > 1e-12 {
+            nsdf[tau] = (2.0 * acf / m_term).clamp(-1.0, 1.0);
+        }
+    }
+
+    // Collect key maxima inside positive lobes after the first zero-crossing.
+    let mut first_neg = min_lag;
+    for (tau, &val) in nsdf.iter().enumerate().take(max_lag + 1).skip(1) {
+        if val <= 0.0 {
+            first_neg = tau;
+            break;
+        }
+    }
+    let start_tau = min_lag.max(first_neg);
+    let mut peaks: Vec<(usize, f32)> = Vec::new();
+    let mut in_pos = false;
+    let mut lobe_tau = start_tau;
+    let mut lobe_max = 0.0f32;
+    for (tau, &v) in nsdf.iter().enumerate().take(max_lag + 1).skip(start_tau) {
+        if v > 0.0 {
+            if !in_pos {
+                in_pos = true;
+                lobe_tau = tau;
+                lobe_max = v;
+            } else if v > lobe_max {
+                lobe_max = v;
+                lobe_tau = tau;
+            }
+        } else if in_pos {
+            peaks.push((lobe_tau, lobe_max));
+            in_pos = false;
+        }
+    }
+    if in_pos && lobe_max > 0.0 {
+        peaks.push((lobe_tau, lobe_max));
+    }
+    if peaks.is_empty() {
+        return (None, 0.0);
+    }
+
+    let max_peak = peaks.iter().fold(0.0f32, |m, p| m.max(p.1));
+    if max_peak < 0.35 {
+        return (None, max_peak.max(0.0));
+    }
+    let thresh = 0.88 * max_peak;
+    let &(best_tau, conf) = peaks.iter().find(|p| p.1 >= thresh).unwrap_or(&peaks[0]);
+
+    let refined_tau = if best_tau > 1 && best_tau < max_lag {
+        let y0 = nsdf[best_tau - 1];
+        let y1 = nsdf[best_tau];
+        let y2 = nsdf[best_tau + 1];
+        let denom = y0 - 2.0 * y1 + y2;
+        if denom.abs() > 1e-7 {
+            best_tau as f32 + (0.5 * (y0 - y2) / denom).clamp(-0.5, 0.5)
+        } else {
+            best_tau as f32
+        }
+    } else {
+        best_tau as f32
+    };
+
+    let hz = eff_sr / refined_tau.max(1.0);
+    let conf = conf.clamp(0.0, 1.0);
+    if conf >= 0.45 && (55.0..=1150.0).contains(&hz) {
+        (Some(hz), conf)
+    } else {
+        (None, conf)
+    }
+}
+
+/// Asymmetric zero-crossing snapper around `idx` searching `[-back_ms, +fwd_ms]`
+/// with a `0.85` pre-center distance bias so transient attacks are never shaved off.
+/// Falls back to `argmin(|samples[k]|)` when DC offset prevents a sign change.
+pub fn snap_zero_crossing(
+    samples: &[f32],
+    sample_rate: u32,
+    idx: usize,
+    back_ms: f32,
+    fwd_ms: f32,
+) -> usize {
+    if samples.len() < 2 || sample_rate == 0 {
+        return idx.min(samples.len().saturating_sub(1));
+    }
+    let n = samples.len();
+    let idx = idx.min(n - 1);
+    let sr = sample_rate as f32;
+    let back = ((back_ms.max(0.0) * 0.001 * sr).round() as usize).max(1);
+    let fwd = ((fwd_ms.max(0.0) * 0.001 * sr).round() as usize).max(1);
+    let lo = idx.saturating_sub(back);
+    let hi = (idx + fwd).min(n - 2);
+    if lo > hi {
+        return idx;
+    }
+
+    let mut best_zc: Option<(usize, f32)> = None;
+    let mut min_abs_i = idx;
+    let mut min_abs_v = samples[idx].abs();
+
+    for k in lo..=hi {
+        let s0 = samples[k];
+        let s1 = samples[k + 1];
+        let a0 = s0.abs();
+        if a0 < min_abs_v {
+            min_abs_v = a0;
+            min_abs_i = k;
+        }
+        let crosses = (s0 <= 0.0 && s1 > 0.0) || (s0 >= 0.0 && s1 < 0.0);
+        if crosses {
+            let pick = if s0.abs() <= s1.abs() { k } else { k + 1 };
+            let raw_dist = pick.abs_diff(idx) as f32;
+            let weighted = if pick <= idx { raw_dist * 0.85 } else { raw_dist };
+            if best_zc.is_none_or(|(_, best_w)| weighted < best_w) {
+                best_zc = Some((pick, weighted));
+            }
+        }
+    }
+    best_zc.map(|(i, _)| i).unwrap_or(min_abs_i)
+}
+
+/// Split `samples` into 5 biquad bands (`sub <90`, `low 90-250`, `mid 250-2k`,
+/// `high 2k-8k`, `air >8k`) rectified into `4 ms` (`250 Hz`) RMS envelope frames.
+/// Returns `(frames, hop_samples)`.
+pub fn analyze_5band_envelopes(samples: &[f32], sample_rate: u32) -> (Vec<[f32; 5]>, usize) {
+    let sr = sample_rate.max(1) as f32;
+    let hop = ((sample_rate as usize) / 250).max(1);
+    if samples.is_empty() {
+        return (Vec::new(), hop);
+    }
+    let nyq = sr * 0.48;
+    let mut b_sub = Biquad::new(FilterKind::LowPass, sr, 90.0f32.min(nyq), 0.707);
+    let mut b_low = Biquad::new(FilterKind::BandPass, sr, 150.0f32.min(nyq), 1.0);
+    let mut b_mid = Biquad::new(FilterKind::BandPass, sr, 707.0f32.min(nyq), 0.65);
+    let mut b_high = Biquad::new(FilterKind::BandPass, sr, 4000.0f32.min(nyq), 0.75);
+    let mut b_air = if sr > 17_000.0 {
+        Some(Biquad::new(FilterKind::HighPass, sr, 8000.0f32.min(nyq), 0.707))
+    } else {
+        None
+    };
+
+    let n_frames = samples.len().div_ceil(hop);
+    let mut out = Vec::with_capacity(n_frames);
+    for fi in 0..n_frames {
+        let s0 = fi * hop;
+        let s1 = ((fi + 1) * hop).min(samples.len());
+        let inv = 1.0 / (s1 - s0).max(1) as f32;
+        let mut acc = [0.0f32; 5];
+        for &x in &samples[s0..s1] {
+            let v0 = b_sub.process(x);
+            let v1 = b_low.process(x);
+            let v2 = b_mid.process(x);
+            let v3 = b_high.process(x);
+            let v4 = b_air.as_mut().map_or(0.0, |f| f.process(x));
+            acc[0] += v0 * v0;
+            acc[1] += v1 * v1;
+            acc[2] += v2 * v2;
+            acc[3] += v3 * v3;
+            acc[4] += v4 * v4;
+        }
+        out.push([
+            (acc[0] * inv).sqrt(),
+            (acc[1] * inv).sqrt(),
+            (acc[2] * inv).sqrt(),
+            (acc[3] * inv).sqrt(),
+            (acc[4] * inv).sqrt(),
+        ]);
+    }
+    (out, hop)
+}
+
+/// Compute normalized 5-band distribution (`sub, low, mid, high, air` summing to ~1),
+/// transient `punch` (`0..1`), and broadband `rms_db` (`-96..0`) for a slice buffer.
+pub fn slice_band_stats(samples: &[f32], sample_rate: u32) -> ([f32; 5], f32, f32) {
+    if samples.is_empty() || sample_rate == 0 {
+        return ([0.0; 5], 0.0, -96.0);
+    }
+    let total_sq: f32 = samples.iter().map(|s| s * s).sum();
+    let total_rms = (total_sq / samples.len() as f32).sqrt();
+    if total_rms < 1e-6 {
+        return ([0.0; 5], 0.0, -96.0);
+    }
+    let rms_db = (20.0 * total_rms.log10()).clamp(-96.0, 6.0);
+    let att_n = ((0.025 * sample_rate as f32) as usize).clamp(1, samples.len());
+    let att_rms = (samples[..att_n].iter().map(|s| s * s).sum::<f32>() / att_n as f32).sqrt();
+    let peak = samples.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    let punch = ((att_rms / total_rms.max(1e-5)) * 0.45 + (peak * 0.70).min(0.55)).clamp(0.0, 1.0);
+
+    let (envs, _) = analyze_5band_envelopes(samples, sample_rate);
+    let mut sum = [0.0f32; 5];
+    for e in &envs {
+        for b in 0..5 {
+            sum[b] += e[b];
+        }
+    }
+    let norm = (sum.iter().sum::<f32>()).max(1e-6);
+    let bands = [sum[0] / norm, sum[1] / norm, sum[2] / norm, sum[3] / norm, sum[4] / norm];
+    (bands, punch, rms_db)
+}
+
+/// 5-band log-compressed weighted spectral flux onset detector with `-30 ms`
+/// speech/mid consonant pre-roll and asymmetric zero-crossing snap (`[-2.0ms, +1.8ms]`).
+/// Returns non-overlapping `(start_sec, end_sec)` spans in chronological order.
+pub fn detect_onsets_5band(
+    samples: &[f32],
+    sample_rate: u32,
+    max_slices: usize,
+) -> Vec<(f64, f64)> {
+    let max_slices = max_slices.clamp(1, 128);
+    if samples.is_empty() || sample_rate == 0 {
+        return Vec::new();
+    }
+    let dur = samples.len() as f64 / sample_rate as f64;
+    let (envs, hop) = analyze_5band_envelopes(samples, sample_rate);
+    let n = envs.len();
+    if n < 4 {
+        return vec![(0.0, dur)];
+    }
+
+    let tot_env: Vec<f32> = envs
+        .iter()
+        .map(|b| (b[0] * b[0] + b[1] * b[1] + b[2] * b[2] + b[3] * b[3] + b[4] * b[4]).sqrt())
+        .collect();
+    let peak_tot = tot_env.iter().copied().fold(0.0f32, f32::max);
+    if peak_tot < 1e-5 {
+        return vec![(0.0, dur)];
+    }
+    let inv_peak = 1.0 / peak_tot;
+
+    // Smooth sub/low/mid band envelopes across wave-period boundaries (~12ms on sub/low,
+    // ~6ms on mid) so 4ms hops never alias against 50..250 Hz fundamental cycles!
+    const ALPHA: [f32; 5] = [0.24, 0.28, 0.48, 0.78, 0.85];
+    let mut smooth = envs.clone();
+    let mut state = envs[0];
+    for frame in &mut smooth {
+        for b in 0..5 {
+            state[b] += ALPHA[b] * (frame[b] - state[b]);
+            frame[b] = state[b];
+        }
+    }
+
+    // Band weights: [sub, low, mid, high, air], log compression k = 180.0
+    const W: [f32; 5] = [0.70, 1.15, 1.35, 1.50, 1.10];
+    const K: f32 = 180.0;
+    let mut flux = vec![0.0f32; n];
+    for i in 1..n {
+        let mut f = 0.0f32;
+        for b in 0..5 {
+            let cur = (1.0 + K * smooth[i][b] * inv_peak).ln();
+            let prev = (1.0 + K * smooth[i - 1][b] * inv_peak).ln();
+            f += W[b] * (cur - prev).max(0.0);
+        }
+        flux[i] = f;
+    }
+
+    let mut sorted_flux = flux.clone();
+    sorted_flux.sort_by(|a, b| a.total_cmp(b));
+    let p70 = sorted_flux[(sorted_flux.len() * 70 / 100).min(sorted_flux.len() - 1)];
+    let global_floor = (p70 * 0.85).max(0.32);
+
+    // Adaptive local threshold over +-28 frames (+-112 ms) and min_gap = 20 frames (80 ms).
+    let min_gap = 20usize;
+    let mut cands: Vec<(usize, f32)> = Vec::new();
+    if tot_env[0] >= peak_tot * 0.08 {
+        cands.push((0, tot_env[0] * inv_peak + 0.2));
+    }
+    let mut scratch = Vec::with_capacity(57);
+    for i in 1..n - 1 {
+        if flux[i] < flux[i - 1] || flux[i] < flux[i + 1] {
+            continue;
+        }
+        let lo = i.saturating_sub(28);
+        let hi = (i + 28).min(n - 1);
+        scratch.clear();
+        scratch.extend_from_slice(&flux[lo..=hi]);
+        scratch.sort_by(|a, b| a.total_cmp(b));
+        let med = scratch[scratch.len() / 2];
+        let mean = scratch.iter().sum::<f32>() / scratch.len() as f32;
+        let thresh = global_floor.max(1.8 * med + 0.18).max(1.25 * mean + 0.12);
+        let look_hi = (i + 10).min(n);
+        let look_e = tot_env[i..look_hi].iter().copied().fold(0.0f32, f32::max) * inv_peak;
+        if flux[i] >= thresh && look_e > 0.012 {
+            if let Some(&(last_i, last_v)) = cands.last() {
+                if i - last_i < min_gap {
+                    if flux[i] > last_v {
+                        *cands.last_mut().unwrap() = (i, flux[i]);
+                    }
+                    continue;
+                }
+            }
+            cands.push((i, flux[i]));
+        }
+    }
+
+    if cands.is_empty() {
+        return vec![(0.0, dur)];
+    }
+    if cands.len() > max_slices {
+        cands.sort_by(|a, b| b.1.total_cmp(&a.1));
+        cands.truncate(max_slices);
+        cands.sort_by_key(|c| c.0);
+    }
+
+    let sr = sample_rate as usize;
+    let preroll_samples = (0.030 * sample_rate as f32).round() as usize; // 30 ms consonant guard
+    let mut out: Vec<(f64, f64)> = Vec::with_capacity(cands.len());
+    let mut prev_end_samp = 0usize;
+
+    for (idx, &(f0, _)) in cands.iter().enumerate() {
+        let next_f = cands.get(idx + 1).map(|c| c.0).unwrap_or(n);
+        // Active slice end: advance while energy stays above 4% of peak (allowing brief
+        // inter-syllable dips up to 60 ms = 15 frames so spoken phrases aren't chopped mid-word).
+        let mut end_f = (f0 + 6).min(next_f);
+        let mut quiet_run = 0usize;
+        let mut scan = end_f;
+        while scan < next_f {
+            if tot_env[scan] >= peak_tot * 0.04 {
+                quiet_run = 0;
+                end_f = scan + 1;
+            } else {
+                quiet_run += 1;
+                if quiet_run >= 15 {
+                    break;
+                }
+            }
+            scan += 1;
+        }
+
+        // Check whether this slice is mid/phrase-dominant (speech/vocal).
+        let check_end = end_f.min(f0 + 75).max(f0 + 1).min(n);
+        let mut b_sum = [0.0f32; 5];
+        for fr in &envs[f0..check_end] {
+            for b in 0..5 {
+                b_sum[b] += fr[b];
+            }
+        }
+        let b_tot = b_sum.iter().sum::<f32>().max(1e-6);
+        let sub_share = b_sum[0] / b_tot;
+        let vocal_share = (b_sum[2] + 0.55 * b_sum[3] + 0.35 * b_sum[1]) / b_tot;
+        let dur_frames = end_f.saturating_sub(f0);
+        // Spoken syllables/phrases carry vocal formant energy across low-mid..high
+        // and often begin with a soft fricative/plosive consonant up to 30ms before
+        // the vowel flux peak.
+        let is_speech_like = vocal_share >= 0.42 && sub_share < 0.38 && dur_frames >= 12;
+
+        let raw_start = (f0 * hop).min(samples.len().saturating_sub(1));
+        let pulled_start = if is_speech_like && raw_start > prev_end_samp {
+            // Pull -30ms earlier, advancing forward ONLY through true digital silence
+            // (< 0.1% of peak) so soft opening consonants ('s', 'f', 't', 'k') are never clipped!
+            let min_bound = raw_start.saturating_sub(preroll_samples).max(prev_end_samp);
+            let min_f = min_bound / hop;
+            let mut start_f = min_f;
+            while start_f < f0 && tot_env[start_f] < peak_tot * 0.001 {
+                start_f += 1;
+            }
+            (start_f * hop).max(min_bound).min(raw_start)
+        } else {
+            raw_start.max(prev_end_samp)
+        };
+
+        let start_samp = if is_speech_like {
+            // Speech rule: never snap forward > +1.0ms so opening consonants stay intact!
+            snap_zero_crossing(samples, sample_rate, pulled_start, 3.0, 1.0).max(prev_end_samp)
+        } else {
+            snap_zero_crossing(samples, sample_rate, pulled_start, 2.0, 1.8).max(prev_end_samp)
+        };
+
+        let raw_end = (end_f * hop).clamp((start_samp + sr / 80).min(samples.len()), samples.len());
+        let max_end = (next_f * hop).min(samples.len());
+        let end_samp = snap_zero_crossing(samples, sample_rate, raw_end.min(max_end), 2.0, 1.8)
+            .clamp(start_samp.saturating_add(1), max_end.max(start_samp.saturating_add(1)))
+            .min(samples.len());
+
+        let s_sec = start_samp as f64 / sample_rate as f64;
+        let e_sec = end_samp as f64 / sample_rate as f64;
+        if e_sec - s_sec >= 0.01 {
+            out.push((s_sec, e_sec));
+            prev_end_samp = end_samp;
+        }
+    }
+    if out.is_empty() {
+        vec![(0.0, dur)]
+    } else {
+        out
+    }
+}
+
 /// Spectral tilt (the up/down elevation cue): `tilt` +1 = bright/airy
 /// (highs up, lows down), -1 = dark/heavy. One-pole split at 800 Hz,
 /// streaming-safe.

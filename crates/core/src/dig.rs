@@ -417,6 +417,233 @@ pub fn provenance_of(hit: &VideoHit, query: &str, window: (f64, f64)) -> Provena
     }
 }
 
+/// Compact metadata card returned by [`search_youtube`], ready for Add-sheet UI
+/// cards and direct download via [`fetch_link`] / [`fetch_link_window`].
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+pub struct YoutubeSearchHit {
+    pub id: String,
+    pub title: String,
+    pub url: String,
+    pub views: Option<u64>,
+    pub duration: Option<f64>,
+    pub uploader: String,
+    pub upload_date: String,
+}
+
+impl From<VideoHit> for YoutubeSearchHit {
+    fn from(h: VideoHit) -> Self {
+        let url = if h.url.is_empty() && !h.id.is_empty() {
+            format!("https://www.youtube.com/watch?v={}", h.id)
+        } else {
+            h.url
+        };
+        YoutubeSearchHit {
+            id: h.id,
+            title: h.title,
+            url,
+            views: h.views,
+            duration: h.duration,
+            uploader: h.uploader,
+            upload_date: h.upload_date,
+        }
+    }
+}
+
+/// Search YouTube via `yt-dlp` (`ytsearch{N}:{query} --dump-json --flat-playlist`),
+/// returning up to `max_results` non-live video cards that [`fetch_link`] can pull.
+///
+/// When `low_views` is `true`, keeps obscure/forgotten uploads (`< 5_000` views,
+/// sorting lowest views first) and over-fetches `3x` candidates so low-view gems
+/// surface reliably.
+pub fn search_youtube(
+    query: &str,
+    max_results: usize,
+    low_views: bool,
+) -> MediaResult<Vec<YoutubeSearchHit>> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Ok(Vec::new());
+    }
+    let want = max_results.clamp(1, 50);
+    let fetch_n = if low_views { (want * 3).min(60) } else { want } as u32;
+    let hits = crate::media::backend().search_videos(q, fetch_n)?;
+    let mut cards: Vec<YoutubeSearchHit> = hits
+        .into_iter()
+        .filter(|h| !h.live && !h.url.is_empty())
+        .filter(|h| !low_views || h.views.is_none_or(|v| v < 5_000))
+        .map(YoutubeSearchHit::from)
+        .collect();
+    if low_views {
+        cards.sort_by_key(|c| c.views.unwrap_or(u64::MAX));
+    }
+    cards.truncate(want);
+    Ok(cards)
+}
+
+/// Pollable background job for non-blocking [`search_youtube_async`] calls from UI threads.
+#[derive(Debug, Clone)]
+pub struct SearchJob {
+    state: Arc<Mutex<Option<MediaResult<Vec<YoutubeSearchHit>>>>>,
+}
+
+impl SearchJob {
+    /// True once the search thread has finished.
+    pub fn is_finished(&self) -> bool {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    }
+
+    /// Take the completed search result (`None` while still running or after taken).
+    pub fn take_results(&self) -> Option<MediaResult<Vec<YoutubeSearchHit>>> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    /// Block until the search finishes (for tests / CLI tools).
+    pub fn wait(&self) -> MediaResult<Vec<YoutubeSearchHit>> {
+        loop {
+            if let Some(res) = self.take_results() {
+                return res;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+}
+
+/// Non-blocking wrapper around [`search_youtube`] for UI sheets.
+pub fn search_youtube_async(query: &str, max_results: usize, low_views: bool) -> SearchJob {
+    let state = Arc::new(Mutex::new(None));
+    let st = state.clone();
+    let q = query.to_string();
+    std::thread::spawn(move || {
+        let res = search_youtube(&q, max_results, low_views);
+        *st.lock().unwrap_or_else(|e| e.into_inner()) = Some(res);
+    });
+    SearchJob { state }
+}
+
+/// Download `url` (`<= 480p`) and decode only the `[start_secs, start_secs + len_secs]`
+/// window into a [`Source`] with full [`Provenance`].
+pub fn fetch_link_window(url: &str, start_secs: f64, len_secs: f64, opts: DigOptions) -> Job {
+    let job = Job::new();
+    let (j, url) = (job.clone(), url.to_string());
+    std::thread::spawn(move || {
+        let r = (|| -> MediaResult<Source> {
+            let backend = crate::media::backend();
+            j.set(JobStatus::Searching { query: url.clone(), attempt: 1 });
+            let hit = backend
+                .video_info(&url)
+                .unwrap_or_else(|_| VideoHit { url: url.clone(), ..Default::default() });
+            if !hit.title.is_empty() {
+                j.set_title(&hit.title);
+            }
+            cancelled(&j)?;
+            j.set(JobStatus::Downloading(0.0));
+            let path = backend.download_video(&url, &opts.cache_dir, 480, &mut |p| {
+                j.set(JobStatus::Downloading(p))
+            })?;
+            cancelled(&j)?;
+            j.set(JobStatus::Cutting);
+            let start = start_secs.max(0.0);
+            let len = len_secs.clamp(0.25, 600.0);
+            let mut src = crate::media::load_source_window(&path, start, len, opts.sample_rate)?;
+            src.name = source_name(&hit, &path);
+            let actual_len = src.duration();
+            src.provenance = Some(provenance_of(
+                &VideoHit {
+                    url: if hit.url.is_empty() { url.clone() } else { hit.url.clone() },
+                    ..hit
+                },
+                "",
+                (start, actual_len),
+            ));
+            Ok(src)
+        })();
+        j.finish(r);
+    });
+    job
+}
+
+/// Discover mounted Google Drive roots on desktop (`~/Library/CloudStorage/GoogleDrive-*`
+/// and `/Volumes/GoogleDrive*` on macOS, advancing directly into `My Drive` when present
+/// while also keeping `Shared drives` reachable). Returns an empty `Vec` on iOS.
+#[cfg(not(target_os = "ios"))]
+pub fn discover_google_drive_roots() -> Vec<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let cloud_storage = home.as_ref().map(|h| h.join("Library").join("CloudStorage"));
+    let volumes = std::path::Path::new("/Volumes");
+    discover_google_drive_roots_in(cloud_storage.as_deref(), Some(volumes))
+}
+
+/// Stub on iOS so cross-platform callers compile without `#[cfg]` gates.
+#[cfg(target_os = "ios")]
+pub fn discover_google_drive_roots() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+/// Testable helper scanning `cloud_storage_dir` (`GoogleDrive-*`) and `volumes_dir`
+/// (`GoogleDrive*`) for mounted Google Drive directories.
+#[cfg(not(target_os = "ios"))]
+pub fn discover_google_drive_roots_in(
+    cloud_storage_dir: Option<&std::path::Path>,
+    volumes_dir: Option<&std::path::Path>,
+) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let mut push_drive_mount = |mount: PathBuf| {
+        if !mount.is_dir() {
+            return;
+        }
+        let my_drive = mount.join("My Drive");
+        if my_drive.is_dir() {
+            if !roots.contains(&my_drive) {
+                roots.push(my_drive);
+            }
+            let shared = mount.join("Shared drives");
+            if shared.is_dir() && !roots.contains(&shared) {
+                roots.push(shared);
+            }
+        } else if !roots.contains(&mount) {
+            roots.push(mount);
+        }
+    };
+
+    if let Some(cs) = cloud_storage_dir {
+        if let Ok(entries) = std::fs::read_dir(cs) {
+            let mut mounts: Vec<PathBuf> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("GoogleDrive-") || n.starts_with("GoogleDrive"))
+                })
+                .collect();
+            mounts.sort();
+            for m in mounts {
+                push_drive_mount(m);
+            }
+        }
+    }
+
+    if let Some(vols) = volumes_dir {
+        if let Ok(entries) = std::fs::read_dir(vols) {
+            let mut mounts: Vec<PathBuf> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("GoogleDrive") || n == "Google Drive")
+                })
+                .collect();
+            mounts.sort();
+            for m in mounts {
+                push_drive_mount(m);
+            }
+        }
+    }
+
+    roots
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -593,6 +820,52 @@ mod tests {
         let dir = finds("linkfail", &[], &[]);
         let st = with_stub(&dir, || fetch_link("https://www.youtube.com/watch?v=missing", opts(&dir, 1)).wait());
         assert!(matches!(st, JobStatus::Failed(ref e) if e.contains("no media")), "{st:?}");
+    }
+
+    #[test]
+    fn search_youtube_returns_cards_and_filters_low_views() {
+        let hits = [
+            flat("viral99", 250_000, 95.0, false),
+            flat("livecam", 12, 90.0, true),
+            flat("gem_mid", 410, 48.0, false),
+            flat("gem_low", 19, 62.0, false),
+        ];
+        let dir = finds("ytsearch", &hits, &[("gem_low", "")]);
+        let (all_cards, low_cards, win_src) = with_stub(&dir, || {
+            let all = search_youtube("VHS home movie", 10, false).expect("all search");
+            let low = search_youtube_async("IMG_0042", 10, true).wait().expect("low-view search");
+            let job = fetch_link_window(&low[0].url, 5.0, 12.0, opts(&dir, 1));
+            assert_eq!(job.wait(), JobStatus::Done);
+            (all, low, job.take_source().expect("windowed link source"))
+        });
+        assert_eq!(all_cards.len(), 3, "live stream excluded, 3 VOD cards kept");
+        assert_eq!(low_cards.len(), 2, "viral >5k filtered out in low_views mode");
+        assert_eq!(low_cards[0].id, "gem_low", "lowest views sorted first");
+        assert_eq!(low_cards[1].id, "gem_mid");
+        assert!((win_src.duration() - 12.0).abs() < 0.05);
+        assert_eq!(win_src.provenance.unwrap().window.0, 5.0);
+    }
+
+    #[test]
+    fn google_drive_discovery_finds_cloud_storage_and_volumes() {
+        let base = std::env::temp_dir().join(format!("cg-gdrive-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let cs = base.join("CloudStorage");
+        let vols = base.join("Volumes");
+        let my_drive = cs.join("GoogleDrive-artist@example.com").join("My Drive");
+        let shared = cs.join("GoogleDrive-artist@example.com").join("Shared drives");
+        let vol_drive = vols.join("GoogleDrive");
+        std::fs::create_dir_all(&my_drive).unwrap();
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::create_dir_all(&vol_drive).unwrap();
+        std::fs::create_dir_all(cs.join("OneDrive-other")).unwrap();
+
+        let roots = discover_google_drive_roots_in(Some(&cs), Some(&vols));
+        assert!(roots.contains(&my_drive), "found My Drive: {roots:?}");
+        assert!(roots.contains(&shared), "found Shared drives: {roots:?}");
+        assert!(roots.contains(&vol_drive), "found /Volumes/GoogleDrive: {roots:?}");
+        assert_eq!(roots.len(), 3);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Real network dig (yt-dlp + ffmpeg on PATH):
