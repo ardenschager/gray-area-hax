@@ -70,18 +70,35 @@ impl Studio {
             }
             match pad.source {
                 Some(src) => {
+                    let base_frame = pad
+                        .name
+                        .as_deref()
+                        .and_then(|s| s.rsplit_once(" · "))
+                        .and_then(|(_, tail)| tail.parse::<usize>().ok())
+                        .and_then(|n| {
+                            let pp = host.project().lock().unwrap();
+                            let so = pp.sources.get(src)?;
+                            let sl = so.slices.get(n.checked_sub(1)?)?;
+                            Some(atlas::frame_at((sl.start / so.duration().max(1e-6)) as f32))
+                        })
+                        .unwrap_or(5);
                     if let Some((tex, a)) = self.atlas(host, &ctx, src) {
-                        let frame = if on && playing { ((now * 4.0) as usize) % atlas::FRAMES } else { 5 };
+                        let frame = if on && playing { (base_frame + (now * 4.0) as usize) % atlas::FRAMES } else { base_frame };
                         tile(&p, rc, 10, tex, a.uv_cover(frame, pw / ph), gray(if on { 0.95 } else { 0.5 }));
                     } else {
                         p.rect_filled(rc, r(10), G2);
                     }
                     // Label + mode glyph on a soft bottom scrim.
                     let scrim = Rect::from_min_max(egui::pos2(rc.left(), rc.bottom() - 30.0), rc.max);
-                    p.rect_filled(scrim, egui::CornerRadius { nw: 0, ne: 0, sw: 10, se: 10 }, Color32::from_black_alpha(70));
-                    let room = ((pw - 40.0) / 6.6).max(3.0) as usize;
-                    let label = pad.name.clone().unwrap_or_else(|| self.source_name(host, src));
-                    let name = short(&label, room.min(18));
+                    p.rect_filled(scrim, egui::CornerRadius { nw: 0, ne: 0, sw: 10, se: 10 }, Color32::from_black_alpha(120));
+                    let room = ((pw - 26.0) / 5.5).max(6.0) as usize;
+                    let raw_label = pad.name.clone().unwrap_or_else(|| self.source_name(host, src));
+                    let label = super::strip_media_ext(&raw_label);
+                    let cap = room.min(20);
+                    let name = match label.rsplit_once(" · ") {
+                        Some((head, tail)) if tail.len() + 3 < cap => format!("{} · {tail}", short(head, cap - tail.len() - 3)),
+                        _ => short(label, cap),
+                    };
                     p.text(egui::pos2(rc.left() + 10.0, rc.bottom() - 9.0), Align2::LEFT_BOTTOM, name, font_medium(11.5), if on { INK } else { INK2 });
                     let icon = match pad.kind {
                         PadKind::Loop => Icon::Loop,

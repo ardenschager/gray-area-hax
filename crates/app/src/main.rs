@@ -367,6 +367,7 @@ pub struct App {
     /// Live pad hits for the GPU preview, on the app clock.
     live_events: Vec<(usize, u8, chromagrain_core::grain::GrainEvent)>,
     live_id: u64,
+    pad_tiles: chromagrain_core::tile::TileAssigner,
     app_clock: Clock,
     /// `app_clock` seconds of the last engine sync (throttle).
     last_sync: f64,
@@ -514,6 +515,7 @@ impl App {
             cc_mappings: Vec::new(),
             live_events: Vec::new(),
             live_id: 0,
+            pad_tiles: chromagrain_core::tile::TileAssigner::new(),
             app_clock: Clock::Wall(std::time::Instant::now()),
             last_sync: 0.0,
             youtube_url: String::new(),

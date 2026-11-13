@@ -40,6 +40,16 @@ impl Peaks {
             lo[k] = mn.clamp(-1.0, 1.0);
             hi[k] = mx.clamp(-1.0, 1.0);
         }
+        let peak = lo.iter().chain(&hi).map(|v| v.abs()).fold(0.0f32, f32::max);
+        if peak > 1e-4 {
+            let scale = (0.92 / peak).min(14.0);
+            for v in &mut lo {
+                *v = (*v * scale).clamp(-1.0, 1.0);
+            }
+            for v in &mut hi {
+                *v = (*v * scale).clamp(-1.0, 1.0);
+            }
+        }
         Some(Peaks { lo, hi, secs: a.duration() })
     }
 

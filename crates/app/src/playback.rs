@@ -337,9 +337,9 @@ impl Driver {
     fn swap(&mut self, mut next: RealtimeAudio) {
         next.adopt_live(&mut self.engine);
         let old = std::mem::replace(&mut self.engine, next);
-        // An already-fading engine is simply dropped (rare: two swaps
-        // within a few ms).
-        if old.transport {
+        // An already-fading engine keeps fading (if two swaps arrive in the
+        // same block, e.g. set_project + Play, keep the real playing engine).
+        if old.transport && self.prev.is_none() {
             self.prev = Some((old, SWAP_XFADE));
         }
     }

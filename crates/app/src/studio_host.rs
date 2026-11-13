@@ -118,6 +118,16 @@ impl Host for App {
     }
     fn release_voice(&mut self, voice: u64) {
         self.playback.release_voice(voice);
+        if voice != 0 {
+            let now = self.app_clock.secs();
+            for (_, _, ev) in &mut self.live_events {
+                if ev.tag.voice == voice {
+                    if let Some(env) = &mut ev.tag.env {
+                        env.off = env.off.min(now);
+                    }
+                }
+            }
+        }
     }
     fn set_bus(&mut self, bus: u8, chain: Vec<AvEffect>) {
         self.playback.set_bus(bus, chain);
@@ -301,28 +311,52 @@ impl Host for App {
 impl PerformHost for App {
     fn pads(&self) -> Vec<Pad> {
         let p = self.project.lock().unwrap();
+        let now = self.app_clock.secs();
         (0..PADS)
             .map(|i| {
                 let t = p.tracks.get(i);
                 let clip = t.and_then(|t| t.clips.first());
+                let is_slice_pad = t.is_some_and(|t| t.name.contains(" · "));
                 let (source, kind, len) = match clip {
                     Some(c) => {
                         let (s, k) = match c.kind {
+                            ClipKind::Snippet if is_slice_pad => (Some(c.source), PadKind::Chop),
                             ClipKind::Snippet => (Some(c.source), PadKind::Loop),
                             ClipKind::Granular => (Some(c.source), PadKind::Cloud),
-                            ClipKind::Pattern(pid) => (p.patterns.get(pid).and_then(|pat| pat.rows.first()).map(|r| r.source), PadKind::Chop),
+                            ClipKind::Pattern(pid) => {
+                                let pat_src = if c.source > 0 && c.source < p.sources.len() {
+                                    Some(c.source)
+                                } else {
+                                    p.patterns
+                                        .get(pid)
+                                        .and_then(|pat| {
+                                            pat.rows
+                                                .iter()
+                                                .find(|r| !r.muted && r.steps.iter().any(|s| s.on))
+                                                .or_else(|| pat.rows.iter().find(|r| !r.muted))
+                                                .or_else(|| pat.rows.first())
+                                        })
+                                        .map(|r| r.source)
+                                };
+                                (pat_src, PadKind::Chop)
+                            }
                         };
                         (s, k, c.length_beats)
                     }
                     None => (None, PadKind::Loop, 4.0),
                 };
+                let one_shot_on = self.live_events.iter().any(|(_, _, e)| {
+                    (e.tag.voice >> 32) == (0x50AD_0000 | i as u64)
+                        && now >= e.onset
+                        && now < e.tag.env.map_or(e.end(), |v| v.end().min(e.end()))
+                });
                 Pad {
                     source,
                     // A named pad track (not the default "pad N") names the pad.
                     name: t.filter(|t| !t.name.starts_with("pad ") && !t.name.is_empty()).map(|t| t.name.clone()),
                     kind,
                     len_beats: len,
-                    on: t.is_some_and(|t| !t.muted) && source.is_some(),
+                    on: ((t.is_some_and(|t| !t.muted) && !is_slice_pad) || one_shot_on) && source.is_some(),
                     queued: self.pending.iter().find(|(pi, _)| *pi == i).map(|(_, on)| *on),
                 }
             })
@@ -345,10 +379,20 @@ impl PerformHost for App {
         let Some(src) = p.sources.get(source) else { return };
         let (src_len, name) = (src.duration(), src.name.clone());
         let n = src.slices.iter().position(|sl| (sl.start - t0).abs() < 1e-6).map_or(0, |k| k + 1);
-        let slice_beats = p.secs_to_beats((t1 - t0).max(0.0));
+        let slice_dur = (t1 - t0).max(0.05);
+        let slice_beats = p.secs_to_beats(slice_dur);
         let mut clip = build_clip(&mut p, source, 0.0, PlayMode::Snippet);
-        // The slice, looping at its own length (quarter beats, at least one).
+        // The slice: start position, duration in seconds, and a crisp Cut envelope.
         clip.grains.position = if src_len > 0.0 { (t0 / src_len) as f32 } else { 0.0 };
+        clip.grains.duration = slice_dur as f32;
+        clip.grains.adsr = Some(chromagrain_core::envelope::Adsr {
+            attack: 0.005,
+            decay: 0.08,
+            sustain: 0.9,
+            release: 0.14,
+            picture: chromagrain_core::envelope::PictureCut::Cut,
+            ..Default::default()
+        });
         clip.length_beats = ((slice_beats * 4.0).floor() / 4.0).max(0.25);
         let tracks = if perform { &mut p.tracks } else { &mut self.other_tracks };
         while tracks.len() < PADS {
@@ -365,12 +409,19 @@ impl PerformHost for App {
         self.project.lock().unwrap().tracks.get(i).and_then(|t| t.clips.first()).and_then(|c| c.grains.adsr)
     }
     fn set_pad_env(&mut self, i: usize, adsr: chromagrain_core::envelope::Adsr) {
+        let mut picture_flipped = false;
         if let Some(t) = self.project.lock().unwrap().tracks.get_mut(i) {
             for c in &mut t.clips {
+                if c.grains.adsr.is_some_and(|old| old.picture != adsr.picture) {
+                    picture_flipped = true;
+                }
                 c.grains.adsr = Some(adsr);
             }
         }
         self.mark();
+        if picture_flipped {
+            self.toggle_pad(i);
+        }
     }
     fn quantize(&self) -> usize {
         match self.launch_q {

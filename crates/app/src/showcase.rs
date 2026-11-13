@@ -67,6 +67,10 @@ pub enum Gesture {
     /// pointer: multi-touch).
     Touch(Vec<Aim>, f64),
     Key(egui::Key),
+    /// Paste text into the focused field.
+    Paste(&'static str),
+    /// State / musical setup hook at this timestamp (no finger ring).
+    Custom(fn(&mut App)),
     /// Turn a knob: press on it and drag vertically by `dy` points at
     /// each (seconds, dy) key. The ring stays on the knob.
     Knob(&'static str, Vec<(f64, f32)>),
@@ -86,6 +90,8 @@ pub struct Caption {
 pub struct Tour {
     pub cues: Vec<Cue>,
     pub captions: Vec<Caption>,
+    pub title_sub: &'static str,
+    pub end_sub: &'static str,
     /// Title card fades out by this time; the end card fades in from
     /// `end_card`; the film ends at `len`.
     pub title_until: f64,
@@ -98,7 +104,7 @@ impl Gesture {
         match self {
             Gesture::Tap(_) => 0.14,
             Gesture::Hold(_, s) | Gesture::Drag(_, s) | Gesture::Touch(_, s) => *s,
-            Gesture::Key(_) => 0.0,
+            Gesture::Key(_) | Gesture::Paste(_) | Gesture::Custom(_) => 0.0,
             Gesture::Knob(_, keys) => keys.last().map_or(0.0, |k| k.0),
         }
     }
@@ -200,7 +206,556 @@ pub fn tour() -> Tour {
     at(p + 13.8, Tap(lab("mini pad 5")));
     at(p + 14.4, Tap(lab("mini pad 6")));
     at(p + 15.0, Tap(lab("mini pad 7")));
-    Tour { cues, captions: cap, title_until: 2.0, end_card: p + 19.6, len: p + 24.2 }
+    Tour {
+        cues,
+        captions: cap,
+        title_sub: "a granular video sampler",
+        end_sub: "play  ·  sequence  ·  perform",
+        title_until: 2.0,
+        end_card: p + 19.6,
+        len: p + 24.2,
+    }
+}
+
+fn film2_after_file_add(app: &mut App) {
+    if let Some(s) = app.project.lock().unwrap().sources.get_mut(0) {
+        s.name = "fountain keys".into();
+        s.base_hz = 174.614;
+    }
+    let e = &mut app.studio.emitters[0];
+    e.col = 0;
+    e.row = 1.6;
+    e.held = true;
+    e.macros = [0.22, 0.5, 0.18, 0.0];
+    e.adsr.sustain = 0.55;
+    e.adsr.release = 0.45;
+}
+
+fn film2_after_browse_add(app: &mut App) {
+    if let Some(s) = app.project.lock().unwrap().sources.get_mut(1) {
+        s.name = "vocal bench".into();
+        s.base_hz = 391.995;
+    }
+    chromagrain_ui::Host::audition(app, 1, 0.35, 2.55);
+}
+
+fn film2_after_link_add(app: &mut App) {
+    chromagrain_ui::Host::audition(app, 2, 0.0, 1.85);
+}
+
+fn film2_after_dig1_add(app: &mut App) {
+    chromagrain_ui::Host::audition(app, 3, 8.2, 10.6);
+}
+
+fn film2_before_close_add(app: &mut App) {
+    chromagrain_ui::Host::stop_audition(app);
+}
+
+fn film2_release_intro_emitter(app: &mut App) {
+    app.studio.emitters[0].held = false;
+    app.studio.emitters[1].col = 3;
+    app.studio.emitters[1].row = 5.6;
+    app.studio.emitters[1].macros = [0.42, 0.5, 0.28, 0.0];
+}
+
+fn film2_start_chop_bed(app: &mut App) {
+    let e = &mut app.studio.emitters[0];
+    e.col = 0;
+    e.row = 1.4;
+    e.held = true;
+    e.adsr.sustain = 0.26;
+}
+
+fn film2_after_slices_to_pads(app: &mut App) {
+    app.studio.emitters[0].held = false;
+    app.launch_q = crate::LaunchQ::Now;
+    let mut p = app.project.lock().unwrap();
+    let n_src = p.sources.len();
+    // Pads 1–4 hold Playing Vinyl · 1..4 (one-shot slice pads, 0.62s each).
+    for i in 0..4 {
+        if let Some(t) = p.tracks.get_mut(i) {
+            t.muted = true;
+            for c in &mut t.clips {
+                c.grains.duration = 0.62;
+            }
+        }
+    }
+    let campfire_src = p
+        .sources
+        .iter()
+        .position(|s| s.name.to_lowercase().contains("campfire"))
+        .unwrap_or(n_src.saturating_sub(1));
+    // Deduplicated labels & matched thumbnails on Pads 5–8.
+    let labels = [
+        (4usize, 0usize, "fountain keys"),
+        (5usize, 1usize, "vocal bench"),
+        (6usize, 3usize, "rhodes & piano"),
+        (7usize, campfire_src, "campfire"),
+    ];
+    for (pad_i, src_i, name) in labels {
+        if src_i < n_src && pad_i < p.tracks.len() {
+            let mut c = crate::build_clip(&mut p, src_i, 0.0, crate::PlayMode::Snippet);
+            c.length_beats = 4.0;
+            c.grains.gain = 0.48;
+            p.tracks[pad_i].name = name.into();
+            p.tracks[pad_i].clips = vec![c];
+            p.tracks[pad_i].muted = true;
+        }
+    }
+    // Rows 3–4 (Pads 9–15): clean cloud pad names without extensions or " cloud" suffix.
+    for i in 8..15 {
+        let src_i = (i - 8) % n_src.max(1);
+        if src_i < n_src && i < p.tracks.len() {
+            let clean = chromagrain_ui::studio::strip_media_ext(&p.sources[src_i].name).to_string();
+            let mut c = crate::build_clip(&mut p, src_i, 0.0, crate::PlayMode::Grains);
+            c.length_beats = 4.0;
+            p.tracks[i].name = clean;
+            p.tracks[i].clips = vec![c];
+            p.tracks[i].muted = true;
+        }
+    }
+}
+
+fn film2_open_pad1_sheet(app: &mut App) {
+    {
+        let mut p = app.project.lock().unwrap();
+        if let Some(t) = p.tracks.get_mut(0) {
+            for c in &mut t.clips {
+                c.grains.duration = 0.92;
+            }
+        }
+    }
+    app.toggle_pad(0);
+}
+
+fn film2_widen_slice_dur(app: &mut App) {
+    app.pad_tiles = chromagrain_core::tile::TileAssigner::new();
+    let mut p = app.project.lock().unwrap();
+    for i in 0..4 {
+        if let Some(t) = p.tracks.get_mut(i) {
+            for c in &mut t.clips {
+                c.grains.duration = 1.65;
+                if let Some(adsr) = c.grains.adsr.as_mut() {
+                    adsr.decay = 0.12;
+                    adsr.sustain = 0.92;
+                    adsr.release = 0.14;
+                    adsr.picture = chromagrain_core::envelope::PictureCut::Cut;
+                }
+            }
+        }
+    }
+}
+
+/// Start `Pad 5` (`fountain keys`, `src = 0`) held in `slot 0` (Left tile, panned Left `-0.80`)
+/// so that tapping `Pad 1` (`Playing Vinyl · 1`) and `Pad 2` (`Playing Vinyl · 2`) naturally
+/// claims `slot 1` (Right tile, panned Right `+0.80`) via `fire_pad_slice` and cuts out on release.
+fn film2_hold_left_pad5(app: &mut App) {
+    let now = app.app_clock.secs();
+    for (_, _, ev) in &app.live_events {
+        if ev.tag.voice != 0 {
+            app.playback.release_voice(ev.tag.voice);
+        }
+    }
+    app.live_events.clear();
+    app.pad_tiles = chromagrain_core::tile::TileAssigner::new();
+    {
+        let mut p = app.project.lock().unwrap();
+        if let Some(t) = p.tracks.get_mut(4) {
+            t.muted = true;
+        }
+        for i in 0..2 {
+            if let Some(t) = p.tracks.get_mut(i) {
+                for c in &mut t.clips {
+                    c.grains.duration = 0.82;
+                    if let Some(adsr) = c.grains.adsr.as_mut() {
+                        adsr.decay = 0.08;
+                        adsr.sustain = 0.92;
+                        adsr.release = 0.08;
+                        adsr.picture = chromagrain_core::envelope::PictureCut::Cut;
+                    }
+                }
+            }
+        }
+    }
+    let v_left = (0x50AD_0000_0000 | (4u64 << 32)) | 901;
+    let _ = app.pad_tiles.assign_keyed(v_left, 5, now);
+    app.pad_tiles.release(v_left, now + 3.95);
+    let adsr = chromagrain_core::envelope::Adsr {
+        attack: 0.01,
+        decay: 0.10,
+        sustain: 0.92,
+        release: 0.12,
+        picture: chromagrain_core::envelope::PictureCut::Cut,
+        ..Default::default()
+    };
+    let env = Some(chromagrain_core::envelope::VoiceEnv { adsr, on: now, off: now + 3.83 });
+    chromagrain_ui::Host::fire(
+        app,
+        0,
+        0,
+        chromagrain_core::grain::GrainEvent {
+            onset: now,
+            source_pos: 0.15,
+            duration: 3.95,
+            pitch_ratio: 1.0,
+            gain: 0.38,
+            pan: -0.80,
+            envelope: 0.02,
+            env_skew: 0.0,
+            reverse: false,
+            id: v_left,
+            tag: chromagrain_core::grain::VoiceTag { voice: v_left, env, tile: Some(0) },
+        },
+    );
+}
+
+fn film2_setup_sequence(app: &mut App) {
+    use chromagrain_core::envelope::{Adsr, PictureCut};
+    use chromagrain_core::fx::{AvEffect, EffectKind};
+    use chromagrain_core::music::{Key, ScaleKind};
+    let key = Key { root: 5, scale: ScaleKind::Minor };
+    app.studio.key = key;
+    let cut_adsr = |rel: f32| {
+        Some(Adsr {
+            attack: 0.005,
+            decay: 0.06,
+            sustain: 0.92,
+            release: rel,
+            picture: PictureCut::Cut,
+            ..Default::default()
+        })
+    };
+    {
+        let mut p = app.project.lock().unwrap();
+        p.bpm = 124.0;
+        p.layout = chromagrain_core::tile::Layout::Tile;
+        if p.master_effects.is_empty() {
+            p.master_effects.push(AvEffect {
+                video: 0.0,
+                ..AvEffect::new(EffectKind::Reverb { size: 0.48, damp: 0.48, mix: 0.14 })
+            });
+        }
+        // Syncopated 4-lane pocket in F minor so `fountain keys` (steps 1, 9) and
+        // `rhodes` (off-beats 4, 12) call-and-response without harmonic collision,
+        // while `Playing Vinyl` kick (1, 7, 11) and snare (5, 13) lock the groove:
+        if let Some(pid) = app.studio.seq.scene_pats[0] {
+            if let Some(pat) = p.patterns.get_mut(pid) {
+                pat.swing = 0.04;
+                // Row 0 (slot 0): fountain keys — steps 1, 9 (0-indexed 0, 8) + pickup 15 (0-indexed 14)
+                if let Some(r) = pat.rows.get_mut(0) {
+                    r.key = Some(key);
+                    r.grains.duration = 0.42;
+                    r.grains.gain = 0.56;
+                    r.grains.envelope = 0.04;
+                    r.grains.adsr = cut_adsr(0.05);
+                    for &(s, sl) in &[(0usize, 0.05f32), (8, 0.40), (14, 0.66)] {
+                        r.steps[s].on = true;
+                        r.steps[s].slice = sl;
+                    }
+                }
+                // Row 1 (slot 1): vocal bench — syncopated steps 3, 11 (0-indexed 2, 10); steps 7 & 15 tapped live!
+                if let Some(r) = pat.rows.get_mut(1) {
+                    r.key = Some(key);
+                    r.grains.duration = 0.36;
+                    r.grains.gain = 0.62;
+                    r.grains.pan = -0.22;
+                    r.grains.envelope = 0.04;
+                    r.grains.adsr = cut_adsr(0.05);
+                    r.grains.quantize_amount = 1.0;
+                    for &(s, sl, pt) in &[(2usize, 0.04f32, 0.0f32), (10, 0.28, 0.0)] {
+                        r.steps[s].on = true;
+                        r.steps[s].slice = sl;
+                        r.steps[s].pitch = pt;
+                    }
+                }
+                // Row 2 (slot 2): Playing Vinyl — kick (steps 1, 7) and snare (steps 5, 13) tapped live!
+                if let Some(r) = pat.rows.get_mut(2) {
+                    r.grains.duration = 0.36;
+                    r.grains.gain = 0.88;
+                    r.grains.envelope = 0.03;
+                    r.grains.adsr = cut_adsr(0.05);
+                    for (idx, st) in r.steps.iter_mut().enumerate() {
+                        st.length = 0.42;
+                        st.slice_index = Some(if idx == 4 || idx == 12 { 1 } else { 0 });
+                    }
+                }
+                // Row 3 (slot 3): rhodes and piano (in F minor) — off-beat stabs on steps 4, 12 (0-indexed 3, 11)
+                if let Some(r) = pat.rows.get_mut(3) {
+                    r.key = Some(key);
+                    r.grains.duration = 0.36;
+                    r.grains.gain = 0.58;
+                    r.grains.pan = 0.24;
+                    r.grains.envelope = 0.04;
+                    r.grains.adsr = cut_adsr(0.05);
+                    for &(s, sl) in &[(3usize, 0.74f32), (11, 0.84)] {
+                        r.steps[s].on = true;
+                        r.steps[s].slice = sl;
+                    }
+                }
+            }
+        }
+    }
+    if app.playback.is_playing() {
+        app.toggle_play();
+    }
+    app.seek(0.0);
+    app.studio.seq.chain = vec![(0, 4)];
+    app.studio.rev += 1;
+    app.mark_now();
+}
+
+fn film2_setup_perform_climax(app: &mut App) {
+    // Prepare the Perform pads BEFORE switching from Sequence -> Perform so there
+    // is zero audio gap at the view transition, and give each pattern pad its own
+    // distinctive thumbnail source (`c.source`).
+    app.launch_q = crate::LaunchQ::Now;
+    {
+        let mut p = app.project.lock().unwrap();
+        let n_src = p.sources.len();
+        let campfire_src = p
+            .sources
+            .iter()
+            .position(|s| s.name.to_lowercase().contains("campfire"))
+            .unwrap_or(n_src.saturating_sub(1));
+        p.layout = chromagrain_core::tile::Layout::Tile;
+        if let Some(base_pid) = app.studio.seq.scene_pats[1].or(app.studio.seq.scene_pats[0]) {
+            let mut base_pat = p.patterns[base_pid].clone();
+            // Syncopate across 16 steps so tiles dance across subdivisions (1×1, 2×1, 2×2)
+            // with zero harmonic clashes and zero orphan 3-tile gaps:
+            // - Steps 0, 8 (beats 1, 3): all 4 rows fire together -> full 2×2 (4 tiles!)
+            // - Steps 3, 11 (off-beats 4, 12): rows 1 & 3 (vocal + rhodes) fire -> 2×1 (2 tiles!)
+            // - Steps 4, 12 (backbeats 5, 13): rows 0 & 2 (keys + vinyl snare) fire -> 2×1 (2 tiles!)
+            // - Steps 6, 14 (off-beats 7, 15): rows 0, 1, 2, 3 fire -> 2×2 (4 tiles!)
+            if let Some(r0) = base_pat.rows.get_mut(0) {
+                for s in &mut r0.steps {
+                    s.on = false;
+                }
+                for &(s, sl) in &[(0usize, 0.05f32), (4, 0.22), (6, 0.32), (8, 0.40), (12, 0.56), (14, 0.66)] {
+                    r0.steps[s].on = true;
+                    r0.steps[s].slice = sl;
+                }
+            }
+            if let Some(r1) = base_pat.rows.get_mut(1) {
+                for s in &mut r1.steps {
+                    s.on = false;
+                }
+                for &(s, sl, pt) in &[
+                    (0usize, 0.04f32, 0.0f32),
+                    (3, 0.14, 3.0),
+                    (6, 0.22, 0.0),
+                    (8, 0.28, 0.0),
+                    (11, 0.34, -2.0),
+                    (14, 0.40, 0.0),
+                ] {
+                    r1.steps[s].on = true;
+                    r1.steps[s].slice = sl;
+                    r1.steps[s].pitch = pt;
+                }
+            }
+            if let Some(r2) = base_pat.rows.get_mut(2) {
+                for s in &mut r2.steps {
+                    s.on = false;
+                }
+                for &(s, idx) in &[(0usize, 0u16), (4, 1), (6, 2), (8, 0), (12, 3), (14, 2)] {
+                    r2.steps[s].on = true;
+                    r2.steps[s].slice_index = Some(idx);
+                    r2.steps[s].length = 0.42;
+                }
+            }
+            if let Some(r3) = base_pat.rows.get_mut(3) {
+                for s in &mut r3.steps {
+                    s.on = false;
+                }
+                for &(s, sl) in &[(0usize, 0.74f32), (3, 0.78), (6, 0.82), (8, 0.86), (11, 0.76), (14, 0.88)] {
+                    r3.steps[s].on = true;
+                    r3.steps[s].slice = sl;
+                }
+            }
+            let groups: &[(usize, &str, &[usize], usize, bool)] = &[
+                (4, "keys + vocal", &[0, 1], 0, true),
+                (5, "vinyl + rhodes", &[2, 3], 3, true),
+                (6, "campfire air", &[0], campfire_src, false),
+                (7, "full groove", &[0, 1, 2, 3], 1, false),
+            ];
+            let mut updates = Vec::new();
+            for &(pad_i, name, rows, thumb_src, on) in groups {
+                let mut pat = base_pat.clone();
+                pat.name = name.into();
+                for (ri, row) in pat.rows.iter_mut().enumerate() {
+                    if !rows.contains(&ri) {
+                        row.muted = true;
+                    }
+                }
+                let pid = p.add_pattern(pat);
+                let mut c = chromagrain_core::timeline::Clip::new_pattern(pid, 0.0, 4.0);
+                c.source = thumb_src;
+                c.visual.feather = 0.0;
+                c.visual.additive = 0.0;
+                updates.push((pad_i, name.to_string(), c, !on));
+            }
+            let target_tracks = if app.mode == crate::AppMode::Perform {
+                &mut p.tracks
+            } else {
+                &mut app.other_tracks
+            };
+            for (pad_i, name, c, muted) in updates {
+                if pad_i < target_tracks.len() {
+                    target_tracks[pad_i].name = name;
+                    target_tracks[pad_i].clips = vec![c];
+                    target_tracks[pad_i].muted = muted;
+                }
+            }
+        }
+    }
+    app.fill_rev = 0;
+    if !app.playback.is_playing() {
+        app.toggle_play();
+    }
+    app.mark_now();
+}
+
+/// Film 2 (`spec_v003_dig-chop-tile-adsr.md`): start empty, add via Files /
+/// Browse / Link / Dig (1 + 4), chop Koala-style (`Tap`, drag edge, audition,
+/// `Slices -> pads` straight into Perform), finger-drum one-shot slices, shape
+/// pad ADSR (`Fade` vs `Cut` live), flip `stack | tile` with isolated Left/Right
+/// tile panning, sequence a 2-scene track, and perform in Fullscreen (~82 s).
+pub fn tour_film2() -> Tour {
+    use Gesture::*;
+    let mut cues = Vec::new();
+    let mut cap = Vec::new();
+    let mut at = |t: f64, g: Gesture| cues.push(Cue { t, g });
+    let mut say = |t0: f64, t1: f64, text: &'static str| cap.push(Caption { t0, t1, text });
+    let em = |i: usize| Aim::Emitter(i);
+    let rows = |i: usize, path: &[(f32, f32)]| -> Vec<Aim> { path.iter().map(|(dc, dr)| Aim::Off(Box::new(em(i)), *dc, *dr)).collect() };
+
+    // ---- Act 1: Start empty (no phantom chords!), add clips every way (Files · Browse · Link · Dig · Hold to dig 4).
+    at(2.1, Tap(lab("column 1").off(0.0, 48.0)));
+    say(2.2, 5.0, "start empty · add a file");
+    at(3.0, Tap(lab("choose files")));
+    at(3.6, Custom(film2_after_file_add));
+
+    at(5.2, Tap(lab("add Browse")));
+    say(5.7, 8.4, "browse your library");
+    at(5.8, Tap(lab("browse search")));
+    at(6.1, Paste("vocal"));
+    at(6.5, Tap(lab("browse item 1")));
+    at(7.1, Custom(film2_after_browse_add));
+
+    at(8.6, Tap(lab("add Link")));
+    say(9.1, 12.2, "paste any link · yt-dlp fetches it");
+    at(9.1, Tap(lab("link url")));
+    at(9.45, Paste("https://youtu.be/CA9rIqpteD8"));
+    at(9.9, Tap(lab("fetch link")));
+    at(11.05, Custom(film2_after_link_add));
+
+    at(12.4, Tap(lab("add Dig")));
+    say(12.9, 16.0, "dig · a creative commons video almost nobody has seen");
+    at(13.2, Tap(lab("dig")));
+    at(14.55, Custom(film2_after_dig1_add));
+
+    say(16.7, 20.4, "hold to dig 4 · placeholders fill the grid");
+    at(16.2, Hold(lab("dig"), 0.68));
+    at(17.5, Custom(film2_before_close_add));
+    at(17.6, Tap(lab("close sheet")));
+    at(20.6, Custom(film2_release_intro_emitter));
+
+    // ---- Act 2: Play the newly dug material on the grid (warm chords + Rhodes + vocal).
+    say(21.1, 25.8, "touch the grid · play what you found");
+    at(20.8, Touch(rows(0, &[(0.0, 0.0), (0.04, 0.8), (0.0, 1.8)]), 4.9));
+    at(21.5, Touch(rows(1, &[(0.0, 0.0), (0.0, 0.5), (-2.0, -3.8)]), 4.1));
+
+    // ---- Act 3: Koala-style Chop -> `Slices -> pads` opens Perform directly.
+    at(26.35, Custom(film2_start_chop_bed));
+    at(26.5, Hold(lab("column 3"), 0.65));
+    say(26.8, 31.0, "hold a clip to chop · tap as it plays");
+    at(27.4, Tap(lab("chop tap")));
+    at(28.1, Tap(lab("chop tap")));
+    at(28.8, Tap(lab("chop tap")));
+    at(29.5, Tap(lab("chop tap")));
+    at(30.2, Tap(lab("chop tap")));
+    at(30.75, Tap(lab("chop tap done")));
+
+    say(31.7, 34.4, "drag an edge · tap a slice to audition");
+    at(31.6, Drag(vec![lab("slice 1 end"), lab("slice 1 end").off(24.0, 0.0)], 0.7));
+    at(32.6, Tap(lab("chop wave").off(-200.0, 0.0)));
+    at(33.5, Tap(lab("chop wave").off(-10.0, 0.0)));
+
+    say(35.1, 38.5, "slices → pads · one slice per pad");
+    at(35.0, Tap(lab("slices to pads")));
+    at(35.3, Custom(film2_after_slices_to_pads));
+
+    // ---- Act 4: In Perform — finger-drum one-shot slices, shape ADSR (Fade vs Cut live), flip stack -> tile & L/R pan.
+    at(35.9, Tap(lab("pad 1")));
+    at(36.6, Tap(lab("pad 2")));
+    at(37.3, Tap(lab("pad 3")));
+    at(38.0, Tap(lab("pad 4")));
+
+    say(39.3, 43.1, "hold a pad · shape attack, decay, sustain, release");
+    at(39.0, Hold(lab("pad 1"), 0.55));
+    at(39.65, Custom(film2_open_pad1_sheet));
+    at(40.25, Drag(vec![lab("adsr R"), lab("adsr R").off(48.0, 0.0)], 0.7));
+    at(41.45, Drag(vec![lab("adsr D"), lab("adsr D").off(64.0, 92.0)], 0.7));
+
+    say(43.8, 48.0, "cut · full picture until the sound ends, or fade with it");
+    at(43.9, Tap(lab("picture fade")));
+    at(45.5, Tap(lab("picture cut")));
+    at(47.0, Tap(lab("close sheet")));
+    at(47.55, Tap(lab("pad 1")));
+
+    say(48.7, 52.0, "tile · every sounding voice claims a tile");
+    at(48.8, Tap(lab("layout tile")));
+    at(49.2, Custom(film2_widen_slice_dur));
+    at(49.4, Tap(lab("pad 1")));
+    at(49.8, Tap(lab("pad 2")));
+    at(50.2, Tap(lab("pad 3")));
+    at(50.6, Tap(lab("pad 4")));
+
+    say(52.7, 56.8, "left tile, left ear · stereo follows the grid");
+    at(52.5, Tap(lab("pad 5")));
+    at(52.75, Custom(film2_hold_left_pad5));
+    at(53.55, Tap(lab("pad 1")));
+    at(55.05, Tap(lab("pad 2")));
+
+    // ---- Act 5: Sequence a 2-scene track from the chops (driving multi-tile cuts on every beat).
+    at(57.4, Tap(lab("Sequence")));
+    at(57.7, Custom(film2_setup_sequence));
+    say(57.8, 61.4, "sequence what you dug · tap steps to build a groove");
+    at(58.0, Tap(lab("play")));
+    at(58.5, Tap(lab("lane 3 step 1")));
+    at(59.1, Tap(lab("lane 3 step 5")));
+    at(59.7, Tap(lab("lane 3 step 7")));
+    at(60.3, Tap(lab("lane 3 step 13")));
+    at(60.9, Tap(lab("lane 2 step 7")));
+
+    say(62.1, 65.4, "hold a step · pick one of the clip's own slices");
+    at(62.2, Hold(lab("lane 3 step 7"), 0.65));
+    at(63.4, Tap(lab("slice 3")));
+    at(64.5, Key(egui::Key::Escape));
+
+    say(66.1, 69.2, "an empty scene copies and extends the song");
+    at(66.3, Tap(lab("scene 2")));
+    at(67.2, Tap(lab("lane 4 step 11")));
+    at(67.9, Tap(lab("lane 2 step 15")));
+
+    // ---- Act 6: Perform & Fullscreen climax (rhythmic sharp cuts across tiles + HUD strip-back).
+    at(69.65, Custom(film2_setup_perform_climax));
+    at(69.7, Tap(lab("Perform")));
+    say(70.2, 73.4, "fullscreen · sharp cuts across every tile");
+    at(70.6, Tap(lab("Fullscreen")));
+
+    say(74.1, 77.0, "tap for the hud · launch or strip back on the bar");
+    at(74.2, Tap(Aim::Screen(0.5, 0.42)));
+    at(75.1, Tap(lab("mini pad 6")));
+
+    Tour {
+        cues,
+        captions: cap,
+        title_sub: "dig  ·  chop  ·  play",
+        end_sub: "dig  ·  chop  ·  tile  ·  perform",
+        title_until: 2.0,
+        end_card: 77.6,
+        len: 82.0,
+    }
 }
 
 // --------------------------------------------------------------- overlay
@@ -227,6 +782,8 @@ pub struct Overlay {
     /// Title card / end card opacity.
     title: f32,
     end: f32,
+    title_sub: &'static str,
+    end_sub: &'static str,
 }
 
 fn smooth(x: f64) -> f64 {
@@ -272,7 +829,9 @@ impl Overlay {
                 p.text(c, Align2::CENTER_CENTER, text, font(16.0), INK2.gamma_multiply(a));
             }
         }
-        for (a, lines) in [(self.title, ["chromagrain", "a granular video sampler"]), (self.end, ["chromagrain", "play  ·  sequence  ·  perform"])] {
+        let t_sub = if self.title_sub.is_empty() { "a granular video sampler" } else { self.title_sub };
+        let e_sub = if self.end_sub.is_empty() { "play  ·  sequence  ·  perform" } else { self.end_sub };
+        for (a, lines) in [(self.title, ["chromagrain", t_sub]), (self.end, ["chromagrain", e_sub])] {
             if a <= 0.0 {
                 continue;
             }
@@ -362,6 +921,7 @@ fn harness(opts: &RecordOpts) -> Harness<'static, Film> {
             app.playback.offline_latency = 1.0 / FPS;
             app.app_clock = Clock::Sim(0.0);
             app.studio.install_theme(&cc.egui_ctx);
+            app.studio.key = chromagrain_core::music::Key { root: 5, scale: chromagrain_core::music::ScaleKind::Minor };
             cc.egui_ctx.all_styles_mut(|s| s.animation_time = 0.2);
             match cc.wgpu_render_state.as_ref() {
                 Some(rs) => crate::gpu::install(rs),
@@ -452,14 +1012,88 @@ struct Live {
     last: Pos2,
 }
 
+fn harness_film2(opts: &RecordOpts) -> Harness<'static, Film> {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let demo_dir = manifest.join("../../assets/demo");
+    let stub = manifest.join("../../tools/ytdlp-stub");
+    let stub_dir = manifest.join("../../assets/dig-cc");
+    let _ = std::fs::remove_file(stub_dir.join(".calls"));
+    std::env::set_var(chromagrain_core::dig::YTDLP_ENV, &stub);
+    std::env::set_var("CHROMAGRAIN_YTDLP_STUB_DIR", &stub_dir);
+    std::env::set_var(chromagrain_core::dig::DIG_SEED_ENV, "42");
+    std::env::set_var(crate::browser::BROWSE_ROOT_ENV, &demo_dir);
+    let pick_file = demo_dir.join("night_chords.mp4");
+    Harness::builder()
+        .with_size(egui::vec2(opts.size.0, opts.size.1))
+        .with_pixels_per_point(opts.ppp)
+        .with_step_dt(1.0 / FPS as f32)
+        .wgpu()
+        .build_eframe(move |cc| {
+            let mut app = App::new(AppOpts { demo: false, classic: false, headless: true });
+            app.playback = crate::playback::Playback::new_offline();
+            app.playback.offline_latency = 1.0 / FPS;
+            app.app_clock = Clock::Sim(0.0);
+            app.adds.sim_clock = Some(0.0);
+            let p_file = pick_file.clone();
+            app.pick_override = Some(Box::new(move || vec![p_file.clone()]));
+            app.studio.install_theme(&cc.egui_ctx);
+            app.studio.key = chromagrain_core::music::Key { root: 5, scale: chromagrain_core::music::ScaleKind::Minor };
+            cc.egui_ctx.all_styles_mut(|s| s.animation_time = 0.2);
+            match cc.wgpu_render_state.as_ref() {
+                Some(rs) => crate::gpu::install(rs),
+                None => app.gpu_failed.store(true, std::sync::atomic::Ordering::Relaxed),
+            }
+            {
+                let mut p = app.project.lock().unwrap();
+                p.bpm = 124.0;
+                p.width = 480;
+                p.height = 270;
+            }
+            app.browser.ensure_started();
+            Film { app, overlay: Overlay::default() }
+        })
+}
+
 /// Render the tour: every frame to PNG (if asked) and the audio, in sync.
 pub fn record(tour: &Tour, opts: &RecordOpts) -> Recording {
     let mut h = harness(opts);
-    // Warm up at t = 0: fonts, atlases, the first engine sync.
     for _ in 0..6 {
         h.input_mut().time = Some(0.0);
         h.step();
     }
+    record_with(tour, opts, h, None)
+}
+
+/// Render Film 2 (starting from an empty studio, with pre-warmed Browse thumbnails).
+pub fn record_film2(tour: &Tour, opts: &RecordOpts) -> Recording {
+    let mut h = harness_film2(opts);
+    // Warm up fonts + pre-decode Browse thumbnails so the Browse tab is populated immediately.
+    let t0 = std::time::Instant::now();
+    while t0.elapsed().as_secs() < 8 && h.state().app.browser.collections.is_empty() {
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        h.input_mut().time = Some(0.0);
+        h.step();
+    }
+    let paths: Vec<PathBuf> = h
+        .state()
+        .app
+        .browser
+        .collections
+        .iter()
+        .flat_map(|c| c.clips.iter().map(|k| k.path.clone()))
+        .collect();
+    for p in &paths {
+        let _ = h.state_mut().app.browser.thumb(p);
+    }
+    for _ in 0..24 {
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        h.input_mut().time = Some(0.0);
+        h.step();
+    }
+    record_with(tour, opts, h, None)
+}
+
+fn record_with(tour: &Tour, opts: &RecordOpts, mut h: Harness<'static, Film>, intro_bed: Option<&Source>) -> Recording {
     let sr = h.state().app.project.lock().unwrap().sample_rate;
     let spf = (sr as f64 / FPS).round() as usize;
     let len = opts.max_secs.map_or(tour.len, |m| m.min(tour.len));
@@ -495,6 +1129,9 @@ pub fn record(tour: &Tour, opts: &RecordOpts) -> Recording {
     for k in 0..n {
         let t = k as f64 / FPS;
         h.state_mut().app.app_clock = Clock::Sim(t);
+        if h.state().app.adds.sim_clock.is_some() {
+            h.state_mut().app.adds.sim_clock = Some(t);
+        }
         // Start cues whose time has come.
         for (ci, cue) in tour.cues.iter().enumerate() {
             if started[ci] || cue.t > t + 1e-9 {
@@ -505,6 +1142,12 @@ pub fn record(tour: &Tour, opts: &RecordOpts) -> Recording {
                 Gesture::Key(key) => {
                     h.input_mut().events.push(egui::Event::Key { key: *key, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() });
                     h.input_mut().events.push(egui::Event::Key { key: *key, physical_key: None, pressed: false, repeat: false, modifiers: Default::default() });
+                }
+                Gesture::Paste(text) => {
+                    h.input_mut().events.push(egui::Event::Paste((*text).into()));
+                }
+                Gesture::Custom(f) => {
+                    f(&mut h.state_mut().app);
                 }
                 g => {
                     let pts: Vec<Pos2> = g.aims().iter().map(|a| resolve(&h, a)).collect();
@@ -570,7 +1213,15 @@ pub fn record(tour: &Tour, opts: &RecordOpts) -> Recording {
         let title = 1.0 - smooth((t - (tour.title_until - 0.9)) / 0.9);
         let end = smooth((t - tour.end_card) / 1.0);
         let floating = h.state().app.fullscreen;
-        h.state_mut().overlay = Overlay { fingers, caption, floating, title: title as f32, end: end as f32 };
+        h.state_mut().overlay = Overlay {
+            fingers,
+            caption,
+            floating,
+            title: title as f32,
+            end: end as f32,
+            title_sub: tour.title_sub,
+            end_sub: tour.end_sub,
+        };
         h.input_mut().time = Some(t);
         h.step();
         // Background jobs (a Rec take bouncing) finish before time moves on,
@@ -586,7 +1237,18 @@ pub fn record(tour: &Tour, opts: &RecordOpts) -> Recording {
         if let Some(d) = &opts.frames_dir {
             tx.send((d.join(format!("{k:05}.png")), img)).unwrap();
         }
-        let (l, r) = h.state_mut().app.playback.render_offline(spf);
+        let (mut l, mut r) = h.state_mut().app.playback.render_offline(spf);
+        if let Some(bed) = intro_bed.and_then(|s| s.audio.as_ref()).filter(|_| t < 4.2) {
+            let ns = bed.samples.len().max(1);
+            for i in 0..spf {
+                let st = t + i as f64 / sr as f64;
+                let env = (smooth(st / 0.35) * (1.0 - smooth((st - 2.9) / 1.2))) as f32 * 0.24;
+                let idx = (k * spf + i) % ns;
+                let idx_r = (idx + 720) % ns;
+                l[i] += bed.samples[idx] * env;
+                r[i] += bed.samples[idx_r] * env;
+            }
+        }
         for i in 0..spf {
             audio.push(l[i]);
             audio.push(r[i]);
@@ -670,7 +1332,11 @@ fn mux(frames: &Path, wav: &Path, out: &Path, fade_from: f64, len: f64) -> Resul
             "-preset",
             "slow",
             "-crf",
-            "19",
+            "20",
+            "-maxrate",
+            "2000k",
+            "-bufsize",
+            "4000k",
             "-pix_fmt",
             "yuv420p",
             "-c:a",
@@ -693,11 +1359,14 @@ fn mux(frames: &Path, wav: &Path, out: &Path, fade_from: f64, len: f64) -> Resul
 
 // ----------------------------------------------------------------- tests
 
-#[test]
-fn the_tour_is_well_formed() {
-    let tour = tour();
+fn check_tour(tour: &Tour) {
     // One pointer at a time; touches may overlap.
-    let mut pointer: Vec<(f64, f64)> = tour.cues.iter().filter(|c| matches!(c.g, Gesture::Tap(_) | Gesture::Hold(..) | Gesture::Drag(..) | Gesture::Knob(..))).map(|c| (c.t, c.t + c.g.secs())).collect();
+    let mut pointer: Vec<(f64, f64)> = tour
+        .cues
+        .iter()
+        .filter(|c| matches!(c.g, Gesture::Tap(_) | Gesture::Hold(..) | Gesture::Drag(..) | Gesture::Knob(..)))
+        .map(|c| (c.t, c.t + c.g.secs()))
+        .collect();
     pointer.sort_by(|a, b| a.0.total_cmp(&b.0));
     for w in pointer.windows(2) {
         assert!(w[0].1 + 1.0 / FPS < w[1].0, "pointer gestures overlap at {:.2}s", w[1].0);
@@ -710,6 +1379,16 @@ fn the_tour_is_well_formed() {
     assert!(tour.captions.iter().all(|c| c.text == c.text.to_lowercase()), "captions are lowercase");
     assert!(tour.cues.iter().all(|c| c.t + c.g.secs() < tour.end_card));
     assert!((60.0..=90.0).contains(&tour.len));
+}
+
+#[test]
+fn the_tour_is_well_formed() {
+    check_tour(&tour());
+}
+
+#[test]
+fn the_second_tour_is_well_formed() {
+    check_tour(&tour_film2());
 }
 
 #[test]
@@ -749,6 +1428,30 @@ fn showcase_film() {
     // CHROMAGRAIN_SHOWCASE_KEEP_FRAMES=1.
     if std::env::var("CHROMAGRAIN_SHOWCASE_KEEP_FRAMES").is_ok_and(|v| v == "1") {
         eprintln!("showcase: kept frames in {}", frames.display());
+    } else {
+        std::fs::remove_dir_all(&frames).expect("remove frames");
+    }
+}
+
+#[test]
+#[ignore = "renders the second UX showcase film (dig, chop, tile, adsr); see module docs"]
+fn showcase_film2() {
+    let version = std::env::var("CHROMAGRAIN_SHOWCASE").unwrap_or_else(|_| "v001".into());
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../outputs/261112_ux-showcase/film2").join(&version);
+    let out = root.join(format!("261112_chromagrain_ux-showcase-film2_{version}.mp4"));
+    assert!(!out.exists(), "{} exists — versions are never overwritten", out.display());
+    let frames = root.join("work/frames");
+    let _ = std::fs::remove_dir_all(&frames);
+    let tour = tour_film2();
+    let t0 = std::time::Instant::now();
+    let rec = record_film2(&tour, &RecordOpts { size: (1600.0, 900.0), ppp: 1.2, frames_dir: Some(frames.clone()), max_secs: None });
+    eprintln!("showcase film2: {} frames ({}×{}) in {:.0}s", rec.frames, rec.px.0, rec.px.1, t0.elapsed().as_secs_f64());
+    let wav = root.join(format!("work/261112_chromagrain_ux-showcase-film2_{version}.wav"));
+    write_wav(&wav, &rec.audio, rec.sample_rate);
+    mux(&frames, &wav, &out, tour.end_card + 0.2, tour.len).expect("mux");
+    eprintln!("showcase film2: wrote {}", out.display());
+    if std::env::var("CHROMAGRAIN_SHOWCASE_KEEP_FRAMES").is_ok_and(|v| v == "1") {
+        eprintln!("showcase film2: kept frames in {}", frames.display());
     } else {
         std::fs::remove_dir_all(&frames).expect("remove frames");
     }

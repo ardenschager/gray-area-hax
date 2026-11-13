@@ -9,6 +9,8 @@ use chromagrain_core::grain::GrainEvent;
 use chromagrain_core::timeline::Project;
 use std::sync::{Arc, Mutex};
 
+static AUDITION_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub use crate::studio::{DeepTab, DeepTarget, View};
 
 /// Ways to add media (the Add sheet's tabs).
@@ -232,8 +234,12 @@ pub trait Host {
     }
     /// Hear (and see) seconds `t0..t1` of a source once, now.
     fn audition(&mut self, source: usize, t0: f64, t1: f64) {
+        self.stop_audition();
+        let now = self.clock();
+        let seq = AUDITION_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let voice = 0xA0D1_7100_0000 | (seq & 0xFFFF_FFFF);
         let ev = GrainEvent {
-            onset: self.clock(),
+            onset: now,
             source_pos: t0,
             duration: (t1 - t0).max(0.01) as f32,
             pitch_ratio: 1.0,
@@ -243,12 +249,31 @@ pub trait Host {
             env_skew: 0.0,
             reverse: false,
             id: 0xA0D1_0000_0000 ^ (t0 * 1000.0) as u64,
-            tag: Default::default(),
+            tag: chromagrain_core::grain::VoiceTag {
+                voice,
+                env: Some(chromagrain_core::envelope::VoiceEnv::held(
+                    chromagrain_core::envelope::Adsr {
+                        attack: 0.005,
+                        decay: 0.01,
+                        sustain: 1.0,
+                        release: 0.03,
+                        picture: chromagrain_core::envelope::PictureCut::Cut,
+                        ..chromagrain_core::envelope::Adsr::default()
+                    },
+                    now,
+                )),
+                tile: None,
+            },
         };
         self.fire(0, source, ev);
     }
     /// Stop an audition (where the host can).
-    fn stop_audition(&mut self) {}
+    fn stop_audition(&mut self) {
+        let seq = AUDITION_SEQ.load(std::sync::atomic::Ordering::Relaxed);
+        if seq > 0 {
+            self.release_voice(0xA0D1_7100_0000 | (seq & 0xFFFF_FFFF));
+        }
+    }
     /// A live voice (an emitter gesture, `GrainEvent::tag.voice`) was
     /// released: grains already queued learn the note-off.
     fn release_voice(&mut self, _voice: u64) {}
