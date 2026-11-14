@@ -171,7 +171,10 @@ fn vgs_stage_modes_aspect_ratios_and_60fps_export_toggle() {
     });
     h.run_steps(3);
 
-    // 4-way stage mode pill: `stack | split | grid | bleed`.
+    // 4-way stage mode pill: `stack | split | grid | bleed` (defaults to crisp `Grid` on `Project::new`).
+    assert_eq!(h.state().stage_mode(), Some(StageMode::Grid));
+    h.get_by_label("layout stack").click();
+    h.run_steps(2);
     assert_eq!(h.state().stage_mode(), Some(StageMode::Stack));
     h.get_by_label("layout split").click();
     h.run_steps(2);

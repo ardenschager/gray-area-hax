@@ -479,7 +479,7 @@ impl App {
     fn new(opts: AppOpts) -> App {
         let demo = opts.demo;
         let (tx, rx) = mpsc::channel();
-        let project = if demo { Project::demo() } else { Project::default() };
+        let project = if demo { Project::demo() } else { Project::new() };
         let plan = Arc::new(plan_project(&project));
         let mut browser = browser::Browser::new();
         if !opts.headless {

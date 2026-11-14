@@ -69,12 +69,13 @@ pub fn effective_stage_mode(scene: &Scene) -> StageMode {
     match scene.project.layout.name() {
         "split" => StageMode::Split,
         "tile" | "grid" => StageMode::Grid,
+        "collage" => StageMode::Collage,
         "bleed" | "blend" => StageMode::Bleed,
         _ => StageMode::Stack,
     }
 }
 
-/// The frame's tile grid (`Layout::Tile` / `StageMode::Grid`), as the CPU
+/// The frame's tile grid (`Layout::Tile` / `StageMode::Grid` / `StageMode::Collage`), as the CPU
 /// compositor computes it (`render::frame_tile_grids_stage`).
 pub fn tile_grid(scene: &Scene) -> Option<(u32, u32)> {
     tile_grid_and_remap(scene).map(|(g, _, _)| g)
@@ -83,7 +84,8 @@ pub fn tile_grid(scene: &Scene) -> Option<(u32, u32)> {
 fn tile_grid_and_remap(
     scene: &Scene,
 ) -> Option<((u32, u32), usize, [u8; chromagrain_core::tile::MAX_TILES])> {
-    if effective_stage_mode(scene) != StageMode::Grid {
+    let mode = effective_stage_mode(scene);
+    if !matches!(mode, StageMode::Grid | StageMode::Collage) {
         return None;
     }
     let mut slots: Vec<u8> = Vec::new();
@@ -94,6 +96,7 @@ fn tile_grid_and_remap(
         if let Some(slot) = e.tag.tile {
             let carry = if !scene.parked
                 && !e.tag.hard_burst
+                && e.tag.visual_hold <= 0.0
                 && e.tag.env.is_none()
                 && e.tag.choke_at.is_none()
                 && e.duration > 0.085
@@ -103,7 +106,7 @@ fn tile_grid_and_remap(
             } else {
                 0.0
             };
-            if t >= e.onset && t < e.end() + carry && e.tag.picture_at(t) > 0.0 && !slots.contains(&slot) {
+            if t >= e.onset && t < e.visual_tile_end(scene.parked, carry) && e.tag.picture_at(t) > 0.0 && !slots.contains(&slot) {
                 slots.push(slot);
             }
         }
@@ -123,7 +126,9 @@ fn tile_grid_and_remap(
     }
     let aspect = scene.project.width.max(1) as f32 / scene.project.height.max(1) as f32;
     let (cnt, remap) = chromagrain_core::tile::dense_slot_remap(&slots);
-    let grid = if aspect < 0.85 {
+    let grid = if mode == StageMode::Collage {
+        chromagrain_core::tile::collage_grid_for(cnt, aspect)
+    } else if aspect < 0.85 {
         chromagrain_core::tile::portrait_grid_for(cnt, aspect)
     } else {
         chromagrain_core::tile::grid_for(cnt)
@@ -147,11 +152,9 @@ pub fn cover_patch_focus(src_aspect: f32, cell_aspect: f32, focus: (f32, f32), z
     [px, py, pw, ph]
 }
 
-/// Compute `Split + Bleed` panel rect `[x, y, w, h]` and interior-edge feather
-/// bitmask (`bit 0 = left`, `bit 1 = right`, `bit 2 = top`, `bit 3 = bottom`)
-/// for panel `idx` out of `count` foreground voices on `canvas_aspect`.
-/// On widescreen (`16:9`, `canvas_aspect > 1.3`), `2`, `3`, and `4` voices lay
-/// out as side-by-side portrait monolith columns (`2×1`, `3×1`, `4×1`, *MODELL 5*).
+/// Compute crisp `Split` panel rect `[x, y, w, h]` and interior-edge bitmask (`0` — zero blur!)
+/// for panel `idx` out of `count` foreground voices on `canvas_aspect`, leaving crisp `2px`
+/// `#111314` solid dividers between panels!
 pub fn split_panel_rect(idx: usize, count: usize, canvas_aspect: f32) -> ([f32; 4], u32) {
     let n = count.max(1);
     let i = idx.min(n - 1);
@@ -169,32 +172,27 @@ pub fn split_panel_rect(idx: usize, count: usize, canvas_aspect: f32) -> ([f32; 
     let r = i / cols;
     let cw = 1.0 / cols as f32;
     let ch = 1.0 / rows as f32;
-    let overlap_x = 0.065 * cw;
-    let overlap_y = 0.065 * ch;
+    let gx = 0.0008f32;
+    let gy = 0.0008f32;
 
     let mut x0 = c as f32 * cw;
     let mut x1 = (c + 1) as f32 * cw;
     let mut y0 = r as f32 * ch;
     let mut y1 = (r + 1) as f32 * ch;
-    let mut mask = 0u32;
 
     if c > 0 {
-        x0 = (x0 - overlap_x).max(0.0);
-        mask |= 1;
+        x0 = (x0 + gx).min(1.0);
     }
     if c + 1 < cols {
-        x1 = (x1 + overlap_x).min(1.0);
-        mask |= 2;
+        x1 = (x1 - gx).max(x0);
     }
     if r > 0 {
-        y0 = (y0 - overlap_y).max(0.0);
-        mask |= 4;
+        y0 = (y0 + gy).min(1.0);
     }
     if r + 1 < rows {
-        y1 = (y1 + overlap_y).min(1.0);
-        mask |= 8;
+        y1 = (y1 - gy).max(y0);
     }
-    ([x0, y0, (x1 - x0).max(1e-3), (y1 - y0).max(1e-3)], mask)
+    ([x0, y0, (x1 - x0).max(1e-3), (y1 - y0).max(1e-3)], 0u32)
 }
 
 const MAX_SRC_W: u32 = 256;
@@ -648,57 +646,22 @@ fn fs_idct_row(i: VOut) -> @location(0) vec4f {
     return clamp(s + 0.5, vec4f(0.0), vec4f(1.0));
 }
 
-@fragment
-fn fs_iso_blur_h(i: VOut) -> @location(0) vec4f {
-    let w = i32(u.res.x);
-    let h = i32(u.res.y);
-    let px = clamp(vec2i(floor(i.uv * u.res.xy)), vec2i(0), vec2i(w - 1, h - 1));
-    let rad = i32(round(u.d.x));
-    let x0 = max(px.x - rad, 0);
-    let x1 = min(px.x + rad, w - 1);
-    let inv = 1.0 / f32(x1 - x0 + 1);
-    var acc = vec3f(0.0);
-    for (var xx = x0; xx <= x1; xx++) {
-        acc += textureLoad(t0, vec2i(xx, px.y), 0).rgb;
-    }
-    return vec4f(acc * inv, 1.0);
+fn iso_luma(sx: i32, sy: i32, w: i32, h: i32) -> f32 {
+    let cx = clamp(sx, 0, w - 1);
+    let cy = clamp(sy, 0, h - 1);
+    let c = textureLoad(t0, vec2i(cx, cy), 0).rgb;
+    return clamp(0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b, 0.0, 1.0);
 }
 
-@fragment
-fn fs_iso_blur_v(i: VOut) -> @location(0) vec4f {
-    let w = i32(u.res.x);
-    let h = i32(u.res.y);
-    let px = clamp(vec2i(floor(i.uv * u.res.xy)), vec2i(0), vec2i(w - 1, h - 1));
-    let rad = i32(round(u.d.x));
-    let y0 = max(px.y - rad, 0);
-    let y1 = min(px.y + rad, h - 1);
-    let inv = 1.0 / f32(y1 - y0 + 1);
-    var acc = vec3f(0.0);
-    for (var yy = y0; yy <= y1; yy++) {
-        acc += textureLoad(t0, vec2i(px.x, yy), 0).rgb;
-    }
-    return vec4f(acc * inv, 1.0);
-}
-
-@fragment
-fn fs_iso_combine(i: VOut) -> @location(0) vec4f {
-    let w = i32(u.res.x);
-    let h = i32(u.res.y);
-    let px = clamp(vec2i(floor(i.uv * u.res.xy)), vec2i(0), vec2i(w - 1, h - 1));
-    let bm = textureLoad(t0, px, 0).rgb;
-    if (u.b.y > 0.5 && u.cf.w < 0.05) {
-        return vec4f(bm, 1.0);
-    }
-    let bc = textureLoad(t1, px, 0).rgb;
-    let y_luma = clamp(0.2126 * bc.r + 0.7152 * bc.g + 0.0722 * bc.b, 0.0, 1.0);
-    let inv_y = 1.0 - y_luma;
-    let c0 = 0.35 + 0.65 * inv_y * inv_y * inv_y;
-    let c1 = 0.65 * 3.0 * y_luma * inv_y * inv_y;
-    let c2 = 0.65 * 3.0 * y_luma * y_luma * inv_y;
-    let c3 = 0.65 * y_luma * y_luma * y_luma;
-    let w_bc = u.cf.x * c0 + u.cf.y * c1 + u.cf.z * c2 + u.cf.w * (c3 - 1.0);
-    let w_bm = u.cf.w - u.b.x;
-    return vec4f(w_bc * bc + w_bm * bm, 1.0);
+fn bayer4(x: i32, y: i32) -> f32 {
+    let idx = (y & 3) * 4 + (x & 3);
+    var m = array<f32, 16>(
+        0.5 / 16.0,  8.5 / 16.0,  2.5 / 16.0, 10.5 / 16.0,
+       12.5 / 16.0,  4.5 / 16.0, 14.5 / 16.0,  6.5 / 16.0,
+        3.5 / 16.0, 11.5 / 16.0,  1.5 / 16.0,  9.5 / 16.0,
+       15.5 / 16.0,  7.5 / 16.0, 13.5 / 16.0,  5.5 / 16.0
+    );
+    return m[idx];
 }
 
 @fragment
@@ -721,10 +684,67 @@ fn fs_isolator(i: VOut) -> @location(0) vec4f {
 
     var rgb = orig;
     if (u.b.z > 0.5) {
-        let p1 = textureLoad(t1, px, 0).rgb;
-        var band_sum = p1 + u.b.x * orig;
-        if (u.b.y > 0.5 && u.cf.w < 0.05) {
-            band_sum = min(abs(orig - p1) * (2.4 * u.b.x), vec3f(1.0));
+        let g0 = u.cf.x;
+        let g1 = u.cf.y;
+        let g2 = u.cf.z;
+        let g3 = u.cf.w;
+        let g4 = u.b.x;
+        let ink = vec3f(17.0 / 255.0, 19.0 / 255.0, 20.0 / 255.0);
+        let amber = vec3f(238.0 / 255.0, 174.0 / 255.0, 58.0 / 255.0);
+        let cream = vec3f(242.0 / 255.0, 237.0 / 255.0, 224.0 / 255.0);
+
+        let max_band = clamp(max(max(max(g0, g1), max(g2, g3)), g4), 0.0, 1.0);
+        let high_cut = clamp((1.0 - g4) * 0.58 + (1.0 - g3) * 0.42, 0.0, 1.0);
+        let low_cut = clamp((1.0 - g0) * 0.65 + (1.0 - g1) * 0.35, 0.0, 1.0);
+        let low_drive = clamp(0.58 * g0 + 0.42 * g1, 0.0, 1.0);
+        let mid_gain = 0.45 + 0.55 * clamp(max(g2, g3), 0.0, 1.0);
+
+        let y0 = clamp(0.2126 * orig.r + 0.7152 * orig.g + 0.0722 * orig.b, 0.0, 1.0);
+        let tl = iso_luma(px.x - 1, px.y - 1, w, h);
+        let tc = iso_luma(px.x,     px.y - 1, w, h);
+        let tr = iso_luma(px.x + 1, px.y - 1, w, h);
+        let ml = iso_luma(px.x - 1, px.y,     w, h);
+        let mr = iso_luma(px.x + 1, px.y,     w, h);
+        let bl = iso_luma(px.x - 1, px.y + 1, w, h);
+        let bc = iso_luma(px.x,     px.y + 1, w, h);
+        let br = iso_luma(px.x + 1, px.y + 1, w, h);
+        let gx = (tr + 2.0 * mr + br) - (tl + 2.0 * ml + bl);
+        let gy = (bl + 2.0 * bc + br) - (tl + 2.0 * tc + tr);
+        let edge = clamp(sqrt(gx * gx + gy * gy) * 1.35, 0.0, 1.0);
+        let ink_line = clamp((edge - 0.12) / 0.34, 0.0, 1.0);
+        let bayer = bayer4(px.x, px.y);
+
+        var band_sum = vec3f(0.0);
+        if (max_band > 0.01) {
+            if (u.b.y > 0.5) {
+                let hi_gate = clamp((y0 - 0.54) / 0.14, 0.0, 1.0);
+                let dot_gate = clamp((y0 - bayer + 0.08) / 0.16, 0.0, 1.0);
+                let stipple = hi_gate * dot_gate * 0.42;
+                let mark = clamp(max(ink_line, stipple) * g4, 0.0, 1.0);
+                band_sum = ink + (cream - ink) * mark;
+            } else {
+                var cur = orig;
+                if (low_cut > 0.01) {
+                    let y_print = clamp((y0 - 0.36 * low_cut) * (1.0 + 0.55 * low_cut), 0.0, 1.0);
+                    let y_step = floor(y_print * 5.0 + 0.5) / 5.0;
+                    let gain_y = select(0.0, y_step / y0, y0 > 1e-3);
+                    let ink_etch = ink_line * 0.85 * low_cut;
+                    let zine_c = clamp(orig * (gain_y * mid_gain), vec3f(0.0), vec3f(1.0));
+                    let etched = zine_c * (1.0 - ink_etch) + ink * ink_etch;
+                    cur = cur * (1.0 - low_cut) + etched * low_cut;
+                }
+                if (high_cut > 0.01) {
+                    let yc = clamp((y0 - 0.40) * 1.65 + 0.46, 0.0, 1.0) * (0.35 + 0.65 * low_drive);
+                    let dot = select(0.0, 1.0, yc >= bayer * 0.82 + 0.09);
+                    let step3 = floor(yc * 3.0) / 3.0;
+                    let tone = clamp(0.68 * dot + 0.32 * step3, 0.0, 1.0);
+                    let t2 = tone * tone;
+                    let hi_c = amber + (cream - amber) * t2;
+                    let duo_c = ink + (hi_c - ink) * tone;
+                    cur = cur * (1.0 - high_cut) + duo_c * high_cut;
+                }
+                band_sum = cur * max_band;
+            }
         }
         let ch_m = i32(round(u.d.x));
         if (ch_m == 1) {
@@ -782,14 +802,11 @@ enum Pipe {
     Quant,
     IdctCol,
     IdctRow,
-    IsoBlurH,
-    IsoBlurV,
-    IsoCombine,
     Isolator,
 }
 
 impl Pipe {
-    const ALL: [Pipe; 24] = [
+    const ALL: [Pipe; 21] = [
         Pipe::Grain,
         Pipe::GrainScreen,
         Pipe::BlitBlend,
@@ -810,9 +827,6 @@ impl Pipe {
         Pipe::Quant,
         Pipe::IdctCol,
         Pipe::IdctRow,
-        Pipe::IsoBlurH,
-        Pipe::IsoBlurV,
-        Pipe::IsoCombine,
         Pipe::Isolator,
     ];
 
@@ -835,9 +849,6 @@ impl Pipe {
             Pipe::Quant => "fs_quant",
             Pipe::IdctCol => "fs_idct_col",
             Pipe::IdctRow => "fs_idct_row",
-            Pipe::IsoBlurH => "fs_iso_blur_h",
-            Pipe::IsoBlurV => "fs_iso_blur_v",
-            Pipe::IsoCombine => "fs_iso_combine",
             Pipe::Isolator => "fs_isolator",
         }
     }
@@ -855,10 +866,7 @@ impl Pipe {
             Pipe::DctRow
             | Pipe::DctCol
             | Pipe::Quant
-            | Pipe::IdctCol
-            | Pipe::IsoBlurH
-            | Pipe::IsoBlurV
-            | Pipe::IsoCombine => RGBA16F,
+            | Pipe::IdctCol => RGBA16F,
             _ => RGBA8,
         }
     }
@@ -1362,40 +1370,19 @@ impl GpuPreview {
         }
         let (g, ch_mode, mon_mode, eff_exp) = chromagrain_core::fx::isolator_video_uniforms(iso, amt);
         let filter_on = g.iter().any(|&v| (v - 1.0).abs() > 1e-4);
-        let only_high_solo = filter_on && g[0] < 0.05 && g[1] < 0.05 && g[2] < 0.05 && (g[3] > 0.5 || g[4] > 0.5);
-
-        if filter_on {
-            let min_dim = self.size.0.min(self.size.1).max(1) as usize;
-            let r_med = (min_dim / 42).clamp(2, 10) as f32;
-            let r_coarse = (min_dim / 12).clamp(6, 28) as f32;
-
-            let mut um = self.res_uni();
-            um.d[0] = r_med;
-            self.full(FPING, Pipe::IsoBlurH, cur, None, um);
-            self.full(FPONG, Pipe::IsoBlurV, FPING, None, um);
-
-            let mut uc = self.res_uni();
-            uc.d[0] = r_coarse;
-            self.full(FPING, Pipe::IsoBlurH, cur, None, uc);
-            self.full(FISO, Pipe::IsoBlurV, FPING, None, uc);
-
-            let mut ucomb = self.res_uni();
-            ucomb.cf = [g[0], g[1], g[2], g[3]];
-            ucomb.b = [g[4], if only_high_solo { 1.0 } else { 0.0 }, 0.0, 0.0];
-            self.full(FPING, Pipe::IsoCombine, FPONG, Some(FISO), ucomb);
-        }
+        let only_hf_solo = filter_on && g[0] < 0.05 && g[1] < 0.05 && g[2] < 0.05 && g[3] < 0.05 && g[4] > 0.5;
 
         let out = Self::other(cur);
         let mut u = self.res_uni();
         u.cf = [g[0], g[1], g[2], g[3]];
         u.b = [
             g[4],
-            if only_high_solo { 1.0 } else { 0.0 },
+            if only_hf_solo { 1.0 } else { 0.0 },
             if filter_on { 1.0 } else { 0.0 },
             amt,
         ];
         u.d = [ch_mode as f32, mon_mode as f32, eff_exp, 0.0];
-        self.full(out, Pipe::Isolator, cur, if filter_on { Some(FPING) } else { None }, u);
+        self.full(out, Pipe::Isolator, cur, None, u);
         out
     }
 
@@ -1484,6 +1471,7 @@ impl GpuPreview {
         self.draw(Pipe::BlitBlend, Some(tex), None, None, u);
     }
 
+    #[allow(dead_code)]
     fn screen_onto(&mut self, target: usize, tex: usize, opacity: f32) {
         self.pass(target, None);
         let u = Uni { c: [opacity, 1.0, 0.0, 0.0], ..Default::default() };
@@ -1693,16 +1681,12 @@ impl GpuPreview {
             };
             if v.effects.is_empty() {
                 self.pass(MASTER, None);
-                self.record_grains_ext(v.sid, vec![(gd, v.flip_x, edge_mask, v.oxide)], None, 0.0, 0.0, idx > 0);
+                self.record_grains_ext(v.sid, vec![(gd, v.flip_x, edge_mask, v.oxide)], None, 0.0, 0.0, false);
             } else {
                 self.pass(CLIP, Some([0.0; 4]));
                 self.record_grains_ext(v.sid, vec![(gd, v.flip_x, edge_mask, v.oxide)], None, 0.0, 0.0, false);
                 let fx_out = self.apply_chain(&v.effects, v.fx_scope, CLIP, fps, scene.t);
-                if idx == 0 {
-                    self.blend_onto(MASTER, fx_out, 1.0, 0.0);
-                } else {
-                    self.screen_onto(MASTER, fx_out, 1.0);
-                }
+                self.blend_onto(MASTER, fx_out, 1.0, 0.0);
             }
         }
 
@@ -1753,7 +1737,7 @@ impl GpuPreview {
 
         let stage_mode = effective_stage_mode(scene);
         let clear_col = match stage_mode {
-            StageMode::Split | StageMode::Bleed => [0.039, 0.039, 0.043, 1.0],
+            StageMode::Split | StageMode::Bleed | StageMode::Collage => [17.0 / 255.0, 19.0 / 255.0, 20.0 / 255.0, 1.0],
             StageMode::Stack | StageMode::Grid => [0.0, 0.0, 0.0, 1.0],
         };
         self.pass(MASTER, Some(clear_col));

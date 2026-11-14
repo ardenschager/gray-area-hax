@@ -97,10 +97,10 @@ impl Macro {
 }
 
 /// The one-click looks the LOOK macro steps through, in order (parse
-/// names for [`EffectKind::parse`]; `None` = no look). Echo/reverb are left
-/// to SMEAR.
-pub const LOOKS: [Option<&str>; 7] =
-    [None, Some("tune"), Some("crush"), Some("compress"), Some("tint"), Some("tile"), Some("kaleido")];
+/// names for [`EffectKind::parse`]; `None` = no look). Radial `kaleido` is
+/// retired from default looks in favor of crisp graphic treatments.
+pub const LOOKS: [Option<&str>; 6] =
+    [None, Some("tune"), Some("crush"), Some("compress"), Some("tint"), Some("tile")];
 
 /// Host tempo + transport, as plugin hosts report it.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -412,10 +412,15 @@ impl PadSlot {
     }
 
     /// A one-shot pad playing `slice` of `source` (whose media is
-    /// `src_len` seconds long).
+    /// `src_len` seconds long) with full-brightness `PictureCut::Cut` ADSR.
     pub fn from_slice(source: SourceId, slice: crate::chop::Slice, src_len: f64) -> PadSlot {
         let start = if src_len > 0.0 { (slice.start / src_len).clamp(0.0, 1.0) as f32 } else { 0.0 };
-        PadSlot { start, slice: Some(slice), ..PadSlot::new(source, 1.0) }
+        PadSlot {
+            start,
+            slice: Some(slice),
+            adsr: Some(crate::envelope::Adsr::default()),
+            ..PadSlot::new(source, 1.0)
+        }
     }
 }
 
@@ -1832,7 +1837,16 @@ impl Instrument {
         out.grains.clear();
         out.grains.extend(self.grains.iter().map(|g| (g.source, g.ev.clone())));
         out.style = VisualGrainStyle::morph(0.35, &VisualGrainStyle::default(), map.texture);
-        out.link = AvLink::default();
+        let has_slice_or_kit_pads = self.pads.iter().any(|p| p.slot.is_some());
+        out.link = if has_slice_or_kit_pads || self.layout.uses_tiles() {
+            AvLink {
+                gain_to_opacity: 0.0,
+                envelope_to_opacity: 0.0,
+                ..AvLink::default()
+            }
+        } else {
+            AvLink::default()
+        };
         out.effects.clear();
         if out.effects.capacity() < 4 {
             out.effects.reserve(4);
@@ -1954,14 +1968,37 @@ impl FrameRenderer {
                 frame
                     .grains
                     .iter()
-                    .filter(|(_, e)| !e.tag.is_wash && t >= e.onset && t < e.end() + crate::video::OPTICAL_CARRY_SECS && e.tag.picture_at(t) > 0.0)
+                    .filter(|(_, e)| !e.tag.is_wash && t >= e.onset && t < e.visual_tile_end(false, crate::video::OPTICAL_CARRY_SECS) && e.tag.picture_at(t) > 0.0)
                     .filter_map(|(_, e)| e.tag.tile),
                 aspect,
             )),
+            crate::tile::Layout::Collage => {
+                let mut slots = Vec::new();
+                for (sid, e) in &frame.grains {
+                    let is_fg = e.tag.collage_cutout
+                        || sources
+                            .get(*sid)
+                            .and_then(|s| s.video.as_deref())
+                            .is_some_and(|v| v.has_alpha());
+                    if !is_fg && t >= e.onset && t < e.visual_tile_end(false, crate::video::OPTICAL_CARRY_SECS) && e.tag.picture_at(t) > 0.0 {
+                        if let Some(slot) = e.tag.tile {
+                            if !slots.contains(&slot) {
+                                slots.push(slot);
+                            }
+                        }
+                    }
+                }
+                Some(crate::tile::collage_grid_for(slots.len(), aspect))
+            }
             _ => None,
         };
+        let mut fg_collage = Vec::new();
         for (sid, ev) in &frame.grains {
             let Some(video) = sources.get(*sid).and_then(|s| s.video.as_deref()) else { continue };
+            if frame.layout == crate::tile::Layout::Collage && (ev.tag.collage_cutout || video.has_alpha()) {
+                fg_collage.push((*sid, ev));
+                continue;
+            }
             crate::video::composite_grains_frame_stage(
                 video,
                 std::slice::from_ref(ev),
@@ -1979,7 +2016,25 @@ impl FrameRenderer {
         }
         fx::apply_video_chain(&mut layer, &frame.effects, &mut self.states);
         *out = Frame::black(w, h);
+        if matches!(frame.layout, crate::tile::Layout::Collage | crate::tile::Layout::Split) && !frame.grains.is_empty() {
+            crate::video::fill_stage_ink(out);
+        }
         crate::video::blend_stage_layer(out, &layer, frame.layout, frame.style.additive, 1.0, false);
+        for (sid, ev) in fg_collage {
+            if let Some(video) = sources.get(sid).and_then(|s| s.video.as_deref()) {
+                crate::video::composite_collage_foreground(
+                    video,
+                    std::slice::from_ref(ev),
+                    &frame.link,
+                    &ClipTransform::default(),
+                    None,
+                    out,
+                    t,
+                    false,
+                    None,
+                );
+            }
+        }
     }
 }
 

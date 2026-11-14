@@ -7,7 +7,10 @@ use crate::grain::GrainSettings;
 use crate::music::Key;
 use crate::video::{AvLink, ColorFilter, VideoClip, VisualGrainStyle};
 
-pub use crate::chop::{build_kit_across_sources, build_tape_loops_across_sources, KitPadSpec};
+pub use crate::chop::{
+    build_kit_across_sources, build_tape_loops_across_sources, build_ukg_vox_kit_across_sources,
+    CuratedPad, KitPadSpec,
+};
 pub use crate::tile::AspectRatio;
 
 pub type SourceId = usize;
@@ -27,6 +30,15 @@ pub struct Source {
     pub slices: Vec<crate::chop::Slice>,
     /// Where it came from (Dig / Link imports).
     pub provenance: Option<Provenance>,
+    /// Optional on-disk media file path (enabling direct Apple Vision segmentation).
+    pub path: Option<std::path::PathBuf>,
+}
+
+impl AsRef<Source> for Source {
+    #[inline]
+    fn as_ref(&self) -> &Source {
+        self
+    }
 }
 
 /// Where an imported source came from (Dig / Link), shown on its card.
@@ -241,6 +253,9 @@ pub struct Clip {
     /// Pass and gap lengths snap to the beat grid when edited (off = free,
     /// e.g. the media's natural length).
     pub loop_sync: bool,
+    /// Mark this clip as a `Layout::Collage` foreground cutout / framed zine photo-card
+    /// (segmented clips with `VideoClip::has_alpha() == true` also composite as cutouts automatically).
+    pub collage_cutout: bool,
 }
 
 impl Clip {
@@ -266,6 +281,7 @@ impl Clip {
             loop_mask: Vec::new(),
             loop_advance: 0.0,
             loop_sync: true,
+            collage_cutout: false,
         }
     }
 
@@ -283,6 +299,9 @@ impl Clip {
     pub fn new_pattern(pattern: usize, start_beat: f64, length_beats: f64) -> Clip {
         let mut c = Clip::new(0, start_beat, length_beats);
         c.kind = ClipKind::Pattern(pattern);
+        c.visual.additive = 0.0;
+        c.link.gain_to_opacity = 0.0;
+        c.link.envelope_to_opacity = 0.0;
         c
     }
 
@@ -648,6 +667,14 @@ impl Default for Project {
 }
 
 impl Project {
+    /// Create a fresh project defaulting to crisp dynamic hairline Grid (`Layout::Tile`).
+    pub fn new() -> Project {
+        Project {
+            layout: crate::tile::Layout::Tile,
+            ..Project::default()
+        }
+    }
+
     /// Switch output aspect ratio (`16:9`, `1:1`, `9:16`), preserving the current long-edge resolution.
     pub fn set_aspect(&mut self, aspect: crate::tile::AspectRatio) {
         self.aspect = aspect;

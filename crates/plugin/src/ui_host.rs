@@ -191,9 +191,13 @@ impl PluginHost {
         // through the shared SMEAR + LOOK picture effects.
         let mut buses = studio.buses();
         let pad_bus = LiveBus {
-            style: VisualGrainStyle::morph(0.35, &VisualGrainStyle::default(), 0.0),
+            style: VisualGrainStyle::full_frame(0.0),
             effects: buses.first().map(|b| b.effects.clone()).unwrap_or_default(),
-            link: AvLink::default(),
+            link: AvLink {
+                gain_to_opacity: 0.0,
+                envelope_to_opacity: 0.0,
+                ..AvLink::default()
+            },
         };
         buses.push(pad_bus);
         let pad_ix = buses.len() as u8;
@@ -306,7 +310,7 @@ impl Host for PluginHost {
     }
     fn tile_layout(&self) -> Option<bool> {
         Some(match self.stage_mode_override {
-            Some(m) => m == StageMode::Grid,
+            Some(m) => matches!(m, StageMode::Grid | StageMode::Collage),
             None => self.layout_override.unwrap_or_else(|| self.params.layout.value() == crate::params::LayoutParam::Tile),
         })
     }
@@ -336,7 +340,7 @@ impl Host for PluginHost {
         }))
     }
     fn set_stage_mode(&mut self, mode: StageMode) {
-        self.set_tile_layout(mode == StageMode::Grid);
+        self.set_tile_layout(matches!(mode, StageMode::Grid | StageMode::Collage));
         self.stage_mode_override = Some(mode);
         self.project.lock().unwrap().layout = mode.to_layout();
         self.doc_rev += 1;

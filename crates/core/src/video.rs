@@ -151,6 +151,58 @@ impl Frame {
     }
 }
 
+/// Tighten soft `0..255` segmentation matte values into a razor-sharp die-cut
+/// sticker alpha (`< 90 -> 0`, `> 155 -> 255`, crisp 1px ramp between `90..155`)
+/// eliminating blurry ghostly fringes.
+#[inline]
+pub fn tighten_cutout_alpha(a: u8) -> u8 {
+    if a < 90 {
+        0
+    } else if a > 155 {
+        255
+    } else {
+        (((a as u32 - 90) * 255 + 32) / 65).min(255) as u8
+    }
+}
+
+fn morph_dilate_3x3(src: &[u8], w: usize, h: usize, out: &mut [u8]) {
+    for y in 0..h {
+        let y0 = y.saturating_sub(1);
+        let y1 = (y + 1).min(h - 1);
+        for x in 0..w {
+            let x0 = x.saturating_sub(1);
+            let x1 = (x + 1).min(w - 1);
+            let mut mx = 0u8;
+            for ny in y0..=y1 {
+                let row = ny * w;
+                for nx in x0..=x1 {
+                    mx = mx.max(src[row + nx]);
+                }
+            }
+            out[y * w + x] = mx;
+        }
+    }
+}
+
+fn morph_erode_3x3(src: &[u8], w: usize, h: usize, out: &mut [u8]) {
+    for y in 0..h {
+        let y0 = y.saturating_sub(1);
+        let y1 = (y + 1).min(h - 1);
+        for x in 0..w {
+            let x0 = x.saturating_sub(1);
+            let x1 = (x + 1).min(w - 1);
+            let mut mn = 255u8;
+            for ny in y0..=y1 {
+                let row = ny * w;
+                for nx in x0..=x1 {
+                    mn = mn.min(src[row + nx]);
+                }
+            }
+            out[y * w + x] = mn;
+        }
+    }
+}
+
 /// A decoded (or procedural) video clip held in memory.
 #[derive(Debug, Clone, Default)]
 pub struct VideoClip {
@@ -159,6 +211,235 @@ pub struct VideoClip {
 }
 
 impl VideoClip {
+    /// True when this clip carries a segmented foreground silhouette (`alpha`
+    /// varies between transparent background `< 250` and opaque foreground `> 20`).
+    pub fn has_alpha(&self) -> bool {
+        if self.frames.is_empty() {
+            return false;
+        }
+        let n = self.frames.len();
+        let indices = [0, n / 2, n - 1];
+        let mut saw_trans = false;
+        let mut saw_opaque = false;
+        for &fi in &indices {
+            let f = &self.frames[fi];
+            let npx = (f.width as usize) * (f.height as usize);
+            let step = if npx <= 4096 { 1 } else { 7 };
+            let mut p = 0usize;
+            while p < npx {
+                let a = f.data[p * 4 + 3];
+                if a < 250 {
+                    saw_trans = true;
+                }
+                if a > 20 {
+                    saw_opaque = true;
+                }
+                if saw_trans && saw_opaque {
+                    return true;
+                }
+                p += step;
+            }
+        }
+        false
+    }
+
+    /// Fast pure-Rust deterministic foreground subject extractor:
+    /// models per-frame outer border-ring color/luma distribution (2-centroid
+    /// background model) + `(cx, cy)` `focus` spatial prior + `3×3` morphological
+    /// close + crisp `1px` edge ramp (`tighten_cutout_alpha`), giving in-memory,
+    /// synthetic, and plugin clips instant 1-tap `Cutout` silhouettes without
+    /// requiring an on-disk `.mp4` or external sidecar.
+    pub fn cutout_subject_fast(&self, focus: (f32, f32)) -> VideoClip {
+        if self.frames.is_empty() {
+            return VideoClip { frames: Vec::new(), fps: self.fps };
+        }
+        let already_alpha = self.has_alpha();
+        let fx = if focus.0 <= 0.0 && focus.1 <= 0.0 { 0.5 } else { focus.0.clamp(0.08, 0.92) };
+        let fy = if focus.0 <= 0.0 && focus.1 <= 0.0 { 0.5 } else { focus.1.clamp(0.08, 0.92) };
+
+        let frames = self
+            .frames
+            .iter()
+            .map(|f| {
+                let w = f.width as usize;
+                let h = f.height as usize;
+                let npx = w * h;
+                if npx == 0 {
+                    return f.clone();
+                }
+                let mut nf = f.clone();
+                let mut raw_mask = vec![0u8; npx];
+                let mut tmp_a = vec![0u8; npx];
+                let mut tmp_b = vec![0u8; npx];
+
+                if already_alpha {
+                    for i in 0..npx {
+                        raw_mask[i] = nf.data[i * 4 + 3];
+                    }
+                    morph_dilate_3x3(&raw_mask, w, h, &mut tmp_a);
+                    morph_erode_3x3(&tmp_a, w, h, &mut tmp_b);
+                    for i in 0..npx {
+                        nf.data[i * 4 + 3] = tighten_cutout_alpha(tmp_b[i]);
+                    }
+                    return nf;
+                }
+
+                // 1. Sample outer border ring to model background color & luma.
+                let margin = (w.min(h) / 14).clamp(1, 8);
+                let mut border_px: Vec<[f32; 4]> = Vec::with_capacity((w + h) * 4);
+                let step_b = ((w + h) / 160).max(1);
+                for y in (0..h).step_by(step_b) {
+                    for x in (0..w).step_by(step_b) {
+                        let on_border = x < margin || x + margin >= w || y < margin || y + margin >= h;
+                        if !on_border {
+                            continue;
+                        }
+                        let ux = (x as f32 + 0.5) / w as f32;
+                        let uy = (y as f32 + 0.5) / h as f32;
+                        let d_foc = ((ux - fx) * (ux - fx) + (uy - fy) * (uy - fy)).sqrt();
+                        if d_foc < 0.22 && w >= 12 && h >= 12 {
+                            continue;
+                        }
+                        let p = (y * w + x) * 4;
+                        let r = f.data[p] as f32 / 255.0;
+                        let g = f.data[p + 1] as f32 / 255.0;
+                        let b = f.data[p + 2] as f32 / 255.0;
+                        let l = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                        border_px.push([r, g, b, l]);
+                    }
+                }
+                if border_px.is_empty() {
+                    for x in 0..w {
+                        let p = x * 4;
+                        let r = f.data[p] as f32 / 255.0;
+                        let g = f.data[p + 1] as f32 / 255.0;
+                        let b = f.data[p + 2] as f32 / 255.0;
+                        border_px.push([r, g, b, 0.2126 * r + 0.7152 * g + 0.0722 * b]);
+                    }
+                }
+                let mean_l: f32 = border_px.iter().map(|c| c[3]).sum::<f32>() / border_px.len() as f32;
+                let (mut lo_sum, mut lo_n) = ([0.0f32; 4], 0usize);
+                let (mut hi_sum, mut hi_n) = ([0.0f32; 4], 0usize);
+                for &c in &border_px {
+                    if c[3] <= mean_l {
+                        for k in 0..4 {
+                            lo_sum[k] += c[k];
+                        }
+                        lo_n += 1;
+                    } else {
+                        for k in 0..4 {
+                            hi_sum[k] += c[k];
+                        }
+                        hi_n += 1;
+                    }
+                }
+                let bg0 = if lo_n > 0 {
+                    lo_sum.map(|v| v / lo_n as f32)
+                } else {
+                    hi_sum.map(|v| v / hi_n.max(1) as f32)
+                };
+                let bg1 = if hi_n > 0 {
+                    hi_sum.map(|v| v / hi_n as f32)
+                } else {
+                    bg0
+                };
+                let color_dist = |c: [f32; 4], bg: [f32; 4]| -> f32 {
+                    let dr = c[0] - bg[0];
+                    let dg = c[1] - bg[1];
+                    let db = c[2] - bg[2];
+                    let dl = (c[3] - bg[3]) * 1.25;
+                    (dr * dr + dg * dg + db * db + dl * dl).sqrt()
+                };
+                let border_mad: f32 = border_px
+                    .iter()
+                    .map(|&c| color_dist(c, bg0).min(color_dist(c, bg1)))
+                    .sum::<f32>()
+                    / border_px.len() as f32;
+                let inv_sigma = 1.0 / (border_mad * 2.4 + 0.075).clamp(0.08, 0.42);
+
+                // 2. Score every pixel (color/luma separation + spatial focus prior).
+                let mut scores = vec![0.0f32; npx];
+                let mut hist = [0u32; 64];
+                for y in 0..h {
+                    let uy = (y as f32 + 0.5) / h as f32;
+                    let dy = (uy - fy) / 0.34;
+                    let edge_guard_y = (uy.min(1.0 - uy) / 0.045).clamp(0.0, 1.0);
+                    for x in 0..w {
+                        let ux = (x as f32 + 0.5) / w as f32;
+                        let dx = (ux - fx) / 0.28;
+                        let edge_guard_x = (ux.min(1.0 - ux) / 0.045).clamp(0.0, 1.0);
+                        let edge_guard = edge_guard_x.min(edge_guard_y);
+                        let prior = (-0.5 * (dx * dx + dy * dy)).exp();
+                        let p = (y * w + x) * 4;
+                        let r = f.data[p] as f32 / 255.0;
+                        let g = f.data[p + 1] as f32 / 255.0;
+                        let b = f.data[p + 2] as f32 / 255.0;
+                        let c = [r, g, b, 0.2126 * r + 0.7152 * g + 0.0722 * b];
+                        let d_bg = color_dist(c, bg0).min(color_dist(c, bg1));
+                        let c_fg = (d_bg * inv_sigma).clamp(0.0, 1.6);
+                        let sc = ((0.64 * c_fg + 0.48 * prior) * (0.25 + 0.75 * edge_guard)).clamp(0.0, 1.0);
+                        scores[y * w + x] = sc;
+                        hist[((sc * 63.0).round() as usize).min(63)] += 1;
+                    }
+                }
+
+                // Adaptive threshold keeping foreground silhouette inside clean 14%..52% bounds
+                // when contrast is subtle while honoring sharp color cutouts around 0.48.
+                let mut acc = 0u32;
+                let target_hi = (npx as u32 * 28 / 100).max(1);
+                let mut pct_bin = 30usize;
+                for b in (0..64).rev() {
+                    acc += hist[b];
+                    if acc >= target_hi {
+                        pct_bin = b;
+                        break;
+                    }
+                }
+                let pct_thresh = (pct_bin as f32 / 63.0).clamp(0.32, 0.64);
+                let thresh = (0.55 * 0.48 + 0.45 * pct_thresh).clamp(0.34, 0.62);
+
+                for i in 0..npx {
+                    raw_mask[i] = if scores[i] >= thresh { 255 } else { 0 };
+                }
+
+                // 3. 3x3 morphological close (fills interior pinholes) + 3x3 open (drops border specks).
+                morph_dilate_3x3(&raw_mask, w, h, &mut tmp_a);
+                morph_erode_3x3(&tmp_a, w, h, &mut tmp_b);
+                if w >= 8 && h >= 8 {
+                    morph_erode_3x3(&tmp_b, w, h, &mut tmp_a);
+                    morph_dilate_3x3(&tmp_a, w, h, &mut tmp_b);
+                }
+
+                // 4. Crisp 1px edge ramp (`< 90 -> 0`, `> 155 -> 255`, 1px AA transition).
+                for y in 0..h {
+                    for x in 0..w {
+                        let idx = y * w + x;
+                        let inside = tmp_b[idx] > 127;
+                        let a_raw = if inside {
+                            let edge_in = (x > 0 && tmp_b[idx - 1] == 0)
+                                || (x + 1 < w && tmp_b[idx + 1] == 0)
+                                || (y > 0 && tmp_b[idx - w] == 0)
+                                || (y + 1 < h && tmp_b[idx + w] == 0);
+                            if edge_in { 205 } else { 255 }
+                        } else {
+                            let near_fg = (x > 0 && tmp_b[idx - 1] > 127)
+                                || (x + 1 < w && tmp_b[idx + 1] > 127)
+                                || (y > 0 && tmp_b[idx - w] > 127)
+                                || (y + 1 < h && tmp_b[idx + w] > 127);
+                            if near_fg && scores[idx] >= thresh * 0.82 {
+                                122
+                            } else {
+                                0
+                            }
+                        };
+                        nf.data[idx * 4 + 3] = tighten_cutout_alpha(a_raw);
+                    }
+                }
+                nf
+            })
+            .collect();
+        VideoClip { frames, fps: self.fps }
+    }
     /// `len` seconds of frames from `start` (clamped to the clip).
     pub fn trimmed(&self, start: f64, len: f64) -> VideoClip {
         let fps = self.fps.max(1e-3) as f64;
@@ -808,25 +1089,14 @@ pub fn grain_draws_stage_mapped(
             continue;
         }
         let dur_f64 = ev.duration.max(0.001) as f64;
-        // *MODELL 5* staccato micro-bursts (`<= 85 ms` or `hard_burst`) cut sharply
-        // on their exact frame boundary; rhythmic drum/phrase stabs (`85..350 ms`)
-        // hold `52 ms` optical carry across micro-gaps.
-        let carry = if !parked
-            && !ev.tag.hard_burst
-            && ev.tag.env.is_none()
-            && ev.tag.choke_at.is_none()
-            && layout.uses_tiles()
-            && ev.duration > 0.085
-            && ev.duration < 0.35
-        {
-            OPTICAL_CARRY_SECS
-        } else {
-            0.0
-        };
+        let vis_tile_end = ev.visual_tile_end(parked, OPTICAL_CARRY_SECS);
+        let carry = (vis_tile_end - ev.end()).max(0.0);
         let vis_dur = if parked || ev.tag.hard_burst {
             dur_f64
         } else if layout.uses_tiles() && ev.tag.tile.is_some() {
-            dur_f64 + carry
+            (vis_tile_end - ev.onset).max(0.001)
+        } else if ev.tag.visual_hold > 0.0 {
+            (ev.duration.max(ev.tag.visual_hold)) as f64
         } else {
             style.visual_duration(ev.duration).max(dur_f64 + carry)
         };
@@ -846,13 +1116,16 @@ pub fn grain_draws_stage_mapped(
         let oxide = ev.tag.oxide_dropout.clamp(0.0, 1.0);
         let oxide_alpha = 1.0 - 0.82 * oxide;
 
-        // 1. Crisp architectural `Layout::Tile` or feathered `Layout::Split` panel.
+        // 1. Crisp architectural `Layout::Tile`, `Layout::Collage` grid cell, or zero-blur `Layout::Split` band.
         if let (Some((cols, rows)), Some(raw_slot)) = (panel_grid, ev.tag.tile) {
-            if layout == crate::tile::Layout::Tile || (layout == crate::tile::Layout::Split && !ev.tag.is_wash) {
+            let is_panel = layout == crate::tile::Layout::Tile
+                || (layout == crate::tile::Layout::Split && !ev.tag.is_wash)
+                || (layout == crate::tile::Layout::Collage && !ev.tag.collage_cutout && !ev.tag.is_wash);
+            if is_panel {
                 let slot = slot_remap
                     .map(|m| m[(raw_slot as usize).min(crate::tile::MAX_TILES - 1)])
                     .unwrap_or(raw_slot);
-                let carry_fade = if dt <= dur_f64 {
+                let carry_fade = if dt <= dur_f64 || ev.tag.visual_hold > 0.0 {
                     1.0
                 } else if carry > 1e-6 {
                     let u = ((dt - dur_f64) / carry).clamp(0.0, 1.0) as f32;
@@ -864,7 +1137,7 @@ pub fn grain_draws_stage_mapped(
                     continue;
                 }
                 let visual_rate = 1.0 + (ev.pitch_ratio - 1.0) * link.pitch_to_rate;
-                // Freeze-frame during optical carry after the audio slice finishes.
+                // Freeze-frame during visual_hold / optical carry after the audio slice finishes.
                 let eff_dt = dt.min(dur_f64);
                 let local = eff_dt * visual_rate as f64;
                 let src_time = if ev.reverse && link.reverse_video {
@@ -873,8 +1146,8 @@ pub fn grain_draws_stage_mapped(
                     ev.source_pos + local
                 };
                 let (r, feather_edges, tiled) = if layout == crate::tile::Layout::Split {
-                    let (sr, fe) = crate::tile::split_rect(slot as usize, cols, rows);
-                    (sr, fe, false)
+                    let (sr, _) = crate::tile::split_rect(slot as usize, cols, rows);
+                    (sr, [false; 4], true)
                 } else {
                     (
                         crate::tile::tile_rect_for_count(slot as usize, cols, rows, active_count, aspect),
@@ -1261,10 +1534,8 @@ pub fn composite_grains_frame_stage_mapped(
     );
 
     for d in draws {
-        let is_split_panel =
-            layout == crate::tile::Layout::Split && !d.is_wash && d.feather_edges.iter().any(|&e| e);
         let use_screen = layout == crate::tile::Layout::Bleed
-            || (layout == crate::tile::Layout::Split && (d.is_wash || is_split_panel));
+            || (layout == crate::tile::Layout::Split && d.is_wash);
         let (add, feath, shad) = if d.tiled || layout == crate::tile::Layout::Split {
             (0.0, 0.0, 0.0)
         } else {
@@ -1435,11 +1706,345 @@ pub fn composite_grains_frame_stage_mapped(
     }
 }
 
+/// Draw crisp `2px` `#111314` (`STAGE_INK_RGB = [17, 19, 20]`) solid dividers
+/// along interior grid/split boundaries (`0px` blur), honoring the spanned
+/// bottom row when `active_count == 3` in a `2×2` grid.
+pub fn draw_grid_dividers_for_count(
+    frame: &mut Frame,
+    cols: u32,
+    rows: u32,
+    active_count: usize,
+) {
+    let w = frame.width as usize;
+    let h = frame.height as usize;
+    if w < 4 || h < 4 || (cols <= 1 && rows <= 1) {
+        return;
+    }
+    let ink = [
+        crate::tile::STAGE_INK_RGB[0],
+        crate::tile::STAGE_INK_RGB[1],
+        crate::tile::STAGE_INK_RGB[2],
+        255,
+    ];
+    let span_bottom = active_count == 3 && cols == 2 && rows == 2;
+    let v_max_y = if span_bottom { h / 2 } else { h };
+
+    for c in 1..cols {
+        let seam_x = ((c as usize * w) / cols as usize).clamp(1, w - 1);
+        for x in [seam_x - 1, seam_x] {
+            for y in 0..v_max_y {
+                frame.put(x as u32, y as u32, ink);
+            }
+        }
+    }
+    for r in 1..rows {
+        let seam_y = ((r as usize * h) / rows as usize).clamp(1, h - 1);
+        for y in [seam_y - 1, seam_y] {
+            for x in 0..w {
+                frame.put(x as u32, y as u32, ink);
+            }
+        }
+    }
+}
+
+/// Fill crisp `#111314` gutters across `frame` before compositing `Layout::Collage`
+/// or `Layout::Split` panels so background gaps and borders sit on `#111314` ink.
+pub fn fill_stage_ink(frame: &mut Frame) {
+    let ink = crate::tile::STAGE_INK_RGB;
+    for px in frame.data.chunks_exact_mut(4) {
+        px[0] = ink[0];
+        px[1] = ink[1];
+        px[2] = ink[2];
+        px[3] = 255;
+    }
+}
+
+/// Razor-sharp `Layout::Collage` foreground compositor for segmented clips
+/// (`clip.has_alpha() == true`) AND unsegmented foreground hook clips
+/// (`collage_cutout == true`):
+/// - Segmented clips composite as **die-cut paper/sticker cutouts**: tightened
+///   `1px` anti-aliased silhouette (`< 90 -> 0`, `> 155 -> 255`), a **crisp `3px`
+///   warm cream paper border (`[242, 237, 224]`)**, and a **hard solid offset
+///   print shadow (`+5px, +5px` in `[17, 19, 20]`, ZERO blur!)**.
+/// - Unsegmented foreground hook clips stamp as **crisp framed zine photo-cards**
+///   (`3px` `#F2EDE0` border + `+5px, +5px` solid `#111314` shadow, subtle
+///   deterministic beat-stepped framing, zero alpha ghosting).
+#[allow(clippy::too_many_arguments)]
+pub fn composite_collage_foreground(
+    clip: &VideoClip,
+    events: &[GrainEvent],
+    link: &AvLink,
+    transform: &crate::timeline::ClipTransform,
+    color_filter: Option<&ColorFilter>,
+    out: &mut Frame,
+    t: f64,
+    blend_frames: bool,
+    hue_override: Option<f32>,
+) {
+    let ow = out.width as usize;
+    let oh = out.height as usize;
+    if ow < 8 || oh < 8 || clip.frames.is_empty() {
+        return;
+    }
+    let clip_alpha = clip.has_alpha();
+    let cream = crate::tile::STICKER_BORDER_RGB;
+    let ink = crate::tile::STAGE_INK_RGB;
+    let border_r: isize = 3;
+    let shadow_dx: isize = 5;
+    let shadow_dy: isize = 5;
+    let aspect = ow as f32 / oh as f32;
+
+    for ev in events {
+        if ev.tag.chord_harmony {
+            continue;
+        }
+        let dur_f64 = ev.duration.max(0.001) as f64;
+        let vis_end = if ev.tag.visual_hold > 0.0 {
+            ev.onset + ev.duration.max(ev.tag.visual_hold) as f64
+        } else {
+            ev.end()
+        };
+        let eff_end = match ev.tag.choke_at {
+            Some(tc) => vis_end.min(tc + crate::grain::CHOKE_RELEASE_SECS),
+            None => vis_end,
+        };
+        if t < ev.onset || t >= eff_end {
+            continue;
+        }
+        if ev.tag.picture_at(t) <= 0.02 {
+            continue;
+        }
+        let dt = (t - ev.onset).max(0.0).min(dur_f64);
+        let visual_rate = 1.0 + (ev.pitch_ratio - 1.0) * link.pitch_to_rate;
+        let local = dt * visual_rate as f64;
+        let src_time = if ev.reverse && link.reverse_video {
+            ev.source_pos + dur_f64 * visual_rate as f64 - local
+        } else {
+            ev.source_pos + local
+        };
+        let src_cow = if blend_frames {
+            clip.frame_looped_at(src_time, 0.24)
+        } else {
+            clip.frame_at(src_time).map(std::borrow::Cow::Borrowed)
+        };
+        let Some(src) = src_cow else { continue };
+        if src.width == 0 || src.height == 0 {
+            continue;
+        }
+        let hue_shift = hue_override.unwrap_or_else(|| ev.semitones() * link.pitch_to_hue);
+        let step_j1 = hash01(ev.id ^ 0x517C_C1B7);
+        let step_j2 = hash01(ev.id.wrapping_mul(0x9E37_79B9));
+        let default_xform = transform.x.abs() < 1e-3
+            && transform.y.abs() < 1e-3
+            && (transform.scale - 1.0).abs() < 1e-3;
+        let step_x = if default_xform { (step_j1 - 0.5) * 0.14 } else { transform.x * 0.5 };
+        let step_y = if default_xform { (step_j2 - 0.5) * 0.10 } else { transform.y * 0.5 };
+        let user_scale = transform.scale.clamp(0.25, 2.5);
+
+        if clip_alpha {
+            // Segmented cutout silhouette -> die-cut paper sticker (`3px` `#F2EDE0` + `+5,+5` `#111314`).
+            let patch = src.alpha_bounds().unwrap_or([0.0, 0.0, 1.0, 1.0]);
+            let src_ar = (src.width as f32 * patch[2]) / (src.height as f32 * patch[3]).max(1.0);
+            let base_h = (0.76 * user_scale).clamp(0.24, 0.94);
+            let base_w = (base_h * src_ar / aspect).clamp(0.18, 0.94);
+            let dw = ((base_w * ow as f32).round() as usize).clamp(8, ow);
+            let dh = ((base_h * oh as f32).round() as usize).clamp(8, oh);
+            let cx = ((0.5 + step_x) * ow as f32).round() as isize;
+            let cy = ((0.52 + step_y) * oh as f32).round() as isize;
+            let x0 = cx - (dw as isize) / 2;
+            let y0 = cy - (dh as isize) / 2;
+
+            // Sample foreground RGBA onto padded local buffer `(dw + 2*pad) x (dh + 2*pad)`
+            // so `3px` border dilation + `+5,+5` shadow never clip inside the sticker box.
+            let pad = (border_r + 1) as usize;
+            let bw = dw + pad * 2;
+            let bh = dh + pad * 2;
+            let mut fg_rgb = vec![[0u8; 3]; bw * bh];
+            let mut fg_a = vec![0u8; bw * bh];
+            let sw = src.width as f32;
+            let sh = src.height as f32;
+
+            for ly in 0..dh {
+                let qy = (ly as f32 + 0.5) / dh as f32;
+                let sy = ((patch[1] + qy * patch[3]) * (sh - 1.0)).round().clamp(0.0, sh - 1.0) as u32;
+                for lx in 0..dw {
+                    let qx = if ev.tag.ratchet_odd {
+                        1.0 - (lx as f32 + 0.5) / dw as f32
+                    } else {
+                        (lx as f32 + 0.5) / dw as f32
+                    };
+                    let sx = ((patch[0] + qx * patch[2]) * (sw - 1.0)).round().clamp(0.0, sw - 1.0) as u32;
+                    let [mut r, mut g, mut b, raw_a] = src.get(sx, sy);
+                    let mut a = tighten_cutout_alpha(raw_a);
+                    if let Some(cf) = color_filter {
+                        a = tighten_cutout_alpha((a as f32 * cf.mask(r, g, b)).round() as u8);
+                    }
+                    if a == 0 {
+                        continue;
+                    }
+                    if hue_shift.abs() > 0.5 {
+                        let (h, s, v) = rgb_to_hsv(r, g, b);
+                        (r, g, b) = hsv_to_rgb(h + hue_shift, s, v);
+                    }
+                    let bi = (ly + pad) * bw + (lx + pad);
+                    fg_rgb[bi] = [r, g, b];
+                    fg_a[bi] = a;
+                }
+            }
+
+            // Dilate silhouette (`fg_a >= 90`) by Euclidean `3px` (`dx*dx + dy*dy <= 9`) -> `sticker`.
+            let mut sticker = vec![false; bw * bh];
+            let r2 = border_r * border_r;
+            for by in 0..bh {
+                for bx in 0..bw {
+                    if fg_a[by * bw + bx] < 90 {
+                        continue;
+                    }
+                    let dy_min = (-border_r).max(-(by as isize));
+                    let dy_max = border_r.min(bh as isize - 1 - by as isize);
+                    let dx_min = (-border_r).max(-(bx as isize));
+                    let dx_max = border_r.min(bw as isize - 1 - bx as isize);
+                    for dy in dy_min..=dy_max {
+                        for dx in dx_min..=dx_max {
+                            if dx * dx + dy * dy <= r2 {
+                                sticker[(by as isize + dy) as usize * bw + (bx as isize + dx) as usize] = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            let base_x = x0 - pad as isize;
+            let base_y = y0 - pad as isize;
+
+            // Pass 1: Hard solid offset print shadow (`+5px, +5px` in `[17, 19, 20]`, ZERO blur!).
+            for by in 0..bh {
+                let sy = base_y + by as isize + shadow_dy;
+                if sy < 0 || sy >= oh as isize {
+                    continue;
+                }
+                for bx in 0..bw {
+                    if !sticker[by * bw + bx] {
+                        continue;
+                    }
+                    let sx = base_x + bx as isize + shadow_dx;
+                    if sx < 0 || sx >= ow as isize {
+                        continue;
+                    }
+                    // Skip if covered by the sticker itself at `(bx + shadow_dx, by + shadow_dy)`.
+                    let cov_x = bx as isize + shadow_dx;
+                    let cov_y = by as isize + shadow_dy;
+                    if cov_x >= 0
+                        && cov_x < bw as isize
+                        && cov_y >= 0
+                        && cov_y < bh as isize
+                        && sticker[cov_y as usize * bw + cov_x as usize]
+                    {
+                        continue;
+                    }
+                    out.put(sx as u32, sy as u32, [ink[0], ink[1], ink[2], 255]);
+                }
+            }
+
+            // Pass 2: Crisp `3px` warm cream paper border (`[242, 237, 224]`) + 1px AA subject!
+            for by in 0..bh {
+                let dy = base_y + by as isize;
+                if dy < 0 || dy >= oh as isize {
+                    continue;
+                }
+                for bx in 0..bw {
+                    let bi = by * bw + bx;
+                    if !sticker[bi] {
+                        continue;
+                    }
+                    let dx = base_x + bx as isize;
+                    if dx < 0 || dx >= ow as isize {
+                        continue;
+                    }
+                    let a = fg_a[bi];
+                    let px = if a == 255 {
+                        let c = fg_rgb[bi];
+                        [c[0], c[1], c[2], 255]
+                    } else if a == 0 {
+                        [cream[0], cream[1], cream[2], 255]
+                    } else {
+                        let w_fg = a as f32 / 255.0;
+                        let w_bg = 1.0 - w_fg;
+                        let c = fg_rgb[bi];
+                        [
+                            (c[0] as f32 * w_fg + cream[0] as f32 * w_bg + 0.5) as u8,
+                            (c[1] as f32 * w_fg + cream[1] as f32 * w_bg + 0.5) as u8,
+                            (c[2] as f32 * w_fg + cream[2] as f32 * w_bg + 0.5) as u8,
+                            255,
+                        ]
+                    };
+                    out.put(dx as u32, dy as u32, px);
+                }
+            }
+        } else {
+            // Unsegmented foreground hook clip -> crisp framed zine photo-card
+            // (`3px` `#F2EDE0` border + `+5px, +5px` solid `#111314` shadow, zero alpha ghosting).
+            let card_w = ((0.52 * user_scale * ow as f32).round() as isize).clamp(12, ow as isize - 12);
+            let card_h = ((0.56 * user_scale * oh as f32).round() as isize).clamp(12, oh as isize - 12);
+            let cx = ((0.5 + step_x) * ow as f32).round() as isize;
+            let cy = ((0.48 + step_y) * oh as f32).round() as isize;
+            let ix0 = cx - card_w / 2;
+            let iy0 = cy - card_h / 2;
+            let ix1 = ix0 + card_w;
+            let iy1 = iy0 + card_h;
+            let bx0 = ix0 - border_r;
+            let by0 = iy0 - border_r;
+            let bx1 = ix1 + border_r;
+            let by1 = iy1 + border_r;
+
+            // 1. Hard solid `+5px, +5px` print shadow in `#111314` (`0px` blur).
+            for y in (by0 + shadow_dy).max(0)..(by1 + shadow_dy).min(oh as isize) {
+                for x in (bx0 + shadow_dx).max(0)..(bx1 + shadow_dx).min(ow as isize) {
+                    if x >= bx0 && x < bx1 && y >= by0 && y < by1 {
+                        continue;
+                    }
+                    out.put(x as u32, y as u32, [ink[0], ink[1], ink[2], 255]);
+                }
+            }
+
+            // 2. Crisp `3px` `#F2EDE0` border + 100% opaque beat-stepped photo-card interior.
+            let card_ar = card_w as f32 / card_h.max(1) as f32;
+            let src_ar = src.width as f32 / src.height.max(1) as f32;
+            let step_zoom = 1.0 + 0.14 * step_j1;
+            let patch = focus_cover_patch(card_ar, src_ar, ev.tag.focus, step_zoom);
+            let sw = src.width as f32;
+            let sh = src.height as f32;
+
+            for y in by0.max(0)..by1.min(oh as isize) {
+                for x in bx0.max(0)..bx1.min(ow as isize) {
+                    if x < ix0 || x >= ix1 || y < iy0 || y >= iy1 {
+                        out.put(x as u32, y as u32, [cream[0], cream[1], cream[2], 255]);
+                    } else {
+                        let qx = if ev.tag.ratchet_odd {
+                            1.0 - (x - ix0) as f32 / card_w.max(1) as f32
+                        } else {
+                            (x - ix0) as f32 / card_w.max(1) as f32
+                        };
+                        let qy = (y - iy0) as f32 / card_h.max(1) as f32;
+                        let sx = ((patch[0] + qx * patch[2]) * (sw - 1.0)).round().clamp(0.0, sw - 1.0) as u32;
+                        let sy = ((patch[1] + qy * patch[3]) * (sh - 1.0)).round().clamp(0.0, sh - 1.0) as u32;
+                        let [mut r, mut g, mut b, _] = src.get(sx, sy);
+                        if hue_shift.abs() > 0.5 {
+                            let (h, s, v) = rgb_to_hsv(r, g, b);
+                            (r, g, b) = hsv_to_rgb(h + hue_shift, s, v);
+                        }
+                        out.put(x as u32, y as u32, [r, g, b, 255]);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Blend a track layer onto the master stage frame according to `layout`:
-/// - `Stack` / `Tile`: standard `blend_layer` (`additive`, `opacity`).
-/// - `Split`: optical screen-blend along feathered interior panel seams and
-///   sustained wash layers so shared boundaries glow like overlapping film gates
-///   instead of dimming to gray.
+/// - `Stack` / `Tile` / `Collage`: crisp `blend_layer` (`additive`, `opacity`).
+/// - `Split`: crisp hard-edged `alpha-over` on split panels (`0px` seam blur; solid
+///   `2px` `#111314` dividers stamped after panels) + `30%` optical screen on wash beds.
 /// - `Bleed`: luma-keyed optical screen + soft-exclusion highlight roll-off so
 ///   multiple overlapping video streams melt together without blowing out to white.
 pub fn blend_stage_layer(
@@ -1451,10 +2056,16 @@ pub fn blend_stage_layer(
     is_wash_track: bool,
 ) {
     match layout {
-        crate::tile::Layout::Stack | crate::tile::Layout::Tile => {
+        crate::tile::Layout::Stack
+        | crate::tile::Layout::Tile
+        | crate::tile::Layout::Collage => {
             blend_layer(dst, layer, additive, opacity);
         }
         crate::tile::Layout::Split => {
+            if !is_wash_track {
+                blend_layer(dst, layer, additive, opacity);
+                return;
+            }
             let opacity = opacity.clamp(0.0, 1.0);
             if opacity <= 0.002 {
                 return;
@@ -1465,16 +2076,7 @@ pub fn blend_stage_layer(
                 if la <= 0.002 {
                     continue;
                 }
-                let dst_luma = (0.299 * d[0] as f32 + 0.587 * d[1] as f32 + 0.114 * d[2] as f32) / 255.0;
-                // Where `dst` is already lit (interior feathered seam or wash bleed),
-                // blend via optical screen so neither panel darkens at the seam.
-                let seam_screen = if is_wash_track {
-                    0.92
-                } else if raw_a < 0.97 && dst_luma > 0.02 {
-                    0.82
-                } else {
-                    additive.clamp(0.0, 1.0) * 0.35
-                };
+                let seam_screen = 0.92f32;
                 for c in 0..3 {
                     let dn = d[c] as f32 / 255.0;
                     let sn = (s[c] as f32 / 255.0) * la;
@@ -2280,5 +2882,47 @@ mod tests {
         composite_grains_frame_layout(&clip, &evs, &style, &link, &tr, None, &mut out, 0.3, false, None, Some((2, 1)));
         let col = |x: u32| (0..36u32).map(|y| out.data[((y * 64 + x) * 4) as usize] as u32 + out.data[((y * 64 + x) * 4 + 1) as usize] as u32).sum::<u32>();
         assert!(col(10) > 0 && col(54) > 0);
+    }
+
+    #[test]
+    fn cutout_subject_fast_extracts_die_cut_silhouette_and_tightens_edges() {
+        let (w, h) = (64u32, 48u32);
+        let mut f = Frame::black(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let dx = x as f32 - 32.0;
+                let dy = y as f32 - 24.0;
+                let in_subject = dx * dx + dy * dy <= 11.0 * 11.0;
+                let rgba = if in_subject {
+                    [236, 92, 48, 255]
+                } else {
+                    [24, 34, 46, 255]
+                };
+                f.put(x, y, rgba);
+            }
+        }
+        let clip = VideoClip { frames: vec![f], fps: 12.0 };
+        assert!(!clip.has_alpha(), "raw opaque clip is not yet alpha-segmented");
+
+        let cut = clip.cutout_subject_fast((0.5, 0.5));
+        assert!(cut.has_alpha(), "cutout_subject_fast produces die-cut alpha matte");
+        let cf = &cut.frames[0];
+        assert_eq!(cf.get(2, 2)[3], 0, "border background is cleanly knocked out to alpha 0");
+        assert_eq!(cf.get(32, 24)[3], 255, "foreground subject center is solid alpha 255");
+        let soft_fringe = cf
+            .data
+            .chunks_exact(4)
+            .filter(|px| px[3] > 0 && px[3] < 255)
+            .count();
+        assert!(soft_fringe < 160, "silhouette ramp is crisp 1px without wide blurry halo: {soft_fringe}");
+
+        // Verify media::cutout_source seamlessly falls back to cutout_subject_fast for in-memory sources.
+        let src = crate::timeline::Source {
+            name: "synth_subject".into(),
+            video: Some(std::sync::Arc::new(clip)),
+            ..Default::default()
+        };
+        let cut_src = crate::media::cutout_source(&src, "subject");
+        assert!(cut_src.video.as_ref().unwrap().has_alpha());
     }
 }

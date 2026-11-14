@@ -514,15 +514,15 @@ impl Studio {
                 video: 0.82,
             });
         }
-        // 4: Shimmer — lush octave/prism kaleidoscope + cathedral tail.
+        // 4: Shimmer — crisp graphic tint + cathedral tail (no radial kaleidoscope).
         if self.punch_fx[4] {
-            if let Some(k) = EffectKind::parse("kaleido") {
-                chain.push(AvEffect { kind: k, audio: 0.72, video: 0.78 });
+            if let Some(t) = EffectKind::parse("tint") {
+                chain.push(AvEffect { kind: t, audio: 0.72, video: 0.68 });
             }
             chain.push(AvEffect {
-                kind: EffectKind::Reverb { size: 0.94, damp: 0.22, mix: 0.62 },
+                kind: EffectKind::Reverb { size: 0.94, damp: 0.0, mix: 0.62 },
                 audio: 0.88,
-                video: 0.80,
+                video: 0.45,
             });
         }
         // 5: Wear — Basinski oxide disintegration + warm crush/codec decay.
@@ -649,8 +649,8 @@ impl Studio {
         }
         let mut fired: Vec<(usize, u8, GrainEvent, (usize, usize), Option<String>)> = Vec::new();
         let mode = host.stage_mode().unwrap_or(StageMode::Stack);
-        let assign_slot = matches!(mode, StageMode::Grid | StageMode::Split);
-        let pan_by_tile = mode == StageMode::Grid && host.project().lock().unwrap().layout_pan;
+        let assign_slot = matches!(mode, StageMode::Grid | StageMode::Split | StageMode::Collage);
+        let pan_by_tile = matches!(mode, StageMode::Grid | StageMode::Collage) && host.project().lock().unwrap().layout_pan;
         let tape_spin_mul = (1.0 - 0.72 * self.tape_stop_amt).clamp(0.18, 1.0);
         self.tiles.expire(now);
         let mut released = Vec::new();

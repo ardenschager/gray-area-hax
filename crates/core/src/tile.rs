@@ -22,11 +22,15 @@ use serde::{Deserialize, Serialize};
 /// Most tiles at once (3×3). More voices share: the extra voice takes slot
 /// `voice % MAX_TILES`.
 pub const MAX_TILES: usize = 9;
-/// Gap between tiles, as a fraction of the canvas' shorter side.
+/// Gap between tiles, as a fraction of the canvas' shorter side (`~2px` hairline).
 pub const TILE_GAP: f32 = 0.004;
-/// Fractional interior-edge overlap in [`Layout::Split`] (`+6.5%`) for
-/// feathered optical-screen seam blending.
-pub const SPLIT_BLEED_OVERLAP: f32 = 0.065;
+/// Fractional interior-edge overlap in [`Layout::Split`] (`0.0` = zero seam blur,
+/// crisp `2px` `#111314` dividers matching [`Layout::Tile`]).
+pub const SPLIT_BLEED_OVERLAP: f32 = 0.0;
+/// Crisp zine/grid divider & sticker shadow ink (`#111314`).
+pub const STAGE_INK_RGB: [u8; 3] = [17, 19, 20];
+/// Crisp die-cut paper sticker border cream (`#F2EDE0`).
+pub const STICKER_BORDER_RGB: [u8; 3] = [242, 237, 224];
 
 /// Output stage aspect ratio (`16:9`, `1:1`, `9:16`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -98,21 +102,32 @@ impl AspectRatio {
 /// Compositing mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Layout {
-    /// Layered spatial grain compositing (default).
+    /// Layered spatial grain compositing (legacy default on `Project::default()`).
     #[default]
     Stack,
-    /// Feathered Split + Bleed (`1 -> full`, `2 -> 2-up`, `3 -> triptych`,
-    /// `4 -> 2x2`) with `+6.5%` screen-blended interior seams and sustained
+    /// Crisp architectural Split (`1 -> full`, `2 -> 2-up`, `3 -> triptych`,
+    /// `4 -> 4x1` / `2x2`) with `2px` `#111314` dividers (`0px` blur) and sustained
     /// wash voices bleeding full-screen at `30%`.
     Split,
-    /// Crisp architectural Grid (`1.5px` obsidian dividers).
+    /// Crisp architectural Grid (`2px` `#111314` dividers, default on `Project::new` / `Perform`).
     Tile,
     /// Full-canvas optical luma-key + screen multi-exposure melt.
     Bleed,
+    /// Dynamic fast-cutting hairline Grid (`1x1 <-> 2x1 <-> 2x2 <-> 3x2 <-> 3x3`,
+    /// `2px` `#111314` gutters) + razor-sharp die-cut paper/sticker cutouts (`3px`
+    /// `#F2EDE0` cream border + `+5px, +5px` `#111314` solid print shadow, `0px` blur)
+    /// for segmented (`has_alpha`) or `collage_cutout` foreground clips.
+    Collage,
 }
 
 impl Layout {
-    pub const ALL: [Layout; 4] = [Layout::Stack, Layout::Split, Layout::Tile, Layout::Bleed];
+    pub const ALL: [Layout; 5] = [
+        Layout::Stack,
+        Layout::Split,
+        Layout::Tile,
+        Layout::Bleed,
+        Layout::Collage,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -120,22 +135,24 @@ impl Layout {
             Layout::Split => "split",
             Layout::Tile => "tile",
             Layout::Bleed => "bleed",
+            Layout::Collage => "collage",
         }
     }
 
-    /// Short stage pill label (`stack | split | grid | bleed`).
+    /// Short stage pill label (`stack | split | grid | bleed | collage`).
     pub fn label(self) -> &'static str {
         match self {
             Layout::Stack => "stack",
             Layout::Split => "split",
             Layout::Tile => "grid",
             Layout::Bleed => "bleed",
+            Layout::Collage => "collage",
         }
     }
 
-    /// True when discrete voices claim spatial panel slots (`Split` or `Tile`).
+    /// True when discrete voices claim spatial panel slots (`Split`, `Tile`, or `Collage`).
     pub fn uses_tiles(self) -> bool {
-        matches!(self, Layout::Split | Layout::Tile)
+        matches!(self, Layout::Split | Layout::Tile | Layout::Collage)
     }
 
     pub fn parse(s: &str) -> Option<Layout> {
@@ -144,8 +161,44 @@ impl Layout {
             "split" | "split+bleed" | "smart" => Some(Layout::Split),
             "tile" | "tiles" | "grid" => Some(Layout::Tile),
             "bleed" | "blend" | "fullbleed" => Some(Layout::Bleed),
+            "collage" | "cutout" | "sticker" | "zine" => Some(Layout::Collage),
             _ => None,
         }
+    }
+}
+
+/// Stable affinity owner key for tile slot assignment, incorporating `cell_salt`
+/// so rapid ratchets (`x2..x8`) and consecutive `VoxPerc` / slice-locked chops
+/// burst and dance across distinct grid cells (while `chord_harmony` stays at `0`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize)]
+pub struct TileOwner {
+    pub track: u16,
+    pub lane: u16,
+    pub chord_sub: u8,
+    pub cell_salt: u8,
+}
+
+impl TileOwner {
+    #[inline]
+    pub fn key(self) -> u64 {
+        ((self.track as u64) << 32)
+            | ((self.lane as u64) << 16)
+            | ((self.chord_sub as u64) << 8)
+            | (self.cell_salt as u64)
+    }
+}
+
+/// Dynamic fast-cutting grid `(cols, rows)` for [`Layout::Collage`]:
+/// `1 -> 1x1`, `2 -> 2x1` (`1x2` portrait), `3..=4 -> 2x2`, `5..=6 -> 3x2`
+/// (`2x3` portrait), `7..=9 -> 3x3`.
+pub fn collage_grid_for(n: usize, aspect: f32) -> (u32, u32) {
+    let portrait = aspect.is_finite() && aspect < 0.85;
+    match n {
+        0 | 1 => (1, 1),
+        2 => if portrait { (1, 2) } else { (2, 1) },
+        3 | 4 => (2, 2),
+        5 | 6 => if portrait { (2, 3) } else { (3, 2) },
+        _ => (3, 3),
     }
 }
 
@@ -233,9 +286,8 @@ pub fn frame_portrait_grid(slots: impl IntoIterator<Item = u8>, aspect: f32) -> 
     portrait_grid_for(n.max(hi), aspect)
 }
 
-/// Feathered panel rect and interior-edge flags `[left, right, top, bottom]`
-/// for `slot` in [`Layout::Split`]. Interior shared seams expand symmetrically
-/// by [`SPLIT_BLEED_OVERLAP`] (`+6.5%`) for optical screen feathering.
+/// Crisp non-overlapping panel rect for `slot` in [`Layout::Split`] (`0px` blur;
+/// interior boundaries receive a solid `2px` `#111314` divider on stage).
 pub fn split_rect(slot: usize, cols: u32, rows: u32) -> (TileRect, [bool; 4]) {
     let (cols, rows) = (cols.max(1), rows.max(1));
     let slot = slot.min((cols * rows) as usize - 1) as u32;
@@ -244,17 +296,10 @@ pub fn split_rect(slot: usize, cols: u32, rows: u32) -> (TileRect, [bool; 4]) {
     let base_h = 1.0 / rows as f32;
     let base_x = c as f32 * base_w;
     let base_y = r as f32 * base_h;
-    let fl = c > 0;
-    let fr = c + 1 < cols;
-    let ft = r > 0;
-    let fb = r + 1 < rows;
-    let ox = SPLIT_BLEED_OVERLAP * base_w;
-    let oy = SPLIT_BLEED_OVERLAP * base_h;
-    let x0 = if fl { (base_x - ox).max(0.0) } else { base_x };
-    let x1 = if fr { (base_x + base_w + ox).min(1.0) } else { base_x + base_w };
-    let y0 = if ft { (base_y - oy).max(0.0) } else { base_y };
-    let y1 = if fb { (base_y + base_h + oy).min(1.0) } else { base_y + base_h };
-    (TileRect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }, [fl, fr, ft, fb])
+    (
+        TileRect { x: base_x, y: base_y, w: base_w, h: base_h },
+        [false; 4],
+    )
 }
 
 /// Grid (cols, rows) that holds `n` tiles: 1 → 1×1, 2 → 2×1, 3–4 → 2×2,
@@ -444,6 +489,42 @@ impl TileAssigner {
             .find(|&i| self.keys[i] == Some(key))
             .filter(|&i| self.slots[i].is_some())
             .or_else(|| (0..MAX_TILES).filter(free).find(|&i| self.keys[i] == Some(key)))
+            .or_else(|| (0..MAX_TILES).find(free));
+        match i {
+            Some(i) => {
+                self.slots[i] = Some((voice, t, f64::INFINITY));
+                self.keys[i] = Some(key);
+                i as u8
+            }
+            None => (voice % MAX_TILES as u64) as u8,
+        }
+    }
+
+    /// Like [`TileAssigner::assign_keyed`], except when `cell_salt > 0` (rapid
+    /// ratchet bursts or alternating `VoxPerc` micro-chops on the same lane),
+    /// avoids jumping back into `base_key`'s cell so consecutive micro-chops
+    /// dance across distinct grid cells!
+    pub fn assign_keyed_salted(
+        &mut self,
+        voice: u64,
+        key: u64,
+        base_key: u64,
+        cell_salt: u8,
+        t: f64,
+    ) -> u8 {
+        if cell_salt == 0 {
+            return self.assign_keyed(voice, key, t);
+        }
+        if let Some(i) = self.slot_of(voice) {
+            return i as u8;
+        }
+        self.expire(t);
+        let free = |i: &usize| self.slots[*i].is_none();
+        let i = (0..MAX_TILES)
+            .find(|&i| self.keys[i] == Some(key))
+            .filter(|&i| self.slots[i].is_some())
+            .or_else(|| (0..MAX_TILES).filter(free).find(|&i| self.keys[i] == Some(key)))
+            .or_else(|| (0..MAX_TILES).filter(free).find(|&i| self.keys[i] != Some(base_key)))
             .or_else(|| (0..MAX_TILES).find(free));
         match i {
             Some(i) => {

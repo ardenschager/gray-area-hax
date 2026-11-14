@@ -357,16 +357,13 @@ impl Host for App {
             clip.grains.gain = spec.gain;
             clip.grains.sculpt = spec.sculpt;
             clip.grains.choke_group = spec.choke_group;
+            clip.link = spec.link;
             clip.grains.adsr = Some(spec.adsr.unwrap_or(chromagrain_core::envelope::Adsr {
-                attack: if spec.one_shot { 0.004 } else { 0.25 },
+                attack: if spec.one_shot { 0.004 } else { 0.02 },
                 decay: if spec.one_shot { 0.08 } else { 0.20 },
                 sustain: 0.9,
-                release: if spec.one_shot { 0.14 } else { 0.65 },
-                picture: if spec.one_shot {
-                    chromagrain_core::envelope::PictureCut::Cut
-                } else {
-                    chromagrain_core::envelope::PictureCut::Fade
-                },
+                release: if spec.one_shot { 0.14 } else { 0.45 },
+                picture: chromagrain_core::envelope::PictureCut::Cut,
                 ..Default::default()
             }));
             clip.length_beats = if let Some(free_s) = spec.sculpt.free_loop_secs {
@@ -662,9 +659,11 @@ impl PerformHost for App {
         let slice_dur = (t1 - t0).max(0.05);
         let slice_beats = p.secs_to_beats(slice_dur);
         let mut clip = build_clip(&mut p, source, 0.0, PlayMode::Snippet);
-        // The slice: start position, duration in seconds, and a crisp Cut envelope.
+        // The slice: start position, duration in seconds, full-brightness hard Cut.
         clip.grains.position = if src_len > 0.0 { (t0 / src_len) as f32 } else { 0.0 };
         clip.grains.duration = slice_dur as f32;
+        clip.link.gain_to_opacity = 0.0;
+        clip.link.envelope_to_opacity = 0.0;
         clip.grains.adsr = Some(chromagrain_core::envelope::Adsr {
             attack: 0.005,
             decay: 0.08,

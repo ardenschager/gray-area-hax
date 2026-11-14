@@ -137,7 +137,7 @@ impl EffectKind {
             EffectKind::Tune { .. } => "frequencies → key ↔ hues → key colors",
             EffectKind::Tile { .. } => "multi-tap echoes ↔ tiled / kaleidoscope picture",
             EffectKind::Kaleido { .. } => "radial reverse-mirror prism ↔ polar kaleidoscope",
-            EffectKind::Isolator(_) => "5-band 24dB/oct isolator ↔ spatial/tonal band isolator",
+            EffectKind::Isolator(_) => "5-band 24dB/oct isolator ↔ zero-blur graphic zine print isolator",
         }
     }
 }
@@ -1725,104 +1725,22 @@ pub fn isolator_video_uniforms(iso: &BandIsolator, amount: f32) -> ([f32; 5], u3
     (gains, ch, mon, eff_exp)
 }
 
-fn box_blur_rgb(src: &[u8], w: usize, h: usize, radius: usize) -> Vec<[f32; 3]> {
-    let n = w * h;
-    let mut out = vec![[0.0f32; 3]; n];
-    if n == 0 || radius == 0 {
-        for i in 0..n {
-            let p = i * 4;
-            out[i] = [
-                src[p] as f32 / 255.0,
-                src[p + 1] as f32 / 255.0,
-                src[p + 2] as f32 / 255.0,
-            ];
-        }
-        return out;
-    }
-    let mut tmp = vec![[0.0f32; 3]; n];
-    // O(1)-per-pixel horizontal sliding sum.
-    let init_w = w.min(radius + 1);
-    for y in 0..h {
-        let row = y * w;
-        let mut acc = [0i32; 3];
-        for x in 0..init_w {
-            let p = (row + x) * 4;
-            acc[0] += src[p] as i32;
-            acc[1] += src[p + 1] as i32;
-            acc[2] += src[p + 2] as i32;
-        }
-        let mut count = init_w as f32;
-        for x in 0..w {
-            let scale = 1.0 / (count * 255.0);
-            tmp[row + x] = [acc[0] as f32 * scale, acc[1] as f32 * scale, acc[2] as f32 * scale];
-            if x + radius + 1 < w {
-                let pa = (row + x + radius + 1) * 4;
-                acc[0] += src[pa] as i32;
-                acc[1] += src[pa + 1] as i32;
-                acc[2] += src[pa + 2] as i32;
-                count += 1.0;
-            }
-            if x >= radius {
-                let ps = (row + x - radius) * 4;
-                acc[0] -= src[ps] as i32;
-                acc[1] -= src[ps + 1] as i32;
-                acc[2] -= src[ps + 2] as i32;
-                count -= 1.0;
-            }
-        }
-    }
-    // O(1)-per-pixel row-major vertical sliding sum (L1 cache friendly!).
-    let init_h = h.min(radius + 1);
-    let mut col_sums = vec![[0.0f32; 3]; w];
-    for y in 0..init_h {
-        let row = y * w;
-        for x in 0..w {
-            let c = tmp[row + x];
-            col_sums[x][0] += c[0];
-            col_sums[x][1] += c[1];
-            col_sums[x][2] += c[2];
-        }
-    }
-    let mut count = init_h as f32;
-    for y in 0..h {
-        let row = y * w;
-        let inv = 1.0 / count;
-        for x in 0..w {
-            let s = col_sums[x];
-            out[row + x] = [s[0] * inv, s[1] * inv, s[2] * inv];
-        }
-        if y + radius + 1 < h {
-            let add_row = (y + radius + 1) * w;
-            for x in 0..w {
-                let c = tmp[add_row + x];
-                col_sums[x][0] += c[0];
-                col_sums[x][1] += c[1];
-                col_sums[x][2] += c[2];
-            }
-            count += 1.0;
-        }
-        if y >= radius {
-            let sub_row = (y - radius) * w;
-            for x in 0..w {
-                let c = tmp[sub_row + x];
-                col_sums[x][0] -= c[0];
-                col_sums[x][1] -= c[1];
-                col_sums[x][2] -= c[2];
-            }
-            count -= 1.0;
-        }
-    }
-    out
-}
+const BAYER_4X4: [[f32; 4]; 4] = [
+    [0.5 / 16.0, 8.5 / 16.0, 2.5 / 16.0, 10.5 / 16.0],
+    [12.5 / 16.0, 4.5 / 16.0, 14.5 / 16.0, 6.5 / 16.0],
+    [3.5 / 16.0, 11.5 / 16.0, 1.5 / 16.0, 9.5 / 16.0],
+    [15.5 / 16.0, 7.5 / 16.0, 13.5 / 16.0, 5.5 / 16.0],
+];
 
-/// 1:1 visual counterpart of [`BandIsolator`] (`ISOL8`):
-/// Exact 5-band partition of unity (`orig === LF + LMF + MF + HMF + HF`):
-/// - `HF` (`> X4`): fine high-spatial-frequency edge detail (`orig - blur_med`)
-/// - `HMF` (`X3..X4`): medium-high spatial structure (`blur_med - blur_coarse`) + bright highlights
-/// - `MF` (`X2..X3`): midrange Bernstein tonal body (`3 Y^2 (1 - Y)`)
-/// - `LMF` (`X1..X2`): warm low-mid tonal body (`3 Y (1 - Y)^2`)
-/// - `LF` (`< X1`): deep shadow & low-spatial DC mass (`0.35 + 0.65 (1 - Y)^3` of `blur_coarse`)
-/// Plus `Mid / Side` radial center-subject vs peripheral-frame isolation and `L / R / M / S` monitor!
+/// Zero-blur 1:1 visual counterpart of [`BandIsolator`] (`ISOL8`):
+/// - All 5 bands active: untouched crisp pixels.
+/// - High bands muted (`LF` / `LMF` solo): **crisp high-contrast graphic duotone +
+///   ordered `4×4` Bayer halftone punch** (`#111314` obsidian ink shadows, warm
+///   amber `#EEAE3A` -> cream `#F2EDE0` highlights — sharp pixels, ZERO spatial blur!).
+/// - Low bands muted (`MF` / `HMF` / `HF` solo): **crisp `3×3` Sobel zine ink-edge +
+///   stark contrast print** (sharp graphic line-work over crisp high-contrast midtones —
+///   ZERO spatial blur!).
+/// Plus `Mid / Side` radial center-subject vs peripheral-frame isolation and `L / R / M / S` monitor.
 pub fn apply_video_isolator(frame: &mut Frame, iso: &BandIsolator, amount: f32) {
     let amt = amount.clamp(0.0, 1.0);
     if amt <= 1e-4 || !iso.is_active() || frame.width == 0 || frame.height == 0 {
@@ -1832,20 +1750,26 @@ pub fn apply_video_isolator(frame: &mut Frame, iso: &BandIsolator, amount: f32) 
     let h = frame.height as usize;
     let (g, ch_mode, mon_mode, eff_exp) = isolator_video_uniforms(iso, amt);
     let filter_on = g.iter().any(|&v| (v - 1.0).abs() > 1e-4);
+    let src = if filter_on { frame.data.clone() } else { Vec::new() };
 
-    let (blur_med, blur_coarse) = if filter_on {
-        let min_dim = w.min(h).max(1);
-        let r_med = (min_dim / 42).clamp(2, 10);
-        let r_coarse = (min_dim / 12).clamp(6, 28);
-        (
-            box_blur_rgb(&frame.data, w, h, r_med),
-            box_blur_rgb(&frame.data, w, h, r_coarse),
-        )
-    } else {
-        (Vec::new(), Vec::new())
+    const INK: [f32; 3] = [17.0 / 255.0, 19.0 / 255.0, 20.0 / 255.0];
+    const AMBER: [f32; 3] = [238.0 / 255.0, 174.0 / 255.0, 58.0 / 255.0];
+    const CREAM: [f32; 3] = [242.0 / 255.0, 237.0 / 255.0, 224.0 / 255.0];
+
+    let max_band = g[0].max(g[1]).max(g[2]).max(g[3]).max(g[4]).clamp(0.0, 1.0);
+    let high_cut = ((1.0 - g[4]) * 0.58 + (1.0 - g[3]) * 0.42).clamp(0.0, 1.0);
+    let low_cut = ((1.0 - g[0]) * 0.65 + (1.0 - g[1]) * 0.35).clamp(0.0, 1.0);
+    let low_drive = (0.58 * g[0] + 0.42 * g[1]).clamp(0.0, 1.0);
+    let mid_gain = 0.45 + 0.55 * g[2].max(g[3]).clamp(0.0, 1.0);
+    let only_hf_solo =
+        filter_on && g[0] < 0.05 && g[1] < 0.05 && g[2] < 0.05 && g[3] < 0.05 && g[4] > 0.5;
+
+    let sample_luma = |sx: isize, sy: isize| -> f32 {
+        let cx = sx.clamp(0, w as isize - 1) as usize;
+        let cy = sy.clamp(0, h as isize - 1) as usize;
+        let p = (cy * w + cx) * 4;
+        (0.2126 * src[p] as f32 + 0.7152 * src[p + 1] as f32 + 0.0722 * src[p + 2] as f32) / 255.0
     };
-
-    let only_high_solo = filter_on && g[0] < 0.05 && g[1] < 0.05 && g[2] < 0.05 && (g[3] > 0.5 || g[4] > 0.5);
 
     for y in 0..h {
         let v = (y as f32 + 0.5) / h as f32;
@@ -1856,44 +1780,85 @@ pub fn apply_video_isolator(frame: &mut Frame, iso: &BandIsolator, amount: f32) 
             if frame.data[p + 3] == 0 {
                 continue;
             }
-            let orig = [
-                frame.data[p] as f32 / 255.0,
-                frame.data[p + 1] as f32 / 255.0,
-                frame.data[p + 2] as f32 / 255.0,
-            ];
+            let orig = if filter_on {
+                [
+                    src[p] as f32 / 255.0,
+                    src[p + 1] as f32 / 255.0,
+                    src[p + 2] as f32 / 255.0,
+                ]
+            } else {
+                [
+                    frame.data[p] as f32 / 255.0,
+                    frame.data[p + 1] as f32 / 255.0,
+                    frame.data[p + 2] as f32 / 255.0,
+                ]
+            };
 
-            // Radial center-subject (`w_mid`) vs peripheral-frame (`w_side`) mask.
             let dist = (((u - 0.5) * 1.15).powi(2) + (v - 0.5).powi(2)).sqrt();
             let t_rad = ((0.70 - dist) / (0.70 - 0.16)).clamp(0.0, 1.0);
             let w_mid = t_rad * t_rad * (3.0 - 2.0 * t_rad);
             let w_side = 1.0 - w_mid;
 
             let mut rgb = if filter_on {
-                let bm = blur_med[idx];
-                let bc = blur_coarse[idx];
-                let y_luma = (0.2126 * bc[0] + 0.7152 * bc[1] + 0.0722 * bc[2]).clamp(0.0, 1.0);
-                let inv_y = 1.0 - y_luma;
-                // Exact partition of unity: c0 + c1 + c2 + c3 == 1.0!
-                let c0 = 0.35 + 0.65 * inv_y * inv_y * inv_y;
-                let c1 = 0.65 * 3.0 * y_luma * inv_y * inv_y;
-                let c2 = 0.65 * 3.0 * y_luma * y_luma * inv_y;
-                let c3 = 0.65 * y_luma * y_luma * y_luma;
+                let y0 = (0.2126 * orig[0] + 0.7152 * orig[1] + 0.0722 * orig[2]).clamp(0.0, 1.0);
+                let ix = x as isize;
+                let iy = y as isize;
+                let tl = sample_luma(ix - 1, iy - 1);
+                let tc = sample_luma(ix, iy - 1);
+                let tr = sample_luma(ix + 1, iy - 1);
+                let ml = sample_luma(ix - 1, iy);
+                let mr = sample_luma(ix + 1, iy);
+                let bl = sample_luma(ix - 1, iy + 1);
+                let bc = sample_luma(ix, iy + 1);
+                let br = sample_luma(ix + 1, iy + 1);
+                let gx = (tr + 2.0 * mr + br) - (tl + 2.0 * ml + bl);
+                let gy = (bl + 2.0 * bc + br) - (tl + 2.0 * tc + tr);
+                let edge = ((gx * gx + gy * gy).sqrt() * 1.35).clamp(0.0, 1.0);
+                let ink_line = ((edge - 0.12) / 0.34).clamp(0.0, 1.0);
+                let bayer = BAYER_4X4[y & 3][x & 3];
 
-                let mut band_sum = [0.0f32; 3];
-                for c in 0..3 {
-                    let d_hf = orig[c] - bm[c];
-                    let d_hmf = bm[c] - bc[c];
-                    let mut val = g[0] * (c0 * bc[c])
-                        + g[1] * (c1 * bc[c])
-                        + g[2] * (c2 * bc[c])
-                        + g[3] * (c3 * bc[c] + d_hmf)
-                        + g[4] * d_hf;
-                    if only_high_solo && g[3] < 0.05 {
-                        // Pure HF SOLO: render bipolar edge energy as crisp luminous contours!
-                        val = (d_hf.abs() * 2.4 * g[4]).min(1.0);
+                let band_sum = if max_band <= 0.01 {
+                    [0.0; 3]
+                } else if only_hf_solo {
+                    let hi_gate = ((y0 - 0.54) / 0.14).clamp(0.0, 1.0);
+                    let dot_gate = ((y0 - bayer + 0.08) / 0.16).clamp(0.0, 1.0);
+                    let stipple = hi_gate * dot_gate * 0.42;
+                    let mark = (ink_line.max(stipple) * g[4]).clamp(0.0, 1.0);
+                    [
+                        INK[0] + (CREAM[0] - INK[0]) * mark,
+                        INK[1] + (CREAM[1] - INK[1]) * mark,
+                        INK[2] + (CREAM[2] - INK[2]) * mark,
+                    ]
+                } else {
+                    let mut cur = orig;
+                    if low_cut > 0.01 {
+                        let y_print =
+                            ((y0 - 0.36 * low_cut) * (1.0 + 0.55 * low_cut)).clamp(0.0, 1.0);
+                        let y_step = (y_print * 5.0).round() / 5.0;
+                        let gain_y = if y0 > 1e-3 { y_step / y0 } else { 0.0 };
+                        let ink_etch = ink_line * 0.85 * low_cut;
+                        for c in 0..3 {
+                            let zine_c = (orig[c] * gain_y * mid_gain).clamp(0.0, 1.0);
+                            let etched = zine_c * (1.0 - ink_etch) + INK[c] * ink_etch;
+                            cur[c] = cur[c] * (1.0 - low_cut) + etched * low_cut;
+                        }
                     }
-                    band_sum[c] = val;
-                }
+                    if high_cut > 0.01 {
+                        let yc = ((y0 - 0.40) * 1.65 + 0.46).clamp(0.0, 1.0)
+                            * (0.35 + 0.65 * low_drive);
+                        let dot = if yc >= bayer * 0.82 + 0.09 { 1.0 } else { 0.0 };
+                        let step3 = (yc * 3.0).floor() / 3.0;
+                        let tone = (0.68 * dot + 0.32 * step3).clamp(0.0, 1.0);
+                        let t2 = tone * tone;
+                        for c in 0..3 {
+                            let hi_c = AMBER[c] + (CREAM[c] - AMBER[c]) * t2;
+                            let duo_c = INK[c] + (hi_c - INK[c]) * tone;
+                            cur[c] = cur[c] * (1.0 - high_cut) + duo_c * high_cut;
+                        }
+                    }
+                    [cur[0] * max_band, cur[1] * max_band, cur[2] * max_band]
+                };
+
                 match ch_mode {
                     1 => [
                         band_sum[0] * w_mid + orig[0] * w_side,
@@ -2692,10 +2657,11 @@ mod tests {
         apply_video_chain(&mut f_no_lf, std::slice::from_ref(&fx), &mut vstates);
         assert!(f_no_lf.mean_luma() < orig.mean_luma() * 0.85, "muting LF cuts low-spatial mass");
 
-        let mut fx_no_hf = AvEffect::new(EffectKind::parse("isolator").unwrap());
-        fx_no_hf.set_param("mute_hf", 1.0).unwrap();
-        let mut f_no_hf = orig.clone();
-        apply_video_chain(&mut f_no_hf, std::slice::from_ref(&fx_no_hf), &mut vstates);
+        // High bands muted (LF/LMF solo): crisp graphic duotone + ordered 4x4 Bayer halftone punch (zero blur!).
+        let mut fx_lf_solo = AvEffect::new(EffectKind::parse("isolator").unwrap());
+        fx_lf_solo.set_param("solo_lf", 1.0).unwrap();
+        let mut f_lf_solo = orig.clone();
+        apply_video_chain(&mut f_lf_solo, std::slice::from_ref(&fx_lf_solo), &mut vstates);
         let edge_energy = |fr: &Frame| -> f32 {
             let w = fr.width as usize;
             let mut sum = 0.0f32;
@@ -2708,7 +2674,15 @@ mod tests {
             }
             sum
         };
-        assert!(edge_energy(&f_no_hf) < edge_energy(&orig) * 0.85, "muting HF softens crisp edges");
+        assert_ne!(f_lf_solo.data, orig.data, "LF solo engages graphic duotone + Bayer halftone");
+        assert!(edge_energy(&f_lf_solo) > 500.0, "Bayer halftone keeps razor-sharp pixel contrast (zero blur)");
+
+        // Low bands muted (HF solo): crisp Sobel zine ink-edge + stark contrast print!
+        let mut fx_hf_solo = AvEffect::new(EffectKind::parse("isolator").unwrap());
+        fx_hf_solo.set_param("solo_hf", 1.0).unwrap();
+        let mut f_hf_solo = orig.clone();
+        apply_video_chain(&mut f_hf_solo, std::slice::from_ref(&fx_hf_solo), &mut vstates);
+        assert!(edge_energy(&f_hf_solo) > 500.0, "HF solo renders sharp Sobel zine ink contours");
 
         // Mid vs Side monitor isolates center subject vs peripheral frame!
         let mut white = Frame::black(64, 64);

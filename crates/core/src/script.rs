@@ -258,6 +258,22 @@ pub fn build_engine(session: Session, log: Arc<Mutex<String>>) -> Engine {
     );
 
     engine.register_fn(
+        "cutout",
+        |s: &mut Session, src: i64, mode: &str| -> ScriptResult<i64> {
+            let source = s
+                .project
+                .lock()
+                .unwrap()
+                .sources
+                .get(src as usize)
+                .ok_or_else(|| rt_err(format!("no source {src}")))?
+                .clone();
+            let seg = media::cutout_source(&source, mode);
+            Ok(s.project.lock().unwrap().add_source(seg) as i64)
+        },
+    );
+
+    engine.register_fn(
         "slice",
         |s: &mut Session, src: i64, start_secs: f64, len_secs: f64| -> ScriptResult<i64> {
             let mut p = s.project.lock().unwrap();

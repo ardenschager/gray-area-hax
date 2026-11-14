@@ -194,6 +194,7 @@ pub enum Stamp {
     Kick,
     Snare,
     Hat,
+    VoxPerc,
     Pluck,
     Chord,
     Phrase,
@@ -206,11 +207,12 @@ pub enum Stamp {
 pub type SculptStamp = Stamp;
 
 impl Stamp {
-    pub const ALL: [Stamp; 10] = [
+    pub const ALL: [Stamp; 11] = [
         Stamp::Raw,
         Stamp::Kick,
         Stamp::Snare,
         Stamp::Hat,
+        Stamp::VoxPerc,
         Stamp::Pluck,
         Stamp::Chord,
         Stamp::Phrase,
@@ -225,6 +227,7 @@ impl Stamp {
             Stamp::Kick => "kick",
             Stamp::Snare => "snare",
             Stamp::Hat => "hat",
+            Stamp::VoxPerc => "voxperc",
             Stamp::Pluck => "pluck",
             Stamp::Chord => "chord",
             Stamp::Phrase => "phrase",
@@ -240,6 +243,7 @@ impl Stamp {
             Stamp::Kick => "Kick",
             Stamp::Snare => "Snare",
             Stamp::Hat => "Hat",
+            Stamp::VoxPerc => "Vox Perc",
             Stamp::Pluck => "Pluck",
             Stamp::Chord => "Chord",
             Stamp::Phrase => "Phrase",
@@ -255,6 +259,7 @@ impl Stamp {
             "kick" | "sub" | "808" => Some(Stamp::Kick),
             "snare" | "clap" | "snap" => Some(Stamp::Snare),
             "hat" | "hihat" | "air" => Some(Stamp::Hat),
+            "voxperc" | "vocalperc" | "syllable" | "voxhat" | "tick" => Some(Stamp::VoxPerc),
             "pluck" | "comb" | "karplus" => Some(Stamp::Pluck),
             "chord" | "pads" => Some(Stamp::Chord),
             "phrase" | "vox" | "speech" => Some(Stamp::Phrase),
@@ -270,6 +275,9 @@ impl Stamp {
 /// Zero oscillators: every sound is excited strictly by the real media slice.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct VoiceSculpt {
+    /// Musical stamp role that seeded this sculptor (`Stamp::Raw` default).
+    #[serde(default)]
+    pub stamp: Stamp,
     /// Static transposition offset populated by stamps (e.g. `-14` Kick, `+10` Hat).
     #[serde(default)]
     pub pitch_semitones: f32,
@@ -331,6 +339,7 @@ pub struct VoiceSculpt {
 impl Default for VoiceSculpt {
     fn default() -> Self {
         VoiceSculpt {
+            stamp: Stamp::Raw,
             pitch_semitones: 0.0,
             pitch_env_semitones: 0.0,
             pitch_env_ms: default_pitch_env_ms(),
@@ -356,7 +365,7 @@ impl Default for VoiceSculpt {
 impl VoiceSculpt {
     /// Populate continuous sculptor parameters from a musical [`Stamp`].
     pub fn preset(stamp: Stamp) -> VoiceSculpt {
-        let base = VoiceSculpt::default();
+        let base = VoiceSculpt { stamp, ..VoiceSculpt::default() };
         match stamp {
             Stamp::Raw => base,
             Stamp::Kick => VoiceSculpt {
@@ -384,6 +393,15 @@ impl VoiceSculpt {
                 hpf_hz: 5400.0,
                 lpf_hz: 18_500.0,
                 resonance_q: 0.90,
+                ..base
+            },
+            Stamp::VoxPerc => VoiceSculpt {
+                pitch_semitones: 2.0,
+                drive_db: 3.5,
+                hpf_hz: 220.0,
+                lpf_hz: 15_500.0,
+                resonance_q: 0.92,
+                pocket_carve: true,
                 ..base
             },
             Stamp::Pluck => VoiceSculpt {
@@ -449,7 +467,8 @@ impl VoiceSculpt {
     /// True when any per-voice audio DSP stage deviates from clean bypass.
     #[inline]
     pub fn has_audio_dsp(&self) -> bool {
-        self.pitch_env_semitones.abs() > 1e-3
+        self.stamp == Stamp::VoxPerc
+            || self.pitch_env_semitones.abs() > 1e-3
             || self.sub_exciter > 1e-3
             || self.snare_snap > 1e-3
             || self.drive_db > 1e-3
@@ -466,7 +485,8 @@ impl VoiceSculpt {
 
     #[inline]
     pub fn is_active(&self) -> bool {
-        self.has_audio_dsp()
+        self.stamp != Stamp::Raw
+            || self.has_audio_dsp()
             || self.pitch_semitones.abs() > 1e-3
             || self.chord != ChordVoicing::Off
             || self.free_loop_secs.is_some()
@@ -687,9 +707,22 @@ pub struct VoiceTag {
     pub hard_burst: bool,
     /// Secondary harmony voice (`c > 0`) spawned by [`expand_chord_grain_inline`]:
     /// plays in stereo audio while letting the root voice (`c == 0`) own the single
-    /// visual panel in `Split` / `Tile` stage layouts (no duplicate cloned panels).
+    /// visual panel in `Split` / `Tile` / `Collage` stage layouts (no duplicate cloned panels).
     #[serde(default)]
     pub chord_harmony: bool,
+    /// Sub-cell subdivision salt (`0` default; `0..ratchet` on ratchets and alternating
+    /// on rapid `< 0.22s` `VoxPerc` / slice-locked micro-chops so consecutive syllables
+    /// jump across distinct grid cells).
+    #[serde(default)]
+    pub cell_salt: u8,
+    /// Optional crisp freeze-frame visual hold duration in seconds (`0.0` = use grain duration):
+    /// holds short percussive / `VoxPerc` / ratchet hits at 100% hard-cut brightness across
+    /// `(dur.clamp(0.065, 0.14))` and cuts cleanly on off!
+    #[serde(default)]
+    pub visual_hold: f32,
+    /// True when this event belongs to a `Layout::Collage` foreground cutout / zine photo-card.
+    #[serde(default)]
+    pub collage_cutout: bool,
 }
 
 impl Default for VoiceTag {
@@ -708,6 +741,9 @@ impl Default for VoiceTag {
             caption: crate::chop::Caption::default(),
             hard_burst: false,
             chord_harmony: false,
+            cell_salt: 0,
+            visual_hold: 0.0,
+            collage_cutout: false,
         }
     }
 }
@@ -782,6 +818,33 @@ impl GrainEvent {
         }
     }
 
+    /// Effective crisp visual end time for tiled/gridded panels, honoring
+    /// `VoiceTag::visual_hold` (hard-cut freeze-frame for short percussive /
+    /// `VoxPerc` / ratchet bursts) and `optical_carry_secs` for mid-length stabs.
+    #[inline]
+    pub fn visual_tile_end(&self, parked: bool, optical_carry_secs: f64) -> f64 {
+        if parked || self.tag.hard_burst {
+            return self.end();
+        }
+        if self.tag.visual_hold > 0.0 {
+            let hold_end = self.onset + (self.duration.max(self.tag.visual_hold)) as f64;
+            return match self.tag.choke_at {
+                Some(tc) => hold_end.min(tc + CHOKE_RELEASE_SECS),
+                None => hold_end,
+            };
+        }
+        let carry = if self.tag.env.is_none()
+            && self.tag.choke_at.is_none()
+            && self.duration > 0.085
+            && self.duration < 0.35
+        {
+            optical_carry_secs
+        } else {
+            0.0
+        };
+        self.end() + carry
+    }
+
     /// Pitch offset of this grain in semitones (drives visual hue shift).
     pub fn semitones(&self) -> f32 {
         crate::music::ratio_to_semitones(self.pitch_ratio)
@@ -836,6 +899,9 @@ pub fn expand_chord_grain_inline(
         ev.sculpt.hpf_hz = ev.sculpt.hpf_hz.max(210.0);
         ev.id = base.id.wrapping_mul(31).wrapping_add(c as u64);
         ev.tag.chord_harmony = c > 0;
+        if c > 0 {
+            ev.tag.cell_salt = 0;
+        }
         if base.tag.voice == 0 {
             ev.tag.voice = 0xD000_0000_0000_0000 | ((base.id & 0x0FFF_FFFF_FFFF) << 4);
         }

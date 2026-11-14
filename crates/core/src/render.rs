@@ -17,9 +17,9 @@ use crate::grain::{schedule_grains_auto, ChordVoicing, GrainEvent, VoiceSculpt};
 use crate::seq::pattern_events;
 use crate::timeline::{Clip, ClipKind, DuckState, Project, PunchAction, Source};
 use crate::video::{
-    apply_video_tape, apply_video_tape_stop, blend_layer_over, blend_stage_layer,
-    composite_grains_frame_stage_mapped, draw_stage_caption, Frame, VisualGrainStyle,
-    OPTICAL_CARRY_SECS,
+    apply_video_tape, apply_video_tape_stop, blend_layer, blend_layer_over, blend_stage_layer,
+    composite_collage_foreground, composite_grains_frame_stage_mapped, draw_grid_dividers_for_count,
+    draw_stage_caption, fill_stage_ink, Frame, VisualGrainStyle, OPTICAL_CARRY_SECS,
 };
 
 pub struct RenderOutput {
@@ -684,9 +684,15 @@ pub fn plan_project(project: &Project) -> Vec<ClipPlan> {
                         source.effective_base_hz(),
                         clip.key.as_ref(),
                     );
-                    if !source.slices.is_empty() {
+                    let src_has_alpha = source.video.as_deref().is_some_and(|v| v.has_alpha());
+                    if !source.slices.is_empty() || clip.collage_cutout || src_has_alpha {
                         for e in &mut events {
-                            e.tag.focus = source_focus_at(source, e.source_pos);
+                            if !source.slices.is_empty() {
+                                e.tag.focus = source_focus_at(source, e.source_pos);
+                            }
+                            if clip.collage_cutout || src_has_alpha {
+                                e.tag.collage_cutout = true;
+                            }
                         }
                     }
                     (vec![(clip.source, events)], None, clip.visual)
@@ -696,6 +702,8 @@ pub fn plan_project(project: &Project) -> Vec<ClipPlan> {
                     if source.duration() <= 0.0 {
                         continue;
                     }
+                    let src_has_alpha = source.video.as_deref().is_some_and(|v| v.has_alpha());
+                    let is_col_fg = clip.collage_cutout || src_has_alpha;
                     let start_pos = (clip.grains.position as f64 * source.duration()).min(source.duration());
                     let snip_focus = source_focus_at(source, start_pos);
                     let snip_cap = source_caption_at_start(source, start_pos);
@@ -710,6 +718,9 @@ pub fn plan_project(project: &Project) -> Vec<ClipPlan> {
                     );
                     for e in &mut evs {
                         e.tag.focus = snip_focus;
+                        if is_col_fg {
+                            e.tag.collage_cutout = true;
+                        }
                         if !snip_cap.is_empty() && (e.onset - clip_t0).abs() < 0.05 {
                             e.tag.caption = snip_cap;
                         }
@@ -725,6 +736,9 @@ pub fn plan_project(project: &Project) -> Vec<ClipPlan> {
                     .map(|mut v| {
                         for e in &mut v {
                             e.tag.focus = snip_focus;
+                            if is_col_fg {
+                                e.tag.collage_cutout = true;
+                            }
                             if !snip_cap.is_empty() && (e.onset - clip_t0).abs() < 0.05 {
                                 e.tag.caption = snip_cap;
                             }
@@ -752,13 +766,16 @@ pub fn plan_project(project: &Project) -> Vec<ClipPlan> {
                         clip.key.as_ref(),
                         &clip.automation,
                     );
-                    if track.sculpt.is_active() || track.choke_group > 0 {
+                    if track.sculpt.is_active() || track.choke_group > 0 || clip.collage_cutout {
                         for (sid, evs) in &mut parts {
                             let bh = project
                                 .sources
                                 .get(*sid)
                                 .map_or(440.0, |s| s.effective_base_hz());
                             for e in evs {
+                                if clip.collage_cutout {
+                                    e.tag.collage_cutout = true;
+                                }
                                 if !e.sculpt.is_active() && track.sculpt.is_active() {
                                     e.sculpt = track.sculpt;
                                     e.tag.is_wash = track.sculpt.is_wash();
@@ -863,8 +880,18 @@ pub fn plan_project(project: &Project) -> Vec<ClipPlan> {
         // In `Layout::Split`, sustained wash clips (`is_wash`) stay untiled
         // (`tile == None`) so they bleed full-canvas at `30%` screen.
         let muted = |cp: &ClipPlan| project.tracks.get(cp.track).is_some_and(|t| t.muted);
-        let is_split = project.layout == crate::tile::Layout::Split && !project.master_punches.iter().any(|mp| matches!(mp.action, PunchAction::Layout(crate::tile::Layout::Tile)));
-        assign_tiles_where(&mut plans, project.layout_pan, |cp| {
+        let is_split = project.layout == crate::tile::Layout::Split
+            && !project.master_punches.iter().any(|mp| {
+                matches!(mp.action, PunchAction::Layout(crate::tile::Layout::Tile))
+            });
+        let is_pure_collage = project.layout == crate::tile::Layout::Collage
+            && !project.master_punches.iter().any(|mp| {
+                matches!(
+                    mp.action,
+                    PunchAction::Layout(crate::tile::Layout::Tile | crate::tile::Layout::Split)
+                )
+            });
+        assign_tiles_where_opts(&mut plans, project.layout_pan, is_pure_collage, |cp| {
             if muted(cp) {
                 return false;
             }
@@ -884,17 +911,21 @@ pub fn plan_project(project: &Project) -> Vec<ClipPlan> {
     plans
 }
 
-/// Voice id of a whole clip (granular / snippet).
-fn clip_voice(track: usize, clip: usize) -> u64 {
-    0xC000_0000_0000_0000 | ((track as u64 & 0xFFFF) << 32) | (clip as u64 & 0xFFFF_FFFF)
+/// Voice id of a whole clip (granular / snippet), salted by `cell_salt`.
+fn clip_voice_salted(track: usize, clip: usize, salt: u8) -> u64 {
+    0xC000_0000_0000_0000
+        | ((salt as u64 & 0xFF) << 48)
+        | ((track as u64 & 0xFFFF) << 32)
+        | (clip as u64 & 0xFFFF_FFFF)
 }
 
-/// Layout `Tile` / `Split`: give every voice in the plan a stable tile slot, in
-/// voice-start order, preferring the slot its track used last (the same assignment the realtime engine replays,
-/// since it plays this plan). Grains without a voice belong to their
-/// clip's voice. With `layout_pan`, the slot's column sets the grain pan
-/// (keeping a little of the grain's own spread) and its row a subtle gain
-/// cue, from the grid at each grain's onset (the grid the picture shows).
+fn clip_voice(track: usize, clip: usize) -> u64 {
+    clip_voice_salted(track, clip, 0)
+}
+
+/// Layout `Tile` / `Split` / `Collage`: give every voice in the plan a stable tile slot, in
+/// voice-start order, preferring the slot its `TileOwner` (track, lane, chord_sub, `cell_salt`)
+/// used last. With `layout_pan`, the slot's column sets the grain pan and its row a subtle gain cue.
 pub fn assign_tiles(plans: &mut [ClipPlan], layout_pan: bool) {
     assign_tiles_where(plans, layout_pan, |_| true);
 }
@@ -902,45 +933,69 @@ pub fn assign_tiles(plans: &mut [ClipPlan], layout_pan: bool) {
 /// [`assign_tiles`] over only the plans `include` accepts (e.g. clips on
 /// unmuted tracks); the others get no tile and don't count toward the grid.
 pub fn assign_tiles_where(plans: &mut [ClipPlan], layout_pan: bool, include: impl Fn(&ClipPlan) -> bool) {
+    assign_tiles_where_opts(plans, layout_pan, false, include);
+}
+
+fn assign_tiles_where_opts(
+    plans: &mut [ClipPlan],
+    layout_pan: bool,
+    skip_collage_fg: bool,
+    include: impl Fn(&ClipPlan) -> bool,
+) {
     use std::collections::BTreeMap;
-    // voice -> (start, end, track, pitch_ratio)
-    let mut spans: BTreeMap<u64, (f64, f64, usize, f32)> = BTreeMap::new();
+    // voice -> (start, end, track, pitch_ratio, cell_salt)
+    let mut spans: BTreeMap<u64, (f64, f64, usize, f32, u8)> = BTreeMap::new();
     for cp in plans.iter_mut() {
         if !include(cp) {
             continue;
         }
-        let fallback = clip_voice(cp.track, cp.clip_index);
         for (_, evs) in cp.parts.iter_mut().chain(cp.video_parts.iter_mut().flatten()) {
             for e in evs.iter_mut() {
-                if is_wash_only_in_split(e) || e.tag.chord_harmony {
+                if is_wash_only_in_split(e)
+                    || e.tag.chord_harmony
+                    || (skip_collage_fg && e.tag.collage_cutout)
+                {
                     continue;
                 }
+                let salt = e.tag.cell_salt;
                 if e.tag.voice == 0 {
-                    e.tag.voice = fallback;
+                    e.tag.voice = clip_voice_salted(cp.track, cp.clip_index, salt);
                 }
-                let end = e.tag.env.map_or(e.end(), |v| v.end().min(e.end()));
-                let s = spans.entry(e.tag.voice).or_insert((e.onset, end, cp.track, e.pitch_ratio));
+                let base_end = e.tag.env.map_or(e.end(), |v| v.end().min(e.end()));
+                let end = if e.tag.visual_hold > 0.0 {
+                    base_end.max(e.visual_tile_end(false, 0.0))
+                } else {
+                    base_end
+                };
+                let s = spans
+                    .entry(e.tag.voice)
+                    .or_insert((e.onset, end, cp.track, e.pitch_ratio, salt));
                 s.0 = s.0.min(e.onset);
                 s.1 = s.1.max(end);
             }
         }
     }
-    let mut order: Vec<(u64, f64, f64, usize, f32)> =
-        spans.into_iter().map(|(v, (a, b, t, pr))| (v, a, b, t, pr)).collect();
+    let mut order: Vec<(u64, f64, f64, usize, f32, u8)> = spans
+        .into_iter()
+        .map(|(v, (a, b, t, pr, salt))| (v, a, b, t, pr, salt))
+        .collect();
     order.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
     let mut tiles = crate::tile::TileAssigner::new();
     let mut slot_of: BTreeMap<u64, u8> = BTreeMap::new();
     let mut spans: Vec<(u8, f64, f64)> = Vec::with_capacity(order.len());
-    // One tile per track (a pad's loop passes) or per pattern lane (step
-    // hits, `seq::hit_voice`): the next pass / hit keeps its tile.
-    let key_of = |voice: u64, track: usize| {
-        let chord_sub = if (voice >> 60) == 0xD { (voice & 0xF) + 1 } else { 0 };
-        let lane = if voice >> 60 == 0xA { 1 + ((voice >> 52) & 0xFF) } else { 0 };
-        ((track as u64) << 14) | (lane << 5) | chord_sub
+    // One tile per `TileOwner` (track, pattern lane, chord sub-voice, and `cell_salt`
+    // subdivision for multi-cell ratchets & rapid `VoxPerc` micro-chops).
+    let key_of = |voice: u64, track: usize, salt: u8| -> u64 {
+        let chord_sub = if (voice >> 60) == 0xD { ((voice & 0xF) + 1) as u8 } else { 0 };
+        let lane = if (voice >> 60) == 0xA { (1 + ((voice >> 52) & 0xFF)) as u16 } else { 0 };
+        crate::tile::TileOwner {
+            track: track as u16,
+            lane,
+            chord_sub,
+            cell_salt: salt,
+        }
+        .key()
     };
-    // When the key's previous voice ends (continuations at a shared start
-    // claim their slots before new keys pick the lowest free one; simultaneous
-    // chord voices sort low -> high pitch left-to-right).
     let mut key_end: BTreeMap<u64, f64> = BTreeMap::new();
     let mut g = 0;
     while g < order.len() {
@@ -951,16 +1006,18 @@ pub fn assign_tiles_where(plans: &mut [ClipPlan], layout_pan: bool, include: imp
         }
         let group = &mut order[g..h];
         group.sort_by(|a, b| {
-            let cont_a = key_end.get(&key_of(a.0, a.3)).is_some_and(|&e| e >= a.1 - 1e-9);
-            let cont_b = key_end.get(&key_of(b.0, b.3)).is_some_and(|&e| e >= b.1 - 1e-9);
+            let cont_a = key_end.get(&key_of(a.0, a.3, a.5)).is_some_and(|&e| e >= a.1 - 1e-9);
+            let cont_b = key_end.get(&key_of(b.0, b.3, b.5)).is_some_and(|&e| e >= b.1 - 1e-9);
             (!cont_a)
                 .cmp(&(!cont_b))
+                .then_with(|| a.5.cmp(&b.5))
                 .then_with(|| a.4.total_cmp(&b.4))
                 .then_with(|| a.0.cmp(&b.0))
         });
-        for &(voice, start, end, track, _) in group.iter() {
-            let key = key_of(voice, track);
-            let slot = tiles.assign_keyed(voice, key, start);
+        for &(voice, start, end, track, _, salt) in group.iter() {
+            let key = key_of(voice, track, salt);
+            let base_key = key_of(voice, track, 0);
+            let slot = tiles.assign_keyed_salted(voice, key, base_key, salt, start);
             tiles.release(voice, end);
             slot_of.insert(voice, slot);
             spans.push((slot, start, end));
@@ -976,7 +1033,8 @@ pub fn assign_tiles_where(plans: &mut [ClipPlan], layout_pan: bool, include: imp
         }
         for (_, evs) in cp.parts.iter_mut().chain(cp.video_parts.iter_mut().flatten()) {
             for e in evs.iter_mut() {
-                if e.tag.chord_harmony {
+                if e.tag.chord_harmony || (skip_collage_fg && e.tag.collage_cutout) {
+                    e.tag.cell_salt = if e.tag.chord_harmony { 0 } else { e.tag.cell_salt };
                     e.tag.tile = None;
                     continue;
                 }
@@ -1025,7 +1083,7 @@ fn frame_tile_grids_and_maps_stage(
     aspect: f32,
     portrait_columns: bool,
 ) -> Vec<((u32, u32), Option<[u8; crate::tile::MAX_TILES]>, usize)> {
-    let slots = collect_frame_panel_slots(plans, t0, fps, n_frames, false);
+    let slots = collect_frame_panel_slots(plans, t0, fps, n_frames, false, false);
     if aspect.is_finite() && aspect < 0.85 {
         return slots
             .into_iter()
@@ -1085,7 +1143,7 @@ fn frame_tile_grids_and_maps_stage(
 /// Tile grid for each frame (layout `Tile`): from the tile slots of every
 /// grain visible in it, across all clips (see [`crate::tile::frame_grid`]).
 pub fn frame_tile_grids(plans: &[ClipPlan], t0: f64, fps: f32, n_frames: usize) -> Vec<(u32, u32)> {
-    collect_frame_panel_slots(plans, t0, fps, n_frames, false)
+    collect_frame_panel_slots(plans, t0, fps, n_frames, false, false)
         .into_iter()
         .map(crate::tile::frame_grid)
         .collect()
@@ -1114,11 +1172,27 @@ fn frame_split_grids_and_maps(
     n_frames: usize,
     aspect: f32,
 ) -> Vec<((u32, u32), [u8; crate::tile::MAX_TILES], bool)> {
-    collect_frame_panel_slots(plans, t0, fps, n_frames, true)
+    collect_frame_panel_slots(plans, t0, fps, n_frames, true, false)
         .into_iter()
         .map(|s| {
             let (cnt, remap) = crate::tile::dense_slot_remap(&s);
             (crate::tile::split_grid_for(cnt, aspect), remap, cnt > 0)
+        })
+        .collect()
+}
+
+fn frame_collage_grids_and_maps(
+    plans: &[ClipPlan],
+    t0: f64,
+    fps: f32,
+    n_frames: usize,
+    aspect: f32,
+) -> Vec<((u32, u32), Option<[u8; crate::tile::MAX_TILES]>, usize)> {
+    collect_frame_panel_slots(plans, t0, fps, n_frames, true, true)
+        .into_iter()
+        .map(|s| {
+            let (cnt, remap) = crate::tile::dense_slot_remap(&s);
+            (crate::tile::collage_grid_for(cnt, aspect), Some(remap), cnt)
         })
         .collect()
 }
@@ -1129,6 +1203,7 @@ fn collect_frame_panel_slots(
     fps: f32,
     n_frames: usize,
     skip_wash: bool,
+    skip_collage_fg: bool,
 ) -> Vec<Vec<u8>> {
     let mut slots: Vec<Vec<u8>> = vec![Vec::new(); n_frames];
     let fps = fps.max(1e-3) as f64;
@@ -1136,22 +1211,15 @@ fn collect_frame_panel_slots(
         let vparts = cp.video_parts.as_deref().unwrap_or(&cp.parts);
         for (_, evs) in vparts {
             for e in evs {
-                if e.tag.chord_harmony || (skip_wash && e.tag.is_wash) {
+                if e.tag.chord_harmony
+                    || (skip_wash && e.tag.is_wash)
+                    || (skip_collage_fg && e.tag.collage_cutout)
+                {
                     continue;
                 }
                 let Some(slot) = e.tag.tile else { continue };
-                let carry = if !e.tag.hard_burst
-                    && e.tag.env.is_none()
-                    && e.tag.choke_at.is_none()
-                    && e.duration > 0.085
-                    && e.duration < 0.35
-                {
-                    OPTICAL_CARRY_SECS
-                } else {
-                    0.0
-                };
-                let vis_end = e.end() + carry;
-                let f0 = ((e.onset - t0) * fps).ceil().max(0.0) as usize;
+                let vis_end = e.visual_tile_end(false, OPTICAL_CARRY_SECS);
+                let f0 = ((e.onset - t0) * fps).floor().max(0.0) as usize;
                 let f1 = (((vis_end - t0) * fps).ceil().max(0.0) as usize).min(n_frames);
                 for (fi, list) in slots.iter_mut().enumerate().take(f1).skip(f0) {
                     let ft = t0 + fi as f64 / fps;
@@ -1294,11 +1362,16 @@ fn render_project_core(
         || project.master_punches.iter().any(|p| matches!(p.action, PunchAction::Layout(crate::tile::Layout::Tile)));
     let has_split_layout = project.layout == crate::tile::Layout::Split
         || project.master_punches.iter().any(|p| matches!(p.action, PunchAction::Layout(crate::tile::Layout::Split)));
+    let has_collage_layout = project.layout == crate::tile::Layout::Collage
+        || project.master_punches.iter().any(|p| matches!(p.action, PunchAction::Layout(crate::tile::Layout::Collage)));
     let tile_grids_opt = has_tile_layout.then(|| {
         frame_tile_grids_and_maps_stage(&plan, t0, project.fps, n_frames, aspect, project.portrait_columns)
     });
     let split_grids_opt = has_split_layout.then(|| {
         frame_split_grids_and_maps(&plan, t0, project.fps, n_frames, aspect)
+    });
+    let collage_grids_opt = has_collage_layout.then(|| {
+        frame_collage_grids_and_maps(&plan, t0, project.fps, n_frames, aspect)
     });
 
     let n_tracks = project.tracks.len();
@@ -1695,19 +1768,28 @@ fn render_project_core(
         let cur_layout = layout_at(frame_beat);
         let (grid_fi, remap_fi, active_cnt_fi, has_fg_fi) = match cur_layout {
             crate::tile::Layout::Tile => match tile_grids_opt.as_ref().map(|g| g[fi]) {
-                Some((grid, remap, cnt)) => (Some(grid), remap, cnt, true),
+                Some((grid, remap, cnt)) => (Some(grid), remap, cnt, cnt > 0),
                 None => (None, None, 0, false),
             },
             crate::tile::Layout::Split => match split_grids_opt.as_ref().map(|g| g[fi]) {
                 Some((grid, remap, has_fg)) => (Some(grid), Some(remap), 0, has_fg),
                 None => (None, None, 0, false),
             },
+            crate::tile::Layout::Collage => match collage_grids_opt.as_ref().map(|g| g[fi]) {
+                Some((grid, remap, cnt)) => (Some(grid), remap, cnt, cnt > 0),
+                None => (None, None, 0, false),
+            },
             crate::tile::Layout::Stack | crate::tile::Layout::Bleed => (None, None, 0, false),
         };
+        if cur_layout == crate::tile::Layout::Collage {
+            fill_stage_ink(frame);
+        }
+        let mut collage_fg_layers: Vec<(Frame, f32)> = Vec::new();
         for ctx in track_ctxs.iter_mut() {
             let ti = ctx.ti;
             let track = ctx.track;
             let mut track_layer: Option<Frame> = None;
+            let mut track_collage_fg: Option<Frame> = None;
             let mut active_add: Option<f32> = None;
             let mut track_is_wash = track.sculpt.is_wash();
 
@@ -1718,13 +1800,15 @@ fn render_project_core(
                 let carry_pad = if cur_layout.uses_tiles() { OPTICAL_CARRY_SECS } else { 0.0 };
                 let any_active = vparts.iter().any(|(_, evs)| {
                     evs.iter().any(|e| {
-                        ft >= e.onset && ft < e.onset + cp.style.visual_duration(e.duration).max(e.duration as f64 + carry_pad)
+                        let hold = e.duration.max(e.tag.visual_hold) as f64;
+                        ft >= e.onset && ft < e.onset + cp.style.visual_duration(e.duration).max(hold + carry_pad)
                     })
                 });
                 if !any_active && clip.effects.is_empty() {
                     continue;
                 }
                 let mut clip_layer = Frame::transparent(project.width, project.height);
+                let mut clip_fg_layer: Option<Frame> = None;
                 if any_active {
                     active_add = Some(active_add.unwrap_or(0.0).max(cp.style.additive));
                     if vparts.iter().any(|(_, evs)| evs.iter().any(|e| e.tag.is_wash && ft >= e.onset && ft < e.end())) {
@@ -1751,23 +1835,44 @@ fn render_project_core(
                         if let Some(video) =
                             project.sources.get(*sid).and_then(|s| s.video.as_ref())
                         {
-                            composite_grains_frame_stage_mapped(
-                                video,
-                                evs,
-                                &cp.style,
-                                &clip.link,
-                                &clip.transform,
-                                clip.color_filter.as_ref(),
-                                &mut clip_layer,
-                                ft,
-                                is_stretched_snippet,
-                                hue_override,
-                                cur_layout,
-                                grid_fi,
-                                remap_fi.as_ref(),
-                                active_cnt_fi,
-                                has_fg_fi,
-                            );
+                            let part_is_collage_fg = cur_layout == crate::tile::Layout::Collage
+                                && (clip.collage_cutout
+                                    || video.has_alpha()
+                                    || evs.iter().any(|e| e.tag.collage_cutout));
+                            if part_is_collage_fg {
+                                let fg_dst = clip_fg_layer.get_or_insert_with(|| {
+                                    Frame::transparent(project.width, project.height)
+                                });
+                                composite_collage_foreground(
+                                    video,
+                                    evs,
+                                    &clip.link,
+                                    &clip.transform,
+                                    clip.color_filter.as_ref(),
+                                    fg_dst,
+                                    ft,
+                                    is_stretched_snippet,
+                                    hue_override,
+                                );
+                            } else {
+                                composite_grains_frame_stage_mapped(
+                                    video,
+                                    evs,
+                                    &cp.style,
+                                    &clip.link,
+                                    &clip.transform,
+                                    clip.color_filter.as_ref(),
+                                    &mut clip_layer,
+                                    ft,
+                                    is_stretched_snippet,
+                                    hue_override,
+                                    cur_layout,
+                                    grid_fi,
+                                    remap_fi.as_ref(),
+                                    active_cnt_fi,
+                                    has_fg_fi,
+                                );
+                            }
                         }
                     }
                 }
@@ -1775,16 +1880,15 @@ fn render_project_core(
                 let tl = track_layer
                     .get_or_insert_with(|| Frame::transparent(project.width, project.height));
                 blend_layer_over(tl, &clip_layer, cp.style.additive);
+                if let Some(fg_c) = clip_fg_layer {
+                    let ftl = track_collage_fg
+                        .get_or_insert_with(|| Frame::transparent(project.width, project.height));
+                    blend_layer_over(ftl, &fg_c, 0.0);
+                }
             }
 
-            if track_layer.is_none() && !ctx.track_has_fx {
+            if track_layer.is_none() && track_collage_fg.is_none() && !ctx.track_has_fx {
                 continue;
-            }
-            let mut tl = track_layer
-                .unwrap_or_else(|| Frame::transparent(project.width, project.height));
-            fx::apply_video_chain(&mut tl, &track.effects, &mut ctx.track_vstates);
-            if track.tape.is_active() {
-                apply_video_tape(&mut tl, &track.tape, fi, project.fps, 0x5452_4B00 ^ ti as u64);
             }
             let mut opacity =
                 track.opacity_at((t0 + fi as f64 / project.fps as f64) * project.bpm / 60.0);
@@ -1807,10 +1911,36 @@ fn render_project_core(
                     opacity = (opacity * (1.0 - 0.55 * pulse) + pulse * shaped).clamp(0.0, 1.0);
                 }
             }
-            let track_add = track
-                .additive
-                .unwrap_or_else(|| active_add.unwrap_or(ctx.fallback_add));
-            blend_stage_layer(frame, &tl, cur_layout, track_add, opacity, track_is_wash);
+            if track_layer.is_some() || ctx.track_has_fx {
+                let mut tl = track_layer
+                    .unwrap_or_else(|| Frame::transparent(project.width, project.height));
+                fx::apply_video_chain(&mut tl, &track.effects, &mut ctx.track_vstates);
+                if track.tape.is_active() {
+                    apply_video_tape(&mut tl, &track.tape, fi, project.fps, 0x5452_4B00 ^ ti as u64);
+                }
+                let track_add = track
+                    .additive
+                    .unwrap_or_else(|| active_add.unwrap_or(ctx.fallback_add));
+                blend_stage_layer(frame, &tl, cur_layout, track_add, opacity, track_is_wash);
+            }
+            if let Some(fg_tl) = track_collage_fg {
+                collage_fg_layers.push((fg_tl, opacity));
+            }
+        }
+
+        // Crisp `2px` `#111314` solid dividers (`0px` blur) across Split and Collage grids!
+        if let Some((cols, rows)) = grid_fi {
+            if has_fg_fi
+                && (cols > 1 || rows > 1)
+                && matches!(cur_layout, crate::tile::Layout::Split | crate::tile::Layout::Collage)
+            {
+                draw_grid_dividers_for_count(frame, cols, rows, active_cnt_fi);
+            }
+        }
+
+        // Composite die-cut paper/sticker cutouts & framed zine photo-cards OVER the grid!
+        for (fg_tl, fg_op) in &collage_fg_layers {
+            blend_layer(frame, fg_tl, 0.0, *fg_op);
         }
 
         fx::apply_video_chain(frame, &project.master_effects, &mut master_states);
@@ -3155,5 +3285,123 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         assert!(max_diff < 1e-6, "RealtimeAudio + ISOL8 matches render_project sample-exactly: {max_diff}");
+    }
+
+    #[test]
+    fn collage_sticker_border_shadow_zero_blur_split_and_multicell_ratchet() {
+        // 1. Project::new defaults to crisp Layout::Tile while Project::default preserves Layout::Stack.
+        assert_eq!(Project::new().layout, crate::tile::Layout::Tile);
+        assert_eq!(Project::default().layout, crate::tile::Layout::Stack);
+
+        // 2. Layout::Split has zero crossfade blur and draws a crisp 2px #111314 ([17, 19, 20]) divider!
+        let mut p_split = two_track_project(true);
+        p_split.width = 96;
+        p_split.height = 54;
+        p_split.fps = 20.0;
+        p_split.layout = crate::tile::Layout::Split;
+        let out_split = render_project(&p_split, 0.0, 0.5);
+        let split_f = &out_split.frames[2];
+        assert_eq!(
+            split_f.get(48, 27),
+            [17, 19, 20, 255],
+            "Split draws crisp 2px #111314 divider with zero crossfade blur"
+        );
+        assert_eq!(split_f.get(46, 27), [220, 30, 30, 255], "Left of divider is pure unfeathered red");
+        assert_eq!(split_f.get(50, 27), [30, 30, 220, 255], "Right of divider is pure unfeathered blue");
+
+        // 3. Layout::Collage composites background grid cells + die-cut foreground sticker
+        //    with crisp 3px #F2EDE0 ([242, 237, 224]) paper border & hard +5px,+5px #111314 ([17, 19, 20]) shadow!
+        let mut p_col = two_track_project(true);
+        p_col.width = 120;
+        p_col.height = 80;
+        p_col.fps = 20.0;
+        p_col.layout = crate::tile::Layout::Collage;
+
+        let mut cut_frame = crate::video::Frame::transparent(60, 60);
+        for y in 18..42 {
+            for x in 18..42 {
+                cut_frame.put(x, y, [40, 210, 90, 255]);
+            }
+        }
+        let cut_sid = p_col.add_source(crate::timeline::Source {
+            name: "sticker".into(),
+            audio: Some(std::sync::Arc::new(crate::audio::AudioClip::sine(330.0, 2.0, p_col.sample_rate))),
+            video: Some(std::sync::Arc::new(VideoClip {
+                frames: vec![cut_frame],
+                fps: 20.0,
+            })),
+            base_hz: 330.0,
+            ..Default::default()
+        });
+        let fg_tr = p_col.add_track("sticker_fg");
+        let mut fg_clip = Clip::new_snippet(cut_sid, 0.0, 1.0);
+        fg_clip.collage_cutout = true;
+        p_col.tracks[fg_tr].clips.push(fg_clip);
+
+        let out_col = render_project(&p_col, 0.0, 0.5);
+        let col_f = &out_col.frames[2];
+        let mut border_hits = 0usize;
+        let mut shadow_hits = 0usize;
+        let mut subject_hits = 0usize;
+        for px in col_f.data.chunks_exact(4) {
+            let rgb = [px[0], px[1], px[2]];
+            if rgb == crate::tile::STICKER_BORDER_RGB {
+                border_hits += 1;
+            } else if rgb == crate::tile::STAGE_INK_RGB {
+                shadow_hits += 1;
+            } else if px[1] > 180 && px[0] < 80 {
+                subject_hits += 1;
+            }
+        }
+        assert!(subject_hits > 100, "die-cut subject rendered on top of Collage grid: {subject_hits}");
+        assert!(border_hits > 60, "crisp 3px #F2EDE0 paper border rendered around silhouette: {border_hits}");
+        assert!(shadow_hits > 120, "hard solid #111314 shadow + grid gutters rendered: {shadow_hits}");
+
+        // Also verify unsegmented collage_cutout stamps as a crisp framed zine photo-card!
+        let card_sid = p_col.add_source(crate::timeline::Source {
+            name: "zine_card".into(),
+            audio: Some(std::sync::Arc::new(crate::audio::AudioClip::sine(440.0, 2.0, p_col.sample_rate))),
+            video: Some(std::sync::Arc::new(solid_video(235, 190, 40))),
+            base_hz: 440.0,
+            ..Default::default()
+        });
+        p_col.tracks[fg_tr].clips[0].source = card_sid;
+        let out_card = render_project(&p_col, 0.0, 0.5);
+        let card_borders = out_card.frames[2]
+            .data
+            .chunks_exact(4)
+            .filter(|px| [px[0], px[1], px[2]] == crate::tile::STICKER_BORDER_RGB)
+            .count();
+        assert!(card_borders > 80, "unsegmented collage_cutout renders framed zine photo-card: {card_borders}");
+
+        // 4. Multi-cell ratchet subdivision: an x4 ratchet on a single sequence row claims 4 distinct Tile slots!
+        let mut p_rat = Project::new();
+        p_rat.bpm = 134.0;
+        p_rat.width = 96;
+        p_rat.height = 54;
+        p_rat.fps = 30.0;
+        let r_sid = p_rat.add_source(crate::timeline::Source {
+            name: "vox".into(),
+            audio: Some(std::sync::Arc::new(crate::audio::AudioClip::sine(220.0, 2.0, p_rat.sample_rate))),
+            video: Some(std::sync::Arc::new(solid_video(200, 90, 40))),
+            base_hz: 220.0,
+            ..Default::default()
+        });
+        let mut pat = crate::seq::StepPattern::new("ratchet_burst");
+        let ri = pat.add_row(r_sid);
+        pat.rows[ri].sculpt = crate::grain::VoiceSculpt::preset(crate::grain::Stamp::VoxPerc);
+        pat.rows[ri].steps[0].on = true;
+        pat.rows[ri].steps[0].ratchet = 4;
+        let pid = p_rat.add_pattern(pat);
+        let tid = p_rat.add_track("seq");
+        p_rat.tracks[tid].clips.push(Clip::new_pattern(pid, 0.0, 4.0));
+        let plan = plan_project(&p_rat);
+        let tiles: std::collections::BTreeSet<u8> = plan[0].parts[0]
+            .1
+            .iter()
+            .take(4)
+            .filter_map(|e| e.tag.tile)
+            .collect();
+        assert_eq!(tiles.len(), 4, "x4 ratchet claims 4 distinct grid cells via cell_salt: {tiles:?}");
     }
 }

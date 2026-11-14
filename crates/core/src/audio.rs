@@ -633,6 +633,7 @@ fn render_sculpted_grain(
     });
     let kick_sub_makeup = if steep_kick_lpf { 1.38f32 } else { 1.0 };
 
+    let is_vox_perc = sc.stamp == crate::grain::Stamp::VoxPerc;
     let snap = sc.snare_snap.clamp(0.0, 1.0);
     let mut snare_body = (snap > 1e-3).then(|| {
         let bq = crate::dsp::Biquad::peaking(sr_f, 220.0, 1.25, 4.5 * snap);
@@ -640,6 +641,11 @@ fn render_sculpted_grain(
     });
     let mut snare_crack = (snap > 1e-3).then(|| {
         let bq = crate::dsp::Biquad::peaking(sr_f, 2600.0, 0.92, 6.2 * snap);
+        [bq.clone(), bq]
+    });
+    let mut vox_perc_presence = is_vox_perc.then(|| {
+        // Crisp 1.8 kHz..6.5 kHz consonant/sibilant articulation shelf-bell for UKG VoxPerc ticks.
+        let bq = crate::dsp::Biquad::peaking(sr_f, 3400.0, 0.72, 4.8);
         [bq.clone(), bq]
     });
     let mut pocket_bq = (sc.pocket_carve && eff_hpf_hz < 420.0 && eff_lpf_hz > 650.0).then(|| {
@@ -756,8 +762,14 @@ fn render_sculpted_grain(
         let inst_ratio = (ev.pitch_ratio * pitch_mult as f32).clamp(0.05, 8.0);
 
         // 1. Sample read (with 0.82 Hz wow + 4.25 Hz flutter + subtle R Haas chorus).
-        let perc_hit = (sub_mix > 0.1 || snap > 0.1 || comb_mix > 0.2) && sc.free_loop_secs.is_none();
-        let (mut sig_l, mut sig_r) = if i < n_nom {
+        let perc_hit =
+            (is_vox_perc || sub_mix > 0.1 || snap > 0.1 || comb_mix > 0.2) && sc.free_loop_secs.is_none();
+        let vox_gate_secs = if ev.duration <= 0.052 {
+            (ev.duration as f64).clamp(0.028, 0.052)
+        } else {
+            0.038
+        };
+        let (mut sig_l, mut sig_r) = if i < n_nom && (!is_vox_perc || t_rel < vox_gate_secs) {
             let phase = (i as f32 / n_nom as f32).clamp(0.0, 1.0);
             let eff_env = if perc_hit && phase < 0.5 {
                 ev.envelope.min(0.04)
@@ -765,6 +777,18 @@ fn render_sculpted_grain(
                 ev.envelope
             };
             let mut w_env = grain_env_skewed(phase, eff_env, ev.env_skew);
+            if is_vox_perc {
+                // Tight 38 ms (28..52 ms) hard-gated cosine window: full consonant attack,
+                // zero trailing vowel spill.
+                let hold = vox_gate_secs * 0.56;
+                let vox_win = if t_rel <= hold {
+                    1.0
+                } else {
+                    let u = ((t_rel - hold) / (vox_gate_secs - hold).max(1e-4)).clamp(0.0, 1.0) as f32;
+                    0.5 * (1.0 + (std::f32::consts::PI * u).cos())
+                };
+                w_env *= vox_win;
+            }
             if (i as f32) < anti_click_samps {
                 let u = (i as f32) / anti_click_samps;
                 w_env *= 0.5 * (1.0 - (std::f32::consts::PI * u).cos());
@@ -886,6 +910,10 @@ fn render_sculpted_grain(
             sig_r = f[1].process(sig_r);
         }
         if let Some(f) = &mut snare_crack {
+            sig_l = f[0].process(sig_l);
+            sig_r = f[1].process(sig_r);
+        }
+        if let Some(f) = &mut vox_perc_presence {
             sig_l = f[0].process(sig_l);
             sig_r = f[1].process(sig_r);
         }

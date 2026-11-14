@@ -108,6 +108,9 @@ pub struct SeqRow {
     pub choke_group: u8,
     /// Optional per-row continuous voice sculptor / tape-loop physics.
     pub sculpt: VoiceSculpt,
+    /// Composite this row's hits as `Layout::Collage` foreground cutouts / zine photo-cards.
+    #[serde(default)]
+    pub collage_cutout: bool,
 }
 
 impl Default for SeqRow {
@@ -137,6 +140,7 @@ impl SeqRow {
             humanize: 0.0,
             choke_group: 0,
             sculpt: VoiceSculpt::default(),
+            collage_cutout: false,
         }
     }
 
@@ -195,6 +199,251 @@ impl StepPattern {
         for row in &mut self.rows {
             if row.steps.len() == old_n {
                 row.steps.resize(n, Step::default());
+            }
+        }
+    }
+
+    /// Seed an authentic skipping **134 BPM 2-step UKG groove** across this pattern's
+    /// rows: sets `self.swing = 0.61` (`61%` UKG shuffle) and programs each row based
+    /// on `row.sculpt.stamp` (or row index when `Stamp::Raw`):
+    /// - `Kick`: skipping 2-step (`0, 10` + ghost `7` every 2nd bar)
+    /// - `Snare`: crisp rim/snare (`4, 12` + turnaround ghost `15` every 4th bar)
+    /// - `VoxPerc` / `Hat`: swung off-16th vocal-percussion syllables (`2, 3, 7, 9, 11, 14, 15`
+    ///   with slice locks & `x2` ratchet)
+    /// - `Chord`: syncopated `Min7` / `Sus4` garage vocal-organ stabs (`0, 6, 14`)
+    /// - `Pluck`: deep UKG syncopated sub-bass pocket (`0, 3, 10, 13`)
+    /// - `Phrase`: choked (`choke_group = 1`) absurd spoken vocal hook on bar turnarounds!
+    ///
+    /// If `self.rows` is currently empty and `sources` is non-empty, curates a 6-row UKG
+    /// vocal kit across `sources` automatically.
+    pub fn seed_ukg_2step(&mut self, sources: &[Source]) {
+        use crate::grain::Stamp;
+        if self.steps_per_beat != 4 || self.length_beats < 4.0 {
+            self.set_grid(self.length_beats.max(4.0), 4);
+        }
+        self.swing = 0.61;
+
+        if self.rows.is_empty() && !sources.is_empty() {
+            let curated = crate::chop::build_ukg_vox_kit_across_sources(sources);
+            let n_st = self.n_steps().max(16);
+            // Pick 1 representative pad per core UKG lane: Kick, Snare, VoxPerc, Chord, Pluck, Phrase.
+            for target_stamp in [
+                Stamp::Kick,
+                Stamp::Snare,
+                Stamp::VoxPerc,
+                Stamp::Chord,
+                Stamp::Pluck,
+                Stamp::Phrase,
+            ] {
+                if let Some(spec) = curated.iter().find(|p| p.stamp == target_stamp) {
+                    let src_len = sources.get(spec.source).map_or(1.0, |s| s.duration());
+                    let mut row = spec.to_seq_row(n_st, src_len);
+                    if target_stamp == Stamp::Phrase
+                        && sources
+                            .get(spec.source)
+                            .and_then(|s| s.video.as_deref())
+                            .is_some_and(|v| v.has_alpha())
+                    {
+                        row.collage_cutout = true;
+                    }
+                    self.rows.push(row);
+                }
+            }
+        }
+
+        let n_st = self.n_steps().max(16);
+        for (ri, row) in self.rows.iter_mut().enumerate() {
+            row.mode = RowMode::Steps;
+            if row.steps.len() < 16 {
+                row.steps.resize(n_st, Step::default());
+            } else {
+                for s in &mut row.steps {
+                    *s = Step::default();
+                }
+            }
+            let raw_stamp = if row.sculpt.stamp != Stamp::Raw {
+                row.sculpt.stamp
+            } else {
+                row.grains.sculpt.stamp
+            };
+            let role = if raw_stamp != Stamp::Raw {
+                raw_stamp
+            } else {
+                match ri {
+                    0 => Stamp::Kick,
+                    1 => Stamp::Snare,
+                    2 => Stamp::VoxPerc,
+                    3 => Stamp::Chord,
+                    4 => Stamp::Pluck,
+                    _ => Stamp::Phrase,
+                }
+            };
+            if !row.sculpt.is_active() {
+                row.sculpt = VoiceSculpt::preset(role);
+                row.grains.sculpt = row.sculpt;
+            }
+            if row.grains.adsr.is_none() {
+                row.grains.adsr = Some(crate::envelope::Adsr {
+                    attack: 0.002,
+                    decay: 0.08,
+                    sustain: 1.0,
+                    release: 0.04,
+                    picture: crate::envelope::PictureCut::Cut,
+                    cut_threshold: 0.05,
+                });
+            }
+            let n_slices = sources.get(row.source).map_or(0, |s| s.slices.len());
+
+            match role {
+                Stamp::Kick => {
+                    row.choke_group = 2;
+                    row.grains.duration = row.grains.duration.min(0.20);
+                    row.steps[0] = Step { on: true, gain: 1.0, ..Default::default() };
+                    row.steps[10] = Step { on: true, gain: 0.96, ..Default::default() };
+                    row.steps[7] = Step {
+                        on: true,
+                        gain: 0.68,
+                        every_n: 2,
+                        every_offset: 1,
+                        ..Default::default()
+                    };
+                }
+                Stamp::Snare => {
+                    row.grains.duration = row.grains.duration.min(0.18);
+                    row.steps[4] = Step { on: true, gain: 0.95, ..Default::default() };
+                    row.steps[12] = Step { on: true, gain: 0.98, ..Default::default() };
+                    row.steps[15] = Step {
+                        on: true,
+                        gain: 0.50,
+                        pitch: 1.5,
+                        every_n: 4,
+                        every_offset: 3,
+                        ..Default::default()
+                    };
+                }
+                Stamp::VoxPerc | Stamp::Hat => {
+                    row.sculpt = VoiceSculpt::preset(Stamp::VoxPerc);
+                    row.grains.sculpt = row.sculpt;
+                    row.grains.duration = 0.042;
+                    row.choke_group = 3;
+                    let vox_steps: [(usize, f32, f32, u8); 7] = [
+                        (2, 0.84, 0.0, 1),
+                        (3, 0.64, 2.0, 1),
+                        (7, 0.76, -1.0, 1),
+                        (9, 0.68, 1.5, 1),
+                        (11, 0.86, 0.0, 1),
+                        (14, 0.80, 2.5, 2),
+                        (15, 0.66, -1.5, 1),
+                    ];
+                    let norm_fallback = [0.11f32, 0.24, 0.37, 0.51, 0.63, 0.76, 0.88];
+                    for (k, &(st_i, gain, pitch, ratch)) in vox_steps.iter().enumerate() {
+                        if st_i < row.steps.len() {
+                            row.steps[st_i] = Step {
+                                on: true,
+                                gain,
+                                pitch,
+                                length: 0.85,
+                                slice: if n_slices == 0 { norm_fallback[k] } else { -1.0 },
+                                slice_index: (n_slices > 0).then_some((k % n_slices) as u16),
+                                ratchet: ratch,
+                                ratchet_pitch: if ratch > 1 { 2.0 } else { 0.0 },
+                                ..Default::default()
+                            };
+                        }
+                    }
+                }
+                Stamp::Chord => {
+                    row.choke_group = 4;
+                    if row.sculpt.chord == ChordVoicing::Off {
+                        row.sculpt.chord = ChordVoicing::Min7;
+                    }
+                    row.grains.duration = row.grains.duration.clamp(0.22, 0.42);
+                    row.steps[0] = Step {
+                        on: true,
+                        gain: 0.86,
+                        length: 0.90,
+                        chord: ChordVoicing::Min7,
+                        ..Default::default()
+                    };
+                    row.steps[6] = Step {
+                        on: true,
+                        gain: 0.82,
+                        pitch: 3.0,
+                        length: 0.75,
+                        chord: ChordVoicing::Min7,
+                        ..Default::default()
+                    };
+                    row.steps[14] = Step {
+                        on: true,
+                        gain: 0.78,
+                        pitch: -2.0,
+                        length: 0.70,
+                        chord: ChordVoicing::Sus4,
+                        ..Default::default()
+                    };
+                }
+                Stamp::Pluck => {
+                    if row.sculpt.sub_exciter < 0.2 {
+                        row.sculpt.pitch_semitones = -12.0;
+                        row.sculpt.sub_exciter = 0.75;
+                        row.sculpt.lpf_hz = 260.0;
+                    }
+                    row.grains.duration = row.grains.duration.clamp(0.18, 0.34);
+                    for (st_i, pt, gn) in [(0usize, 0.0f32, 0.92f32), (3, 3.0, 0.80), (10, 0.0, 0.90), (13, -2.0, 0.84)] {
+                        if st_i < row.steps.len() {
+                            row.steps[st_i] = Step {
+                                on: true,
+                                pitch: pt,
+                                gain: gn,
+                                ..Default::default()
+                            };
+                        }
+                    }
+                }
+                Stamp::Phrase | Stamp::Raw | Stamp::Wash | Stamp::TapeLoop | Stamp::Disintegrate => {
+                    row.sculpt = VoiceSculpt::preset(Stamp::Phrase);
+                    row.grains.sculpt = row.sculpt;
+                    row.choke_group = 1;
+                    row.grains.duration = row.grains.duration.clamp(0.65, 1.45);
+                    if sources
+                        .get(row.source)
+                        .and_then(|s| s.video.as_deref())
+                        .is_some_and(|v| v.has_alpha())
+                    {
+                        row.collage_cutout = true;
+                    }
+                    let hook_slice = sources.get(row.source).and_then(|src| {
+                        src.slices
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, sl)| sl.len() >= 0.45)
+                            .max_by(|(_, a), (_, b)| a.bands[2].total_cmp(&b.bands[2]))
+                            .map(|(idx, _)| idx as u16)
+                    });
+                    // Choked stutter teaser on step 10 + full spoken hook on bar turnaround (step 12)!
+                    if 10 < row.steps.len() {
+                        row.steps[10] = Step {
+                            on: true,
+                            gain: 0.88,
+                            length: 0.22,
+                            slice_index: hook_slice,
+                            every_n: 2,
+                            every_offset: 1,
+                            ..Default::default()
+                        };
+                    }
+                    if 12 < row.steps.len() {
+                        row.steps[12] = Step {
+                            on: true,
+                            gain: 0.98,
+                            length: 1.0,
+                            slice_index: hook_slice,
+                            every_n: 2,
+                            every_offset: 1,
+                            ..Default::default()
+                        };
+                    }
+                }
             }
         }
     }
@@ -297,6 +546,12 @@ pub fn pattern_events(
 
         match row.mode {
             RowMode::Steps => {
+                let row_collage_fg = row.collage_cutout
+                    || (matches!(row.sculpt.stamp, crate::grain::Stamp::Phrase)
+                        && source.video.as_deref().is_some_and(|v| v.has_alpha()));
+                let mut prev_hit_t: Option<f64> = None;
+                let mut prev_slice: Option<u16> = None;
+                let mut prev_salt: u8 = 0;
                 // Slot k cycles this row's own step count — rows shorter or
                 // longer than the pattern grid phase against it (polymeter).
                 let mut slot = 0usize;
@@ -306,7 +561,8 @@ pub fn pattern_events(
                         break;
                     }
                     let pass_idx = slot / row.steps.len();
-                    let step = row.steps[slot % row.steps.len()];
+                    let step_idx = slot % row.steps.len();
+                    let step = row.steps[step_idx];
                     // Consume jitter deterministically for EVERY slot so
                     // toggling one step doesn't reshuffle the others.
                     let spray_j = rng.bipolar();
@@ -359,6 +615,31 @@ pub fn pattern_events(
 
                     let r_count = step.ratchet.clamp(1, 8);
                     let sub_step_secs = step_secs / r_count as f64;
+                    let rapid_chop = prev_hit_t.is_some_and(|pt| (t - pt) < 0.22);
+                    let step_base_salt: u8 = if sculpt.stamp == crate::grain::Stamp::VoxPerc {
+                        let mut s = step
+                            .slice_index
+                            .map_or((step_idx & 1) as u8, |si| (si & 3) as u8);
+                        if rapid_chop && s == prev_salt {
+                            s = (prev_salt + 1) & 3;
+                        }
+                        s
+                    } else if rapid_chop
+                        && step.slice_index.is_some()
+                        && step.slice_index != prev_slice
+                    {
+                        let mut s = (step.slice_index.unwrap_or(0) & 3) as u8;
+                        if s == prev_salt {
+                            s = (prev_salt + 1) & 3;
+                        }
+                        s
+                    } else {
+                        0
+                    };
+                    prev_hit_t = Some(t);
+                    prev_slice = step.slice_index;
+                    prev_salt = step_base_salt;
+
                     for sub in 0..r_count {
                         let sub_t = t + sub as f64 * sub_step_secs;
                         if sub_t >= clip_len_secs {
@@ -380,6 +661,9 @@ pub fn pattern_events(
                         if r_count > 1 {
                             dur = dur.min((sub_step_secs * 0.92).max(0.01) as f32);
                         }
+                        if sculpt.stamp == crate::grain::Stamp::VoxPerc {
+                            dur = dur.clamp(0.028, 0.052);
+                        }
                         let sub_gain = if r_count > 1 {
                             0.88f32.powi(sub as i32)
                         } else {
@@ -395,10 +679,25 @@ pub fn pattern_events(
                         } else {
                             (slot as u64).wrapping_mul(8).wrapping_add(sub as u64)
                         };
-                        let hit_env = if sculpt.sub_exciter > 0.1
-                            || sculpt.snare_snap > 0.1
-                            || sculpt.comb_mix > 0.2
-                        {
+                        let cell_salt = if r_count > 1 { sub as u8 } else { step_base_salt };
+                        let is_short_perc = sculpt.stamp == crate::grain::Stamp::VoxPerc
+                            || matches!(
+                                sculpt.stamp,
+                                crate::grain::Stamp::Kick
+                                    | crate::grain::Stamp::Snare
+                                    | crate::grain::Stamp::Hat
+                            )
+                            || sculpt.sub_exciter > 0.1
+                            || sculpt.snare_snap > 0.1;
+                        let visual_hold = if r_count > 1 {
+                            (((r_count - sub) as f64 * sub_step_secs * 0.96)
+                                .max(dur.clamp(0.065, 0.14) as f64)) as f32
+                        } else if is_short_perc && dur <= 0.14 {
+                            dur.clamp(0.065, 0.14)
+                        } else {
+                            0.0
+                        };
+                        let hit_env = if is_short_perc || sculpt.comb_mix > 0.2 {
                             g.envelope.min(0.04)
                         } else {
                             g.envelope
@@ -419,7 +718,13 @@ pub fn pattern_events(
                             loop_pass: pass_idx as u32,
                             ..Default::default()
                         };
-                        apply_hit_adsr(&mut ev, &g, hit_voice(row_idx, voice_slot, clip_start_secs));
+                        let h_voice = hit_voice(row_idx, voice_slot, clip_start_secs);
+                        ev.tag.voice = h_voice;
+                        apply_hit_adsr(&mut ev, &g, h_voice);
+                        ev.tag.voice = h_voice;
+                        ev.tag.cell_salt = cell_salt;
+                        ev.tag.visual_hold = visual_hold;
+                        ev.tag.collage_cutout = row_collage_fg;
                         ev.tag.focus = focus;
                         ev.tag.caption = caption;
                         ev.tag.ratchet_odd = sub % 2 == 1;
@@ -1001,5 +1306,92 @@ mod tests {
         lp.process_buffer(&mut sub_only);
         let sub_rms = (sub_only.iter().map(|x| x * x).sum::<f32>() / sub_only.len() as f32).sqrt();
         assert!(sub_rms >= 0.04, "Kick sub_exciter delivers solid <95Hz RMS >= 0.04, got {sub_rms:.4}");
+    }
+
+    #[test]
+    fn voxperc_stamp_and_seed_ukg_2step_groove_and_cell_salt() {
+        let sr = 48_000u32;
+        // 1. Stamp::VoxPerc gates any long spoken syllable into a tight 28..52 ms UKG percussive tick
+        //    with >= 220 Hz HPF so zero low-mid mud leaks through.
+        let mut syllable = vec![0.0f32; sr as usize];
+        for (i, s) in syllable.iter_mut().enumerate() {
+            let t = i as f32 / sr as f32;
+            *s = 0.55 * (2.0 * std::f32::consts::PI * 110.0 * t).sin()
+                + 0.55 * (2.0 * std::f32::consts::PI * 3400.0 * t).sin();
+        }
+        let clip = AudioClip::new(syllable, sr);
+        let mut buf = crate::audio::StereoBuffer::new(0.25, sr);
+        let sculpt = VoiceSculpt::preset(crate::grain::Stamp::VoxPerc);
+        assert_eq!(sculpt.pitch_semitones, 2.0);
+        assert!(sculpt.hpf_hz >= 220.0);
+        let mut ev = GrainEvent {
+            onset: 0.0,
+            source_pos: 0.0,
+            duration: 0.20,
+            pitch_ratio: crate::music::semitones_to_ratio(sculpt.pitch_semitones),
+            gain: 0.9,
+            envelope: 0.08,
+            ..Default::default()
+        };
+        ev.sculpt = sculpt;
+        crate::audio::render_grains_audio(&clip, std::slice::from_ref(&ev), &mut buf, 0.0);
+        let tick_end = (0.056 * sr as f64) as usize;
+        let tail_peak = buf.left[tick_end..]
+            .iter()
+            .map(|x| x.abs())
+            .fold(0.0f32, f32::max);
+        assert!(tail_peak < 1e-4, "Stamp::VoxPerc hard-gates cleanly within <=52ms: tail_peak={tail_peak}");
+        let tick_peak = buf.left[..tick_end].iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        assert!(tick_peak > 0.15, "Stamp::VoxPerc delivers crisp consonant presence: {tick_peak}");
+
+        // 2. StepPattern::seed_ukg_2step programs 61% shuffle + authentic 2-step UKG drum/voxperc/chord/hook rows.
+        let mut src = Source {
+            name: "vox".into(),
+            audio: Some(std::sync::Arc::new(clip)),
+            ..Default::default()
+        };
+        src.slices = vec![
+            crate::chop::Slice::new(0.0, 0.04),
+            crate::chop::Slice::new(0.08, 0.12),
+            crate::chop::Slice::new(0.16, 0.20),
+            crate::chop::Slice::new(0.24, 0.88),
+        ];
+        let sources = vec![src];
+        let mut pat = StepPattern::new("ukg");
+        for st in [
+            crate::grain::Stamp::Kick,
+            crate::grain::Stamp::Snare,
+            crate::grain::Stamp::VoxPerc,
+            crate::grain::Stamp::Chord,
+            crate::grain::Stamp::Phrase,
+        ] {
+            let ri = pat.add_row(0);
+            pat.rows[ri].sculpt = VoiceSculpt::preset(st);
+        }
+        pat.seed_ukg_2step(&sources);
+        assert!((pat.swing - 0.61).abs() < 1e-5, "61% UKG shuffle");
+        assert!(pat.rows[0].steps[0].on && pat.rows[0].steps[10].on && !pat.rows[0].steps[8].on, "2-step kick skips beat 3");
+        assert!(pat.rows[1].steps[4].on && pat.rows[1].steps[12].on, "backbeat rim/snare on 4 & 12");
+        assert!(pat.rows[2].steps[2].on && pat.rows[2].steps[7].on && pat.rows[2].steps[15].on, "off-16th VoxPerc shuffle");
+        assert!(pat.rows[3].steps[0].on && pat.rows[3].steps[6].on && pat.rows[3].steps[14].on, "syncopated Min7 chord stabs");
+        assert_eq!(pat.rows[4].choke_group, 1, "turnaround vocal hook is choked");
+
+        // 3. Multi-cell transient subdivision (`cell_salt`) on ratchets & rapid VoxPerc steps!
+        pat.rows[2].steps[2].ratchet = 4;
+        let parts = pattern_events(&pat, &sources, 0.0, 8.0, 60.0 / 134.0, None, &[]);
+        let vox_evs: Vec<&GrainEvent> = parts
+            .iter()
+            .flat_map(|(_, evs)| evs.iter())
+            .filter(|ev| ev.sculpt.stamp == crate::grain::Stamp::VoxPerc && !ev.tag.chord_harmony)
+            .collect();
+        let ratchet_salts: std::collections::BTreeSet<u8> = vox_evs
+            .iter()
+            .take(4)
+            .map(|e| e.tag.cell_salt)
+            .collect();
+        assert_eq!(ratchet_salts.len(), 4, "x4 ratchet assigns 4 distinct cell_salt values: {ratchet_salts:?}");
+        for e in &vox_evs {
+            assert!((0.065..=0.141).contains(&e.tag.visual_hold), "VoxPerc holds crisp visual frame: {}", e.tag.visual_hold);
+        }
     }
 }

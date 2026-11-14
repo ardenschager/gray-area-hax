@@ -354,13 +354,13 @@ fn adsr_handles_shape_the_pad_envelope_and_picture_mode() {
 fn layout_switch_flips_stack_and_tile() {
     let mut h = harness(SIZES[1], View::Play, |_| {});
     h.run_steps(3);
-    assert_eq!(h.state().project.lock().unwrap().layout, Layout::Stack);
-    h.get_by_label("layout tile").click();
-    h.run_steps(2);
     assert_eq!(h.state().project.lock().unwrap().layout, Layout::Tile);
     h.get_by_label("layout stack").click();
     h.run_steps(2);
     assert_eq!(h.state().project.lock().unwrap().layout, Layout::Stack);
+    h.get_by_label("layout tile").click();
+    h.run_steps(2);
+    assert_eq!(h.state().project.lock().unwrap().layout, Layout::Tile);
 }
 
 #[test]

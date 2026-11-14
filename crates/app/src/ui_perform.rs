@@ -80,6 +80,9 @@ impl App {
             std::mem::swap(&mut p.tracks, &mut self.other_tracks);
             let first = m == AppMode::Perform && p.tracks.is_empty();
             if first {
+                if self.stage_mode_override.is_none() && p.layout == chromagrain_core::tile::Layout::Stack {
+                    p.layout = chromagrain_core::tile::Layout::Tile;
+                }
                 // Seed the pads with the arrangement's non-pattern media clips so there's
                 // something to play straight away while keeping any active SET sequence live.
                 let seeds: Vec<_> = self

@@ -548,8 +548,30 @@ pub fn compute_key_quantize_semitones(f0_hz: f32, key: Key) -> f32 {
     diff.clamp(-6.0, 6.0)
 }
 
-/// One curated pad specification produced by [`build_kit_across_sources`] or
-/// [`build_tape_loops_across_sources`].
+fn default_kit_pad_link() -> crate::video::AvLink {
+    crate::video::AvLink {
+        gain_to_opacity: 0.0,
+        envelope_to_opacity: 0.0,
+        ..crate::video::AvLink::default()
+    }
+}
+
+fn hard_cut_adsr() -> crate::envelope::Adsr {
+    crate::envelope::Adsr {
+        attack: 0.002,
+        decay: 0.08,
+        sustain: 1.0,
+        release: 0.05,
+        picture: crate::envelope::PictureCut::Cut,
+        cut_threshold: 0.05,
+    }
+}
+
+/// Alias for [`KitPadSpec`] used by UKG & multi-source kit builders.
+pub type CuratedPad = KitPadSpec;
+
+/// One curated pad specification produced by [`build_kit_across_sources`],
+/// [`build_ukg_vox_kit_across_sources`], or [`build_tape_loops_across_sources`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KitPadSpec {
     pub pad_index: usize,
@@ -563,6 +585,8 @@ pub struct KitPadSpec {
     pub choke_group: u8,
     pub one_shot: bool,
     pub adsr: Option<crate::envelope::Adsr>,
+    #[serde(default = "default_kit_pad_link")]
+    pub link: crate::video::AvLink,
     pub label: String,
 }
 
@@ -586,10 +610,32 @@ impl KitPadSpec {
             }
         };
         slot.gain = self.gain;
-        slot.adsr = self.adsr;
+        slot.adsr = Some(self.adsr.unwrap_or_else(hard_cut_adsr));
         slot.sculpt = sculpt;
         slot.choke_group = self.choke_group;
         slot
+    }
+
+    /// Convert into a [`crate::seq::SeqRow`] ready for [`crate::seq::StepPattern::seed_ukg_2step`].
+    pub fn to_seq_row(&self, n_steps: usize, src_len: f64) -> crate::seq::SeqRow {
+        let mut row = crate::seq::SeqRow::new(self.source, n_steps);
+        row.grains.position = if src_len > 0.0 {
+            (self.slice.start / src_len).clamp(0.0, 1.0) as f32
+        } else {
+            0.0
+        };
+        row.grains.duration = self.slice.len().clamp(0.02, 4.0) as f32;
+        row.grains.pitch = self.pitch_semitones;
+        row.grains.gain = self.gain;
+        row.grains.pan = self.pan;
+        row.grains.pan_spread = 0.06;
+        row.grains.envelope = 0.04;
+        row.grains.adsr = Some(self.adsr.unwrap_or_else(hard_cut_adsr));
+        row.sculpt = self.sculpt;
+        row.grains.sculpt = self.sculpt;
+        row.choke_group = self.choke_group;
+        row.grains.choke_group = self.choke_group;
+        row
     }
 }
 
@@ -708,7 +754,8 @@ pub fn build_kit_across_sources_opt(sources: &[Source], key: Option<Key>) -> Vec
                 pan: 0.0,
                 choke_group: 2,
                 one_shot: true,
-                adsr: None,
+                adsr: Some(hard_cut_adsr()),
+                link: default_kit_pad_link(),
                 label: format!("Kick {}", k + 1),
             });
         }
@@ -734,7 +781,8 @@ pub fn build_kit_across_sources_opt(sources: &[Source], key: Option<Key>) -> Vec
                 pan: 0.0,
                 choke_group: 0,
                 one_shot: true,
-                adsr: None,
+                adsr: Some(hard_cut_adsr()),
+                link: default_kit_pad_link(),
                 label: format!("Snare {}", k + 1),
             });
         }
@@ -761,7 +809,8 @@ pub fn build_kit_across_sources_opt(sources: &[Source], key: Option<Key>) -> Vec
                 pan: if k == 0 { -0.22 } else { 0.22 },
                 choke_group: 3,
                 one_shot: true,
-                adsr: None,
+                adsr: Some(hard_cut_adsr()),
+                link: default_kit_pad_link(),
                 label: if k == 0 { "Hat Cl".into() } else { "Hat Op".into() },
             });
         }
@@ -805,7 +854,8 @@ pub fn build_kit_across_sources_opt(sources: &[Source], key: Option<Key>) -> Vec
                 pan: if k % 2 == 0 { -0.15 } else { 0.15 },
                 choke_group: if is_chord { 4 } else { 0 },
                 one_shot: true,
-                adsr: None,
+                adsr: Some(hard_cut_adsr()),
+                link: default_kit_pad_link(),
                 label: if is_chord { format!("Chord {}", k - 1) } else { format!("Pluck {}", k + 1) },
             });
         }
@@ -838,7 +888,8 @@ pub fn build_kit_across_sources_opt(sources: &[Source], key: Option<Key>) -> Vec
             pan: 0.0,
             choke_group: 1,
             one_shot: true,
-            adsr: None,
+            adsr: Some(hard_cut_adsr()),
+            link: default_kit_pad_link(),
             label: "Stutter".into(),
         });
         out.push(KitPadSpec {
@@ -852,7 +903,8 @@ pub fn build_kit_across_sources_opt(sources: &[Source], key: Option<Key>) -> Vec
             pan: 0.0,
             choke_group: 1,
             one_shot: true,
-            adsr: None,
+            adsr: Some(hard_cut_adsr()),
+            link: default_kit_pad_link(),
             label: "Phrase 1".into(),
         });
     }
@@ -875,7 +927,8 @@ pub fn build_kit_across_sources_opt(sources: &[Source], key: Option<Key>) -> Vec
             pan: 0.0,
             choke_group: 1,
             one_shot: true,
-            adsr: None,
+            adsr: Some(hard_cut_adsr()),
+            link: default_kit_pad_link(),
             label: format!("Phrase {}", out.len() - 9),
         });
     }
@@ -942,10 +995,325 @@ pub fn build_kit_across_sources_opt(sources: &[Source], key: Option<Key>) -> Vec
             pan: if tex_idx == 0 { -0.25 } else { 0.25 },
             choke_group: 0,
             one_shot: !is_tape,
-            adsr: None,
+            adsr: Some(hard_cut_adsr()),
+            link: default_kit_pad_link(),
             label: if is_tape { "Tape Loop".into() } else { "Wash".into() },
         });
         tex_idx += 1;
+    }
+
+    for (i, spec) in out.iter_mut().enumerate() {
+        spec.pad_index = i;
+    }
+    out
+}
+
+/// Curate up to 16 pads across loaded video/audio [`Source`]s specifically tailored
+/// for **UKG + Vocal-Snippet Percussion + 1–2 Absurd Spoken Hooks**:
+/// - `0..2`: `Kick` (chestiest low-formant plosives/impacts sculpted with `52 Hz` sample-excited SVF sub punch)
+/// - `2..4`: `Snare` (sharpest rim/clap/consonant cracks)
+/// - `4..8`: `VoxPerc` (`28..55 ms` crisp sibilants/plosives/micro-vowels `"t"`, `"k"`, `"s"`, `"uh"` for shuffled 16th percussion)
+/// - `8..11`: `Chord` (`Min7` / `Sus4` garage vocal-organ stabs from sustained pitched vowels) + `Pluck` / deep UKG sub-bass vowel (`-12 st` + `sub_exciter`)
+/// - `11..16`: `Phrase` (`0.55..1.9s` highest-clarity spoken hooks, `-30 ms` consonant pre-roll preserved, `choke_group = 1` so hooks cut each other cleanly, `PictureCut::Cut`)
+pub fn build_ukg_vox_kit_across_sources<S: AsRef<Source>>(sources: &[S]) -> Vec<CuratedPad> {
+    build_ukg_vox_kit_across_sources_opt(sources, None)
+}
+
+/// Like [`build_ukg_vox_kit_across_sources`], accepting an optional target [`Key`].
+pub fn build_ukg_vox_kit_across_sources_opt<S: AsRef<Source>>(
+    sources: &[S],
+    key: Option<Key>,
+) -> Vec<CuratedPad> {
+    #[derive(Clone)]
+    struct Cand {
+        sid: SourceId,
+        src_dur: f64,
+        slice: Slice,
+        used: bool,
+    }
+    let mut pool: Vec<Cand> = Vec::new();
+    for (sid, src_ref) in sources.iter().enumerate() {
+        let src = src_ref.as_ref();
+        let src_dur = src.duration();
+        if src_dur < MIN_SLICE {
+            continue;
+        }
+        let mut sls = if !src.slices.is_empty() {
+            let mut v = src.slices.clone();
+            if v.iter().all(|s| s.rms_db <= -95.0 && s.role_hint == SliceRole::Raw) {
+                enrich_slices(&mut v, src.audio.as_deref(), src.video.as_deref());
+            }
+            v
+        } else {
+            analyze_source_slices(src, 32)
+        };
+        if sls.len() < 16 && src_dur >= 0.6 {
+            let mut extra = equal_slices(src_dur, 16);
+            enrich_slices(&mut extra, src.audio.as_deref(), src.video.as_deref());
+            for es in extra {
+                if !sls.iter().any(|x| (x.start - es.start).abs() < 0.03) {
+                    sls.push(es);
+                }
+            }
+        }
+        for slice in sls {
+            if slice.rms_db > -68.0 || src.audio.is_none() {
+                pool.push(Cand { sid, src_dur, slice, used: false });
+            }
+        }
+    }
+    if pool.is_empty() {
+        return Vec::new();
+    }
+
+    let n_sources = sources.len().max(1);
+    let mut src_counts = vec![0usize; n_sources];
+    let pick = |pool: &mut [Cand],
+                src_counts: &mut [usize],
+                allow_reuse: bool,
+                score_fn: &dyn Fn(&Cand) -> f32|
+     -> Option<(SourceId, f64, Slice)> {
+        let mut best_i = None;
+        let mut best_s = f32::NEG_INFINITY;
+        for (i, c) in pool.iter().enumerate() {
+            if c.used && !allow_reuse {
+                continue;
+            }
+            let base = score_fn(c);
+            if base <= -1e6 {
+                continue;
+            }
+            let div_bonus = 1.0 / (1.0 + 0.32 * src_counts[c.sid] as f32);
+            let reuse_pen = if c.used { 0.35 } else { 1.0 };
+            let s = base * div_bonus * reuse_pen;
+            if s > best_s {
+                best_s = s;
+                best_i = Some(i);
+            }
+        }
+        let idx = best_i?;
+        pool[idx].used = true;
+        src_counts[pool[idx].sid] += 1;
+        Some((pool[idx].sid, pool[idx].src_dur, pool[idx].slice))
+    };
+    let pick_or_reuse = |pool: &mut [Cand],
+                         src_counts: &mut [usize],
+                         score_fn: &dyn Fn(&Cand) -> f32|
+     -> Option<(SourceId, f64, Slice)> {
+        pick(pool, src_counts, false, score_fn).or_else(|| pick(pool, src_counts, true, score_fn))
+    };
+
+    let mut out: Vec<CuratedPad> = Vec::with_capacity(16);
+
+    // 1. Pads 0..2: `Kick` (chestiest low-formant plosives/impacts sculpted with 52 Hz SVF sub punch).
+    for k in 0..2 {
+        if let Some((sid, _, mut sl)) = pick_or_reuse(&mut pool, &mut src_counts, &|c| {
+            let s = &c.slice;
+            let low = s.bands[0] * 1.35 + s.bands[1] * 1.05 + 0.12;
+            let dur_fit = if s.len() <= 0.40 { 1.2 } else { 0.8 };
+            (s.punch + 0.30) * low * dur_fit
+        }) {
+            sl.end = (sl.start + sl.len().clamp(0.11, 0.24)).min(sl.start + 0.24);
+            sl.role_hint = SliceRole::Kick;
+            let mut sculpt = VoiceSculpt::preset(Stamp::Kick);
+            sculpt.sub_exciter = 0.82;
+            sculpt.lpf_hz = 152.0;
+            out.push(KitPadSpec {
+                pad_index: out.len(),
+                source: sid,
+                slice: sl,
+                stamp: Stamp::Kick,
+                sculpt,
+                pitch_semitones: if k == 0 { 0.0 } else { -2.0 },
+                gain: 0.96,
+                pan: 0.0,
+                choke_group: 2,
+                one_shot: true,
+                adsr: Some(hard_cut_adsr()),
+                link: default_kit_pad_link(),
+                label: format!("UKG Kick {}", k + 1),
+            });
+        }
+    }
+
+    // 2. Pads 2..4: `Snare` (sharpest rim/clap/consonant cracks).
+    for k in 0..2 {
+        if let Some((sid, _, mut sl)) = pick_or_reuse(&mut pool, &mut src_counts, &|c| {
+            let s = &c.slice;
+            let crack = s.bands[2] * 0.80 + s.bands[3] * 1.30 + s.bands[4] * 0.45 + 0.10;
+            let dur_fit = if s.len() <= 0.35 { 1.25 } else { 0.75 };
+            (s.punch + 0.25) * crack * dur_fit
+        }) {
+            sl.end = (sl.start + sl.len().clamp(0.09, 0.22)).min(sl.start + 0.22);
+            sl.role_hint = SliceRole::Snare;
+            out.push(KitPadSpec {
+                pad_index: out.len(),
+                source: sid,
+                slice: sl,
+                stamp: Stamp::Snare,
+                sculpt: VoiceSculpt::preset(Stamp::Snare),
+                pitch_semitones: if k == 0 { 0.0 } else { 2.0 },
+                gain: 0.92,
+                pan: if k == 0 { -0.04 } else { 0.06 },
+                choke_group: 0,
+                one_shot: true,
+                adsr: Some(hard_cut_adsr()),
+                link: default_kit_pad_link(),
+                label: if k == 0 { "UKG Rim".into() } else { "UKG Snap".into() },
+            });
+        }
+    }
+
+    // 3. Pads 4..8: `VoxPerc` (`28..55 ms` crisp sibilants/plosives/micro-vowels `"t"`, `"k"`, `"s"`, `"uh"`).
+    let vox_durs = [0.032f64, 0.038, 0.045, 0.052];
+    let vox_pans = [-0.24f32, 0.22, -0.14, 0.28];
+    let vox_pitches = [0.0f32, 2.0, -1.5, 3.5];
+    let vox_labels = ["Vox T", "Vox K", "Vox S", "Vox Uh"];
+    for k in 0..4 {
+        if let Some((sid, src_dur, mut sl)) = pick_or_reuse(&mut pool, &mut src_counts, &|c| {
+            let s = &c.slice;
+            let cons = if k < 3 {
+                s.bands[3] * 1.15 + s.bands[4] * 1.40 + s.bands[2] * 0.45 + 0.10
+            } else {
+                // Micro-vowel `"uh"` tick: crisp formant body + transient attack.
+                s.bands[2] * 1.30 + s.bands[3] * 0.85 + 0.10
+            };
+            let short_bonus = if s.len() <= 0.18 { 1.35 } else { 0.90 };
+            cons * short_bonus * (0.45 + 0.55 * s.punch)
+        }) {
+            let target_len = vox_durs[k];
+            sl.end = (sl.start + target_len).min(src_dur).max(sl.start + 0.028);
+            sl.role_hint = SliceRole::Hat;
+            out.push(KitPadSpec {
+                pad_index: out.len(),
+                source: sid,
+                slice: sl,
+                stamp: Stamp::VoxPerc,
+                sculpt: VoiceSculpt::preset(Stamp::VoxPerc),
+                pitch_semitones: vox_pitches[k],
+                gain: 0.86,
+                pan: vox_pans[k],
+                choke_group: 3,
+                one_shot: true,
+                adsr: Some(hard_cut_adsr()),
+                link: default_kit_pad_link(),
+                label: vox_labels[k].into(),
+            });
+        }
+    }
+
+    // 4. Pads 8..11: `Chord` (`Min7` / `Sus4` garage vocal-organ stabs from sustained pitched vowels)
+    //    + `Pluck` / deep UKG sub-bass vowel (`-12 st` + `sub_exciter`).
+    for k in 0..3 {
+        if let Some((sid, src_dur, mut sl)) = pick_or_reuse(&mut pool, &mut src_counts, &|c| {
+            let s = &c.slice;
+            let vowel_fit = if (0.18..=1.60).contains(&s.len()) { 1.35 } else { 0.85 };
+            let pitched = 0.30 + 1.15 * s.pitch_confidence;
+            let body = if k < 2 {
+                s.bands[2] * 1.2 + s.bands[1] * 0.6 + 0.15
+            } else {
+                s.bands[0] * 0.9 + s.bands[1] * 1.2 + s.bands[2] * 0.6 + 0.15
+            };
+            pitched * vowel_fit * body
+        }) {
+            let tune_st = match (key, sl.f0_hz) {
+                (Some(ky), Some(hz)) => compute_key_quantize_semitones(hz, ky),
+                _ => 0.0,
+            };
+            sl.role_hint = SliceRole::Tonal;
+            if k < 2 {
+                sl.end = (sl.start + sl.len().clamp(0.24, 0.58)).min(src_dur);
+                let mut sculpt = VoiceSculpt::preset(Stamp::Chord);
+                sculpt.chord = if k == 0 { ChordVoicing::Min7 } else { ChordVoicing::Sus4 };
+                out.push(KitPadSpec {
+                    pad_index: out.len(),
+                    source: sid,
+                    slice: sl,
+                    stamp: Stamp::Chord,
+                    sculpt,
+                    pitch_semitones: tune_st + if k == 0 { 0.0 } else { 5.0 },
+                    gain: 0.84,
+                    pan: if k == 0 { -0.12 } else { 0.14 },
+                    choke_group: 4,
+                    one_shot: true,
+                    adsr: Some(hard_cut_adsr()),
+                    link: default_kit_pad_link(),
+                    label: if k == 0 { "Vox Min7".into() } else { "Vox Sus4".into() },
+                });
+            } else {
+                sl.end = (sl.start + sl.len().clamp(0.22, 0.50)).min(src_dur);
+                let mut sculpt = VoiceSculpt::preset(Stamp::Pluck);
+                sculpt.pitch_semitones = -12.0;
+                sculpt.sub_exciter = 0.78;
+                sculpt.drive_db = 5.5;
+                sculpt.hpf_hz = 32.0;
+                sculpt.lpf_hz = 260.0;
+                sculpt.comb_mix = 0.36;
+                sculpt.pocket_carve = false;
+                out.push(KitPadSpec {
+                    pad_index: out.len(),
+                    source: sid,
+                    slice: sl,
+                    stamp: Stamp::Pluck,
+                    sculpt,
+                    pitch_semitones: tune_st,
+                    gain: 0.92,
+                    pan: 0.0,
+                    choke_group: 0,
+                    one_shot: true,
+                    adsr: Some(hard_cut_adsr()),
+                    link: default_kit_pad_link(),
+                    label: "UKG Sub".into(),
+                });
+            }
+        }
+    }
+
+    // 5. Pads 11..16: `Phrase` (`0.55..1.9s` highest-clarity spoken hooks, `-30ms` consonant pre-roll
+    //    preserved, `choke_group = 1` so hooks cut each other cleanly, `PictureCut::Cut`).
+    let mut hook_num = 1usize;
+    while out.len() < 16 {
+        let Some((sid, src_dur, mut sl)) = pick_or_reuse(&mut pool, &mut src_counts, &|c| {
+            let s = &c.slice;
+            let outro_guard = if c.src_dur >= 8.0 && s.end > 0.82 * c.src_dur { 0.12 } else { 1.0 };
+            let len_fit = if (0.55..=1.90).contains(&s.len()) {
+                1.55
+            } else if s.len() >= 0.35 {
+                1.05
+            } else {
+                0.35
+            };
+            let speech_clarity = s.bands[2] * 1.45 + s.bands[3] * 0.75 + 0.10;
+            let caption_bonus = if s.caption.is_empty() { 1.0 } else { 1.45 };
+            speech_clarity * len_fit * outro_guard * caption_bonus
+        }) else {
+            break;
+        };
+        // Preserve `-30ms` consonant pre-roll and clamp cleanly into `0.55..1.90s` when source allows.
+        sl.start = (sl.start - 0.030).max(0.0);
+        let min_end = (sl.start + 0.55).min(src_dur);
+        let max_end = (sl.start + 1.90).min(src_dur);
+        sl.end = sl.end.clamp(min_end, max_end).max(sl.start + MIN_SLICE);
+        if let Some(src_obj) = sources.get(sid).map(|s| s.as_ref()) {
+            analyze_slice_features(&mut sl, src_obj.audio.as_deref(), src_obj.video.as_deref());
+        }
+        sl.role_hint = SliceRole::Phrase;
+        out.push(KitPadSpec {
+            pad_index: out.len(),
+            source: sid,
+            slice: sl,
+            stamp: Stamp::Phrase,
+            sculpt: VoiceSculpt::preset(Stamp::Phrase),
+            pitch_semitones: 0.0,
+            gain: 0.96,
+            pan: 0.0,
+            choke_group: 1,
+            one_shot: true,
+            adsr: Some(hard_cut_adsr()),
+            link: default_kit_pad_link(),
+            label: format!("Hook {hook_num}"),
+        });
+        hook_num += 1;
     }
 
     for (i, spec) in out.iter_mut().enumerate() {
@@ -1054,6 +1422,7 @@ pub fn build_tape_loops_across_sources(sources: &[Source], key: Option<Key>) -> 
                 picture: crate::envelope::PictureCut::Fade,
                 cut_threshold: 0.02,
             }),
+            link: default_kit_pad_link(),
             label: format!("Loop {:.1}s", loop_s),
         });
     }
@@ -1471,5 +1840,96 @@ mod tests {
             let secs = lp.sculpt.free_loop_secs.expect("unsynced real-seconds loop");
             assert!((3.5..=14.5).contains(&secs), "free_loop_secs={secs}");
         }
+    }
+
+    #[test]
+    fn ukg_vox_kit_curates_percussion_chords_hooks_and_hard_cuts() {
+        let sr = 48_000u32;
+        // Source 0: chesty low plosive (0.05..0.18s) + sharp sibilant ticks (0.40..0.46s, 0.70..0.75s).
+        let mut a0 = vec![0.0f32; sr as usize * 2];
+        for i in (0.05 * sr as f64) as usize..(0.18 * sr as f64) as usize {
+            let dt = (i as f64 / sr as f64 - 0.05) as f32;
+            a0[i] = 0.85 * (-dt * 26.0).exp() * (2.0 * std::f32::consts::PI * 68.0 * dt).sin();
+        }
+        for &(t0, freq) in &[(0.40f64, 4200.0f32), (0.70f64, 5100.0f32)] {
+            for i in (t0 * sr as f64) as usize..((t0 + 0.045) * sr as f64) as usize {
+                let dt = (i as f64 / sr as f64 - t0) as f32;
+                a0[i] = 0.75 * (-dt * 55.0).exp() * (2.0 * std::f32::consts::PI * freq * dt).sin();
+            }
+        }
+        let mut src0 = crate::timeline::Source {
+            name: "beatbox_ticks".into(),
+            audio: Some(std::sync::Arc::new(AudioClip::new(a0, sr))),
+            ..Default::default()
+        };
+        src0.slices = vec![Slice::new(0.05, 0.18), Slice::new(0.40, 0.45), Slice::new(0.70, 0.75)];
+        enrich_slices(&mut src0.slices, src0.audio.as_deref(), None);
+
+        // Source 1: rim crack (0.10..0.20s) + sustained pitched vowel (0.50..1.10s).
+        let mut a1 = vec![0.0f32; sr as usize * 2];
+        for i in (0.10 * sr as f64) as usize..(0.20 * sr as f64) as usize {
+            let dt = (i as f64 / sr as f64 - 0.10) as f32;
+            a1[i] = 0.8 * (-dt * 42.0).exp() * ((2.0 * std::f32::consts::PI * 950.0 * dt).sin() + 0.7 * (2.0 * std::f32::consts::PI * 2900.0 * dt).sin());
+        }
+        for i in (0.50 * sr as f64) as usize..(1.10 * sr as f64) as usize {
+            let t = i as f32 / sr as f32;
+            a1[i] = 0.6 * (2.0 * std::f32::consts::PI * 220.0 * t).sin();
+        }
+        let mut src1 = crate::timeline::Source {
+            name: "sung_vowel".into(),
+            audio: Some(std::sync::Arc::new(AudioClip::new(a1, sr))),
+            base_hz: 220.0,
+            ..Default::default()
+        };
+        src1.slices = vec![Slice::new(0.10, 0.20), Slice::new(0.50, 1.10)];
+        enrich_slices(&mut src1.slices, src1.audio.as_deref(), None);
+
+        // Source 2: absurd spoken hooks (0.12..1.05s, 1.20..2.10s).
+        let mut a2 = vec![0.0f32; sr as usize * 3];
+        for &(t0, t1) in &[(0.12f64, 1.05f64), (1.20f64, 2.10f64)] {
+            for i in (t0 * sr as f64) as usize..(t1 * sr as f64) as usize {
+                let t = i as f32 / sr as f32;
+                let env = (2.0 * std::f32::consts::PI * 5.0 * t).sin().abs();
+                a2[i] = 0.7 * env * ((2.0 * std::f32::consts::PI * 540.0 * t).sin() + 0.5 * (2.0 * std::f32::consts::PI * 1650.0 * t).sin());
+            }
+        }
+        let mut src2 = crate::timeline::Source {
+            name: "turbo_gadget".into(),
+            audio: Some(std::sync::Arc::new(AudioClip::new(a2, sr))),
+            ..Default::default()
+        };
+        let mut h1 = Slice::new(0.12, 1.05);
+        h1.caption = Caption::new("DINGLE ARM");
+        let mut h2 = Slice::new(1.20, 2.10);
+        h2.caption = Caption::new("WORLD DOMINATION");
+        src2.slices = vec![h1, h2];
+        enrich_slices(&mut src2.slices, src2.audio.as_deref(), None);
+
+        let refs = [&src0, &src1, &src2];
+        let kit = build_ukg_vox_kit_across_sources(&refs);
+        assert_eq!(kit.len(), 16, "curates full 16-pad UKG + vocal-percussion + hook kit");
+        assert!(kit[0..2].iter().all(|p| p.stamp == crate::grain::Stamp::Kick && p.sculpt.sub_exciter >= 0.7));
+        assert!(kit[2..4].iter().all(|p| p.stamp == crate::grain::Stamp::Snare));
+        assert!(kit[4..8].iter().all(|p| p.stamp == crate::grain::Stamp::VoxPerc && (0.025..=0.056).contains(&p.slice.len())));
+        assert!(kit[8..11].iter().any(|p| p.stamp == crate::grain::Stamp::Chord));
+        assert!(kit[8..11].iter().any(|p| p.stamp == crate::grain::Stamp::Pluck && p.sculpt.pitch_semitones <= -12.0));
+        assert!(kit[11..16].iter().all(|p| {
+            p.stamp == crate::grain::Stamp::Phrase
+                && p.choke_group == 1
+                && (0.55..=1.91).contains(&p.slice.len())
+        }));
+        // Every curated pad & Instrument::slices_to_pads slot defaults to full-brightness hard Cut (zero muddy dimming).
+        for p in &kit {
+            assert_eq!(p.adsr.unwrap().picture, crate::envelope::PictureCut::Cut);
+            assert_eq!(p.link.gain_to_opacity, 0.0);
+            assert_eq!(p.link.envelope_to_opacity, 0.0);
+        }
+        let mut inst = crate::instrument::Instrument::new(sr);
+        inst.add_source(src2.clone());
+        assert_eq!(inst.slices_to_pads(0, 0), 2);
+        let slot0 = crate::instrument::PadSlot::from_slice(0, src2.slices[0].clone(), 3.0);
+        assert_eq!(slot0.adsr.unwrap().picture, crate::envelope::PictureCut::Cut);
+        assert_eq!(inst.frame().link.gain_to_opacity, 0.0);
+        assert_eq!(inst.frame().link.envelope_to_opacity, 0.0);
     }
 }

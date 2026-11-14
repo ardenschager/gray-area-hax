@@ -13,21 +13,23 @@ static AUDITION_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 
 pub use crate::studio::{DeepTab, DeepTarget, View};
 
-/// Stage compositing mode (`stack | split | grid | bleed`).
+/// Stage compositing mode (`stack | split | grid | bleed | collage`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StageMode {
     /// Spatial layered grain compositing (`Layout::Stack`).
     #[default]
     Stack,
-    /// Full-canvas `Split + Bleed` (`Layout::Split`): feathered `+6.5%`
-    /// screen-blended interior seams + sustained wash bleed across 100%.
+    /// Full-canvas `Split` (`Layout::Split`): crisp `2px` `#111314` dividers (`0px` blur).
     Split,
-    /// Architectural `Grid` (`Layout::Tile`): crisp `1.5 px` obsidian dividers,
+    /// Architectural `Grid` (`Layout::Tile`): crisp `2px` `#111314` dividers,
     /// low→high chord panels, `ratchet_odd` horizontal mirror.
     Grid,
     /// `Full Bleed` (`Layout::Bleed`): optical luma-key + screen melt across
     /// all active voices.
     Bleed,
+    /// `Collage` (`Layout::Collage`): dynamic hairline grid background + die-cut
+    /// sticker / zine photo-card cutouts (`3px` `#F2EDE0` border + `+5,+5` `#111314` shadow).
+    Collage,
 }
 
 impl StageMode {
@@ -42,13 +44,16 @@ impl StageMode {
         match self {
             StageMode::Stack => 0,
             StageMode::Split => 1,
-            StageMode::Grid => 2,
+            StageMode::Grid | StageMode::Collage => 2,
             StageMode::Bleed => 3,
         }
     }
 
     pub fn from_index(i: usize) -> Self {
-        Self::ALL.get(i).copied().unwrap_or(StageMode::Stack)
+        match i {
+            4 => StageMode::Collage,
+            _ => Self::ALL.get(i).copied().unwrap_or(StageMode::Stack),
+        }
     }
 
     pub fn label(self) -> &'static str {
@@ -57,6 +62,7 @@ impl StageMode {
             StageMode::Split => "split",
             StageMode::Grid => "grid",
             StageMode::Bleed => "bleed",
+            StageMode::Collage => "collage",
         }
     }
 
@@ -66,6 +72,7 @@ impl StageMode {
             StageMode::Split => chromagrain_core::tile::Layout::Split,
             StageMode::Grid => chromagrain_core::tile::Layout::Tile,
             StageMode::Bleed => chromagrain_core::tile::Layout::Bleed,
+            StageMode::Collage => chromagrain_core::tile::Layout::Collage,
         }
     }
 
@@ -75,6 +82,7 @@ impl StageMode {
             chromagrain_core::tile::Layout::Split => StageMode::Split,
             chromagrain_core::tile::Layout::Tile => StageMode::Grid,
             chromagrain_core::tile::Layout::Bleed => StageMode::Bleed,
+            chromagrain_core::tile::Layout::Collage => StageMode::Collage,
         }
     }
 }
@@ -160,6 +168,7 @@ pub enum SculptStamp {
     Kick,
     Snare,
     Hat,
+    VoxPerc,
     Pluck,
     Chord,
     Phrase,
@@ -168,11 +177,12 @@ pub enum SculptStamp {
 }
 
 impl SculptStamp {
-    pub const ALL: [SculptStamp; 9] = [
+    pub const ALL: [SculptStamp; 10] = [
         SculptStamp::Raw,
         SculptStamp::Kick,
         SculptStamp::Snare,
         SculptStamp::Hat,
+        SculptStamp::VoxPerc,
         SculptStamp::Pluck,
         SculptStamp::Chord,
         SculptStamp::Phrase,
@@ -186,6 +196,7 @@ impl SculptStamp {
             SculptStamp::Kick => "Kick",
             SculptStamp::Snare => "Snare",
             SculptStamp::Hat => "Hat",
+            SculptStamp::VoxPerc => "VoxPerc",
             SculptStamp::Pluck => "Pluck",
             SculptStamp::Chord => "Chord",
             SculptStamp::Phrase => "Phrase",
@@ -196,6 +207,7 @@ impl SculptStamp {
 
     pub fn short_label(self) -> &'static str {
         match self {
+            SculptStamp::VoxPerc => "Vox",
             SculptStamp::TapeLoop => "Tape",
             SculptStamp::Disintegrate => "Wear",
             other => other.label(),
@@ -209,6 +221,7 @@ impl SculptStamp {
             SculptStamp::Kick => Stamp::Kick,
             SculptStamp::Snare => Stamp::Snare,
             SculptStamp::Hat => Stamp::Hat,
+            SculptStamp::VoxPerc => Stamp::VoxPerc,
             SculptStamp::Pluck => Stamp::Pluck,
             SculptStamp::Chord => Stamp::Chord,
             SculptStamp::Phrase => Stamp::Phrase,
@@ -224,6 +237,7 @@ impl SculptStamp {
             Stamp::Kick => SculptStamp::Kick,
             Stamp::Snare => SculptStamp::Snare,
             Stamp::Hat => SculptStamp::Hat,
+            Stamp::VoxPerc => SculptStamp::VoxPerc,
             Stamp::Pluck => SculptStamp::Pluck,
             Stamp::Chord => SculptStamp::Chord,
             Stamp::Phrase => SculptStamp::Phrase,
@@ -380,6 +394,13 @@ impl SculptParams {
             }
             SculptStamp::Hat => {
                 p.snap = 0.25;
+                p.drive_db = 3.5;
+                p.choke = 3;
+            }
+            SculptStamp::VoxPerc => {
+                p.pitch_drop_st = 1.5;
+                p.pitch_drop_ms = 18.0;
+                p.snap = 0.16;
                 p.drive_db = 3.5;
                 p.choke = 3;
             }

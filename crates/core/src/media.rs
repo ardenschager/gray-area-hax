@@ -309,6 +309,7 @@ pub fn load_source(path: &Path, sample_rate: u32) -> MediaResult<Source> {
         audio: audio.map(std::sync::Arc::new),
         video: video.map(std::sync::Arc::new),
         base_hz,
+        path: Some(path.to_path_buf()),
         ..Default::default()
     })
 }
@@ -454,13 +455,35 @@ fn feather(mask: &mut MaskFrame, radius: u32) {
     }
 }
 
-/// Bake mask frames into a video's alpha channel (pure; tested directly).
-/// Masks are index-mapped onto frames when counts differ and
-/// nearest-sampled when dimensions differ.
+/// Bake mask frames into a video's alpha channel with a crisp die-cut sticker
+/// silhouette cleanup (`< 90 -> 0`, `> 155 -> 255`, crisp 1px ramp between
+/// `90..155`), eliminating blurry ghostly fringes.
+/// Masks are index-mapped onto frames when counts differ and bilinearly
+/// upsampled when dimensions differ.
 pub fn apply_masks(video: &VideoClip, masks: &[MaskFrame]) -> VideoClip {
     if masks.is_empty() {
         return video.clone();
     }
+    let sample_mask_bilinear = |m: &MaskFrame, x: u32, y: u32, dst_w: u32, dst_h: u32| -> u8 {
+        if m.width == 0 || m.height == 0 {
+            return 0;
+        }
+        if m.width == dst_w && m.height == dst_h {
+            return m.data[(y * m.width + x) as usize];
+        }
+        let fx = ((x as f32 + 0.5) * m.width as f32 / dst_w.max(1) as f32 - 0.5).max(0.0);
+        let fy = ((y as f32 + 0.5) * m.height as f32 / dst_h.max(1) as f32 - 0.5).max(0.0);
+        let x0 = (fx.floor() as u32).min(m.width - 1);
+        let y0 = (fy.floor() as u32).min(m.height - 1);
+        let x1 = (x0 + 1).min(m.width - 1);
+        let y1 = (y0 + 1).min(m.height - 1);
+        let tx = (fx - x0 as f32).clamp(0.0, 1.0);
+        let ty = (fy - y0 as f32).clamp(0.0, 1.0);
+        let at = |mx: u32, my: u32| m.data[(my * m.width + mx) as usize] as f32;
+        let top = at(x0, y0) * (1.0 - tx) + at(x1, y0) * tx;
+        let bot = at(x0, y1) * (1.0 - tx) + at(x1, y1) * tx;
+        (top * (1.0 - ty) + bot * ty).round().clamp(0.0, 255.0) as u8
+    };
     let frames = video
         .frames
         .iter()
@@ -470,12 +493,10 @@ pub fn apply_masks(video: &VideoClip, masks: &[MaskFrame]) -> VideoClip {
             let m = &masks[mi];
             let mut nf = f.clone();
             for y in 0..nf.height {
-                let my = (y * m.height / nf.height.max(1)).min(m.height - 1);
                 for x in 0..nf.width {
-                    let mx = (x * m.width / nf.width.max(1)).min(m.width - 1);
-                    let a = m.data[(my * m.width + mx) as usize];
+                    let raw_a = sample_mask_bilinear(m, x, y, nf.width, nf.height);
                     let di = ((y * nf.width + x) * 4 + 3) as usize;
-                    nf.data[di] = a;
+                    nf.data[di] = crate::video::tighten_cutout_alpha(raw_a);
                 }
             }
             nf
@@ -569,13 +590,13 @@ pub fn segment_video(
         let _ = std::fs::write(&key_path, &cache_key);
         p
     };
-    let radius = ((video.frames[0].width.min(video.frames[0].height) as f32
-        * MASK_FEATHER_FRAC) as u32)
-        .max(1);
     let mut masks = Vec::with_capacity(paths.len());
     for p in &paths {
         let mut m = read_pgm(p)?;
-        feather(&mut m, radius);
+        // 1px gentle anti-alias before `apply_masks` tightens `< 90 -> 0, > 155 -> 255`
+        // into a razor-sharp 1px die-cut silhouette (zero wide blurry halo).
+        let _ = MASK_FEATHER_FRAC;
+        feather(&mut m, 1);
         masks.push(m);
     }
     Ok(apply_masks(video, &masks))
@@ -1259,8 +1280,60 @@ pub fn segment_source(src: &Source, prompt: &str, work_dir: &Path) -> MediaResul
         audio: src.audio.clone(),
         video: Some(std::sync::Arc::new(masked)),
         base_hz: src.base_hz,
-        ..Default::default()
+        slices: src.slices.clone(),
+        provenance: src.provenance.clone(),
+        path: src.path.clone(),
     })
+}
+
+/// Instant 1-tap `Cutout` silhouette extractor on a [`Source`]:
+/// uses Apple Vision (`tools/segment_vision.swift`) when `src.path` exists on disk
+/// and [`segment_available()`] is true, and falls back seamlessly to the fast
+/// pure-Rust deterministic [`VideoClip::cutout_subject_fast`] for in-memory,
+/// synthetic, or plugin clips!
+pub fn cutout_source(src: &Source, mode: &str) -> Source {
+    let prompt = if mode.trim().is_empty() { "person" } else { mode.trim() };
+    let Some(video) = src.video.as_ref() else {
+        return src.clone();
+    };
+    let focus = if !src.slices.is_empty() {
+        let mut sx = 0.0f32;
+        let mut sy = 0.0f32;
+        for sl in &src.slices {
+            sx += sl.focus.0;
+            sy += sl.focus.1;
+        }
+        let inv = 1.0 / src.slices.len() as f32;
+        (sx * inv, sy * inv)
+    } else {
+        (0.5, 0.5)
+    };
+
+    if let Some(path) = src.path.as_deref().filter(|p| p.exists()) {
+        if segment_available() {
+            let fp = video_fingerprint(video, &format!("cutout:{prompt}:{}", path.display()));
+            let cache_root = std::env::var_os("HOME")
+                .map(|h| PathBuf::from(h).join("Library/Caches/chromagrain/cutouts"))
+                .unwrap_or_else(|| std::env::temp_dir().join("chromagrain-cutouts"));
+            let work = cache_root.join(format!("{fp:016x}"));
+            if let Ok(seg) = segment_source(src, prompt, &work) {
+                if seg.video.as_ref().is_some_and(|v| v.has_alpha()) {
+                    return seg;
+                }
+            }
+        }
+    }
+
+    let fast = video.cutout_subject_fast(focus);
+    Source {
+        name: format!("{prompt} @ {}", src.name),
+        audio: src.audio.clone(),
+        video: Some(std::sync::Arc::new(fast)),
+        base_hz: src.base_hz,
+        slices: src.slices.clone(),
+        provenance: src.provenance.clone(),
+        path: src.path.clone(),
+    }
 }
 
 #[cfg(test)]
@@ -1459,13 +1532,12 @@ print("ok 4")
         assert_eq!(v.frames.len(), src.video.as_ref().unwrap().frames.len());
         let f = &v.frames[0];
         let a = |x: u32, y: u32| f.data[((y * f.width + x) * 4 + 3) as usize];
-        // Top rows transparent, bottom rows opaque (feather softens the
-        // boundary, so sample away from the midline).
-        assert!(a(5, 1) < 30, "top should be transparent, got {}", a(5, 1));
-        assert!(a(5, 22) > 225, "bottom should be opaque, got {}", a(5, 22));
-        // The feathered edge actually grades.
-        let mid = a(5, 12);
-        assert!(mid > 30 && mid < 225, "edge should be feathered, got {mid}");
+        // Top rows transparent, bottom rows opaque; crisp die-cut sticker cleanup
+        // eliminates wide ghostly fringes (< 90 -> 0, > 155 -> 255, 1px boundary ramp).
+        assert_eq!(a(5, 1), 0, "top should be crisp 0, got {}", a(5, 1));
+        assert_eq!(a(5, 22), 255, "bottom should be crisp 255, got {}", a(5, 22));
+        assert_eq!(a(5, 9), 0, "no wide blurry halo above boundary, got {}", a(5, 9));
+        assert_eq!(a(5, 15), 255, "no wide blurry halo below boundary, got {}", a(5, 15));
     }
 
     #[test]
