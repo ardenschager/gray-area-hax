@@ -62,6 +62,8 @@ pub enum Live {
     /// Start / stop pad n on the next launch-grid line.
     TogglePad(usize),
     StopPads,
+    /// Update the 5-Band `ISOL8` Frequency Isolator on the audio thread (0 allocations).
+    Isolator(chromagrain_core::dsp::BandIsolator),
 }
 
 /// Audio -> loader: replaced things, to be dropped off the audio thread.
@@ -410,6 +412,7 @@ impl AudioSide {
                 Live::Pad(n, slot) => self.inst.set_pad(n, slot),
                 Live::TogglePad(n) => self.inst.toggle_pad(n),
                 Live::StopPads => self.inst.stop_pads(),
+                Live::Isolator(iso) => self.inst.set_isolator(iso),
             }
         }
     }

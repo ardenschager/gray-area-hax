@@ -185,7 +185,8 @@ const PONG: usize = 4;
 const FPING: usize = 5;
 const FPONG: usize = 6;
 const CARRY: usize = 7;
-const FIXED_TARGETS: usize = 8;
+const FISO: usize = 8;
+const FIXED_TARGETS: usize = 9;
 
 /// Per-draw uniforms: one struct shared by every pass (unused fields are
 /// ignored). Mirrors `struct U` in the WGSL below.
@@ -617,6 +618,110 @@ fn fs_idct_row(i: VOut) -> @location(0) vec4f {
     }
     return clamp(s + 0.5, vec4f(0.0), vec4f(1.0));
 }
+
+@fragment
+fn fs_iso_blur_h(i: VOut) -> @location(0) vec4f {
+    let w = i32(u.res.x);
+    let h = i32(u.res.y);
+    let px = clamp(vec2i(floor(i.uv * u.res.xy)), vec2i(0), vec2i(w - 1, h - 1));
+    let rad = i32(round(u.d.x));
+    let x0 = max(px.x - rad, 0);
+    let x1 = min(px.x + rad, w - 1);
+    let inv = 1.0 / f32(x1 - x0 + 1);
+    var acc = vec3f(0.0);
+    for (var xx = x0; xx <= x1; xx++) {
+        acc += textureLoad(t0, vec2i(xx, px.y), 0).rgb;
+    }
+    return vec4f(acc * inv, 1.0);
+}
+
+@fragment
+fn fs_iso_blur_v(i: VOut) -> @location(0) vec4f {
+    let w = i32(u.res.x);
+    let h = i32(u.res.y);
+    let px = clamp(vec2i(floor(i.uv * u.res.xy)), vec2i(0), vec2i(w - 1, h - 1));
+    let rad = i32(round(u.d.x));
+    let y0 = max(px.y - rad, 0);
+    let y1 = min(px.y + rad, h - 1);
+    let inv = 1.0 / f32(y1 - y0 + 1);
+    var acc = vec3f(0.0);
+    for (var yy = y0; yy <= y1; yy++) {
+        acc += textureLoad(t0, vec2i(px.x, yy), 0).rgb;
+    }
+    return vec4f(acc * inv, 1.0);
+}
+
+@fragment
+fn fs_iso_combine(i: VOut) -> @location(0) vec4f {
+    let w = i32(u.res.x);
+    let h = i32(u.res.y);
+    let px = clamp(vec2i(floor(i.uv * u.res.xy)), vec2i(0), vec2i(w - 1, h - 1));
+    let bm = textureLoad(t0, px, 0).rgb;
+    if (u.b.y > 0.5 && u.cf.w < 0.05) {
+        return vec4f(bm, 1.0);
+    }
+    let bc = textureLoad(t1, px, 0).rgb;
+    let y_luma = clamp(0.2126 * bc.r + 0.7152 * bc.g + 0.0722 * bc.b, 0.0, 1.0);
+    let inv_y = 1.0 - y_luma;
+    let c0 = 0.35 + 0.65 * inv_y * inv_y * inv_y;
+    let c1 = 0.65 * 3.0 * y_luma * inv_y * inv_y;
+    let c2 = 0.65 * 3.0 * y_luma * y_luma * inv_y;
+    let c3 = 0.65 * y_luma * y_luma * y_luma;
+    let w_bc = u.cf.x * c0 + u.cf.y * c1 + u.cf.z * c2 + u.cf.w * (c3 - 1.0);
+    let w_bm = u.cf.w - u.b.x;
+    return vec4f(w_bc * bc + w_bm * bm, 1.0);
+}
+
+@fragment
+fn fs_isolator(i: VOut) -> @location(0) vec4f {
+    let w = i32(u.res.x);
+    let h = i32(u.res.y);
+    let px = clamp(vec2i(floor(i.uv * u.res.xy)), vec2i(0), vec2i(w - 1, h - 1));
+    let orig4 = textureLoad(t0, px, 0);
+    if (orig4.a <= 0.0) {
+        return orig4;
+    }
+    let orig = orig4.rgb;
+    let uv = (vec2f(px) + 0.5) / u.res.xy;
+    let dx = (uv.x - 0.5) * 1.15;
+    let dy = uv.y - 0.5;
+    let dist = sqrt(dx * dx + dy * dy);
+    let t_rad = clamp((0.70 - dist) / (0.70 - 0.16), 0.0, 1.0);
+    let w_mid = t_rad * t_rad * (3.0 - 2.0 * t_rad);
+    let w_side = 1.0 - w_mid;
+
+    var rgb = orig;
+    if (u.b.z > 0.5) {
+        let p1 = textureLoad(t1, px, 0).rgb;
+        var band_sum = p1 + u.b.x * orig;
+        if (u.b.y > 0.5 && u.cf.w < 0.05) {
+            band_sum = min(abs(orig - p1) * (2.4 * u.b.x), vec3f(1.0));
+        }
+        let ch_m = i32(round(u.d.x));
+        if (ch_m == 1) {
+            rgb = band_sum * w_mid + orig * w_side;
+        } else if (ch_m == 2) {
+            rgb = orig * w_mid + band_sum * w_side;
+        } else {
+            rgb = band_sum;
+        }
+    }
+
+    let mon_m = i32(round(u.d.y));
+    var mon_mask = 1.0;
+    if (mon_m == 1) {
+        mon_mask = 0.18 + 0.82 * clamp((0.54 - uv.x) / 0.08, 0.0, 1.0);
+    } else if (mon_m == 2) {
+        mon_mask = 0.18 + 0.82 * clamp((uv.x - 0.46) / 0.08, 0.0, 1.0);
+    } else if (mon_m == 3) {
+        mon_mask = 0.16 + 0.84 * w_mid;
+    } else if (mon_m == 4) {
+        mon_mask = 0.14 + 0.86 * w_side;
+    }
+    let mon_blend = 1.0 + (mon_mask - 1.0) * u.b.w;
+    let out_rgb = clamp(rgb * (mon_blend * u.d.z), vec3f(0.0), vec3f(orig4.a));
+    return vec4f(out_rgb, orig4.a);
+}
 "#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -648,10 +753,14 @@ enum Pipe {
     Quant,
     IdctCol,
     IdctRow,
+    IsoBlurH,
+    IsoBlurV,
+    IsoCombine,
+    Isolator,
 }
 
 impl Pipe {
-    const ALL: [Pipe; 20] = [
+    const ALL: [Pipe; 24] = [
         Pipe::Grain,
         Pipe::GrainScreen,
         Pipe::BlitBlend,
@@ -672,6 +781,10 @@ impl Pipe {
         Pipe::Quant,
         Pipe::IdctCol,
         Pipe::IdctRow,
+        Pipe::IsoBlurH,
+        Pipe::IsoBlurV,
+        Pipe::IsoCombine,
+        Pipe::Isolator,
     ];
 
     fn entry(self) -> &'static str {
@@ -693,6 +806,10 @@ impl Pipe {
             Pipe::Quant => "fs_quant",
             Pipe::IdctCol => "fs_idct_col",
             Pipe::IdctRow => "fs_idct_row",
+            Pipe::IsoBlurH => "fs_iso_blur_h",
+            Pipe::IsoBlurV => "fs_iso_blur_v",
+            Pipe::IsoCombine => "fs_iso_combine",
+            Pipe::Isolator => "fs_isolator",
         }
     }
 
@@ -706,7 +823,13 @@ impl Pipe {
 
     fn format(self) -> wgpu::TextureFormat {
         match self {
-            Pipe::DctRow | Pipe::DctCol | Pipe::Quant | Pipe::IdctCol => RGBA16F,
+            Pipe::DctRow
+            | Pipe::DctCol
+            | Pipe::Quant
+            | Pipe::IdctCol
+            | Pipe::IsoBlurH
+            | Pipe::IsoBlurV
+            | Pipe::IsoCombine => RGBA16F,
             _ => RGBA8,
         }
     }
@@ -986,7 +1109,7 @@ impl GpuPreview {
         self.tex_bgs.clear();
         self.fx.clear();
         for i in 0..FIXED_TARGETS {
-            self.new_target(i == FPING || i == FPONG);
+            self.new_target(i == FPING || i == FPONG || i == FISO);
         }
         self.canvas_tex = None;
         self.carry_active_t = None;
@@ -1193,11 +1316,58 @@ impl GpuPreview {
                     self.full(out, Pipe::Kaleido, cur, None, u);
                     cur = out;
                 }
+                EffectKind::Isolator(iso) => {
+                    cur = self.apply_isolator(&iso, fx.video, cur);
+                }
                 #[allow(unreachable_patterns)]
                 _ => {}
             }
         }
         cur
+    }
+
+    fn apply_isolator(&mut self, iso: &chromagrain_core::dsp::BandIsolator, amount: f32, cur: usize) -> usize {
+        let amt = amount.clamp(0.0, 1.0);
+        if amt <= 1e-4 || !iso.is_active() {
+            return cur;
+        }
+        let (g, ch_mode, mon_mode, eff_exp) = chromagrain_core::fx::isolator_video_uniforms(iso, amt);
+        let filter_on = g.iter().any(|&v| (v - 1.0).abs() > 1e-4);
+        let only_high_solo = filter_on && g[0] < 0.05 && g[1] < 0.05 && g[2] < 0.05 && (g[3] > 0.5 || g[4] > 0.5);
+
+        if filter_on {
+            let min_dim = self.size.0.min(self.size.1).max(1) as usize;
+            let r_med = (min_dim / 42).clamp(2, 10) as f32;
+            let r_coarse = (min_dim / 12).clamp(6, 28) as f32;
+
+            let mut um = self.res_uni();
+            um.d[0] = r_med;
+            self.full(FPING, Pipe::IsoBlurH, cur, None, um);
+            self.full(FPONG, Pipe::IsoBlurV, FPING, None, um);
+
+            let mut uc = self.res_uni();
+            uc.d[0] = r_coarse;
+            self.full(FPING, Pipe::IsoBlurH, cur, None, uc);
+            self.full(FISO, Pipe::IsoBlurV, FPING, None, uc);
+
+            let mut ucomb = self.res_uni();
+            ucomb.cf = [g[0], g[1], g[2], g[3]];
+            ucomb.b = [g[4], if only_high_solo { 1.0 } else { 0.0 }, 0.0, 0.0];
+            self.full(FPING, Pipe::IsoCombine, FPONG, Some(FISO), ucomb);
+        }
+
+        let out = Self::other(cur);
+        let mut u = self.res_uni();
+        u.cf = [g[0], g[1], g[2], g[3]];
+        u.b = [
+            g[4],
+            if only_high_solo { 1.0 } else { 0.0 },
+            if filter_on { 1.0 } else { 0.0 },
+            amt,
+        ];
+        u.d = [ch_mode as f32, mon_mode as f32, eff_exp, 0.0];
+        self.full(out, Pipe::Isolator, cur, if filter_on { Some(FPING) } else { None }, u);
+        out
     }
 
     fn ensure_accum(&mut self, key: u64) {
@@ -1767,8 +1937,11 @@ impl GpuPreview {
             }
         }
 
-        // Master effect chain + optional live Perform `Tape Stop` VHS roll.
+        // Master effect chain + master 5-Band `ISOL8` isolator + optional live `Tape Stop` VHS roll.
         let mut out_tex = self.apply_chain(&scene.project.master_effects, 0xFFFF_0000_0000, MASTER, fps, t);
+        if scene.project.isolator.is_active() {
+            out_tex = self.apply_isolator(&scene.project.isolator, 1.0, out_tex);
+        }
         if scene.tape_stop > 0.005 {
             let next = Self::other(out_tex);
             let mut u = self.res_uni();
@@ -2201,8 +2374,41 @@ mod tests {
         let beat = t * 2.0; // 120 bpm
         let mut frame = 0;
         let mut report = Vec::new();
-        for name in ["none", "feather", "crush", "tint", "tune", "tile", "kaleido", "compress", "delay", "reverb"] {
-            let fx = EffectKind::parse(name).map(AvEffect::new);
+        for name in [
+            "none",
+            "feather",
+            "crush",
+            "tint",
+            "tune",
+            "tile",
+            "kaleido",
+            "isolator-lf",
+            "isolator-vocal",
+            "isolator-hf",
+            "compress",
+            "delay",
+            "reverb",
+        ] {
+            let fx = match name {
+                "isolator-lf" => {
+                    let mut iso = chromagrain_core::dsp::BandIsolator::default();
+                    iso.solo = [true, false, false, false, false];
+                    iso.monitor = chromagrain_core::dsp::IsolatorMonitor::Left;
+                    Some(AvEffect::new(EffectKind::Isolator(iso)))
+                }
+                "isolator-vocal" => {
+                    let mut iso = chromagrain_core::dsp::BandIsolator::default();
+                    iso.solo = [false, true, true, true, false];
+                    iso.ch_mode = chromagrain_core::dsp::IsolatorChannelMode::Mid;
+                    Some(AvEffect::new(EffectKind::Isolator(iso)))
+                }
+                "isolator-hf" => {
+                    let mut iso = chromagrain_core::dsp::BandIsolator::default();
+                    iso.solo = [false, false, false, false, true];
+                    Some(AvEffect::new(EffectKind::Isolator(iso)))
+                }
+                _ => EffectKind::parse(name).map(AvEffect::new),
+            };
             let mut p = project(fx);
             if name == "feather" {
                 p.tracks[1].clips[0].visual.feather = 0.6;
@@ -2217,7 +2423,8 @@ mod tests {
                 let _ = chromagrain_core::media::save_frame_png(&dir.join(format!("parity_{name}_cpu.png")), &cpu);
             }
             report.push(format!("{name}: {d:.2}"));
-            assert!(gpu.mean_luma() > 10.0, "{name}: GPU frame is not black ({})", gpu.mean_luma());
+            let min_luma = if name == "isolator-hf" { 1.5 } else { 10.0 };
+            assert!(gpu.mean_luma() > min_luma, "{name}: GPU frame is not black ({})", gpu.mean_luma());
             let tol = match name {
                 "delay" | "reverb" => 6.0,
                 "compress" => 6.0,

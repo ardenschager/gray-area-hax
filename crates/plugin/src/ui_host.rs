@@ -461,6 +461,13 @@ impl Host for PluginHost {
             self.key_override = Some(key);
         }
     }
+    fn isolator(&self) -> Option<chromagrain_core::dsp::BandIsolator> {
+        Some(self.project.lock().unwrap().isolator)
+    }
+    fn set_isolator(&mut self, iso: chromagrain_core::dsp::BandIsolator) {
+        self.project.lock().unwrap().isolator = iso;
+        self.shared.live(Live::Isolator(iso));
+    }
 }
 
 impl PerformHost for PluginHost {

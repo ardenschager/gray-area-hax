@@ -1171,6 +1171,21 @@ fn effects_chain_ui(ui: &mut egui::Ui, effects: &mut Vec<AvEffect>, salt: &str, 
                             changed |= param("folds", 2.0, 12.0).tip("radial mirror wedges (2..12)").show(ui, folds);
                             changed |= param("spin", -1.0, 1.0).tip("angular rotation rate").show(ui, spin);
                         }
+                        EffectKind::Isolator(iso) => {
+                            ui.horizontal_wrapped(|ui| {
+                                for (bi, name) in chromagrain_core::dsp::BandIsolator::BAND_NAMES.iter().enumerate() {
+                                    if ui.selectable_label(iso.solo[bi], format!("{name} solo")).clicked() {
+                                        iso.solo[bi] = !iso.solo[bi];
+                                        changed = true;
+                                    }
+                                    if ui.selectable_label(iso.mute[bi], format!("{name} mute")).clicked() {
+                                        iso.mute[bi] = !iso.mute[bi];
+                                        changed = true;
+                                    }
+                                }
+                            });
+                            changed |= param("output", -24.0, 12.0).suffix(" dB").show(ui, &mut iso.output_db);
+                        }
                     }
                     changed |= param("on sound", 0.0, 1.0).show(ui, &mut fx.audio);
                     changed |= param("on picture", 0.0, 1.0).show(ui, &mut fx.video);

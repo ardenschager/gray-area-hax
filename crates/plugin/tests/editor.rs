@@ -513,10 +513,12 @@ fn plugin_ui_hybrid_snapshots() {
 
 #[test]
 fn plugin_vgs_snapshots() {
+    use chromagrain_core::dsp::IsolatorMonitor;
+    use chromagrain_core::tile::Layout;
     use chromagrain_ui::studio::{ClipTarget, Sheet};
-    use chromagrain_ui::{Host, SculptStamp, StageMode};
+    use chromagrain_ui::{Host, PerformHost, SculptStamp, StageMode};
     let version = std::env::var("CHROMAGRAIN_UI_VERSION").unwrap_or_else(|_| "v001".into());
-    let p = plugin_with(clips());
+    let mut p = plugin_with(clips());
     let size = (960.0f32, 600.0f32);
     let mut h = harness(size, editor_ui(&p));
     h.run_steps(2);
@@ -530,6 +532,9 @@ fn plugin_vgs_snapshots() {
         ui.studio.emitters[0].sculpt = chromagrain_ui::SculptParams::preset(SculptStamp::Pluck);
     }
     h.run_steps(8);
+    // #72 item 5: StageMode::Split persists across sync() frames without reverting to Stack!
+    assert_eq!(h.state().host.stage_mode(), Some(StageMode::Split));
+    assert_eq!(h.state().host.project.lock().unwrap().layout, Layout::Split);
     shot(&mut h, &format!("261113_chromagrain_vgs_plugin-play_960x600_{version}"));
 
     h.get_by_label("open clip").click();
@@ -542,10 +547,32 @@ fn plugin_vgs_snapshots() {
     {
         let ui = h.state_mut();
         ui.host.build_kit_to_pads();
+        ui.host.set_stage_mode(StageMode::Bleed);
+        let sc = chromagrain_ui::SculptParams::preset(SculptStamp::Kick);
+        let mut core_sc = sc.to_core();
+        core_sc.pitch_semitones = -7.0;
+        ui.host.set_pad_sculpt(0, core_sc, 1);
+        for pad in [0usize, 1, 5] {
+            ui.host.toggle_pad(pad);
+        }
         ui.studio.set_view(&mut ui.host, View::Perform);
         ui.studio.punch_fx[0] = true;
         ui.studio.punch_fx[4] = true;
     }
-    h.run_steps(6);
+    h.run_steps(4);
+    h.get_by_label("isol8 solo lmf").click();
+    h.get_by_label("isol8 solo mf").click();
+    h.get_by_label("isol8 solo hmf").click();
+    h.get_by_label("isol8 mon m").click();
+    h.run_steps(4);
+    assert_eq!(h.state().host.stage_mode(), Some(StageMode::Bleed));
+    assert_eq!(h.state().host.project.lock().unwrap().layout, Layout::Bleed);
+    play(&mut p, 0.8, 0.0, &[]);
+    h.run_steps(2);
+    assert!(
+        (p.audio().inst.pad(0).slot.unwrap().sculpt.pitch_semitones - (-7.0)).abs() < 1e-4
+    );
+    assert_eq!(p.audio().inst.isolator().solo, [false, true, true, true, false]);
+    assert_eq!(p.audio().inst.isolator().monitor, IsolatorMonitor::Mid);
     shot(&mut h, &format!("261113_chromagrain_vgs_plugin-perform_960x600_{version}"));
 }

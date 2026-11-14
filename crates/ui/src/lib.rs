@@ -19,9 +19,8 @@ pub mod wave;
 pub mod widgets;
 
 pub use host::{
-    AddRoute, AddTarget, Added, BrowseItem, Caps, ChordChoice, Host, IsolatorMonitor, IsolatorUi,
-    Pad, PadKind, Pending, PerformHost, SculptParams, SculptStamp, StageAspect, StageMode,
-    YoutubeHit,
+    AddRoute, AddTarget, Added, BrowseItem, Caps, ChordChoice, Host, Pad, PadKind, Pending,
+    PerformHost, SculptParams, SculptStamp, StageAspect, StageMode, YoutubeHit,
 };
 pub use studio::{ClipTarget, DeepTab, DeepTarget, Sheet, Studio, View};
 

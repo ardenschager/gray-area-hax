@@ -512,6 +512,14 @@ impl Host for App {
         self.project.lock().unwrap().set_aspect_hd(aspect.to_core());
         self.mark_now();
     }
+    fn isolator(&self) -> Option<chromagrain_core::dsp::BandIsolator> {
+        Some(self.project.lock().unwrap().isolator)
+    }
+    fn set_isolator(&mut self, iso: chromagrain_core::dsp::BandIsolator) {
+        self.project.lock().unwrap().isolator = iso;
+        self.plan_project.isolator = iso;
+        self.playback.set_isolator(iso);
+    }
 }
 
 impl PerformHost for App {

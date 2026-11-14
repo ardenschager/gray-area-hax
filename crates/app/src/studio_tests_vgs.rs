@@ -453,7 +453,7 @@ fn vgs_ui_snapshots() {
         shot(&mut h, &vgs_shot_name("sequence-ratchet-set", size));
     }
 
-    // 6. Perform — `Split + Bleed` in `9:16` vertical aspect + active pads + VJ Punch-In FX + Set Bar
+    // 6. Perform — `Split + Bleed` in `9:16` vertical aspect + active pads + VJ Punch-In FX + ISOL8 Vocal Solo
     {
         let size = (1600.0, 1000.0);
         let mut h = harness(size, View::Perform, |app| {
@@ -467,6 +467,12 @@ fn vgs_ui_snapshots() {
             app.studio.punch_fx[0] = true; // Stutter
             app.studio.punch_fx[4] = true; // Shimmer
             app.studio.active_caption = Some(("purely psychosomatic".into(), 999.0));
+            let mut iso = chromagrain_core::dsp::BandIsolator::default();
+            iso.solo = [false, true, true, true, false];
+            iso.ch_mode = chromagrain_core::dsp::IsolatorChannelMode::Mid;
+            iso.monitor = chromagrain_core::dsp::IsolatorMonitor::Mid;
+            app.set_isolator(iso);
+            app.studio.isolator = iso;
             for pad in [0usize, 1, 5] {
                 app.toggle_pad(pad);
             }
@@ -477,10 +483,9 @@ fn vgs_ui_snapshots() {
         shot(&mut h, &vgs_shot_name("perform-split-bleed-9x16", size));
     }
 
-    // 7. Perform — `Bleed` in `16:9` widescreen (Basinski / Caretaker tape loops + Wear + Shimmer)
-    {
-        let size = (1600.0, 1000.0);
-        let mut h = harness(size, View::Perform, |app| {
+    // 7. Perform — `Bleed` in `16:9` widescreen (Basinski / Caretaker tape loops + Wear + Shimmer + ISOL8 LF/LMF + DIM)
+    for size in [(1600.0f32, 1000.0f32), (960.0, 600.0)] {
+        let mut h = harness(size, View::Perform, move |app| {
             showcase(app);
             app.build_loops_to_pads();
             app.set_stage_mode(StageMode::Bleed);
@@ -488,13 +493,128 @@ fn vgs_ui_snapshots() {
             app.studio.seq.hold_scene = true;
             app.studio.punch_fx[4] = true; // Shimmer
             app.studio.punch_fx[5] = true; // Wear
-            for pad in [0usize, 2, 5] {
+            let mut iso = chromagrain_core::dsp::BandIsolator::default();
+            if size.0 == 1600.0 {
+                iso.solo = [false, true, true, true, true];
+                iso.mute = [true, false, false, false, false];
+            } else {
+                iso.solo = [true, true, false, false, false];
+                iso.mute = [false, false, false, false, true];
+                iso.dim = true;
+            }
+            app.set_isolator(iso);
+            app.studio.isolator = iso;
+            for pad in [0usize, 1, 5] {
                 app.toggle_pad(pad);
             }
             app.playback.stop();
-            app.playhead_beats = 2.4;
+            app.playhead_beats = 1.6;
         });
         h.run_steps(10);
-        shot(&mut h, &vgs_shot_name("perform-bleed-16x9", size));
+        let tag = if size.0 == 1600.0 {
+            vgs_shot_name("perform-bleed-16x9", size)
+        } else {
+            vgs_shot_name("perform-isol8", size)
+        };
+        shot(&mut h, &tag);
+    }
+}
+
+#[test]
+fn vgs_verifier_fixes_and_isol8_wiring() {
+    use chromagrain_core::dsp::IsolatorMonitor;
+    use chromagrain_core::render::plan_project;
+    use chromagrain_ui::PerformHost;
+
+    // (a) #72 item 3: Free-loop pads in Perform stay one unbroken Clip >= 64 beats
+    // so `loop_pass` and `disintegrate` advance across passes instead of resetting!
+    let mut h = harness((1600.0, 1000.0), View::Perform, |app| {
+        showcase(app);
+        app.build_loops_to_pads();
+        app.toggle_pad(0);
+        app.playback.stop();
+    });
+    h.run_steps(4);
+    {
+        assert!(h.state().loop_end >= 64.0, "free-loop horizon >= 64 beats");
+        let p = h.state().project.lock().unwrap();
+        assert_eq!(p.tracks[0].clips.len(), 1, "single unbroken clip for free-loop pad");
+        assert!(p.tracks[0].clips[0].length_beats >= 64.0);
+        let plan = plan_project(&p);
+        let max_pass = plan
+            .iter()
+            .filter(|cp| cp.track == 0)
+            .flat_map(|cp| cp.parts.iter().flat_map(|(_, evs)| evs.iter().map(|e| e.loop_pass)))
+            .max()
+            .unwrap_or(0);
+        assert!(max_pass >= 4, "expected free-loop pass progression >= 4, got {max_pass}");
+    }
+
+    // (b) #72 item 4: Pad sculpt in Arrange mode routes to `other_tracks` (never mutating
+    // the sequence track), Emitter sculpt applies pitch_semitones, and Kit -> pads syncs captions.
+    let mut h2 = harness((1600.0, 1000.0), View::Play, |app| {
+        showcase(app);
+        {
+            let mut p = app.project.lock().unwrap();
+            let len = p.sources[0].duration();
+            let mut sl = chop::equal_slices(len, 4);
+            for s in &mut sl {
+                s.caption = "psychosomatic hook".into();
+            }
+            p.sources[0].slices = sl;
+            for src in p.sources.iter_mut().skip(1) {
+                let l = src.duration();
+                let mut v = chop::equal_slices(l, 4);
+                for s in &mut v {
+                    s.caption = "psychosomatic hook".into();
+                }
+                src.slices = v;
+            }
+        }
+        app.build_kit_to_pads();
+    });
+    h2.run_steps(3);
+    assert!(
+        h2.state().studio.pad_captions.iter().any(|c| c == "psychosomatic hook"),
+        "build_kit_to_pads syncs Slice::caption into studio.pad_captions"
+    );
+    {
+        let app = h2.state_mut();
+        let seq_sculpt_before = app.project.lock().unwrap().tracks[0].sculpt;
+        let kick = chromagrain_ui::SculptParams::preset(SculptStamp::Kick);
+        let mut core_kick = kick.to_core();
+        core_kick.pitch_semitones = -12.0;
+        app.set_pad_sculpt(0, core_kick, 1);
+        assert_eq!(
+            app.project.lock().unwrap().tracks[0].sculpt.pitch_semitones,
+            seq_sculpt_before.pitch_semitones,
+            "sequence track sculpt untouched while in Play/Arrange"
+        );
+        assert!(
+            (app.other_tracks[0].sculpt.pitch_semitones - (-12.0)).abs() < 1e-4,
+            "pad 0 sculpt persisted on other_tracks[0]"
+        );
+        // Emitter sculpt applies `pitch_semitones`:
+        app.studio.emitters[0].sculpt = kick;
+        app.studio.emitters[0].held = true;
+    }
+    h2.run_steps(4);
+    assert!(
+        h2.state().live_events.iter().any(|(_, _, ev)| ev.pitch_ratio < 0.65),
+        "emitter Kick sculpt lowers grain pitch_ratio (< 0.65)"
+    );
+
+    // (c) #73: Clicking ISOL8 hardware switches in Perform updates Project::isolator live.
+    h.get_by_label("isol8 solo lmf").click();
+    h.get_by_label("isol8 solo mf").click();
+    h.get_by_label("isol8 solo hmf").click();
+    h.get_by_label("isol8 mon m").click();
+    h.get_by_label("isol8 dim").click();
+    h.run_steps(3);
+    {
+        let iso = h.state().project.lock().unwrap().isolator;
+        assert_eq!(iso.solo, [false, true, true, true, false]);
+        assert_eq!(iso.monitor, IsolatorMonitor::Mid);
+        assert!(iso.dim);
     }
 }

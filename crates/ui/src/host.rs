@@ -822,63 +822,9 @@ pub trait Host {
         None
     }
 
-    /// Master 5-Band `ISOL8` Frequency Isolator state (`LF · LMF · MF · HMF · HF`).
-    fn isolator_ui(&self) -> Option<IsolatorUi> {
+    /// Master 5-Band `ISOL8` Frequency Isolator (`LF · LMF · MF · HMF · HF`).
+    fn isolator(&self) -> Option<chromagrain_core::dsp::BandIsolator> {
         None
     }
-    fn set_isolator_ui(&mut self, _iso: IsolatorUi) {}
-}
-
-/// Channel / monitor routing on the 5-Band `ISOL8` Frequency Isolator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum IsolatorMonitor {
-    #[default]
-    Stereo,
-    Left,
-    Right,
-    Mid,
-    Side,
-}
-
-impl IsolatorMonitor {
-    pub fn ch_mode_label(self) -> &'static str {
-        match self {
-            IsolatorMonitor::Stereo | IsolatorMonitor::Left | IsolatorMonitor::Right => "STEREO",
-            IsolatorMonitor::Mid => "MID",
-            IsolatorMonitor::Side => "SIDE",
-        }
-    }
-}
-
-/// UI mirror of the 5-Band `24 dB/Oct` Linkwitz-Riley `ISOL8` Frequency Isolator.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct IsolatorUi {
-    /// 4 crossover frequencies in Hz (`X1..X4`, default `[200, 700, 2500, 8000]`).
-    pub crossovers: [f32; 4],
-    /// Per-band mute (`LF, LMF, MF, HMF, HF`).
-    pub mute: [bool; 5],
-    /// Per-band solo (`LF, LMF, MF, HMF, HF`).
-    pub solo: [bool; 5],
-    /// Channel / monitor sculpt (`Stereo | L | R | M | S`).
-    pub monitor: IsolatorMonitor,
-    /// Filter bypass (`true` = flat pass-through).
-    pub bypass: bool,
-    /// `-18 dB` dim attenuator.
-    pub dim: bool,
-    /// Output trim in dB (`-24..+6`, default `0.0`).
-    pub output_db: f32,
-}
-
-impl Default for IsolatorUi {
-    fn default() -> Self {
-        Self {
-            crossovers: [200.0, 700.0, 2500.0, 8000.0],
-            mute: [false; 5],
-            solo: [false; 5],
-            monitor: IsolatorMonitor::Stereo,
-            bypass: false,
-            dim: false,
-            output_db: 0.0,
-        }
-    }
+    fn set_isolator(&mut self, _iso: chromagrain_core::dsp::BandIsolator) {}
 }
