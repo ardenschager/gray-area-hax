@@ -114,7 +114,7 @@ impl Editor for StudioEditor {
         let window = Window::open_parented(
             &Parent(parent),
             WindowOpenOptions {
-                title: "chromagrain".into(),
+                title: "videograin".into(),
                 size: Size::new(w as f64, h as f64),
                 scale: scale.map(|s| WindowScalePolicy::ScaleFactor(s as f64)).unwrap_or(WindowScalePolicy::SystemScaleFactor),
             },

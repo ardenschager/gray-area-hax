@@ -184,9 +184,9 @@ fn vgs_stage_modes_aspect_ratios_and_60fps_export_toggle() {
     h.run_steps(2);
     assert_eq!(h.state().stage_mode(), Some(StageMode::Grid));
 
-    h.get_by_label("layout bleed").click();
+    h.get_by_label("layout collage").click();
     h.run_steps(2);
-    assert_eq!(h.state().stage_mode(), Some(StageMode::Bleed));
+    assert_eq!(h.state().stage_mode(), Some(StageMode::Collage));
 
     // Aspect ratio pill: `16:9 · 1:1 · 9:16`.
     assert_eq!(h.state().stage_aspect(), Some(StageAspect::Wide16x9));
@@ -331,16 +331,19 @@ fn vgs_sequence_step_ratchet_chord_set_bar_and_perform_punch_fx() {
     h.run_steps(2);
     assert!(h.state().studio.seq.hold_scene);
 
-    // 2. Switch to Perform -> test 6 VJ Punch-In FX pills (`Stutter`, `Tape Stop`, `Shimmer`, `Wear`).
+    // 2. Switch to Perform -> test 6 VJ Punch-In FX switches (`Stutter`, `Grid ×`, `Cutout`, `Tape Stop`, `Comb`, `Crush`).
     h.get_by_label("Perform").click();
     h.run_steps(3);
     h.get_by_label("punch stutter").click();
+    h.get_by_label("punch cutout").click();
     h.get_by_label("punch tape stop").click();
-    h.get_by_label("punch shimmer").click();
+    h.get_by_label("punch crush").click();
     h.run_steps(4);
     assert!(h.state().studio.punch_fx[0], "Stutter latched");
-    assert!(h.state().studio.punch_fx[1], "Tape Stop latched");
-    assert!(h.state().studio.punch_fx[4], "Shimmer latched");
+    assert!(h.state().studio.punch_fx[2], "Cutout latched");
+    assert_eq!(h.state().stage_mode(), Some(StageMode::Collage), "Cutout punch flips stage to Collage");
+    assert!(h.state().studio.punch_fx[3], "Tape Stop latched");
+    assert!(h.state().studio.punch_fx[5], "Crush latched");
     assert!(h.state().studio.tape_stop_amt > 0.05, "Tape Stop ramps active");
 }
 
@@ -619,5 +622,272 @@ fn vgs_verifier_fixes_and_isol8_wiring() {
         assert_eq!(iso.solo, [false, true, true, true, false]);
         assert_eq!(iso.monitor, IsolatorMonitor::Mid);
         assert!(iso.dim);
+    }
+}
+
+fn v004_shot(h: &mut Harness<'static, App>, view: &str, size: (f32, f32)) {
+    let img = h.render().expect("render v004 snapshot");
+    let dir_opt = std::env::var("VIDEOGRAIN_UI_SHOTS")
+        .ok()
+        .or_else(|| std::env::var("CHROMAGRAIN_UI_SHOTS").ok());
+    if let Some(dir) = dir_opt {
+        let dir = std::path::Path::new(&dir);
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join(format!(
+            "261114_videograin_ui_{view}_{}x{}_v004.png",
+            size.0 as u32, size.1 as u32
+        ));
+        img.save(&path).unwrap();
+        eprintln!("wrote {}", path.display());
+    }
+}
+
+fn rename_v004_crate_sources(app: &mut App) {
+    const CRATE_NAMES: [&str; 7] = [
+        "wA1_turbo_encabulator_Ac7G7xOG2Ag.mp4",
+        "wB1_soul_stutter_acapella_XUaVI90fs5w.mp4",
+        "wB4_solo_rhodes_improv_MxOzUVFZwCs.mp4",
+        "wB5_fingerstyle_bass_groove_KnvZ81XivtE.mp4",
+        "wB6_tap_shuffle_heel_6uD9rTyeurk.mp4",
+        "wA3_omnibot_zeon_robot_E8d7kbbrvQU.mp4",
+        "wA7_suzuki_omnichord_chords_j-z1lO9v24M.mp4",
+    ];
+    let mut p = app.project.lock().unwrap();
+    p.bpm = 134.0;
+    for (i, nm) in CRATE_NAMES.iter().enumerate() {
+        if let Some(s) = p.sources.get_mut(i) {
+            s.name = (*nm).into();
+        }
+    }
+}
+
+#[test]
+fn v004_videograin_ui_wiring_and_snapshots() {
+    use chromagrain_ui::PerformHost;
+
+    // 0. `clean_clip_label` strips messy crate prefixes, extensions & trailing YouTube IDs.
+    assert_eq!(
+        chromagrain_ui::studio::clean_clip_label("person @ wA1_turbo_encabulator_Ac7G7xOG2Ag.mp4 · Vox 3"),
+        "turbo encabulator"
+    );
+
+    let writing_shots = std::env::var("VIDEOGRAIN_UI_SHOTS").is_ok()
+        || std::env::var("CHROMAGRAIN_UI_SHOTS").is_ok();
+
+    // 1. Top-bar `SWING` LCD (`"swing"`), `+ Add` (`"top add"`), Sequence `2-Step` (`"seed ukg 2step"`),
+    //    Perform `Vocal Kit` (`"perform ukg kit"`), `Cutout` (`"perform cutout"`), Punch-In `Grid ×`/`Cutout`/`Crush`,
+    //    and Clip `Cutout Person` / `Cutout Subject` / `Vocal Kit → pads` / `Vox Perc` stamp!
+    let mut h = harness((1600.0, 1000.0), View::Sequence, move |app| {
+        showcase(app);
+        rename_v004_crate_sources(app);
+        if !writing_shots {
+            // Keep interactive Vision cutout unit tests <1s during regular `cargo test --workspace`.
+            let mut p = app.project.lock().unwrap();
+            for s in p.sources.iter_mut() {
+                s.video = Some(std::sync::Arc::new(chromagrain_core::video::VideoClip::test_pattern(
+                    120, 68, 8.0, 0.6,
+                )));
+            }
+        }
+    });
+    h.run_steps(4);
+
+    // Click `2-Step` (`"seed ukg 2step"`) in Sequence Groove Bar -> sets ~61% swing and populates UKG 2-step pattern!
+    h.get_by_label("seed ukg 2step").click();
+    h.run_steps(3);
+    assert!(
+        (h.state().studio.swing - 0.61).abs() < 0.02,
+        "2-Step UKG sets ~61% swing, got {}",
+        h.state().studio.swing
+    );
+    {
+        let p = h.state().project.lock().unwrap();
+        let active_steps: usize = p.patterns[0]
+            .rows
+            .iter()
+            .map(|r| r.steps.iter().filter(|s| s.on).count())
+            .sum();
+        assert!(active_steps >= 14, "seed_ukg_2step populates 2-step pattern hits: {active_steps}");
+    }
+
+    // Top-bar `swing` LCD click cycles swing presets & updates Project pattern swing.
+    let sw0 = h.state().studio.swing;
+    h.get_by_label("swing").click();
+    h.run_steps(2);
+    assert!((h.state().studio.swing - sw0).abs() > 0.01, "clicking top-bar swing cycles preset");
+
+    // Top-bar `+ Add` (`"top add"`) opens `Sheet::Add(AddTarget::Any)`.
+    h.get_by_label("top add").click();
+    h.run_steps(2);
+    assert_eq!(h.state().studio.sheet, Some(Sheet::Add(AddTarget::Any)));
+    h.get_by_label("close sheet").click();
+    h.run_steps(2);
+
+    // Switch to Perform -> click `Vocal Kit` (`"perform ukg kit"`) & `Cutout` (`"perform cutout"`).
+    h.get_by_label("Perform").click();
+    h.run_steps(3);
+    h.get_by_label("perform ukg kit").click();
+    h.run_steps(3);
+    let pads = PerformHost::pads(h.state());
+    assert!(
+        pads.iter().filter(|pd| pd.source.is_some()).count() >= 12,
+        "perform ukg kit harvests multi-pad vocal percussion & chord kit"
+    );
+    assert!(
+        h.state().studio.pad_sculpt.iter().any(|sp| sp.stamp == SculptStamp::VoxPerc),
+        "UKG kit assigns VoxPerc stamp onto vocal chop pads"
+    );
+
+    h.get_by_label("perform cutout").click();
+    h.run_steps(3);
+    let sel_src = PerformHost::pads(h.state())[h.state().studio.sel_pad].source.unwrap();
+    assert!(
+        h.state().studio.source_has_alpha(h.state(), sel_src),
+        "perform cutout segments selected pad source with alpha mask"
+    );
+    assert_eq!(h.state().stage_mode(), Some(StageMode::Collage));
+
+    // Test `Grid ×` punch (`"punch grid"`).
+    h.get_by_label("punch grid").click();
+    h.run_steps(2);
+    assert!(h.state().studio.punch_fx[1]);
+    h.get_by_label("punch grid").click();
+    h.run_steps(2);
+
+    // Open Clip sheet on Pad 1 -> test `Vox Perc` (`"sculpt VoxPerc"`), `Cutout Subject` (`"cutout subject"`),
+    // `Cutout Person` (`"cutout person"`), and `Vocal Kit → pads` (`"ukg vox kit"`).
+    h.get_by_label("open clip").click();
+    h.run_steps(3);
+    h.get_by_label("sculpt VoxPerc").click();
+    h.run_steps(2);
+    let p0 = h.state().studio.sel_pad;
+    assert_eq!(h.state().studio.pad_sculpt[p0].stamp, SculptStamp::VoxPerc);
+
+    // Verify `FX_SLOTS` in Tab 1 exposes `fx isol8` and zero `fx kaleido`.
+    h.get_by_label("clip tab detail").click();
+    h.run_steps(2);
+    assert!(h.query_by_label("fx kaleido").is_none(), "zero Kaleido slot in Clip FX");
+    let _ = h.get_by_label("fx isol8");
+    h.get_by_label("clip tab sculpt").click();
+    h.run_steps(2);
+
+    h.get_by_label("cutout subject").click();
+    h.run_steps(2);
+    h.get_by_label("cutout person").click();
+    h.run_steps(2);
+    h.get_by_label("ukg vox kit").click();
+    h.run_steps(3);
+    assert_eq!(h.state().studio.sheet, None);
+    assert_eq!(h.state().studio.view, View::Perform);
+
+    // 2. Render all 10 standalone `v004` UI snapshots (`1600x1000` and `960x600`) reusing `h` (`1` wgpu device)!
+    {
+        let app = h.state_mut();
+        app.cutout_source(1, "subject");
+        app.studio.seq.scene_names[0] = "intro".into();
+        app.studio.seq.scene_names[1] = "2step".into();
+        app.studio.seq.scene_names[2] = "vox".into();
+        app.studio.seq.scene_names[3] = "drop".into();
+    }
+    for size in [(1600.0f32, 1000.0f32), (960.0, 600.0)] {
+        h.set_size(egui::vec2(size.0, size.1));
+
+        // (a) Perform (`collage` + `grid` + `ISOL8` + `Vocal Kit` + `Cutout` badges)
+        {
+            let app = h.state_mut();
+            app.studio.sheet = None;
+            app.with_studio(|st, host| {
+                st.set_view(host, View::Perform);
+                st.set_active_swing(host, 0.61);
+                st.trigger_ukg_kit(host);
+            });
+            app.set_stage_mode(if size.0 >= 1200.0 { StageMode::Collage } else { StageMode::Grid });
+            app.studio.punch_fx = [true, false, size.0 >= 1200.0, false, false, false];
+            let mut iso = chromagrain_core::dsp::BandIsolator::default();
+            iso.solo = [false, true, true, true, false];
+            app.set_isolator(iso);
+            app.studio.isolator = iso;
+            for pad in [0usize, 2, 4, 8] {
+                if !PerformHost::pads(app)[pad].on {
+                    app.toggle_pad(pad);
+                }
+            }
+            app.playback.stop();
+            app.playhead_beats = 1.5;
+        }
+        h.run_steps(6);
+        v004_shot(&mut h, "perform", size);
+
+        // (b) Sequence (live Stage Monitor + `2-Step` UKG groove + `61%` Swing + `×2` & `min7` badges)
+        {
+            let app = h.state_mut();
+            app.studio.punch_fx = [false; 6];
+            app.studio.sheet = None;
+            app.with_studio(|st, host| st.set_view(host, View::Sequence));
+            app.set_stage_mode(StageMode::Grid);
+            app.playback.stop();
+            app.playhead_beats = 1.25;
+        }
+        h.run_steps(3);
+        h.get_by_label("seed ukg 2step").click();
+        h.run_steps(5);
+        v004_shot(&mut h, "sequence", size);
+
+        // (c) Play (calm recessed tape-slot empty column + unobstructed `grid` Stage + 4 `ISOL8` Emitter Cards)
+        {
+            let app = h.state_mut();
+            app.studio.sheet = None;
+            app.with_studio(|st, host| st.set_view(host, View::Play));
+            app.set_stage_mode(StageMode::Grid);
+            app.studio.swing = 0.61;
+            app.studio.emitters[0].held = true;
+            app.studio.emitters[1].held = true;
+            app.studio.emitters[2].held = true;
+            app.playback.stop();
+            app.playhead_beats = 2.0;
+        }
+        h.run_steps(6);
+        v004_shot(&mut h, "play", size);
+
+        // (d) Clip (`Cutout` + `Vocal Kit → pads` + `Vox Perc` in 2-Tab lower deck)
+        {
+            let app = h.state_mut();
+            app.studio.emitters[0].held = false;
+            app.studio.emitters[1].held = false;
+            app.studio.emitters[2].held = false;
+            {
+                let mut p = app.project.lock().unwrap();
+                let len = p.sources[1].duration();
+                p.sources[1].slices = chop::equal_slices(len, 8);
+            }
+            app.with_studio(|st, host| {
+                st.set_view(host, View::Perform);
+                st.set_active_swing(host, 0.61);
+                st.trigger_ukg_kit(host);
+            });
+            app.studio.source_focus.insert(1, (0.44, 0.38));
+            app.studio.pad_sculpt[4] = chromagrain_ui::SculptParams::preset(SculptStamp::VoxPerc);
+            app.studio.pad_captions[4] = "turbo encabulator vox chop".into();
+            app.studio.clip_tab = 0;
+            app.studio.open_clip(ClipTarget::Pad(4));
+            app.playback.stop();
+        }
+        h.run_steps(6);
+        v004_shot(&mut h, "clip", size);
+
+        // (e) Add (`YouTube` search + `<500 views` + `VIDEOGRAIN` chrome)
+        {
+            let app = h.state_mut();
+            app.with_studio(|st, host| st.set_view(host, View::Play));
+            app.adds.yt_mock = Some(mock_youtube_catalog());
+            app.studio.add.tab = AddRoute::Link;
+            app.studio.add.yt_query = "uk garage acapella cassette".into();
+            app.studio.add.yt_low_views = true;
+            app.adds.search_youtube("1960s psychiatrist cello answering machine", true);
+            app.studio.sheet = Some(Sheet::Add(AddTarget::Column(7)));
+            app.playback.stop();
+        }
+        h.run_steps(6);
+        v004_shot(&mut h, "add", size);
     }
 }

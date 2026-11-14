@@ -1,7 +1,7 @@
-//! The calm `Project` modal sheet (`D · Hybrid`), replacing the old right-hand
+//! The calm `Project` modal sheet (`VIDEOGRAIN`), replacing the old right-hand
 //! `Deep` sidebar drawer. Includes `30 fps | 60 fps` export rate, `Time & key`,
 //! `Set · scenes` (12 named scenes + cue chain), `Library`, `Master effects ♪ ▣`
-//! (including `Kaleido`), and `Script`.
+//! (`Crush · Echo · Reverb · Isol8 · Codec · Tint · Stretch · Filter`), and `Script`.
 
 use super::add::modal;
 use super::{ClipTarget, Sheet, Studio, View, EMITTERS, LANES, SCENES};
@@ -52,7 +52,7 @@ pub const FX_SLOTS: [(&str, &str); 8] = [
     ("crush", "Crush"),
     ("delay", "Echo"),
     ("reverb", "Reverb"),
-    ("kaleido", "Kaleido"),
+    ("isolator", "Isol8"),
     ("compress", "Codec"),
     ("tint", "Tint"),
     ("stretch", "Stretch"),
@@ -103,10 +103,10 @@ pub fn fx_kind_matches(kind: &EffectKind, slot_key: &str) -> bool {
         "crush" => matches!(kind, EffectKind::Crush { .. }),
         "delay" => matches!(kind, EffectKind::Delay { .. }),
         "reverb" => matches!(kind, EffectKind::Reverb { .. }),
+        "isolator" => matches!(kind, EffectKind::Isolator(_)),
         "compress" => matches!(kind, EffectKind::Compress { .. }),
         "tint" => matches!(kind, EffectKind::Tint { .. }),
-        "kaleido" => kind.name() == "kaleido" || matches!(kind, EffectKind::Tile { mirror, .. } if *mirror >= 0.5),
-        "stretch" => matches!(kind, EffectKind::Tile { mirror, .. } if *mirror < 0.5),
+        "stretch" => matches!(kind, EffectKind::Tile { .. }),
         "highpass" | "tune" => matches!(kind, EffectKind::Tune { .. }),
         _ => false,
     }
@@ -117,9 +117,12 @@ pub fn fx_default_kind(slot_key: &str, key: Key) -> Option<EffectKind> {
         "crush" => EffectKind::parse("crush"),
         "delay" => EffectKind::parse("delay"),
         "reverb" => EffectKind::parse("reverb"),
+        "isolator" => Some(EffectKind::Isolator(chromagrain_core::dsp::BandIsolator {
+            solo: [false, true, true, true, false],
+            ..Default::default()
+        })),
         "compress" => EffectKind::parse("compress"),
         "tint" => EffectKind::parse("tint"),
-        "kaleido" => EffectKind::parse("kaleido"),
         "stretch" => EffectKind::parse("tile"),
         "highpass" | "tune" => Some(EffectKind::Tune {
             root: key.root as f32,
@@ -437,34 +440,20 @@ impl Studio {
             }
         }
 
-        // 3. Swing knob.
-        let (scene, _) = self.seq_current(host);
-        let pid = self.seq_pattern(scene);
-        let mut swing_pct = {
-            let pp = host.project().lock().unwrap();
-            pid.and_then(|i| pp.patterns.get(i))
-                .map(|pat| ((pat.swing - 0.5) * 2.0).clamp(0.0, 0.5) * 2.0)
-                .unwrap_or(0.0)
-        };
+        // 3. Swing knob (`50%..72%`).
+        let cur_swing = self.active_swing(host);
+        let mut swing_norm = ((cur_swing - 0.50) / 0.22).clamp(0.0, 1.0);
         let sc = egui::pos2(top_r.left() + col_w * 2.5, ky);
-        let before_sw = swing_pct;
-        knob(ui, sc, krad, id.with("swing"), "project swing", &mut swing_pct, 0.0, 0);
-        if (swing_pct - before_sw).abs() > 1e-4 {
-            let new_swing = 0.5 + swing_pct * 0.25;
-            let mut pp = host.project().lock().unwrap();
-            for sp in self.seq.scene_pats.iter().flatten() {
-                if let Some(pat) = pp.patterns.get_mut(*sp) {
-                    pat.swing = new_swing;
-                }
-            }
-            drop(pp);
-            host.mark();
+        let before_sw = swing_norm;
+        knob(ui, sc, krad, id.with("swing"), "project swing", &mut swing_norm, 0.0, 0);
+        if (swing_norm - before_sw).abs() > 1e-4 {
+            self.set_active_swing(host, 0.50 + swing_norm * 0.22);
         }
         caps(&p, egui::pos2(sc.x, ky + krad + 11.0), Align2::CENTER_CENTER, "Swing", 9.0);
         lcd_readout(
             &p,
             Rect::from_center_size(egui::pos2(sc.x, ky + krad + 27.0), egui::vec2(54.0, 18.0)),
-            &format!("{:.0}%", swing_pct * 50.0),
+            &format!("{:.0}%", self.active_swing(host) * 100.0),
             10.5,
         );
 
@@ -488,18 +477,18 @@ impl Studio {
             10.5,
         );
 
-        // Bottom row: `stack | split | grid | bleed` + `now | beat | bar`.
+        // Bottom row: `grid | collage | split | stack` + `now | beat | bar`.
         let bot_y = inner.bottom() - 34.0;
         let mut bx = inner.left();
         if let Some(cur_mode) = host.stage_mode() {
-            let lay_w = 186.0f32.min((inner.width() * 0.54).max(150.0));
+            let lay_w = 212.0f32.min((inner.width() * 0.58).max(164.0));
             let lay_r = Rect::from_min_size(egui::pos2(bx, bot_y), egui::vec2(lay_w, 34.0));
             if let Some(pick) = segmented_named(
                 ui,
                 lay_r,
                 id.with("layout"),
-                &["stack", "split", "grid", "bleed"],
-                &["project layout stack", "project layout split", "project layout tile", "project layout bleed"],
+                &["grid", "collage", "split", "stack"],
+                &["project layout tile", "project layout collage", "project layout split", "project layout stack"],
                 &[],
                 cur_mode.index(),
                 font(11.5),

@@ -261,7 +261,13 @@ pub fn paint_switch_cap(painter: &Painter, rect: Rect, kind: SwitchKind, on: boo
         Stroke::new(1.0, BEVEL_HI),
     );
 
-    let pad = if rect.height() >= 38.0 { 2.8 } else { 2.0 };
+    let pad = if rect.height() >= 40.0 {
+        3.6
+    } else if rect.height() >= 32.0 {
+        2.5
+    } else {
+        1.9
+    };
     let mut cap = rect.shrink(pad);
     if pressed {
         cap = cap.translate(egui::vec2(0.0, 0.7));
@@ -635,6 +641,7 @@ pub enum Icon {
     Grid,
     Tile,
     Stack,
+    Cutout,
     ChevronLeft,
     ChevronRight,
 }
@@ -685,12 +692,11 @@ pub fn draw_icon(p: &Painter, icon: Icon, c: Pos2, size: f32, col: Color32) {
             p.line_segment([pt(6.0, 12.0), pt(18.0, 12.0)], st);
         }
         Icon::Brand => {
-            for i in 0..3 {
-                for j in 0..3 {
-                    let o = pt(5.0 + i as f32 * 5.5, 5.0 + j as f32 * 5.5);
-                    p.rect_filled(Rect::from_min_size(o, egui::vec2(3.6 * s, 3.6 * s)), r(1), col);
-                }
-            }
+            // Crisp 2x2 grid + offset collage cutout mark (`VIDEOGRAIN`).
+            p.rect_filled(Rect::from_min_max(pt(3.5, 4.0), pt(10.5, 11.0)), r(1), col);
+            p.rect_filled(Rect::from_min_max(pt(12.5, 4.0), pt(20.5, 11.0)), r(1), col);
+            p.rect_filled(Rect::from_min_max(pt(3.5, 13.0), pt(10.5, 20.0)), r(1), col);
+            p.rect_stroke(Rect::from_min_max(pt(12.5, 13.0), pt(20.5, 20.0)), r(1), Stroke::new(1.5 * s.max(0.65), col), StrokeKind::Inside);
         }
         Icon::Loop => {
             p.circle_stroke(pt(8.5, 12.0), 3.5 * s, st);
@@ -737,6 +743,13 @@ pub fn draw_icon(p: &Painter, icon: Icon, c: Pos2, size: f32, col: Color32) {
         Icon::Stack => {
             p.rect_stroke(Rect::from_min_max(pt(7.0, 4.0), pt(20.0, 13.0)), r(1), st, StrokeKind::Middle);
             p.rect_stroke(Rect::from_min_max(pt(4.0, 8.0), pt(17.0, 17.0)), r(1), st, StrokeKind::Middle);
+        }
+        Icon::Cutout => {
+            // Crisp vector scissors (`✂`) — zero font/glyph dependency.
+            p.circle_stroke(pt(7.2, 8.0), 2.7 * s, st);
+            p.circle_stroke(pt(7.2, 16.0), 2.7 * s, st);
+            p.line_segment([pt(9.6, 9.6), pt(20.0, 17.6)], st);
+            p.line_segment([pt(9.6, 14.4), pt(20.0, 6.4)], st);
         }
         Icon::ChevronLeft => {
             p.add(Shape::line(vec![pt(14.5, 6.0), pt(8.5, 12.0), pt(14.5, 18.0)], st));
@@ -1079,6 +1092,60 @@ pub fn chev_button(ui: &mut Ui, vis_rect: Rect, hit_rect: Rect, id: egui::Id, a1
     p.rect_stroke(vis_rect, r(4), hair(if hovered { AMBER_MID } else { WELL_LINE2 }), StrokeKind::Inside);
     draw_icon(p, Icon::ChevronRight, vis_rect.center(), 12.0, if hovered { AMBER_MID } else { CREAM2 });
     resp
+}
+
+/// Crisp high-contrast hardware role tag pill (`KICK`, `SNARE`, `VOX`, `CHORD`, `BASS`, `HOOK`, `LOOP`);
+/// returns the painted rect so callers can chain a cutout badge right beside it.
+pub fn role_tag_pill(p: &Painter, pos: Pos2, tag: &str, active: bool) -> Rect {
+    let (bg, fg, rim) = match tag {
+        "KICK" => (
+            if active { RUBY_MID } else { Color32::from_rgba_unmultiplied(118, 38, 30, 232) },
+            if active { Color32::from_rgb(0x22, 0x08, 0x06) } else { CREAM },
+            RUBY_EDGE,
+        ),
+        "SNARE" => (
+            if active { AMBER_MID } else { Color32::from_rgba_unmultiplied(128, 96, 28, 232) },
+            if active { ON_HI } else { AMBER_CORE },
+            AMBER_EDGE,
+        ),
+        "VOX" => (
+            if active { MINT_MID } else { Color32::from_rgba_unmultiplied(36, 98, 72, 232) },
+            if active { Color32::from_rgb(0x0f, 0x29, 0x1d) } else { MINT_CORE },
+            MINT_EDGE,
+        ),
+        "CHORD" | "BASS" => (
+            if active { MINT_CORE } else { Color32::from_rgba_unmultiplied(44, 86, 82, 232) },
+            if active { Color32::from_rgb(0x10, 0x26, 0x22) } else { CREAM },
+            MINT_EDGE,
+        ),
+        "HOOK" => (
+            if active { CREAM } else { Color32::from_rgba_unmultiplied(238, 230, 210, 228) },
+            INK,
+            PANEL_LO,
+        ),
+        _ => (
+            Color32::from_rgba_unmultiplied(28, 31, 32, 224),
+            if active { AMBER_MID } else { CREAM2 },
+            WELL_LINE2,
+        ),
+    };
+    let galley = p.layout_no_wrap(tag.to_string(), mono_medium(8.5), fg);
+    let rc = Rect::from_min_size(pos, egui::vec2(galley.size().x + 9.0, 15.0));
+    p.rect_filled(rc, r(3), bg);
+    p.rect_stroke(rc, r(3), Stroke::new(1.0, rim), StrokeKind::Inside);
+    p.galley(rc.center() - galley.size() * 0.5, galley, fg);
+    rc
+}
+
+/// Crisp cream die-cut sticker badge (`✂` vector scissors on `#F2EDE0` cream stock)
+/// shown whenever `VideoClip::has_alpha()` is true.
+pub fn cutout_badge(p: &Painter, pos: Pos2) -> Rect {
+    let rc = Rect::from_min_size(pos, egui::vec2(17.0, 15.0));
+    p.rect_filled(rc.translate(egui::vec2(1.0, 1.0)), r(3), Color32::from_rgb(0x11, 0x13, 0x14));
+    p.rect_filled(rc, r(3), Color32::from_rgb(0xf2, 0xed, 0xe0));
+    p.rect_stroke(rc, r(3), Stroke::new(1.0, Color32::from_rgb(0x11, 0x13, 0x14)), StrokeKind::Inside);
+    draw_icon(p, Icon::Cutout, rc.center(), 10.5, Color32::from_rgb(0x19, 0x17, 0x12));
+    rc
 }
 
 /// Sunken console display switch for AV effects (`♪` amber audio + `▣` mint video LEDs).

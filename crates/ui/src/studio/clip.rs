@@ -85,21 +85,21 @@ pub struct ChopState {
 
 /// Snapshot of the 6 macros + Grain/Pitch sub-params for the active owner.
 #[derive(Clone, Copy)]
-struct OwnerParams {
-    grain: f32,
-    pitch_m: f32,
-    smear: f32,
-    look_m: f32,
-    level: f32,
-    pan_m: f32,
-    density: f32,
-    duration: f32,
-    spray: f32,
-    reverse: f32,
-    fine_cents: f32,
-    octave: i32,
-    wobble: f32,
-    spread: f32,
+pub(crate) struct OwnerParams {
+    pub(crate) grain: f32,
+    pub(crate) pitch_m: f32,
+    pub(crate) smear: f32,
+    pub(crate) look_m: f32,
+    pub(crate) level: f32,
+    pub(crate) pan_m: f32,
+    pub(crate) density: f32,
+    pub(crate) duration: f32,
+    pub(crate) spray: f32,
+    pub(crate) reverse: f32,
+    pub(crate) fine_cents: f32,
+    pub(crate) octave: i32,
+    pub(crate) wobble: f32,
+    pub(crate) spread: f32,
 }
 
 /// Compute a lightweight deterministic acoustic badge (`sub`, `snap`, `air`,
@@ -369,7 +369,12 @@ impl Studio {
             return;
         };
         let screen = ctx.screen_rect();
-        let size = egui::vec2((screen.width() - 32.0).min(1260.0), (screen.height() - 24.0).min(940.0));
+        let tall_screen = screen.height() >= 760.0;
+        let desired_h = if tall_screen { 744.0 } else { 576.0 };
+        let size = egui::vec2(
+            (screen.width() - 32.0).min(1320.0),
+            (screen.height() - 24.0).min(desired_h),
+        );
         let caps_cfg = host.caps();
         let owner = self.effective_owner(target, src);
         let mut close = false;
@@ -377,13 +382,14 @@ impl Studio {
         let mut add_action: Option<(AddRoute, AddTarget)> = None;
 
         let scrim = modal(ctx, "cg-clip", size, |ui, rect| {
-            let inner = rect.shrink2(egui::vec2(20.0, 12.0));
+            let inner = rect.shrink2(egui::vec2(18.0, 11.0));
             let id = egui::Id::new("cg-clip");
             let p = ui.painter().clone();
             let wide_sheet = inner.width() >= 1040.0;
 
             let raw_name = self.source_name(host, src);
-            let clean_name = super::strip_media_ext(&raw_name).to_string();
+            let clean_name = super::clean_clip_label(&raw_name);
+            let has_alpha = self.source_has_alpha(host, src);
             let (len, has_audio) = {
                 let pp = host.project().lock().unwrap();
                 pp.sources.get(src).map(|s| (s.duration(), s.audio.is_some())).unwrap_or((0.0, true))
@@ -477,47 +483,40 @@ impl Studio {
                 rx = box_r.left() - 12.0;
             }
 
-            let max_title_chars = ((rx - title_x) / 8.5).max(8.0) as usize;
+            let badge_reserve = if has_alpha { 26.0 } else { 0.0 };
+            let max_title_chars = ((rx - title_x - badge_reserve) / 8.5).max(8.0) as usize;
             let max_sub_chars = ((rx - title_x) / 6.5).max(12.0) as usize;
-            p.text(
+            let title_r = p.text(
                 egui::pos2(title_x, inner.top() + 10.0),
                 Align2::LEFT_CENTER,
                 short(&clean_name, max_title_chars),
-                font_semibold(17.0),
+                font_semibold(16.5),
                 INK,
             );
+            if has_alpha && title_r.right() + 22.0 <= rx {
+                cutout_badge(&p, egui::pos2(title_r.right() + 7.0, inner.top() + 2.5));
+            }
             p.text(
                 egui::pos2(title_x, inner.top() + 28.0),
                 Align2::LEFT_CENTER,
                 short(&sub, max_sub_chars),
-                mono(11.0),
+                mono(10.5),
                 INK3,
             );
 
-            // --- Body: fits 100% without scroll at 1600×1000 & 1180×820; scrolls cleanly at 960×600 ---
+            // --- Body: Clean 3-Row Hardware Sheet (zero scroll at 1600×1000 AND 960×600!) ---
             let body = Rect::from_min_max(egui::pos2(inner.left(), inner.top() + 42.0), inner.max);
             let mut body_ui = ui.new_child(egui::UiBuilder::new().max_rect(body));
             egui::ScrollArea::vertical()
                 .id_salt("cg-clip-scroll")
                 .auto_shrink([false, false])
                 .show(&mut body_ui, |ui| {
-                    let tall = body.height() >= 820.0;
-                    let gap = if tall { 10.0 } else { 8.0 };
-                    let top_h = if tall { 166.0 } else { 148.0 };
-                    let chop_card_h = if tall { 206.0 } else { 180.0 };
-                    let sculpt_card_h = if tall { 154.0 } else { 138.0 };
-                    let cards_row1_h = if tall { 270.0 } else { 232.0 };
-                    let wide_cards = body.width() >= 1030.0;
-                    let cards_row2_h = if wide_cards { 0.0 } else { 204.0 };
-                    let total_h = top_h
-                        + gap
-                        + chop_card_h
-                        + gap
-                        + sculpt_card_h
-                        + gap
-                        + cards_row1_h
-                        + if wide_cards { 0.0 } else { gap + cards_row2_h }
-                        + 2.0;
+                    let tall = body.height() >= 620.0;
+                    let gap = if tall { 11.0 } else { 6.0 };
+                    let top_h = if tall { 196.0 } else { 152.0 };
+                    let chop_card_h = if tall { 228.0 } else { 174.0 };
+                    let deck_h = if tall { 230.0 } else { 170.0 };
+                    let total_h = top_h + gap + chop_card_h + gap + deck_h;
                     let needs_scroll = total_h > body.height() + 2.0;
                     let avail_w = if needs_scroll {
                         (body.width() - 8.0).max(320.0)
@@ -528,86 +527,108 @@ impl Studio {
                     let (canvas, _) = ui.allocate_exact_size(egui::vec2(avail_w, total_h), Sense::hover());
                     let cp = ui.painter().clone();
 
-                    // 1. Top Band: Stage Preview + Draggable `(cx, cy)` Focus + 6 Macros
-                    let stage_w = (top_h * 16.0 / 9.0).floor().min(avail_w * 0.35);
+                    // 1. Row 1: Unobstructed Preview + Bezel | 6 Owner Macros | SHAPE · ADSR
+                    let stage_w = (avail_w * 0.245).floor().clamp(212.0, 308.0);
+                    let shape_w = (avail_w * 0.285).floor().clamp(238.0, 356.0);
+                    let macros_w = (avail_w - stage_w - shape_w - gap * 2.0).max(260.0);
+
                     let stage_r = Rect::from_min_size(canvas.min, egui::vec2(stage_w, top_h));
                     self.clip_stage_preview(host, ui, stage_r, src, len, owner);
-                    let macros_r = Rect::from_min_max(
+
+                    let macros_r = Rect::from_min_size(
                         egui::pos2(stage_r.right() + gap, canvas.top()),
-                        egui::pos2(canvas.right(), canvas.top() + top_h),
+                        egui::vec2(macros_w, top_h),
                     );
                     self.clip_macros_card(host, ui, macros_r, owner);
 
-                    // 2. Middle Band: CHOP Card (`Slices → pads`, `Kit → pads`, `Loops → pads`)
+                    let shape_r = Rect::from_min_size(
+                        egui::pos2(macros_r.right() + gap, canvas.top()),
+                        egui::vec2(avail_w - stage_w - macros_w - gap * 2.0, top_h),
+                    );
+                    self.clip_shape_card(host, ui, shape_r, owner, src);
+
+                    // 2. Row 2: `CHOP & CUTOUT` Bay (`Cutout Person`, `Cutout Subject`, `Vocal Kit → pads`, etc.)
                     let chop_card_r = Rect::from_min_size(
                         egui::pos2(canvas.left(), stage_r.bottom() + gap),
                         egui::vec2(avail_w, chop_card_h),
                     );
-                    let chop_inner = sheet_card(&cp, chop_card_r, "Chop");
-                    if !has_audio {
+                    putty_panel(&cp, chop_card_r, 7);
+                    caps(
+                        &cp,
+                        egui::pos2(chop_card_r.left() + 14.0, chop_card_r.top() + 15.0),
+                        Align2::LEFT_CENTER,
+                        "Chop & cutout",
+                        9.0,
+                    );
+                    // Top-right header rail: `Cutout Person` (`"cutout person"`) + `Cutout Subject` (`"cutout subject"`).
+                    let hdr_y = chop_card_r.top() + 4.0;
+                    let hdr_h = 24.0;
+                    let mut hrx = chop_card_r.right() - 12.0;
+                    let subj_w = if avail_w >= 960.0 { 130.0 } else { 118.0 };
+                    let pers_w = if avail_w >= 960.0 { 126.0 } else { 114.0 };
+                    let subj_r = Rect::from_min_size(egui::pos2(hrx - subj_w, hdr_y), egui::vec2(subj_w, hdr_h));
+                    hrx = subj_r.left() - 6.0;
+                    let pers_r = Rect::from_min_size(egui::pos2(hrx - pers_w, hdr_y), egui::vec2(pers_w, hdr_h));
+                    hrx = pers_r.left() - 8.0;
+
+                    for (btn_r, lbl, a11y, mode, key_id) in [
+                        (pers_r, "Cutout Person", "cutout person", "person", "cutout-person"),
+                        (subj_r, "Cutout Subject", "cutout subject", "subject", "cutout-subject"),
+                    ] {
+                        let resp = hit(ui, btn_r, id.with((key_id, src)), Sense::click(), a11y);
+                        paint_switch_cap(
+                            &cp,
+                            btn_r,
+                            SwitchKind::PuttyMint,
+                            false,
+                            resp.hovered(),
+                            resp.is_pointer_button_down_on(),
+                        );
+                        draw_icon(&cp, Icon::Cutout, egui::pos2(btn_r.left() + 12.0, btn_r.center().y), 11.5, INK);
                         cp.text(
-                            egui::pos2(chop_card_r.right() - 16.0, chop_card_r.top() + 14.0),
+                            egui::pos2(btn_r.left() + 23.0, btn_r.center().y),
+                            Align2::LEFT_CENTER,
+                            lbl,
+                            font_semibold(10.5),
+                            INK,
+                        );
+                        if resp.clicked() {
+                            self.trigger_cutout(host, src, mode);
+                        }
+                    }
+                    if has_alpha && hrx > chop_card_r.left() + 210.0 {
+                        cp.text(
+                            egui::pos2(hrx, chop_card_r.top() + 15.0),
+                            Align2::RIGHT_CENTER,
+                            "ALPHA STICKER READY",
+                            mono_medium(8.5),
+                            Color32::from_rgb(0x1f, 0x5c, 0x42),
+                        );
+                    } else if !has_audio && hrx > chop_card_r.left() + 180.0 {
+                        cp.text(
+                            egui::pos2(hrx, chop_card_r.top() + 15.0),
                             Align2::RIGHT_CENTER,
                             "PICTURE",
-                            mono(9.5),
+                            mono(9.0),
                             INK3,
                         );
                     }
+
+                    let chop_inner = Rect::from_min_max(
+                        egui::pos2(chop_card_r.left() + 12.0, chop_card_r.top() + 31.0),
+                        egui::pos2(chop_card_r.right() - 12.0, chop_card_r.bottom() - 8.0),
+                    );
                     self.chop_panel(host, ui, chop_inner, src);
                     if self.sheet.is_none() {
                         return;
                     }
 
-                    // 3. `SCULPT & TAPE` Band
-                    let sculpt_card_r = Rect::from_min_size(
+                    // 3. Row 3: Clean 2-Tab Lower Deck (`SCULPT & TAPE` | `GRAIN · FX · LINKS`)
+                    let deck_r = Rect::from_min_size(
                         egui::pos2(canvas.left(), chop_card_r.bottom() + gap),
-                        egui::vec2(avail_w, sculpt_card_h),
+                        egui::vec2(avail_w, deck_h),
                     );
-                    self.clip_sculpt_card(host, ui, sculpt_card_r, owner, src);
-
-                    // 4. Bottom Band: 5 Parameter Cards (`SHAPE`, `GRAIN`, `PITCH`, `EFFECTS`, `LINKS`)
-                    let cards_top = sculpt_card_r.bottom() + gap;
-                    if wide_cards {
-                        let w_total = avail_w - gap * 4.0;
-                        let w_shape = (w_total * 0.225).floor();
-                        let w_grain = (w_total * 0.155).floor();
-                        let w_pitch = (w_total * 0.155).floor();
-                        let w_fx = (w_total * 0.23).floor();
-                        let w_links = w_total - w_shape - w_grain - w_pitch - w_fx;
-
-                        let r_shape = Rect::from_min_size(egui::pos2(canvas.left(), cards_top), egui::vec2(w_shape, cards_row1_h));
-                        let r_grain = Rect::from_min_size(egui::pos2(r_shape.right() + gap, cards_top), egui::vec2(w_grain, cards_row1_h));
-                        let r_pitch = Rect::from_min_size(egui::pos2(r_grain.right() + gap, cards_top), egui::vec2(w_pitch, cards_row1_h));
-                        let r_fx = Rect::from_min_size(egui::pos2(r_pitch.right() + gap, cards_top), egui::vec2(w_fx, cards_row1_h));
-                        let r_links = Rect::from_min_size(egui::pos2(r_fx.right() + gap, cards_top), egui::vec2(w_links, cards_row1_h));
-
-                        self.clip_shape_card(host, ui, r_shape, owner, src);
-                        self.clip_grain_card(host, ui, r_grain, owner);
-                        self.clip_pitch_card(host, ui, r_pitch, owner);
-                        self.clip_effects_card(host, ui, r_fx, owner);
-                        self.clip_links_card(host, ui, r_links, owner);
-                    } else {
-                        let w1 = avail_w - gap * 2.0;
-                        let w_shape = (w1 * 0.40).floor();
-                        let w_grain = (w1 * 0.30).floor();
-                        let w_pitch = w1 - w_shape - w_grain;
-
-                        let r_shape = Rect::from_min_size(egui::pos2(canvas.left(), cards_top), egui::vec2(w_shape, cards_row1_h));
-                        let r_grain = Rect::from_min_size(egui::pos2(r_shape.right() + gap, cards_top), egui::vec2(w_grain, cards_row1_h));
-                        let r_pitch = Rect::from_min_size(egui::pos2(r_grain.right() + gap, cards_top), egui::vec2(w_pitch, cards_row1_h));
-
-                        self.clip_shape_card(host, ui, r_shape, owner, src);
-                        self.clip_grain_card(host, ui, r_grain, owner);
-                        self.clip_pitch_card(host, ui, r_pitch, owner);
-
-                        let r2_top = r_shape.bottom() + gap;
-                        let w2 = ((avail_w - gap) * 0.5).floor();
-                        let r_fx = Rect::from_min_size(egui::pos2(canvas.left(), r2_top), egui::vec2(w2, cards_row2_h));
-                        let r_links = Rect::from_min_size(egui::pos2(r_fx.right() + gap, r2_top), egui::vec2(avail_w - w2 - gap, cards_row2_h));
-
-                        self.clip_effects_card(host, ui, r_fx, owner);
-                        self.clip_links_card(host, ui, r_links, owner);
-                    }
+                    self.clip_lower_deck(host, ui, deck_r, owner, src);
                 });
         });
 
@@ -631,10 +652,14 @@ impl Studio {
         }
     }
 
-    fn clip_stage_preview(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, stage: Rect, src: usize, len: f64, owner: EnvTarget) {
+    fn clip_stage_preview(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, total: Rect, src: usize, len: f64, owner: EnvTarget) {
         let ctx = ui.ctx().clone();
         let p = ui.painter().clone();
         let now = host.clock();
+        let bezel_h = 24.0;
+        let stage = Rect::from_min_size(total.min, egui::vec2(total.width(), (total.height() - bezel_h - 4.0).max(72.0)));
+        let bezel = Rect::from_min_size(egui::pos2(total.left(), stage.bottom() + 4.0), egui::vec2(total.width(), bezel_h));
+
         let norm_pos = if let Some(tc) = self.chop.tap.as_ref().filter(|tc| tc.source == src) {
             ((now - tc.t0) / tc.len.max(1e-6)).clamp(0.0, 0.999) as f32
         } else if let Some((_, sl_i, t0)) = self.chop.playing.filter(|(s, _, _)| *s == src) {
@@ -652,25 +677,30 @@ impl Studio {
                 _ => 0.25,
             }
         };
-        monitor_well(&p, stage, 8);
+        monitor_well(&p, stage, 7);
         if let Some((tex, a)) = self.atlas(host, &ctx, src) {
-            tile(&p, stage.shrink(1.8), 6, tex, a.uv_cover(atlas::frame_at(norm_pos), stage.width() / stage.height()), gray(0.95));
+            tile(&p, stage.shrink(1.8), 5, tex, a.uv_cover(atlas::frame_at(norm_pos), stage.width() / stage.height()), gray(0.95));
         } else {
-            p.rect_filled(stage.shrink(1.8), r(6), WELL2);
+            p.rect_filled(stage.shrink(1.8), r(5), WELL2);
         }
-        monitor_bezel(&p, stage, 8);
+        monitor_bezel(&p, stage, 7);
 
-        // Top-left stage mode pill (`stack | split | grid | bleed`).
-        let pill_r = self.stage_mode_pill(
+        // Dedicated bezel mode strip BELOW the video preview (`grid · collage · split · stack`) — 0% video obstruction!
+        p.rect_filled(bezel, r(4), SLOT_BG);
+        p.line_segment(
+            [egui::pos2(bezel.left() + 2.0, bezel.bottom() + 0.6), egui::pos2(bezel.right() - 2.0, bezel.bottom() + 0.6)],
+            Stroke::new(1.0, BEVEL_HI),
+        );
+        p.rect_stroke(bezel, r(4), Stroke::new(1.0, Color32::from_rgb(0x14, 0x13, 0x10)), StrokeKind::Inside);
+        self.stage_mode_bezel_cells(
             host,
             ui,
-            egui::pos2(stage.left() + 8.0, stage.top() + 8.0),
-            stage.width() - 16.0,
+            bezel.shrink2(egui::vec2(2.5, 2.0)),
             "clip-layout",
-            ["clip layout stack", "clip layout split", "clip layout tile", "clip layout bleed"],
+            ["clip layout tile", "clip layout collage", "clip layout split", "clip layout stack"],
         );
 
-        // Draggable `(cx, cy)` smart crop focus crosshair!
+        // Draggable `(cx, cy)` smart crop focus crosshair across the entire unobstructed aperture!
         let mut focus = self
             .source_focus
             .get(&src)
@@ -679,13 +709,7 @@ impl Studio {
                 EnvTarget::Emitter(i) => self.emitters[i].focus,
                 _ => (0.5, 0.5),
             });
-        let focus_pt = egui::pos2(
-            stage.left() + focus.0.clamp(0.15, 0.85) * stage.width(),
-            stage.top() + focus.1.clamp(0.15, 0.85) * stage.height(),
-        );
-        // Hit zone excludes the top-left layout switch pill so clicks on it never collide.
-        let drag_zone = Rect::from_min_max(egui::pos2(stage.left(), pill_r.bottom() + 4.0), stage.max);
-        let fresp = hit(ui, drag_zone, ui.id().with(("clip-focus", src)), Sense::click_and_drag(), "focus point");
+        let fresp = hit(ui, stage, ui.id().with(("clip-focus", src)), Sense::click_and_drag(), "focus point");
         if fresp.double_clicked() {
             focus = (0.5, 0.5);
             self.source_focus.insert(src, focus);
@@ -710,7 +734,6 @@ impl Studio {
             stage.left() + focus.0.clamp(0.15, 0.85) * stage.width(),
             stage.top() + focus.1.clamp(0.15, 0.85) * stage.height(),
         );
-        let _ = focus_pt;
         let act = fresp.dragged() || fresp.hovered() || (focus.0 - 0.5).abs() > 0.01 || (focus.1 - 0.5).abs() > 0.01;
         let ring_col = Color32::from_white_alpha(if act { 215 } else { 125 });
         p.circle_stroke(fp, 7.0, Stroke::new(1.5, Color32::from_black_alpha(150)));
@@ -732,22 +755,70 @@ impl Studio {
         }
     }
 
-    fn clip_sculpt_card(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, card: Rect, owner: EnvTarget, src: usize) {
+    fn clip_lower_deck(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, deck: Rect, owner: EnvTarget, src: usize) {
         let p = ui.painter().clone();
-        let inner = sheet_card(&p, card, "Sculpt & tape");
+        putty_panel(&p, deck, 7);
+
+        // Top 2-Tab Physical Interlock Switch: `SCULPT & TAPE` | `GRAIN · FX · LINKS`
+        let tab_bar = Rect::from_min_size(egui::pos2(deck.left() + 12.0, deck.top() + 4.0), egui::vec2(336.0_f32.min(deck.width() - 24.0), 25.0));
+        let cur_tab = self.clip_tab.min(1);
+        if let Some(picked) = segmented_named(
+            ui,
+            tab_bar,
+            ui.id().with("clip-lower-tabs"),
+            &["Sculpt & Tape", "Grain · FX · Links"],
+            &["clip tab sculpt", "clip tab detail"],
+            &[],
+            cur_tab,
+            font_semibold(11.0),
+            true,
+        ) {
+            self.clip_tab = picked;
+        }
+
+        let inner = Rect::from_min_max(
+            egui::pos2(deck.left() + 12.0, deck.top() + 33.0),
+            egui::pos2(deck.right() - 12.0, deck.bottom() - 7.0),
+        );
+        if self.clip_tab == 0 {
+            self.clip_sculpt_inner(host, ui, inner, owner, src);
+        } else {
+            let g = 10.0;
+            let w_gp = (inner.width() * 0.38).floor();
+            let w_fx = ((inner.width() - w_gp - g * 2.0) * 0.5).floor();
+            let w_lk = inner.width() - w_gp - w_fx - g * 2.0;
+
+            let r_gp = Rect::from_min_size(inner.min, egui::vec2(w_gp, inner.height()));
+            let r_fx = Rect::from_min_size(egui::pos2(r_gp.right() + g, inner.top()), egui::vec2(w_fx, inner.height()));
+            let r_lk = Rect::from_min_size(egui::pos2(r_fx.right() + g, inner.top()), egui::vec2(w_lk, inner.height()));
+
+            self.clip_grain_pitch_bay(host, ui, r_gp, owner);
+            self.clip_effects_bay(host, ui, r_fx, owner);
+            self.clip_links_bay(host, ui, r_lk, owner);
+        }
+    }
+
+    fn clip_sculpt_inner(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, inner: Rect, owner: EnvTarget, src: usize) {
+        let p = ui.painter().clone();
         let id = ui.id().with(("clip-sculpt", owner));
         let mut sp = self.owner_sculpt(owner);
         let before = sp;
 
-        // --- Row 1: 1-tap Musical Stamps + Editable `Caption` field ---
-        let row1_h = 28.0;
-        let compact_stamps = inner.width() < 920.0;
+        // --- Row 1: 1-tap Musical Stamps (including `Vox Perc`) + Editable `Caption` field ---
+        let row1_h = if inner.height() >= 150.0 { 29.0 } else { 25.0 };
+        let compact_stamps = inner.width() < 980.0;
         let mut sx = inner.left();
         let sy = inner.top();
         for st in SculptStamp::ALL {
-            let lbl = if compact_stamps { st.short_label() } else { st.label() };
+            let lbl = if st == SculptStamp::VoxPerc {
+                "Vox Perc"
+            } else if compact_stamps {
+                st.short_label()
+            } else {
+                st.display_label()
+            };
             let tw = p.layout_no_wrap(lbl.into(), font_semibold(10.5), INK).size().x;
-            let pw = (tw + if compact_stamps { 14.0 } else { 18.0 }).max(34.0);
+            let pw = (tw + if compact_stamps { 13.0 } else { 17.0 }).max(34.0);
             let pr = Rect::from_min_size(egui::pos2(sx, sy), egui::vec2(pw, row1_h));
             let on = sp.stamp == st;
             let resp = hit(ui, pr, id.with(("stamp", st.label())), Sense::click(), &format!("sculpt {}", st.label()));
@@ -766,7 +837,7 @@ impl Studio {
         }
 
         // Caption field on right of Row 1 (updates active slice + owner caption).
-        let cap_left = (sx + 8.0).max(inner.right() - 250.0);
+        let cap_left = (sx + 8.0).max(inner.right() - 260.0);
         if inner.right() - cap_left >= 110.0 {
             let cap_r = Rect::from_min_size(egui::pos2(cap_left, sy), egui::vec2(inner.right() - cap_left, row1_h));
             let sel_sl = self.chop.selected_slice.filter(|(s, _)| *s == src).map(|(_, i)| i);
@@ -785,9 +856,9 @@ impl Studio {
                 cap_r,
                 id.with("caption"),
                 &mut cap_txt,
-                "Caption (VJ spoken hook)…",
+                "Caption (spoken hook)…",
                 "slice caption",
-                11.5,
+                11.0,
             );
             if cap_txt != prev_cap {
                 if let Some(si) = sel_sl {
@@ -813,12 +884,13 @@ impl Studio {
         }
 
         // --- Row 2: 7 Continuous Dials + 3 Discrete/Drag Selectors (`Chord`, `Choke`, `Free Loop`) ---
-        let row2 = Rect::from_min_max(egui::pos2(inner.left(), sy + row1_h + 6.0), inner.max);
-        let right_w = (row2.width() * 0.34).clamp(248.0, 340.0);
+        let row2 = Rect::from_min_max(egui::pos2(inner.left(), sy + row1_h + 5.0), inner.max);
+        let right_w = (row2.width() * 0.34).clamp(242.0, 340.0);
         let knobs_w = (row2.width() - right_w - 12.0).max(280.0);
         let kw = knobs_w / 7.0;
-        let rad = (row2.height() * 0.23).clamp(13.5, 17.5);
-        let ky = row2.top() + rad + 4.0;
+        let compact_r2 = row2.height() < 118.0;
+        let rad = (row2.height() * 0.23).clamp(13.0, 17.5);
+        let ky = row2.top() + rad + if compact_r2 { 2.0 } else { 6.0 };
 
         let mut n_drop = ((sp.pitch_drop_st + 24.0) / 48.0).clamp(0.0, 1.0);
         let mut n_sub = sp.sub.clamp(0.0, 1.0);
@@ -873,13 +945,13 @@ impl Studio {
         ];
         for (k, (&(name, _, _), vs)) in dials.iter().zip(val_strs.iter()).enumerate() {
             let cx = row2.left() + (k as f32 + 0.5) * kw;
-            caps(&p, egui::pos2(cx, ky + rad + 7.5), Align2::CENTER_CENTER, name, 8.0);
+            caps(&p, egui::pos2(cx, ky + rad + 6.5), Align2::CENTER_CENTER, name, 8.0);
             let lcd_w = (kw - 6.0).clamp(38.0, 56.0);
-            lcd_readout(&p, Rect::from_center_size(egui::pos2(cx, ky + rad + 20.5), egui::vec2(lcd_w, 15.5)), vs, 9.0);
+            lcd_readout(&p, Rect::from_center_size(egui::pos2(cx, ky + rad + 19.0), egui::vec2(lcd_w, 15.0)), vs, 9.0);
         }
 
         // Right 3 selector switches: `Chord`, `Choke`, `Sync | Free Loop (s)`.
-        let sel_area = Rect::from_min_max(egui::pos2(row2.right() - right_w, row2.top() + 4.0), egui::pos2(row2.right(), row2.bottom() - 2.0));
+        let sel_area = Rect::from_min_max(egui::pos2(row2.right() - right_w, row2.top() + 2.0), egui::pos2(row2.right(), row2.bottom() - 2.0));
         let sg = 6.0;
         let sw = (sel_area.width() - sg * 2.0) / 3.0;
         let sh = sel_area.height().min(54.0);
@@ -942,6 +1014,14 @@ impl Studio {
         if sp != before {
             self.set_owner_sculpt(host, owner, sp);
         }
+    }
+
+    pub(crate) fn read_owner_params_pub(&self, host: &dyn Host, owner: EnvTarget) -> OwnerParams {
+        self.read_owner_params(host, owner)
+    }
+
+    pub(crate) fn write_owner_params_pub(&mut self, host: &mut dyn Host, owner: EnvTarget, op: OwnerParams) {
+        self.write_owner_params(host, owner, op);
     }
 
     fn read_owner_params(&self, host: &dyn Host, owner: EnvTarget) -> OwnerParams {
@@ -1142,10 +1222,11 @@ impl Studio {
     fn clip_macros_card(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, rect: Rect, owner: EnvTarget) {
         let p = ui.painter().clone();
         putty_panel(&p, rect, 7);
-        let inner = rect.shrink2(egui::vec2(16.0, 6.0));
+        let compact = rect.height() < 168.0;
+        let inner = rect.shrink2(egui::vec2(if compact { 12.0 } else { 16.0 }, if compact { 4.0 } else { 6.0 }));
         let col_w = inner.width() / 3.0;
         let row_h = inner.height() / 2.0;
-        let rad = (row_h * 0.22).clamp(14.0, 19.0);
+        let rad = (row_h * 0.215).clamp(12.5, 18.5);
         let id = ui.id().with(("clip-macros", owner));
 
         let mut op = self.read_owner_params(host, owner);
@@ -1163,7 +1244,7 @@ impl Studio {
         let key = self.key;
         for (k, &(name, a11y, def, detents)) in slots.iter().enumerate() {
             let cx = inner.left() + ((k % 3) as f32 + 0.5) * col_w;
-            let cy = inner.top() + (k / 3) as f32 * row_h + rad + 3.0;
+            let cy = inner.top() + (k / 3) as f32 * row_h + rad + if compact { 2.0 } else { 4.0 };
             let c = egui::pos2(cx, cy);
             let val_ref = match k {
                 0 => &mut op.grain,
@@ -1192,8 +1273,17 @@ impl Studio {
                     }
                 }
             };
-            caps(&p, egui::pos2(cx, cy + rad + 7.0), Align2::CENTER_CENTER, name, 8.5);
-            lcd_readout(&p, Rect::from_center_size(egui::pos2(cx, cy + rad + 20.0), egui::vec2((col_w - 28.0).clamp(48.0, 74.0), 16.0)), &shown, 9.5);
+            caps(&p, egui::pos2(cx, cy + rad + if compact { 6.0 } else { 7.5 }), Align2::CENTER_CENTER, name, if compact { 7.8 } else { 8.5 });
+            let lcd_h = if compact { 14.5 } else { 16.0 };
+            lcd_readout(
+                &p,
+                Rect::from_center_size(
+                    egui::pos2(cx, cy + rad + if compact { 18.0 } else { 20.5 }),
+                    egui::vec2((col_w - 22.0).clamp(44.0, 76.0), lcd_h),
+                ),
+                &shown,
+                if compact { 9.0 } else { 9.5 },
+            );
         }
 
         if (op.grain, op.pitch_m, op.smear, op.look_m, op.level, op.pan_m) != before {
@@ -1204,10 +1294,12 @@ impl Studio {
     fn clip_shape_card(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, card: Rect, owner: EnvTarget, src: usize) {
         let ctx = ui.ctx().clone();
         let p = ui.painter().clone();
-        let inner = sheet_card(&p, card, "Shape · sound + picture");
+        let inner = sheet_card(&p, card, "Shape · ADSR");
         let Some(mut adsr) = self.target_env(host, owner) else { return };
 
-        let env_h = (inner.height() - 62.0).clamp(76.0, 148.0);
+        let compact = inner.height() < 132.0;
+        let bot_h = if compact { 30.0 } else { 36.0 };
+        let env_h = (inner.height() - bot_h - 5.0).clamp(62.0, 148.0);
         let er = Rect::from_min_size(inner.min, egui::vec2(inner.width(), env_h));
         let frame = match owner {
             EnvTarget::Emitter(i) => atlas::frame_at(self.emitters[i].pos()),
@@ -1218,9 +1310,10 @@ impl Studio {
             .map(|(tex, _)| (tex, atlas::uv_cover(frame, er.width() / er.height().max(1.0))));
         let mut changed = adsr_editor(ui, er, ui.id().with(("env", owner)), &mut adsr, thumb);
 
-        let bot = Rect::from_min_max(egui::pos2(inner.left(), er.bottom() + 6.0), inner.max);
-        let seg_w = (bot.width() * 0.56).clamp(92.0, 128.0);
-        let seg_r = Rect::from_min_size(egui::pos2(bot.left(), bot.center().y - 16.0), egui::vec2(seg_w, 32.0));
+        let bot = Rect::from_min_max(egui::pos2(inner.left(), er.bottom() + 4.0), inner.max);
+        let seg_w = (bot.width() * 0.48).clamp(84.0, 118.0);
+        let seg_h = (bot.height() - 2.0).clamp(24.0, 30.0);
+        let seg_r = Rect::from_min_size(egui::pos2(bot.left(), bot.center().y - seg_h * 0.5), egui::vec2(seg_w, seg_h));
         let fade = adsr.picture == PictureCut::Fade;
         if let Some(pick) = segmented_named(
             ui,
@@ -1230,29 +1323,33 @@ impl Studio {
             &["picture cut", "picture fade"],
             &[],
             usize::from(fade),
-            font(11.5),
+            font(11.0),
             false,
         ) {
             adsr.picture = if pick == 1 { PictureCut::Fade } else { PictureCut::Cut };
             changed = true;
         }
 
-        let kc = egui::pos2(seg_r.right() + (bot.right() - seg_r.right()) * 0.5, bot.center().y - 8.0);
+        let right_r = Rect::from_min_max(egui::pos2(seg_r.right() + 8.0, bot.top()), bot.max);
+        let krad = if compact { 11.5 } else { 13.5 };
+        let kc = egui::pos2(right_r.left() + krad + 4.0, right_r.center().y);
         let mut tv = ((adsr.cut_threshold - 0.01) / 0.49).clamp(0.0, 1.0);
         let before_tv = tv;
-        knob(ui, kc, 15.5, ui.id().with(("cut-at", owner)), "cut threshold", &mut tv, (0.08 - 0.01) / 0.49, 0);
+        knob(ui, kc, krad, ui.id().with(("cut-at", owner)), "cut threshold", &mut tv, (0.08 - 0.01) / 0.49, 0);
         if (tv - before_tv).abs() > 1e-4 {
             adsr.cut_threshold = 0.01 + tv * 0.49;
             changed = true;
         }
-        caps(&p, egui::pos2(kc.x, kc.y + 23.0), Align2::CENTER_CENTER, "Cut at", 8.5);
-        p.text(
-            egui::pos2(kc.x, kc.y + 34.0),
-            Align2::CENTER_CENTER,
-            format!("{:.0}%", adsr.cut_threshold * 100.0),
-            mono(9.5),
-            INK,
-        );
+        let lx = kc.x + krad + 8.0;
+        if right_r.right() - lx >= 34.0 {
+            caps(&p, egui::pos2(lx, right_r.center().y - 7.0), Align2::LEFT_CENTER, "Cut at", 7.5);
+            lcd_readout(
+                &p,
+                Rect::from_min_size(egui::pos2(lx, right_r.center().y - 0.5), egui::vec2((right_r.right() - lx).min(46.0), 14.5)),
+                &format!("{:.0}%", adsr.cut_threshold * 100.0),
+                8.8,
+            );
+        }
 
         if changed {
             self.set_target_env(host, owner, adsr);
@@ -1270,82 +1367,33 @@ impl Studio {
         }
     }
 
-    fn clip_grain_card(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, card: Rect, owner: EnvTarget) {
+    fn clip_grain_pitch_bay(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, bay: Rect, owner: EnvTarget) {
         let p = ui.painter().clone();
-        let inner = sheet_card(&p, card, "Grain");
-        let id = ui.id().with(("clip-grain", owner));
+        caps(&p, egui::pos2(bay.left(), bay.top() + 5.0), Align2::LEFT_CENTER, "Grain & pitch", 8.5);
+        let inner = Rect::from_min_max(egui::pos2(bay.left(), bay.top() + 15.0), bay.max);
+        let id = ui.id().with(("clip-gp", owner));
         let mut op = self.read_owner_params(host, owner);
-        let before = (op.density, op.duration, op.spray, op.reverse);
+        let before = (op.density, op.duration, op.spray, op.reverse, op.fine_cents, op.octave, op.wobble, op.spread);
 
-        let col_w = inner.width() * 0.5;
+        let col_w = inner.width() / 4.0;
         let row_h = inner.height() * 0.5;
-        let rad = (row_h * 0.21).clamp(15.5, 18.5);
+        let compact = row_h < 76.0;
+        let rad = (row_h * 0.215).clamp(11.5, 16.5);
 
         let mut n_dens = ((op.density - 2.0) / 118.0).clamp(0.0, 1.0);
         let mut n_dur = ((op.duration - 0.01) / 0.39).clamp(0.0, 1.0);
         let mut n_spray = op.spray.clamp(0.0, 1.0);
         let mut n_rev = op.reverse.clamp(0.0, 1.0);
-
-        let items: [(&str, &str, f32); 4] = [
-            ("Density", "grain density", (30.0 - 2.0) / 118.0),
-            ("Length", "grain length", (0.08 - 0.01) / 0.39),
-            ("Spray", "grain spray", 0.3),
-            ("Reverse", "grain reverse", 0.15),
-        ];
-
-        for (k, &(_name, a11y, def)) in items.iter().enumerate() {
-            let cx = inner.left() + ((k % 2) as f32 + 0.5) * col_w;
-            let cy = inner.top() + (k / 2) as f32 * row_h + rad + 6.0;
-            let c = egui::pos2(cx, cy);
-            let vref = match k {
-                0 => &mut n_dens,
-                1 => &mut n_dur,
-                2 => &mut n_spray,
-                _ => &mut n_rev,
-            };
-            knob(ui, c, rad, id.with(k), a11y, vref, def, 0);
-        }
-
-        op.density = 2.0 + n_dens * 118.0;
-        op.duration = 0.01 + n_dur * 0.39;
-        op.spray = n_spray;
-        op.reverse = n_rev;
-
-        let texts = [
-            format!("{:.0}/s", op.density),
-            format!("{:.0}ms", op.duration * 1000.0),
-            format!("{:.0}%", op.spray * 100.0),
-            format!("{:.0}%", op.reverse * 100.0),
-        ];
-        for (k, (&(name, _, _), val_s)) in items.iter().zip(texts.iter()).enumerate() {
-            let cx = inner.left() + ((k % 2) as f32 + 0.5) * col_w;
-            let cy = inner.top() + (k / 2) as f32 * row_h + rad + 6.0;
-            caps(&p, egui::pos2(cx, cy + rad + 8.0), Align2::CENTER_CENTER, name, 8.0);
-            lcd_readout(&p, Rect::from_center_size(egui::pos2(cx, cy + rad + 21.0), egui::vec2((col_w - 16.0).clamp(42.0, 62.0), 15.5)), val_s, 9.5);
-        }
-
-        if (op.density, op.duration, op.spray, op.reverse) != before {
-            self.write_owner_params(host, owner, op);
-        }
-    }
-
-    fn clip_pitch_card(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, card: Rect, owner: EnvTarget) {
-        let p = ui.painter().clone();
-        let inner = sheet_card(&p, card, "Pitch");
-        let id = ui.id().with(("clip-pitch", owner));
-        let mut op = self.read_owner_params(host, owner);
-        let before = (op.fine_cents, op.octave, op.wobble, op.spread);
-
-        let col_w = inner.width() * 0.5;
-        let row_h = inner.height() * 0.5;
-        let rad = (row_h * 0.21).clamp(15.5, 18.5);
-
         let mut n_fine = ((op.fine_cents + 50.0) / 100.0).clamp(0.0, 1.0);
         let mut n_oct = ((op.octave + 2) as f32 + 0.5) / 5.0;
         let mut n_wob = (op.wobble / 12.0).clamp(0.0, 1.0);
         let mut n_spr = op.spread.clamp(0.0, 1.0);
 
-        let items: [(&str, &str, f32, usize); 4] = [
+        let items: [(&str, &str, f32, usize); 8] = [
+            ("Density", "grain density", (30.0 - 2.0) / 118.0, 0),
+            ("Length", "grain length", (0.08 - 0.01) / 0.39, 0),
+            ("Spray", "grain spray", 0.3, 0),
+            ("Reverse", "grain reverse", 0.15, 0),
             ("Fine", "pitch fine", 0.5, 0),
             ("Octave", "pitch octave", 0.5, 5),
             ("Wobble", "pitch wobble", 0.0, 0),
@@ -1353,50 +1401,70 @@ impl Studio {
         ];
 
         for (k, &(_name, a11y, def, det)) in items.iter().enumerate() {
-            let cx = inner.left() + ((k % 2) as f32 + 0.5) * col_w;
-            let cy = inner.top() + (k / 2) as f32 * row_h + rad + 6.0;
-            let c = egui::pos2(cx, cy);
+            let cx = inner.left() + ((k % 4) as f32 + 0.5) * col_w;
+            let cy = inner.top() + (k / 4) as f32 * row_h + rad + if compact { 1.5 } else { 4.0 };
             let vref = match k {
-                0 => &mut n_fine,
-                1 => &mut n_oct,
-                2 => &mut n_wob,
+                0 => &mut n_dens,
+                1 => &mut n_dur,
+                2 => &mut n_spray,
+                3 => &mut n_rev,
+                4 => &mut n_fine,
+                5 => &mut n_oct,
+                6 => &mut n_wob,
                 _ => &mut n_spr,
             };
-            knob(ui, c, rad, id.with(k), a11y, vref, def, det);
+            knob(ui, egui::pos2(cx, cy), rad, id.with(k), a11y, vref, def, det);
         }
 
+        op.density = 2.0 + n_dens * 118.0;
+        op.duration = 0.01 + n_dur * 0.39;
+        op.spray = n_spray;
+        op.reverse = n_rev;
         op.fine_cents = (n_fine * 100.0 - 50.0).round();
         op.octave = ((n_oct * 5.0).floor() as i32).clamp(0, 4) - 2;
         op.wobble = n_wob * 12.0;
         op.spread = n_spr;
 
         let texts = [
+            format!("{:.0}/s", op.density),
+            format!("{:.0}ms", op.duration * 1000.0),
+            format!("{:.0}%", op.spray * 100.0),
+            format!("{:.0}%", op.reverse * 100.0),
             format!("{:+.0}ct", op.fine_cents).replace("+0ct", "0ct"),
             format!("{:+}", op.octave).replace("+0", "0"),
             format!("{:.1}st", op.wobble),
             format!("{:.0}%", op.spread * 100.0),
         ];
         for (k, (&(name, _, _, _), val_s)) in items.iter().zip(texts.iter()).enumerate() {
-            let cx = inner.left() + ((k % 2) as f32 + 0.5) * col_w;
-            let cy = inner.top() + (k / 2) as f32 * row_h + rad + 6.0;
-            caps(&p, egui::pos2(cx, cy + rad + 8.0), Align2::CENTER_CENTER, name, 8.0);
-            lcd_readout(&p, Rect::from_center_size(egui::pos2(cx, cy + rad + 21.0), egui::vec2((col_w - 16.0).clamp(42.0, 62.0), 15.5)), val_s, 9.5);
+            let cx = inner.left() + ((k % 4) as f32 + 0.5) * col_w;
+            let cy = inner.top() + (k / 4) as f32 * row_h + rad + if compact { 1.5 } else { 4.0 };
+            caps(&p, egui::pos2(cx, cy + rad + if compact { 5.5 } else { 7.0 }), Align2::CENTER_CENTER, name, 7.6);
+            lcd_readout(
+                &p,
+                Rect::from_center_size(
+                    egui::pos2(cx, cy + rad + if compact { 17.0 } else { 19.5 }),
+                    egui::vec2((col_w - 8.0).clamp(38.0, 58.0), if compact { 14.0 } else { 15.0 }),
+                ),
+                val_s,
+                8.8,
+            );
         }
 
-        if (op.fine_cents, op.octave, op.wobble, op.spread) != before {
+        if (op.density, op.duration, op.spray, op.reverse, op.fine_cents, op.octave, op.wobble, op.spread) != before {
             self.write_owner_params(host, owner, op);
         }
     }
 
-    fn clip_effects_card(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, card: Rect, owner: EnvTarget) {
+    fn clip_effects_bay(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, bay: Rect, owner: EnvTarget) {
         let p = ui.painter().clone();
-        let inner = sheet_card(&p, card, "Effects  ♪ ▣");
+        caps(&p, egui::pos2(bay.left(), bay.top() + 5.0), Align2::LEFT_CENTER, "Effects  ♪ ▣", 8.5);
+        let inner = Rect::from_min_max(egui::pos2(bay.left(), bay.top() + 15.0), bay.max);
         let id = ui.id().with(("clip-fx", owner));
         let cols = 2usize;
         let rows = 4usize;
-        let g = 6.0;
+        let g = if inner.height() < 125.0 { 4.0 } else { 6.0 };
         let pw = (inner.width() - g) * 0.5;
-        let ph = ((inner.height() - g * (rows as f32 - 1.0)) / rows as f32).clamp(28.0, 40.0);
+        let ph = ((inner.height() - g * (rows as f32 - 1.0)) / rows as f32).clamp(22.0, 38.0);
         let key = self.key;
 
         match owner {
@@ -1527,15 +1595,16 @@ impl Studio {
         }
     }
 
-    fn clip_links_card(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, card: Rect, owner: EnvTarget) {
+    fn clip_links_bay(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, bay: Rect, owner: EnvTarget) {
         let p = ui.painter().clone();
-        let inner = sheet_card(&p, card, "Links");
+        caps(&p, egui::pos2(bay.left(), bay.top() + 5.0), Align2::LEFT_CENTER, "Links", 8.5);
+        let inner = Rect::from_min_max(egui::pos2(bay.left(), bay.top() + 15.0), bay.max);
         let id = ui.id().with(("clip-links", owner));
         let cols = 2usize;
         let rows = 4usize;
-        let g = 6.0;
+        let g = if inner.height() < 125.0 { 4.0 } else { 6.0 };
         let pw = (inner.width() - g) * 0.5;
-        let ph = ((inner.height() - g * (rows as f32 - 1.0)) / rows as f32).clamp(28.0, 40.0);
+        let ph = ((inner.height() - g * (rows as f32 - 1.0)) / rows as f32).clamp(22.0, 38.0);
 
         let mut link: AvLink = match owner {
             EnvTarget::Emitter(i) => self.emitters[i].link,
@@ -1634,13 +1703,13 @@ impl Studio {
 
     /// The chop panel, self-contained: filmstrip + waveform with slices +
     /// acoustic badges, then `Auto / 4 / 8 / 16`, `Tap`, `Clear`, `Loops → pads`,
-    /// `Kit → pads`, `Slices → pads`.
+    /// `Kit → pads`, `Vocal Kit → pads`, `Slices → pads`.
     pub fn chop_panel(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, rect: Rect, src: usize) {
         let now = host.clock();
         let len = host.project().lock().unwrap().sources.get(src).map(|s| s.duration()).unwrap_or(0.0);
         let slices = self.slices(host, src);
-        let bar_h = 36.0;
-        let film_h = (rect.height() * 0.21).clamp(28.0, 40.0);
+        let bar_h = if rect.height() < 150.0 { 30.0 } else { 35.0 };
+        let film_h = (rect.height() * 0.21).clamp(24.0, 38.0);
         let film = Rect::from_min_size(rect.min, egui::vec2(rect.width(), film_h));
         let wave = Rect::from_min_max(
             egui::pos2(rect.left(), film.bottom() + 4.0),
@@ -1878,8 +1947,8 @@ impl Studio {
 
     fn chop_bar(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, src: usize, len: f64, bar: Rect, now: f64) {
         let p = ui.painter().clone();
-        let compact = bar.width() < 900.0;
-        let seg_w = if compact { 208.0 } else { 236.0 };
+        let compact = bar.width() < 980.0;
+        let seg_w = if compact { 188.0 } else { 228.0 };
         let seg = Rect::from_min_size(bar.min, egui::vec2(seg_w, bar.height()));
         if let Some(i) = segmented_named(
             ui,
@@ -1889,7 +1958,7 @@ impl Studio {
             &["slice auto", "slice 4", "slice 8", "slice 16"],
             &[],
             usize::MAX,
-            font(12.0),
+            font(if compact { 11.5 } else { 12.0 }),
             false,
         ) {
             let v = match i {
@@ -1911,8 +1980,8 @@ impl Studio {
         }
 
         let tapping = self.chop.tap.as_ref().is_some_and(|t| t.source == src);
-        let tap_w = if tapping { 126.0 } else if compact { 82.0 } else { 92.0 };
-        let tb = Rect::from_min_size(egui::pos2(seg.right() + 8.0, bar.top()), egui::vec2(tap_w, bar.height()));
+        let tap_w = if tapping { 118.0 } else if compact { 72.0 } else { 88.0 };
+        let tb = Rect::from_min_size(egui::pos2(seg.right() + 6.0, bar.top()), egui::vec2(tap_w, bar.height()));
         let label = if tapping { "Chop here" } else { "Tap" };
         if button_named(ui, tb, ui.id().with(("chop-tap", src)), label, "chop tap", tapping, Some(Icon::Chop), None).clicked() {
             if tapping {
@@ -1926,22 +1995,22 @@ impl Studio {
         }
         let mut left_end = tb.right();
         if tapping {
-            let sb = Rect::from_min_size(egui::pos2(tb.right() + 6.0, bar.top()), egui::vec2(66.0, bar.height()));
+            let sb = Rect::from_min_size(egui::pos2(tb.right() + 5.0, bar.top()), egui::vec2(62.0, bar.height()));
             left_end = sb.right();
             if button_named(ui, sb, ui.id().with(("chop-tap-done", src)), "Done", "chop tap done", false, None, None).clicked() {
                 self.finish_tap(host);
             }
         }
 
-        // Right: `Slices → pads` (single clip), `Kit → pads` (multi-clip harvester),
-        // `Loops → pads` (unsynced tape loops), and `Clear`.
+        // Right: `Slices → pads` (single clip), `Vocal Kit → pads` (`"ukg vox kit"`),
+        // `Kit → pads` (multi-clip harvester), `Loops → pads` (unsynced tape loops), and `Clear`.
         let has_pads = host.caps().views.contains(&super::View::Perform) && host.perform().is_some();
         let n = self.slices(host, src).len();
         let mut rx = bar.right();
         if has_pads {
-            let sl_w = if compact { 128.0 } else { 142.0 };
+            let sl_w = if compact { 120.0 } else { 138.0 };
             let pb = Rect::from_min_size(egui::pos2(rx - sl_w, bar.top()), egui::vec2(sl_w, bar.height()));
-            rx = pb.left() - 6.0;
+            rx = pb.left() - 5.0;
             if button_named(ui, pb, ui.id().with(("to-pads", src)), "Slices → pads", "slices to pads", n > 0, Some(Icon::Grid), None).clicked()
                 && n > 0
             {
@@ -1954,11 +2023,29 @@ impl Studio {
                 return;
             }
 
+            // `Vocal Kit → pads` (`a11y: "ukg vox kit"`): UKG vocal percussion & chord harvester!
+            let vox_lbl = if compact { "Vocal Kit" } else { "Vocal Kit → pads" };
+            let vox_w = if compact { 96.0 } else { 142.0 };
+            if rx - vox_w > left_end + 6.0 {
+                let vb = Rect::from_min_size(egui::pos2(rx - vox_w, bar.top()), egui::vec2(vox_w, bar.height()));
+                rx = vb.left() - 5.0;
+                if button_named(ui, vb, ui.id().with("ukg-vox-kit"), vox_lbl, "ukg vox kit", true, None, None).clicked() {
+                    let k = self.trigger_ukg_kit(host);
+                    if k > 0 {
+                        self.finish_tap(host);
+                        host.stop_audition();
+                        self.sheet = None;
+                        self.set_view(host, super::View::Perform);
+                        return;
+                    }
+                }
+            }
+
             // `Kit → pads` + `Loops → pads` (multi-clip harvester across standalone & plugin).
-            let kit_w = if compact { 96.0 } else { 108.0 };
-            if rx - kit_w > left_end + 8.0 {
+            let kit_w = if compact { 90.0 } else { 104.0 };
+            if rx - kit_w > left_end + 6.0 {
                 let kb = Rect::from_min_size(egui::pos2(rx - kit_w, bar.top()), egui::vec2(kit_w, bar.height()));
-                rx = kb.left() - 6.0;
+                rx = kb.left() - 5.0;
                 if button_named(ui, kb, ui.id().with("kit-to-pads"), "Kit → pads", "kit to pads", false, None, None).clicked() {
                     let k = host.build_kit_to_pads();
                     if k > 0 {
@@ -1991,10 +2078,10 @@ impl Studio {
                 }
             }
 
-            let lp_w = if compact { 108.0 } else { 118.0 };
-            if rx - lp_w > left_end + 8.0 {
+            let lp_w = if compact { 100.0 } else { 114.0 };
+            if rx - lp_w > left_end + 6.0 {
                 let lb = Rect::from_min_size(egui::pos2(rx - lp_w, bar.top()), egui::vec2(lp_w, bar.height()));
-                rx = lb.left() - 6.0;
+                rx = lb.left() - 5.0;
                 if button_named(ui, lb, ui.id().with("loops-to-pads"), "Loops → pads", "loops to pads", false, None, None).clicked() {
                     let k = host.build_loops_to_pads();
                     if k > 0 {
@@ -2018,20 +2105,20 @@ impl Studio {
             }
         }
         if n > 0 {
-            let clr_w = if compact { 62.0 } else { 72.0 };
+            let clr_w = if compact { 56.0 } else { 68.0 };
             if rx - clr_w >= left_end + 6.0 {
                 let cb = Rect::from_min_size(egui::pos2(rx - clr_w, bar.top()), egui::vec2(clr_w, bar.height()));
-                rx = cb.left() - 10.0;
+                rx = cb.left() - 8.0;
                 if button_named(ui, cb, ui.id().with(("chop-clear", src)), "Clear", "clear slices", false, None, None).clicked() {
                     self.set_slices(host, src, Vec::new());
                 }
             }
-            if rx > left_end + 58.0 {
+            if rx > left_end + 52.0 {
                 p.text(
                     egui::pos2(rx, bar.center().y),
                     Align2::RIGHT_CENTER,
                     if n == 1 { "1 slice".to_string() } else { format!("{n} slices") },
-                    mono(11.0),
+                    mono(10.5),
                     INK3,
                 );
             }

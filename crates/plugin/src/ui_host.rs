@@ -365,6 +365,53 @@ impl Host for PluginHost {
         }
         specs.len()
     }
+    fn build_ukg_vox_kit_to_pads(&mut self) -> usize {
+        let key = self.shared_key();
+        let (specs, lens): (Vec<chromagrain_core::chop::KitPadSpec>, Vec<f64>) = {
+            let mut p = self.project.lock().unwrap();
+            for s in p.sources.iter_mut() {
+                if s.slices.is_empty() {
+                    s.slices = chromagrain_core::chop::analyze_source_slices(s, 32);
+                }
+            }
+            let lens = p.sources.iter().map(|s| s.duration()).collect();
+            let specs = chromagrain_core::chop::build_ukg_vox_kit_across_sources_opt(&p.sources, key);
+            (specs, lens)
+        };
+        for spec in &specs {
+            let pad = spec.pad_index.min(PADS - 1);
+            let src_len = lens.get(spec.source).copied().unwrap_or(0.0);
+            self.put_pad(pad, spec.to_pad_slot(src_len));
+        }
+        specs.len()
+    }
+    fn cutout_source(&mut self, source: usize, mode: &str) -> bool {
+        let src_opt = {
+            let p = self.project.lock().unwrap();
+            p.sources.get(source).cloned()
+        };
+        let Some(mut src) = src_opt else { return false };
+        for prefix in ["person @ ", "subject @ ", "foreground @ "] {
+            if let Some(rest) = src.name.strip_prefix(prefix) {
+                src.name = rest.to_string();
+            }
+        }
+        let seg = chromagrain_core::media::cutout_source(&src, mode);
+        let ok = seg.video.as_ref().is_some_and(|v| v.has_alpha());
+        {
+            let mut p = self.project.lock().unwrap();
+            if let Some(slot) = p.sources.get_mut(source) {
+                *slot = seg.clone();
+            }
+        }
+        if let Ok(mut u) = self.shared.ui_sources.lock() {
+            if let Some(slot) = u.get_mut(source) {
+                *slot = seg;
+            }
+        }
+        self.doc_rev += 1;
+        ok
+    }
     fn build_loops_to_pads(&mut self) -> usize {
         let key = self.shared_key();
         let (specs, lens): (Vec<chromagrain_core::chop::KitPadSpec>, Vec<f64>) = {

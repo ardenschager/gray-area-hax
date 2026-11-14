@@ -133,7 +133,7 @@ fn main() -> eframe::Result<()> {
     let open: Vec<PathBuf> =
         args.iter().skip(1).map(PathBuf::from).filter(|p| p.is_file()).collect();
     eframe::run_native(
-        "chromagrain",
+        "videograin",
         options,
         Box::new(move |cc| {
             if classic {

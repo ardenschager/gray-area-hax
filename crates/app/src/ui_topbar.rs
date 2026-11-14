@@ -7,7 +7,7 @@ use eframe::egui;
 impl App {
     pub(crate) fn transport_ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("chromagrain").size(17.0).strong().color(ACCENT));
+            ui.label(egui::RichText::new("videograin").size(17.0).strong().color(ACCENT));
             ui.add_space(10.0);
 
             // Mode switch.

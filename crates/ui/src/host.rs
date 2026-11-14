@@ -13,56 +13,67 @@ static AUDITION_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 
 pub use crate::studio::{DeepTab, DeepTarget, View};
 
-/// Stage compositing mode (`stack | split | grid | bleed | collage`).
+/// Stage compositing mode (`grid · collage · split · stack`, plus legacy `bleed`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StageMode {
-    /// Spatial layered grain compositing (`Layout::Stack`).
-    #[default]
-    Stack,
-    /// Full-canvas `Split` (`Layout::Split`): crisp `2px` `#111314` dividers (`0px` blur).
-    Split,
     /// Architectural `Grid` (`Layout::Tile`): crisp `2px` `#111314` dividers,
-    /// low→high chord panels, `ratchet_odd` horizontal mirror.
+    /// multi-cell transient cuts, low→high chord panels.
+    #[default]
     Grid,
-    /// `Full Bleed` (`Layout::Bleed`): optical luma-key + screen melt across
-    /// all active voices.
-    Bleed,
     /// `Collage` (`Layout::Collage`): dynamic hairline grid background + die-cut
     /// sticker / zine photo-card cutouts (`3px` `#F2EDE0` border + `+5,+5` `#111314` shadow).
     Collage,
+    /// Full-canvas `Split` (`Layout::Split`): crisp `2px` `#111314` dividers (`0px` blur).
+    Split,
+    /// Spatial layered grain compositing (`Layout::Stack`).
+    Stack,
+    /// Legacy `Full Bleed` (`Layout::Bleed`).
+    Bleed,
 }
 
 impl StageMode {
+    /// Primary 4 hardware bezel modes (`grid · collage · split · stack`).
     pub const ALL: [StageMode; 4] = [
-        StageMode::Stack,
-        StageMode::Split,
         StageMode::Grid,
-        StageMode::Bleed,
+        StageMode::Collage,
+        StageMode::Split,
+        StageMode::Stack,
     ];
 
     pub fn index(self) -> usize {
         match self {
-            StageMode::Stack => 0,
-            StageMode::Split => 1,
-            StageMode::Grid | StageMode::Collage => 2,
-            StageMode::Bleed => 3,
+            StageMode::Grid => 0,
+            StageMode::Collage => 1,
+            StageMode::Split => 2,
+            StageMode::Stack | StageMode::Bleed => 3,
         }
     }
 
     pub fn from_index(i: usize) -> Self {
         match i {
-            4 => StageMode::Collage,
-            _ => Self::ALL.get(i).copied().unwrap_or(StageMode::Stack),
+            4 => StageMode::Bleed,
+            _ => Self::ALL.get(i).copied().unwrap_or(StageMode::Grid),
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
-            StageMode::Stack => "stack",
-            StageMode::Split => "split",
             StageMode::Grid => "grid",
-            StageMode::Bleed => "bleed",
             StageMode::Collage => "collage",
+            StageMode::Split => "split",
+            StageMode::Stack => "stack",
+            StageMode::Bleed => "bleed",
+        }
+    }
+
+    /// Canonical accessibility suffix (`"layout tile"`, `"layout collage"`, etc.).
+    pub fn a11y_suffix(self) -> &'static str {
+        match self {
+            StageMode::Grid => "tile",
+            StageMode::Collage => "collage",
+            StageMode::Split => "split",
+            StageMode::Stack => "stack",
+            StageMode::Bleed => "bleed",
         }
     }
 
@@ -202,6 +213,13 @@ impl SculptStamp {
             SculptStamp::Phrase => "Phrase",
             SculptStamp::TapeLoop => "Tape Loop",
             SculptStamp::Disintegrate => "Disintegrate",
+        }
+    }
+
+    pub fn display_label(self) -> &'static str {
+        match self {
+            SculptStamp::VoxPerc => "Vox Perc",
+            other => other.label(),
         }
     }
 
@@ -732,6 +750,14 @@ pub trait Host {
     /// Build a 16-pad collage kit across all loaded sources onto Perform pads.
     fn build_kit_to_pads(&mut self) -> usize {
         0
+    }
+    /// Build a 16-pad UKG vocal-percussion + garage chord + spoken-hook kit across loaded sources.
+    fn build_ukg_vox_kit_to_pads(&mut self) -> usize {
+        0
+    }
+    /// Segment `source` (`"person"` or `"subject"`) into a crisp alpha cutout in place.
+    fn cutout_source(&mut self, _source: usize, _mode: &str) -> bool {
+        false
     }
     /// Deal unsynced free-running tape loops across Perform pads.
     fn build_loops_to_pads(&mut self) -> usize {

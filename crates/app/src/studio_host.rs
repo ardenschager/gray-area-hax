@@ -81,6 +81,92 @@ impl App {
         drop(p);
         self.other_tracks = tracks;
     }
+
+    /// Stage a curated kit (`build_kit_across_sources` or `build_ukg_vox_kit_across_sources`) onto Perform pads.
+    fn apply_curated_kit_specs(&mut self, specs: &[chromagrain_core::chop::KitPadSpec]) -> usize {
+        if specs.is_empty() {
+            return 0;
+        }
+        let perform = self.mode == AppMode::Perform;
+        let mut p = self.project.lock().unwrap();
+        let mut staged = Vec::new();
+        for spec in specs {
+            let pad = spec.pad_index.min(PADS - 1);
+            let Some(src) = p.sources.get(spec.source) else { continue };
+            let (src_len, src_name) = (src.duration(), src.name.clone());
+            let slice_dur = spec.slice.len().max(0.035);
+            let slice_beats = p.secs_to_beats(slice_dur);
+            let mut clip = build_clip(&mut p, spec.source, 0.0, PlayMode::Snippet);
+            clip.grains.position = if src_len > 0.0 { (spec.slice.start / src_len) as f32 } else { 0.0 };
+            clip.grains.duration = slice_dur as f32;
+            clip.grains.pitch = spec.pitch_semitones;
+            clip.grains.pan = spec.pan;
+            clip.grains.gain = spec.gain;
+            clip.grains.sculpt = spec.sculpt;
+            clip.grains.choke_group = spec.choke_group;
+            clip.link = spec.link;
+            clip.visual = VisualGrainStyle::full_frame(0.0);
+            clip.grains.adsr = Some(spec.adsr.unwrap_or(chromagrain_core::envelope::Adsr {
+                attack: if spec.one_shot { 0.004 } else { 0.02 },
+                decay: if spec.one_shot { 0.08 } else { 0.20 },
+                sustain: 0.9,
+                release: if spec.one_shot { 0.14 } else { 0.45 },
+                picture: chromagrain_core::envelope::PictureCut::Cut,
+                ..Default::default()
+            }));
+            clip.length_beats = if let Some(free_s) = spec.sculpt.free_loop_secs {
+                p.secs_to_beats(free_s as f64).clamp(0.5, 64.0)
+            } else {
+                ((slice_beats * 4.0).floor() / 4.0).max(0.25)
+            };
+            let track_name = if spec.one_shot {
+                format!("{src_name} · {}", spec.label)
+            } else {
+                format!("{src_name} ~ {}", spec.label)
+            };
+            staged.push((
+                pad,
+                clip,
+                track_name,
+                spec.stamp,
+                spec.sculpt,
+                spec.choke_group,
+                spec.slice.focus,
+                spec.slice.caption,
+            ));
+        }
+        let tracks = if perform { &mut p.tracks } else { &mut self.other_tracks };
+        while tracks.len() < PADS {
+            let k = tracks.len();
+            tracks.push(Track { name: format!("pad {}", k + 1), muted: true, ..Default::default() });
+        }
+        let count = staged.len();
+        for (pad, clip, track_name, stamp, sculpt, choke, focus, caption) in staged {
+            let sid = clip.source;
+            tracks[pad].clips = vec![clip];
+            tracks[pad].name = track_name;
+            tracks[pad].sculpt = sculpt;
+            tracks[pad].choke_group = choke;
+            tracks[pad].tape.wow = sculpt.wow_flutter;
+            tracks[pad].tape.age = sculpt.disintegrate * 0.8;
+            self.studio.pad_sculpt[pad] = chromagrain_ui::SculptParams::from_core(stamp, sculpt, choke);
+            if !caption.is_empty() {
+                self.studio.pad_captions[pad] = caption.as_str().to_string();
+            } else {
+                self.studio.pad_captions[pad].clear();
+            }
+            if !self.studio.source_focus.contains_key(&sid) && ((focus.0 - 0.5).abs() > 0.02 || (focus.1 - 0.5).abs() > 0.02) {
+                self.studio.source_focus.insert(sid, focus);
+            }
+        }
+        drop(p);
+        self.fill_rev = 0;
+        self.mark_now();
+        if perform {
+            self.perform_fill();
+        }
+        count
+    }
 }
 
 impl Host for App {
@@ -144,13 +230,7 @@ impl Host for App {
     fn sequence_changed(&mut self, layout: &[(usize, f64, f64)]) -> bool {
         let clips_for = |lay: &[(usize, f64, f64)]| -> Vec<Clip> {
             lay.iter()
-                .map(|(pid, at, len)| {
-                    let mut c = Clip::new_pattern(*pid, *at, *len);
-                    // Hits glow in with soft edges instead of hard blocks.
-                    c.visual.feather = 0.3;
-                    c.visual.additive = 0.3;
-                    c
-                })
+                .map(|(pid, at, len)| Clip::new_pattern(*pid, *at, *len))
                 .collect()
         };
         let total: f64 = layout.iter().map(|l| l.2).sum();
@@ -327,7 +407,6 @@ impl Host for App {
     }
     fn build_kit_to_pads(&mut self) -> usize {
         self.studio_seed_pads();
-        let perform = self.mode == AppMode::Perform;
         let key = self.studio.key;
         let specs = {
             let mut p = self.project.lock().unwrap();
@@ -338,86 +417,54 @@ impl Host for App {
             }
             chromagrain_core::chop::build_kit_across_sources(&p.sources, key)
         };
-        if specs.is_empty() {
-            return 0;
-        }
-        let mut p = self.project.lock().unwrap();
-        let mut staged = Vec::new();
-        for spec in &specs {
-            let pad = spec.pad_index.min(PADS - 1);
-            let Some(src) = p.sources.get(spec.source) else { continue };
-            let (src_len, src_name) = (src.duration(), src.name.clone());
-            let slice_dur = spec.slice.len().max(0.05);
-            let slice_beats = p.secs_to_beats(slice_dur);
-            let mut clip = build_clip(&mut p, spec.source, 0.0, PlayMode::Snippet);
-            clip.grains.position = if src_len > 0.0 { (spec.slice.start / src_len) as f32 } else { 0.0 };
-            clip.grains.duration = slice_dur as f32;
-            clip.grains.pitch = spec.pitch_semitones;
-            clip.grains.pan = spec.pan;
-            clip.grains.gain = spec.gain;
-            clip.grains.sculpt = spec.sculpt;
-            clip.grains.choke_group = spec.choke_group;
-            clip.link = spec.link;
-            clip.grains.adsr = Some(spec.adsr.unwrap_or(chromagrain_core::envelope::Adsr {
-                attack: if spec.one_shot { 0.004 } else { 0.02 },
-                decay: if spec.one_shot { 0.08 } else { 0.20 },
-                sustain: 0.9,
-                release: if spec.one_shot { 0.14 } else { 0.45 },
-                picture: chromagrain_core::envelope::PictureCut::Cut,
-                ..Default::default()
-            }));
-            clip.length_beats = if let Some(free_s) = spec.sculpt.free_loop_secs {
-                p.secs_to_beats(free_s as f64).clamp(0.5, 64.0)
-            } else {
-                ((slice_beats * 4.0).floor() / 4.0).max(0.25)
-            };
-            let track_name = if spec.one_shot {
-                format!("{src_name} · {}", spec.label)
-            } else {
-                format!("{src_name} ~ {}", spec.label)
-            };
-            staged.push((
-                pad,
-                clip,
-                track_name,
-                spec.stamp,
-                spec.sculpt,
-                spec.choke_group,
-                spec.slice.focus,
-                spec.slice.caption,
-            ));
-        }
-        let tracks = if perform { &mut p.tracks } else { &mut self.other_tracks };
-        while tracks.len() < PADS {
-            let k = tracks.len();
-            tracks.push(Track { name: format!("pad {}", k + 1), muted: true, ..Default::default() });
-        }
-        let count = staged.len();
-        for (pad, clip, track_name, stamp, sculpt, choke, focus, caption) in staged {
-            let sid = clip.source;
-            tracks[pad].clips = vec![clip];
-            tracks[pad].name = track_name;
-            tracks[pad].sculpt = sculpt;
-            tracks[pad].choke_group = choke;
-            tracks[pad].tape.wow = sculpt.wow_flutter;
-            tracks[pad].tape.age = sculpt.disintegrate * 0.8;
-            self.studio.pad_sculpt[pad] = chromagrain_ui::SculptParams::from_core(stamp, sculpt, choke);
-            if !caption.is_empty() {
-                self.studio.pad_captions[pad] = caption.as_str().to_string();
-            } else {
-                self.studio.pad_captions[pad].clear();
+        self.apply_curated_kit_specs(&specs)
+    }
+    fn build_ukg_vox_kit_to_pads(&mut self) -> usize {
+        self.studio_seed_pads();
+        let key = self.studio.key;
+        let specs = {
+            let mut p = self.project.lock().unwrap();
+            for s in p.sources.iter_mut() {
+                if s.slices.is_empty() {
+                    s.slices = chromagrain_core::chop::analyze_source_slices(s, 32);
+                }
             }
-            if !self.studio.source_focus.contains_key(&sid) && ((focus.0 - 0.5).abs() > 0.02 || (focus.1 - 0.5).abs() > 0.02) {
-                self.studio.source_focus.insert(sid, focus);
+            chromagrain_core::chop::build_ukg_vox_kit_across_sources_opt(&p.sources, Some(key))
+        };
+        self.apply_curated_kit_specs(&specs)
+    }
+    fn cutout_source(&mut self, source: usize, mode: &str) -> bool {
+        let src_opt = {
+            let p = self.project.lock().unwrap();
+            p.sources.get(source).cloned()
+        };
+        let Some(mut src) = src_opt else { return false };
+        for prefix in ["person @ ", "subject @ ", "foreground @ "] {
+            if let Some(rest) = src.name.strip_prefix(prefix) {
+                src.name = rest.to_string();
             }
         }
-        drop(p);
+        let seg = chromagrain_core::media::cutout_source(&src, mode);
+        let ok = seg.video.as_ref().is_some_and(|v| v.has_alpha());
+        {
+            let mut p = self.project.lock().unwrap();
+            if let Some(slot) = p.sources.get_mut(source) {
+                *slot = seg;
+            }
+            for pat in &mut p.patterns {
+                for row in &mut pat.rows {
+                    if row.source == source {
+                        row.collage_cutout = true;
+                    }
+                }
+            }
+        }
         self.fill_rev = 0;
         self.mark_now();
-        if perform {
+        if self.mode == AppMode::Perform {
             self.perform_fill();
         }
-        count
+        ok
     }
     fn build_loops_to_pads(&mut self) -> usize {
         self.studio_seed_pads();

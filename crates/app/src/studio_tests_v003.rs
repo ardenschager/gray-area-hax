@@ -409,6 +409,8 @@ fn d_hybrid_open_clip_buttons_pad_chevrons_project_sheet_and_owner_tabs() {
     assert_eq!(h.state().studio.sheet, Some(Sheet::Clip(ClipTarget::Emitter(1))));
 
     // 2. Editing Grain / Links / Shape cards inside `Sheet::Clip` mutates engine parameters.
+    h.get_by_label("clip tab detail").click();
+    h.run_steps(2);
     let dens0 = h.state().studio.emitters[1].cloud.density;
     let dk = h.get_by_label("grain density").rect().center();
     drag(&mut h, dk, dk - egui::vec2(0.0, 70.0));

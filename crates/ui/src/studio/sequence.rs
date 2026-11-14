@@ -52,6 +52,7 @@ impl Studio {
         let mut created = false;
         if self.seq.scene_pats[0].is_none() {
             let mut pat = StepPattern::new("scene 1");
+            pat.swing = self.swing.clamp(0.50, 0.72);
             for lane in lanes.iter() {
                 let r = pat.add_row(lane.unwrap_or(usize::MAX));
                 pat.rows[r].key = Some(key);
@@ -623,38 +624,290 @@ impl Studio {
         }
     }
 
+    /// Seed the active scene pattern with a skipping 2-Step UKG groove (`61%` swing,
+    /// `Kick`, `Snare`, swung off-16th `VoxPerc` with `×2` ratchets, `Min7`/`Sus4` chords,
+    /// sub `Pluck`, and choked `Phrase` vocal hook) via [`StepPattern::seed_ukg_2step`].
+    pub fn seed_ukg_2step_groove(&mut self, host: &mut dyn Host) {
+        self.seq_ensure(host);
+        let (scene, _) = self.seq_current(host);
+        let Some(pid) = self.seq_pattern(scene) else { return };
+        let key = self.key;
+        let mut any_alpha = false;
+        {
+            let mut p = host.project().lock().unwrap();
+            for s in p.sources.iter_mut() {
+                if s.slices.is_empty() {
+                    s.slices = chromagrain_core::chop::analyze_source_slices(s, 32);
+                }
+                if s.video.as_ref().is_some_and(|v| v.has_alpha()) {
+                    any_alpha = true;
+                }
+            }
+            let sources = p.sources.clone();
+            let Some(pat) = p.patterns.get_mut(pid) else { return };
+            pat.rows.clear();
+            pat.seed_ukg_2step(&sources);
+            for r in &mut pat.rows {
+                r.key = Some(key);
+            }
+            self.swing = pat.swing.clamp(0.50, 0.72);
+
+            // Sync UI lanes, lane sculpts, and step ratchet/chord extensions from seeded rows.
+            self.seq.step_ext.retain(|&(sc, _, _), _| sc != scene);
+            for i in 0..LANES {
+                if let Some(row) = pat.rows.get(i) {
+                    self.seq.lanes[i] = (row.source < sources.len()).then_some(row.source);
+                    self.lane_sculpt[i] = crate::host::SculptParams::from_core(
+                        row.sculpt.stamp,
+                        row.sculpt,
+                        row.choke_group,
+                    );
+                    for (st_i, st) in row.steps.iter().enumerate() {
+                        let ch = ChordChoice::from_core(st.chord);
+                        if st.ratchet > 1 || st.ratchet_pitch.abs() > 1e-3 || ch != ChordChoice::Off {
+                            self.seq.step_ext.insert((scene, i, st_i), (st.ratchet.max(1), st.ratchet_pitch, ch));
+                        }
+                    }
+                } else {
+                    // Preserve any extra unseeded column clips in remaining muted/silent lanes.
+                    let fallback = self.columns[i].filter(|&s| s < sources.len());
+                    self.seq.lanes[i] = fallback;
+                    let r_idx = pat.add_row(fallback.unwrap_or(usize::MAX));
+                    pat.rows[r_idx].key = Some(key);
+                }
+            }
+        }
+        if any_alpha {
+            host.set_stage_mode(crate::host::StageMode::Collage);
+        } else if matches!(
+            host.stage_mode(),
+            Some(crate::host::StageMode::Stack | crate::host::StageMode::Bleed)
+        ) {
+            host.set_stage_mode(crate::host::StageMode::Grid);
+        }
+        self.rev += 1;
+        host.mark_now();
+        host.status("seeded 2-step groove · 61% swing + vocal percussion".into());
+    }
+
+    /// Clear all active steps on the current scene pattern.
+    pub fn clear_active_pattern(&mut self, host: &mut dyn Host) {
+        let (scene, _) = self.seq_current(host);
+        let Some(pid) = self.seq_pattern(scene) else { return };
+        {
+            let mut p = host.project().lock().unwrap();
+            if let Some(pat) = p.patterns.get_mut(pid) {
+                for row in &mut pat.rows {
+                    for st in &mut row.steps {
+                        *st = chromagrain_core::seq::Step::default();
+                    }
+                }
+            }
+        }
+        self.seq.step_ext.retain(|&(sc, _, _), _| sc != scene);
+        self.rev += 1;
+        host.mark();
+    }
+
     // ------------------------------------------------------------ view
 
     pub fn sequence_view(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, area: Rect) {
-        let narrow = area.width() < 1100.0;
-        let (lanes_rect, song) = if narrow {
-            let strip_h = (area.height() * 0.19).clamp(78.0, 108.0);
-            let song = Rect::from_min_size(area.min, egui::vec2(area.width(), strip_h));
-            (Rect::from_min_max(egui::pos2(area.left(), song.bottom() + 12.0), area.max), song)
-        } else {
-            let rw = (area.width() * 0.24).clamp(272.0, 384.0);
-            let song = Rect::from_min_max(egui::pos2(area.right() - rw, area.top()), area.max);
-            (Rect::from_min_max(area.min, egui::pos2(song.left() - 20.0, area.bottom())), song)
-        };
+        let narrow = area.width() < 1120.0;
+        let col_gap = if narrow { 10.0 } else { 16.0 };
+        let left_w = (area.width() * if narrow { 0.34 } else { 0.35 }).clamp(306.0, 540.0).floor();
+        let left_col = Rect::from_min_size(area.min, egui::vec2(left_w, area.height()));
+        let lanes_rect = Rect::from_min_max(egui::pos2(left_col.right() + col_gap, area.top()), area.max);
+
+        self.sequence_left_column(host, ui, left_col);
         self.seq_lanes(host, ui, lanes_rect);
-        if narrow {
-            self.song_strip(host, ui, song);
-        } else {
-            self.song_column(host, ui, song);
-        }
         self.step_sheet(host, ui);
+    }
+
+    fn sequence_left_column(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, col: Rect) {
+        let compact = col.height() < 620.0 || col.width() < 360.0;
+        let vgap = if compact { 6.0 } else { 10.0 };
+
+        // 1. Live Stage Monitor + Dedicated Bezel Control Strip (`grid · collage · split · stack`).
+        let ideal_stage_h = (col.width() * 9.0 / 16.0 + 30.0).floor();
+        let max_stage_h = (col.height() * if compact { 0.42 } else { 0.46 }).max(158.0);
+        let stage_block = Rect::from_min_size(col.min, egui::vec2(col.width(), ideal_stage_h.min(max_stage_h)));
+        self.stage_with_bezel(host, ui, stage_block, "seq-stage", true);
+        let mut y = stage_block.bottom() + vgap;
+
+        // 2. Groove & Pocket Hardware Bay (`2-Step`, `Clear`, `SWING` pointer knob + `61%` silver LCD).
+        let groove_h = if compact { 68.0 } else { 88.0 };
+        let groove_r = Rect::from_min_size(egui::pos2(col.left(), y), egui::vec2(col.width(), groove_h));
+        self.sequence_groove_bar(host, ui, groove_r, compact);
+        y = groove_r.bottom() + vgap;
+
+        // 3. Bottom Selected Lane Strip (`Lane N · title` + `Open clip ›`).
+        let lane_bar_h = if compact { 28.0 } else { 32.0 };
+        let lane_bar_top = col.bottom() - lane_bar_h;
+
+        // 4. Compact `SET · SCENES` Bay (standalone).
+        if host.caps().scenes && lane_bar_top - y >= 92.0 {
+            let max_set_h = if compact { 210.0 } else { 252.0 };
+            let set_h = (lane_bar_top - vgap - y).min(max_set_h);
+            let set_box = Rect::from_min_size(egui::pos2(col.left(), y), egui::vec2(col.width(), set_h));
+            let p = ui.painter().clone();
+            putty_panel(&p, set_box, 7);
+            let s_in = set_box.shrink2(egui::vec2(if compact { 7.0 } else { 10.0 }, if compact { 5.0 } else { 8.0 }));
+            let (cur, _) = self.seq_current(host);
+            let mut sy = s_in.top();
+            if !compact && s_in.height() >= 180.0 {
+                caps(&p, egui::pos2(s_in.left(), sy + 5.0), Align2::LEFT_CENTER, "Set · scenes", 8.5);
+                sy += 16.0;
+            }
+
+            if s_in.height() >= 132.0 {
+                let name_h = if compact { 24.0 } else { 27.0 };
+                let name_bar = Rect::from_min_size(egui::pos2(s_in.left(), sy), egui::vec2(s_in.width(), name_h));
+                let mut nm = self.seq.scene_names[cur.min(SCENES - 1)].clone();
+                let (_, enter) = super::add::field_sized(
+                    ui,
+                    name_bar,
+                    egui::Id::new(("seq-scn-name", cur)),
+                    &mut nm,
+                    &format!("Scene {} — intro, drop, break…", cur + 1),
+                    "scene name",
+                    if compact { 10.5 } else { 11.5 },
+                );
+                if nm != self.seq.scene_names[cur.min(SCENES - 1)] {
+                    self.seq.scene_names[cur.min(SCENES - 1)] = nm.clone();
+                    if let Some(pid) = self.seq_pattern(cur) {
+                        if let Some(pat) = host.project().lock().unwrap().patterns.get_mut(pid) {
+                            pat.name = if nm.trim().is_empty() { format!("scene {}", cur + 1) } else { nm.trim().to_string() };
+                        }
+                    }
+                    host.mark();
+                }
+                if enter {
+                    self.seq.editing_name = None;
+                }
+                sy = name_bar.bottom() + if compact { 5.0 } else { 7.0 };
+            }
+
+            let chain_h = if compact { 26.0 } else { 30.0 };
+            let chain_r = Rect::from_min_size(egui::pos2(s_in.left(), s_in.bottom() - chain_h), egui::vec2(s_in.width(), chain_h));
+            let grid_avail = (chain_r.top() - sy - if compact { 4.0 } else { 6.0 }).max(48.0);
+
+            // `6×2` compact hardware scene matrix (`1..12`).
+            let sg = if compact { 3.5 } else { 5.0 };
+            let cols_n = 6usize;
+            let sw = (s_in.width() - sg * (cols_n as f32 - 1.0)) / cols_n as f32;
+            let sh = ((grid_avail - sg) * 0.5).clamp(22.0, 52.0);
+            for s in 0..SCENES {
+                let rc = Rect::from_min_size(
+                    egui::pos2(s_in.left() + (s % cols_n) as f32 * (sw + sg), sy + (s / cols_n) as f32 * (sh + sg)),
+                    egui::vec2(sw, sh),
+                );
+                self.scene_cell(host, ui, rc, s, cur);
+            }
+
+            self.set_arranger_bar(host, ui, chain_r, "seq-set");
+        }
+
+        // Selected Lane Strip at bottom of Left Column.
+        if self.seq.lanes.get(self.sel_lane).copied().flatten().is_none() {
+            if let Some(first) = self.seq.lanes.iter().position(|l| l.is_some()) {
+                self.sel_lane = first;
+            }
+        }
+        let l = self.sel_lane.min(LANES - 1);
+        if let Some(src) = self.seq.lanes[l] {
+            let ob = Rect::from_min_size(egui::pos2(col.left(), lane_bar_top), egui::vec2(col.width(), lane_bar_h));
+            let p = ui.painter();
+            putty_panel(p, ob, 6);
+            let raw = self.source_name(host, src);
+            let clean = super::clean_clip_label(&raw);
+            let pill_w = if compact { 82.0 } else { 90.0 };
+            let room = ((ob.width() - pill_w - 24.0) / 6.2).max(5.0) as usize;
+            p.text(
+                egui::pos2(ob.left() + 10.0, ob.center().y),
+                Align2::LEFT_CENTER,
+                format!("LANE {} · {}", l + 1, super::play::short(&clean, room.min(18))),
+                font_semibold(if compact { 10.0 } else { 11.0 }),
+                INK,
+            );
+            let pill = Rect::from_min_size(
+                egui::pos2(ob.right() - pill_w - 4.0, ob.center().y - (lane_bar_h - 6.0) * 0.5),
+                egui::vec2(pill_w, lane_bar_h - 6.0),
+            );
+            if open_clip_pill(ui, pill, ui.id().with("seq-open-clip"), "open clip").clicked() {
+                self.open_clip(super::ClipTarget::Lane(l));
+            }
+        }
+    }
+
+    fn sequence_groove_bar(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, card: Rect, compact: bool) {
+        let p = ui.painter().clone();
+        putty_panel(&p, card, 7);
+        let inner = card.shrink2(egui::vec2(if compact { 8.0 } else { 11.0 }, if compact { 5.0 } else { 7.0 }));
+        let id = ui.id().with("seq-groove");
+
+        // Right side: `SWING` charcoal pointer knob + sunken silver LCD (`61%`).
+        let swing_zone_w = if compact { 112.0 } else { 142.0 };
+        let swing_r = Rect::from_min_max(egui::pos2(inner.right() - swing_zone_w, inner.top()), inner.max);
+        let cur_swing = self.active_swing(host);
+        let mut sw_norm = ((cur_swing - 0.50) / 0.22).clamp(0.0, 1.0);
+        let prev_norm = sw_norm;
+        let krad = (swing_r.height() * 0.36).clamp(13.0, 19.0);
+        let kc = egui::pos2(swing_r.left() + krad + 4.0, swing_r.center().y);
+        knob(ui, kc, krad, id.with("swing-knob"), "seq swing", &mut sw_norm, (0.61 - 0.50) / 0.22, 0);
+        if (sw_norm - prev_norm).abs() > 1e-4 {
+            self.set_active_swing(host, 0.50 + sw_norm * 0.22);
+        }
+        let lcd_x = kc.x + krad + 8.0;
+        let lcd_w = (swing_r.right() - lcd_x).max(42.0);
+        caps(&p, egui::pos2(lcd_x + lcd_w * 0.5, swing_r.center().y - 11.0), Align2::CENTER_CENTER, "SWING", if compact { 7.5 } else { 8.5 });
+        let sw_pct = (self.active_swing(host) * 100.0).round() as u32;
+        lcd_readout(
+            &p,
+            Rect::from_center_size(egui::pos2(lcd_x + lcd_w * 0.5, swing_r.center().y + 5.5), egui::vec2(lcd_w, if compact { 16.0 } else { 18.0 })),
+            &format!("{sw_pct}%"),
+            if compact { 10.0 } else { 11.0 },
+        );
+
+        // Left side: `GROOVE` silkscreen + `2-Step` (`"seed ukg 2step"`) + `Clear` (`"clear pattern"`).
+        let left_r = Rect::from_min_max(inner.min, egui::pos2(swing_r.left() - 8.0, inner.bottom()));
+        caps(&p, egui::pos2(left_r.left() + 2.0, left_r.top() + 6.0), Align2::LEFT_CENTER, "GROOVE", if compact { 8.0 } else { 9.0 });
+        let btn_top = left_r.top() + if compact { 15.0 } else { 18.0 };
+        let btn_h = (left_r.bottom() - btn_top).clamp(24.0, 34.0);
+        let clr_w = if compact { 48.0 } else { 58.0 };
+        let seed_w = (left_r.width() - clr_w - 6.0).max(74.0);
+        let seed_r = Rect::from_min_size(egui::pos2(left_r.left(), btn_top), egui::vec2(seed_w, btn_h));
+        let clr_r = Rect::from_min_size(egui::pos2(seed_r.right() + 6.0, btn_top), egui::vec2(clr_w, btn_h));
+
+        let is_ukg_swung = (self.active_swing(host) - 0.61).abs() < 0.015;
+        let s_resp = hit(ui, seed_r, id.with("seed-ukg"), Sense::click(), "seed ukg 2step");
+        paint_switch_cap(&p, seed_r, SwitchKind::Amber, is_ukg_swung, s_resp.hovered(), s_resp.is_pointer_button_down_on());
+        p.text(
+            seed_r.center(),
+            Align2::CENTER_CENTER,
+            if seed_w >= 106.0 { "2-Step Groove" } else { "2-Step" },
+            font_semibold(if compact { 10.0 } else { 11.0 }),
+            if is_ukg_swung { ON_HI } else { Color32::from_rgb(0x24, 0x1c, 0x09) },
+        );
+        if s_resp.clicked() {
+            self.seed_ukg_2step_groove(host);
+        }
+
+        if button_named(ui, clr_r, id.with("clear-pat"), "Clear", "clear pattern", false, None, None).clicked() {
+            self.clear_active_pattern(host);
+        }
     }
 
     fn seq_lanes(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, area: Rect) {
         let ctx = ui.ctx().clone();
         let p = ui.painter().clone();
-        let g = 4.0;
+        let g = if area.height() < 560.0 { 3.5 } else { 4.5 };
         let lh = (area.height() - g * (LANES as f32 - 1.0)) / LANES as f32;
-        let hw = (area.width() * 0.16).clamp(70.0, 200.0);
-        let sx = area.left() + hw + if area.width() < 900.0 { 10.0 } else { 12.0 };
-        let group = if area.width() < 900.0 { 4.0 } else { 8.0 };
-        let sw = (area.right() - sx - g * 15.0 - group * 3.0) / STEPS as f32;
-        let step_x = |s: usize| sx + s as f32 * (sw + g) + (s / 4) as f32 * group;
+        let hw = (area.width() * 0.145).clamp(78.0, 148.0);
+        let sx = area.left() + hw + if area.width() < 760.0 { 6.0 } else { 10.0 };
+        let group = if area.width() < 760.0 { 4.0 } else { 7.0 };
+        let step_gap = if area.width() < 760.0 { 2.5 } else { 3.5 };
+        let sw = (area.right() - sx - step_gap * 15.0 - group * 3.0) / STEPS as f32;
+        let step_x = |s: usize| sx + s as f32 * (sw + step_gap) + (s / 4) as f32 * group;
         let (scene, playing_at) = self.seq_current(host);
         let playing = host.playing();
         let key = self.key;
@@ -674,19 +927,18 @@ impl Studio {
                     ctx.request_repaint();
                     continue;
                 }
+                // Calm single recessed slate slot across empty lane (no 16 noisy empty boxes!).
+                let empty_row = Rect::from_min_max(header.min, egui::pos2(area.right(), header.bottom()));
+                p.rect_filled(empty_row, r(6), Color32::from_rgba_unmultiplied(36, 36, 30, 68));
+                p.rect_stroke(empty_row, r(6), hair(LINE2), StrokeKind::Inside);
                 monitor_well(&p, header, 6);
                 if first_empty {
                     first_empty = false;
                     let resp = hit(ui, header, ui.id().with(("lane-add", lane)), Sense::click(), "add a lane");
-                    draw_icon(&p, Icon::Plus, header.center(), 16.0, if resp.hovered() { CREAM } else { CREAM3 });
+                    draw_icon(&p, Icon::Plus, header.center(), 15.0, if resp.hovered() { CREAM } else { CREAM3 });
                     if resp.clicked() {
                         self.open_add(host, crate::host::AddTarget::Lane(lane));
                     }
-                }
-                for s in 0..STEPS {
-                    let c = Rect::from_min_size(egui::pos2(step_x(s), y), egui::vec2(sw, lh));
-                    p.rect_filled(c, r(4), Color32::from_rgba_unmultiplied(24, 27, 28, 85));
-                    p.rect_stroke(c, r(4), hair(LINE2), StrokeKind::Inside);
                 }
                 continue;
             };
@@ -695,12 +947,15 @@ impl Studio {
             let steps: Vec<chromagrain_core::seq::Step> = (0..len).filter_map(|s| self.seq_step(host, scene, lane, s)).collect();
             let silent = steps.iter().all(|s| !s.on);
             let at = self.atlas(host, &ctx, src);
-            let chop_starts: Vec<f32> = {
+            let (chop_starts, has_alpha) = {
                 let pp = host.project().lock().unwrap();
-                pp.sources
+                let ha = pp.sources.get(src).and_then(|so| so.video.as_ref()).is_some_and(|v| v.has_alpha());
+                let cs: Vec<f32> = pp
+                    .sources
                     .get(src)
                     .map(|so| so.slices.iter().map(|sl| (sl.start / so.duration().max(1e-6)) as f32).collect())
-                    .unwrap_or_default()
+                    .unwrap_or_default();
+                (cs, ha)
             };
             let is_sel = lane == self.sel_lane;
             let lane_adsr = self.target_env(host, super::clip::EnvTarget::Lane(lane)).unwrap_or_default();
@@ -710,37 +965,61 @@ impl Studio {
                 p.rect_filled(Rect::from_min_size(header.min + egui::vec2(1.0, 1.0), egui::vec2(3.0, lh - 2.0)), r(2), a.swatch);
             }
             let top_scrim = Rect::from_min_size(header.min, egui::vec2(hw, 20.0_f32.min(lh * 0.45)));
-            p.rect_filled(top_scrim, egui::CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 }, Color32::from_black_alpha(110));
+            p.rect_filled(top_scrim, egui::CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 }, Color32::from_black_alpha(120));
             let bot_scrim = Rect::from_min_max(egui::pos2(header.left(), (header.bottom() - 22.0).max(header.top())), header.max);
-            p.rect_filled(bot_scrim, egui::CornerRadius { nw: 0, ne: 0, sw: 6, se: 6 }, Color32::from_black_alpha(135));
-            if lh >= 42.0 && hw >= 88.0 {
+            p.rect_filled(bot_scrim, egui::CornerRadius { nw: 0, ne: 0, sw: 6, se: 6 }, Color32::from_black_alpha(145));
+
+            let stamp = self.lane_sculpt[lane].stamp;
+            let mut top_x = header.left() + 7.0;
+            if stamp != crate::host::SculptStamp::Raw && hw >= 88.0 {
+                let rtag = super::role_tag_for(stamp, None, None);
+                let rr = role_tag_pill(&p, egui::pos2(top_x, header.top() + 4.0), rtag, !muted && !silent);
+                top_x = rr.right() + 3.0;
+            }
+            if has_alpha && top_x + 18.0 <= header.right() - 24.0 {
+                cutout_badge(&p, egui::pos2(top_x, header.top() + 4.0));
+            } else if stamp == crate::host::SculptStamp::Raw && hw >= 76.0 {
                 let raw_name = self.source_name(host, src);
-                let clean = super::strip_media_ext(&raw_name);
-                let room = ((hw - 36.0) / 6.0).max(4.0) as usize;
+                let clean = super::clean_clip_label(&raw_name);
+                let room = ((hw - 34.0) / 6.0).max(4.0) as usize;
                 p.text(
-                    egui::pos2(header.left() + 9.0, header.top() + 6.5),
+                    egui::pos2(header.left() + 8.0, header.top() + 5.5),
                     Align2::LEFT_TOP,
-                    super::play::short(clean, room.min(16)),
-                    font_medium(10.5),
+                    super::play::short(&clean, room.min(15)),
+                    font_medium(9.8),
                     if muted { CREAM3 } else if is_sel { CREAM } else { CREAM2 },
                 );
             }
+
             if !muted {
-                let env_w = (hw * 0.36).clamp(18.0, 48.0);
-                let env_r = Rect::from_min_size(egui::pos2(header.left() + 9.0, header.bottom() - 16.5), egui::vec2(env_w, 10.5));
-                mini_adsr(&p, env_r, &lane_adsr, if is_sel { 0.92 } else { 0.68 });
+                if stamp != crate::host::SculptStamp::Raw && lh >= 48.0 {
+                    let raw_name = self.source_name(host, src);
+                    let clean = super::clean_clip_label(&raw_name);
+                    let room = ((hw - 16.0) / 5.8).max(4.0) as usize;
+                    p.text(
+                        egui::pos2(header.left() + 7.0, header.bottom() - 5.0),
+                        Align2::LEFT_BOTTOM,
+                        super::play::short(&clean, room.min(16)),
+                        font_medium(9.5),
+                        if is_sel { CREAM } else { CREAM2 },
+                    );
+                } else {
+                    let env_w = (hw * 0.36).clamp(18.0, 44.0);
+                    let env_r = Rect::from_min_size(egui::pos2(header.left() + 8.0, header.bottom() - 15.5), egui::vec2(env_w, 9.5));
+                    mini_adsr(&p, env_r, &lane_adsr, if is_sel { 0.92 } else { 0.68 });
+                }
             } else {
-                p.text(header.left_bottom() + egui::vec2(10.0, -5.0), Align2::LEFT_BOTTOM, "MUTED", font_semibold(9.5), RUBY_MID);
+                p.text(header.left_bottom() + egui::vec2(8.0, -5.0), Align2::LEFT_BOTTOM, "MUTED", font_semibold(9.0), RUBY_MID);
             }
             if len != STEPS {
-                p.text(header.right_bottom() + egui::vec2(-8.0, -5.0), Align2::RIGHT_BOTTOM, len.to_string(), mono(10.0), CREAM2);
+                p.text(header.right_bottom() + egui::vec2(-6.0, -5.0), Align2::RIGHT_BOTTOM, len.to_string(), mono(9.5), CREAM2);
             }
             if is_sel {
                 p.rect_stroke(header, r(6), Stroke::new(1.8, AMBER_MID), StrokeKind::Inside);
             }
             let hresp = hit(ui, header, ui.id().with(("lane-head", lane)), Sense::click(), &format!("lane {}", lane + 1));
-            let chev_vis = Rect::from_min_size(egui::pos2(header.right() - 24.0, header.top() + 4.0), egui::vec2(20.0, 20.0));
-            let chev_hit = Rect::from_center_size(chev_vis.center(), egui::vec2(24.0, 24.0));
+            let chev_vis = Rect::from_min_size(egui::pos2(header.right() - 22.0, header.top() + 3.5), egui::vec2(18.5, 18.5));
+            let chev_hit = Rect::from_center_size(chev_vis.center(), egui::vec2(23.0, 23.0));
             let chev_resp = chev_button(ui, chev_vis, chev_hit, ui.id().with(("lane-clip", lane)), &format!("clip lane {}", lane + 1));
             let h = hold(ui, &hresp, 0.45);
             if chev_resp.clicked() {
@@ -758,12 +1037,14 @@ impl Studio {
                 let c = Rect::from_min_size(egui::pos2(step_x(s), y), egui::vec2(sw, lh));
                 if s >= len {
                     if s == len {
-                        draw_loop_glyph(&p, egui::pos2(c.left() + 10.0, c.center().y), INK3);
+                        draw_loop_glyph(&p, egui::pos2(c.left() + 8.0, c.center().y), INK3);
                     }
                     continue;
                 }
                 let st = steps.get(s).copied().unwrap_or_default();
-                let (ratchet, _, step_chord) = self.step_ratchet_ext(scene, lane, s);
+                let (ext_r, _, ext_c) = self.step_ratchet_ext(scene, lane, s);
+                let ratchet = ext_r.max(st.ratchet.max(1));
+                let step_chord = if ext_c != ChordChoice::Off { ext_c } else { ChordChoice::from_core(st.chord) };
                 let ghost = if muted { 0.35 } else { 1.0 };
                 if st.on {
                     monitor_well(&p, c, 5);
@@ -777,23 +1058,25 @@ impl Studio {
                     }
                     if st.pitch.abs() > 0.01 {
                         let d = semis_to_degree(&key, st.pitch);
-                        p.text(c.left_top() + egui::vec2(5.0, 4.0), Align2::LEFT_TOP, format!("{d:+}"), mono_medium(10.0), CREAM);
+                        p.text(c.left_top() + egui::vec2(4.0, 3.0), Align2::LEFT_TOP, format!("{d:+}"), mono_medium(9.5), CREAM);
                     }
                     if st.chance < 0.999 {
-                        p.text(c.right_top() + egui::vec2(-5.0, 4.0), Align2::RIGHT_TOP, format!("{:.0}%", st.chance * 100.0), mono(9.0), CREAM2);
+                        p.text(c.right_top() + egui::vec2(-4.0, 3.0), Align2::RIGHT_TOP, format!("{:.0}%", st.chance * 100.0), mono(8.5), CREAM2);
                     }
-                    if ratchet > 1 && sw >= 24.0 {
-                        let tag_r = Rect::from_min_size(egui::pos2(c.left() + 3.0, c.bottom() - 14.0), egui::vec2(18.0, 11.0));
-                        p.rect_filled(tag_r, r(3), Color32::from_black_alpha(200));
-                        p.text(tag_r.center(), Align2::CENTER_CENTER, format!("×{ratchet}"), mono_medium(8.5), AMBER_MID);
+                    if ratchet > 1 && sw >= 22.0 {
+                        let tag_r = Rect::from_min_size(egui::pos2(c.left() + 2.5, c.bottom() - 13.5), egui::vec2(17.5, 11.0));
+                        p.rect_filled(tag_r, r(3), Color32::from_black_alpha(210));
+                        p.text(tag_r.center(), Align2::CENTER_CENTER, format!("×{ratchet}"), mono_medium(8.2), AMBER_MID);
                     }
-                    if step_chord != ChordChoice::Off && sw >= 34.0 {
-                        p.text(c.right_bottom() + egui::vec2(-4.0, -3.0), Align2::RIGHT_BOTTOM, step_chord.label(), mono_medium(8.0), MINT_MID);
+                    if step_chord != ChordChoice::Off && sw >= 28.0 {
+                        let ch_r = Rect::from_min_size(egui::pos2(c.right() - 25.0, c.bottom() - 13.5), egui::vec2(22.5, 11.0));
+                        p.rect_filled(ch_r, r(3), Color32::from_black_alpha(195));
+                        p.text(ch_r.center(), Align2::CENTER_CENTER, step_chord.label(), mono_medium(7.8), MINT_MID);
                     }
                     p.rect_stroke(c, r(5), Stroke::new(1.2, AMBER_EDGE), StrokeKind::Inside);
                 } else {
                     monitor_well(&p, c, 5);
-                    p.circle_filled(c.center(), if s % 4 == 0 { 2.0 } else { 1.4 }, if s % 4 == 0 { CREAM3 } else { Color32::from_white_alpha(45) });
+                    p.circle_filled(c.center(), if s % 4 == 0 { 2.0 } else { 1.3 }, if s % 4 == 0 { CREAM3 } else { Color32::from_white_alpha(45) });
                 }
                 if cur == Some(s) {
                     p.rect_stroke(c, r(5), Stroke::new(2.0, AMBER_CORE), StrokeKind::Inside);
@@ -912,121 +1195,6 @@ impl Studio {
         } else if resp.clicked() {
             self.seq_scene_tap(host, s);
         }
-    }
-
-    fn song_column(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, col: Rect) {
-        let stage_h = (col.width() * 9.0 / 16.0).floor().min(col.height() * 0.36);
-        let stage = Rect::from_min_size(col.min, egui::vec2(col.width(), stage_h));
-        self.stage(host, ui, stage, 12.0);
-        self.layout_switch(host, ui, stage);
-        let mut y_after = stage.bottom() + 12.0;
-
-        if host.caps().scenes {
-            let (cur, _) = self.seq_current(host);
-
-            // Scene header + inline editable scene name (`intro`, `drop`, `dialogue`, `wash`, `outro`).
-            let name_bar = Rect::from_min_size(egui::pos2(col.left(), y_after), egui::vec2(col.width(), 30.0));
-            let mut nm = self.seq.scene_names[cur.min(SCENES - 1)].clone();
-            let (_, enter) = super::add::field_sized(
-                ui,
-                name_bar,
-                egui::Id::new(("seq-scn-name", cur)),
-                &mut nm,
-                &format!("Scene {} name — intro, drop, dialogue, wash…", cur + 1),
-                "scene name",
-                12.0,
-            );
-            if nm != self.seq.scene_names[cur.min(SCENES - 1)] {
-                self.seq.scene_names[cur.min(SCENES - 1)] = nm.clone();
-                if let Some(pid) = self.seq_pattern(cur) {
-                    if let Some(pat) = host.project().lock().unwrap().patterns.get_mut(pid) {
-                        pat.name = if nm.trim().is_empty() { format!("scene {}", cur + 1) } else { nm.trim().to_string() };
-                    }
-                }
-                host.mark();
-            }
-            if enter {
-                self.seq.editing_name = None;
-            }
-            y_after = name_bar.bottom() + 8.0;
-
-            // 4×3 grid of Scenes 1..12.
-            let g = 6.0;
-            let sw = (col.width() - g * 3.0) / 4.0;
-            let avail_for_grid = (col.bottom() - y_after - 88.0).max(114.0);
-            let sh = ((avail_for_grid - g * 2.0) / 3.0).clamp(38.0, 52.0);
-            for s in 0..SCENES {
-                let rc = Rect::from_min_size(
-                    egui::pos2(col.left() + (s % 4) as f32 * (sw + g), y_after + (s / 4) as f32 * (sh + g)),
-                    egui::vec2(sw, sh),
-                );
-                self.scene_cell(host, ui, rc, s, cur);
-            }
-            y_after += 3.0 * sh + 2.0 * g + 10.0;
-
-            // Set / Cue Arranger Bar.
-            let chain = Rect::from_min_size(egui::pos2(col.left(), y_after), egui::vec2(col.width(), 34.0));
-            self.set_arranger_bar(host, ui, chain, "seq-set");
-            y_after = chain.bottom() + 10.0;
-        }
-
-        if col.bottom() - y_after >= 32.0 {
-            if self.seq.lanes.get(self.sel_lane).copied().flatten().is_none() {
-                if let Some(first) = self.seq.lanes.iter().position(|l| l.is_some()) {
-                    self.sel_lane = first;
-                }
-            }
-            let l = self.sel_lane.min(LANES - 1);
-            if let Some(src) = self.seq.lanes[l] {
-                let ob = Rect::from_min_size(egui::pos2(col.left(), y_after), egui::vec2(col.width(), 32.0));
-                let p = ui.painter();
-                p.rect_filled(ob, r(10), G1);
-                p.rect_stroke(ob, r(10), hair(LINE), StrokeKind::Inside);
-                let raw = self.source_name(host, src);
-                let clean = super::strip_media_ext(&raw);
-                let room = ((ob.width() - 122.0) / 6.2).max(5.0) as usize;
-                p.text(
-                    egui::pos2(ob.left() + 12.0, ob.center().y),
-                    Align2::LEFT_CENTER,
-                    format!("Lane {} · {}", l + 1, super::play::short(clean, room.min(18))),
-                    font_medium(12.0),
-                    INK2,
-                );
-                let pill = Rect::from_min_size(egui::pos2(ob.right() - 100.0, ob.center().y - 13.0), egui::vec2(92.0, 26.0));
-                if open_clip_pill(ui, pill, ui.id().with("seq-open-clip"), "open clip").clicked() {
-                    self.open_clip(super::ClipTarget::Lane(l));
-                }
-            }
-        }
-    }
-
-    fn song_strip(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, strip: Rect) {
-        let h = strip.height();
-        let stage = Rect::from_min_size(strip.min, egui::vec2((h * 16.0 / 9.0).floor(), h));
-        self.stage(host, ui, stage, 10.0);
-        self.layout_switch(host, ui, stage);
-        if !host.caps().scenes {
-            return;
-        }
-        let right = Rect::from_min_max(egui::pos2(stage.right() + 12.0, strip.top()), strip.max);
-        let top_h = ((h - 6.0) * 0.5).max(32.0);
-        let (cur, _) = self.seq_current(host);
-
-        // Top row of narrow strip: Scenes 1..12.
-        let sg = 4.0;
-        let sw = ((right.width() - sg * (SCENES as f32 - 1.0)) / SCENES as f32).max(28.0);
-        for s in 0..SCENES {
-            let x = right.left() + s as f32 * (sw + sg);
-            if x + sw > right.right() + 1.0 {
-                break;
-            }
-            let rc = Rect::from_min_size(egui::pos2(x, right.top()), egui::vec2(sw, top_h));
-            self.scene_cell(host, ui, rc, s, cur);
-        }
-
-        // Bottom row of narrow strip: Set / Cue Arranger Bar.
-        let bot = Rect::from_min_max(egui::pos2(right.left(), right.top() + top_h + 6.0), right.max);
-        self.set_arranger_bar(host, ui, bot, "seq-strip-set");
     }
 
     /// Step hold-sheet: `Slice` (8×2) + Row 1 (`Pitch`, `Length`, `Chance`) +
