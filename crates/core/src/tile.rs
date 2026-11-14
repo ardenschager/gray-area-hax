@@ -298,6 +298,23 @@ pub fn tile_rect(slot: usize, cols: u32, rows: u32, aspect: f32) -> TileRect {
     TileRect { x: c as f32 * (w + gx), y: r as f32 * (h + gy), w, h }
 }
 
+/// Like [`tile_rect`], spanning the 3rd active cell (`slot == 2`) full-width
+/// across the bottom row when `active_count == 3` in a `2×2` grid so 3 active
+/// voices fill 100% of the canvas with zero empty black quadrants!
+pub fn tile_rect_for_count(
+    slot: usize,
+    cols: u32,
+    rows: u32,
+    active_count: usize,
+    aspect: f32,
+) -> TileRect {
+    if active_count == 3 && cols == 2 && rows == 2 && slot >= 2 {
+        let r = tile_rect(2, 2, 2, aspect);
+        return TileRect { x: 0.0, y: r.y, w: 1.0, h: r.h };
+    }
+    tile_rect(slot, cols, rows, aspect)
+}
+
 /// Grid for one frame from the tile slots of the voices visible in it
 /// (pure: the same grains give the same grid on CPU and GPU). Big enough
 /// for the number of voices and the highest slot in use.

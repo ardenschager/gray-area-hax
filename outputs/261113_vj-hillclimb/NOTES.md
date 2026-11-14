@@ -27,6 +27,10 @@ While preparing and performing the 6 pieces with real YouTube footage, we fixed 
    - Added `dense_slot_remap` for `Layout::Split` (all aspect ratios) and portrait `9:16` `Layout::Tile` so `2` active voices pack into full-width `1×2` bands (`2×1` on wide) and `3` voices pack into `1×3` (`3×1` on wide) with zero empty black quadrants, while holding fixed `(3, 1)` `1.5 px`-divided monolith columns when `portrait_columns == true` in `Layout::Tile`.
 9. **Tiled Subject Crop Zoom (`transform.scale`) & Auto-Scaling `9:16` Stage Captions (`crates/core/src/video.rs`):**
    - Honored `clip.transform.scale` inside `focus_cover_patch` for tiled/split/bleed panels so clips can zoom tightly into expressive human faces or crop out corner text, and upgraded `draw_stage_caption` with responsive width auto-scaling + high-contrast smoked-obsidian pill + warm amber accent bar so long spoken punchlines never drop on vertical `9:16` stages.
+10. **`Kit -> pads` & `Loops -> pads` YouTuber Outro / Speech CTA Guard (`crates/core/src/chop.rs`):**
+    - Updated `build_kit_across_sources` (`Pads 15–16` `Wash` / `Tape Loop`) and `build_tape_loops_across_sources` to penalize late-clip outro segments (last `20%` of clips `>= 8s`, where YouTubers put `"like & subscribe"` CTAs) and `1–3.5 kHz` syllabic speech slices (`pitch_confidence < 0.62`), favoring sustained harmonic/rhythmic slices instead.
+11. **`N == 3` Full-Width Bottom-Row Span in `Layout::Tile` (`crates/core/src/{tile.rs,video.rs,render.rs}`, `crates/ui/src/gpu.rs`):**
+    - Added `tile_rect_for_count` across both CPU (`render_project`) and GPU (`GpuPreview::render`, verified by `gpu_matches_the_cpu_for_tiles_and_envelopes` `"tile3"`): when `3` voices are active in `Layout::Tile` (`!portrait_columns`), cells `0` and `1` occupy the top row while cell `2` spans `100%` width across the bottom row — eliminating the empty black `25%` quadrant!
 
 ---
 
@@ -99,3 +103,23 @@ While preparing and performing the 6 pieces with real YouTube footage, we fixed 
 | `261113_chromagrain_oxide-ballroom_disintegration-loops_v002.mp4` | `1920×1080 @ 60fps` | `25.60 s` | `-12.70 LUFS` | `-2.60 dBTP` | `6.30 LU` | `0.4%` | `78.4%` |
 | `261113_chromagrain_modell5-pulse_portrait-bursts_v002.mp4` | `1920×1080 @ 60fps` | `16.40 s` | `-12.50 LUFS` | `-1.20 dBTP` | `2.10 LU` | `26.6%` | `28.1%` |
 | `261113_chromagrain_isol8-studio_vj-showcase_v002.mp4` | `1920×1080 @ 30fps` | `52.50 s` | `-14.50 LUFS` | `-2.10 dBTP` | `5.20 LU` | `19.2%` | `53.4%` |
+
+### `v003` (`outputs/261113_vj-hillclimb/v003/out/`)
+- **Addressed all 3 `#90` surgical items (`[SYSTEM]` + `[PIECE]`) across `crates/` and `vj_hillclimb.rs` (`RUSTFLAGS="-D warnings" cargo test --workspace` green):**
+  1. **Piece 6 + `[SYSTEM]` Loop-Pad Outro/Speech Guard (`crates/core/src/chop.rs` + `vj_hillclimb.rs`):**
+     - `build_kit_across_sources` (`Pads 15–16` `Wash` / `Tape Loop`) and `build_tape_loops_across_sources` now penalize late-clip outro segments (last `20%` of clips `>= 8s`) and `1–3.5 kHz` syllabic speech slices (`pitch_confidence < 0.62`) in favor of sustained harmonics.
+     - Trimmed `s0` (`Footwork Sub`) in `harness_isol8_showcase` to `0..17.8s` and cropped frames `[0.45, 0.08, 0.50, 0.76]` (physically excising the `18..28s` `"smashing that like button"` spoken outro, red `"SUBSCRIBE"` banner, and `"RECAP / YOUR ANGLE"` overlay), and faded audio to `0.0` before `48.8s` so the `0:48.8–0:52.5` `chromagrain` end card has zero bleed (`-14.60 LUFS`, `-2.40 dBTP`, `5.40 LU` LRA).
+  2. **Piece 3 + `[SYSTEM]` `N == 3` Full-Width Bottom-Row Span (`crates/core/src/{tile.rs,video.rs,render.rs}`, `crates/ui/src/gpu.rs`, `vj_hillclimb.rs`):**
+     - Added `tile_rect_for_count` across CPU and GPU (`gpu_matches_the_cpu_for_tiles_and_envelopes` `"tile3"` verified) so when `3` voices are active in `Layout::Tile` (`!portrait_columns`), cell `2` spans full-width across the bottom row — eliminating empty black quadrants in both Piece 3 (`0:00`, `0:07`, `0:16`) and Piece 6 (`0:41–0:44` Fullscreen `Grid`).
+     - High-passed `t_crt` (`>= 380 Hz`, `0 st` `440–880 Hz` register), high-passed `t_prism` (`>= 540 Hz`, whisper audio gain), carved `265–275 Hz`, and boosted `1.65–3.4 kHz` bite on the `Q = 5.4` handpan ratchets & anvil percussion: **`mud(180–450 Hz)` dropped from `27.3% -> 8.4%`** while **`mid(450–4k)` jumped from `6.0% -> 26.0%`** (`-15.90 LUFS`, `-1.50 dBTP`, `2.20 LU` LRA).
+  3. **Piece 5 (`modell5-pulse_portrait-bursts_v003.mp4`):**
+     - Set `scan_speed = 0.0` (`spray = 0.004`) in `make_monolith` and clamped Right monolith `pos_pts` strictly inside `14.84..15.25s` so `source_pos` never drifts past `15.8s` onto the wide orchestra cut — all 3 `1.5 px`-divided monolith columns hold tight monumental human faces across every frame (`-11.90 LUFS`, `-2.10 dBTP`, `5.50 LU` LRA, `12.1%` mud).
+
+| File (`v003/out/`) | Spec | Duration | Integrated LUFS | True Peak | LRA | Mud (`180–450 Hz`) | Mid (`450–4k Hz`) |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `261113_chromagrain_frontier-therapy_dialogue-collage_v003.mp4` | `1080×1920 @ 60fps` | `19.59 s` | `-13.80 LUFS` | `-1.40 dBTP` | `3.00 LU` | `13.0%` | `37.3%` |
+| `261113_chromagrain_lemon-and-string_books-collage_v003.mp4` | `1920×1080 @ 60fps` | `18.64 s` | `-15.20 LUFS` | `-2.20 dBTP` | `10.40 LU` | `23.9%` | `46.0%` |
+| `261113_chromagrain_kinetic-prism_ratchet-grid_v003.mp4` | `1080×1080 @ 60fps` | `17.14 s` | `-15.90 LUFS` | `-1.50 dBTP` | `2.20 LU` | `8.4%` | `26.0%` |
+| `261113_chromagrain_oxide-ballroom_disintegration-loops_v003.mp4` | `1920×1080 @ 60fps` | `25.60 s` | `-12.70 LUFS` | `-2.60 dBTP` | `6.30 LU` | `18.0%` | `78.4%` |
+| `261113_chromagrain_modell5-pulse_portrait-bursts_v003.mp4` | `1920×1080 @ 60fps` | `16.40 s` | `-11.90 LUFS` | `-2.10 dBTP` | `5.50 LU` | `12.1%` | `46.0%` |
+| `261113_chromagrain_isol8-studio_vj-showcase_v003.mp4` | `1920×1080 @ 30fps` | `52.50 s` | `-14.60 LUFS` | `-2.40 dBTP` | `5.40 LU` | `13.0%` | `50.0%` |

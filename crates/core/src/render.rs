@@ -1013,7 +1013,7 @@ pub fn frame_tile_grids_stage(
 ) -> Vec<(u32, u32)> {
     frame_tile_grids_and_maps_stage(plans, t0, fps, n_frames, aspect, portrait_columns)
         .into_iter()
-        .map(|(g, _)| g)
+        .map(|(g, _, _)| g)
         .collect()
 }
 
@@ -1024,14 +1024,14 @@ fn frame_tile_grids_and_maps_stage(
     n_frames: usize,
     aspect: f32,
     portrait_columns: bool,
-) -> Vec<((u32, u32), Option<[u8; crate::tile::MAX_TILES]>)> {
+) -> Vec<((u32, u32), Option<[u8; crate::tile::MAX_TILES]>, usize)> {
     let slots = collect_frame_panel_slots(plans, t0, fps, n_frames, false);
     if aspect.is_finite() && aspect < 0.85 {
         return slots
             .into_iter()
             .map(|s| {
                 let (cnt, remap) = crate::tile::dense_slot_remap(&s);
-                (crate::tile::portrait_grid_for(cnt, aspect), Some(remap))
+                (crate::tile::portrait_grid_for(cnt, aspect), Some(remap), cnt)
             })
             .collect();
     }
@@ -1040,7 +1040,7 @@ fn frame_tile_grids_and_maps_stage(
             .into_iter()
             .map(|s| {
                 let (cnt, remap) = crate::tile::dense_slot_remap(&s);
-                (crate::tile::grid_for(cnt), Some(remap))
+                (crate::tile::grid_for(cnt), Some(remap), cnt)
             })
             .collect();
     }
@@ -1053,7 +1053,7 @@ fn frame_tile_grids_and_maps_stage(
             .max()
             .unwrap_or(1);
         let fixed_grid = crate::tile::portrait_grid_for(max_hi, aspect);
-        return vec![(fixed_grid, None); n_frames];
+        return vec![(fixed_grid, None, 0); n_frames];
     }
     let fps_f = fps.max(1e-3) as f64;
     let mut burst_frame = vec![false; n_frames];
@@ -1073,9 +1073,10 @@ fn frame_tile_grids_and_maps_stage(
         .enumerate()
         .map(|(fi, s)| {
             if burst_frame[fi] {
-                (crate::tile::frame_portrait_grid(s, aspect), None)
+                (crate::tile::frame_portrait_grid(s, aspect), None, 0)
             } else {
-                (crate::tile::frame_grid(s), None)
+                let (cnt, remap) = crate::tile::dense_slot_remap(&s);
+                (crate::tile::grid_for(cnt), Some(remap), cnt)
             }
         })
         .collect()
@@ -1692,16 +1693,16 @@ fn render_project_core(
         let ft = t0 + fi as f64 / project.fps as f64;
         let frame_beat = ft * project.bpm / 60.0;
         let cur_layout = layout_at(frame_beat);
-        let (grid_fi, remap_fi, has_fg_fi) = match cur_layout {
+        let (grid_fi, remap_fi, active_cnt_fi, has_fg_fi) = match cur_layout {
             crate::tile::Layout::Tile => match tile_grids_opt.as_ref().map(|g| g[fi]) {
-                Some((grid, remap)) => (Some(grid), remap, true),
-                None => (None, None, false),
+                Some((grid, remap, cnt)) => (Some(grid), remap, cnt, true),
+                None => (None, None, 0, false),
             },
             crate::tile::Layout::Split => match split_grids_opt.as_ref().map(|g| g[fi]) {
-                Some((grid, remap, has_fg)) => (Some(grid), Some(remap), has_fg),
-                None => (None, None, false),
+                Some((grid, remap, has_fg)) => (Some(grid), Some(remap), 0, has_fg),
+                None => (None, None, 0, false),
             },
-            crate::tile::Layout::Stack | crate::tile::Layout::Bleed => (None, None, false),
+            crate::tile::Layout::Stack | crate::tile::Layout::Bleed => (None, None, 0, false),
         };
         for ctx in track_ctxs.iter_mut() {
             let ti = ctx.ti;
@@ -1764,6 +1765,7 @@ fn render_project_core(
                                 cur_layout,
                                 grid_fi,
                                 remap_fi.as_ref(),
+                                active_cnt_fi,
                                 has_fg_fi,
                             );
                         }

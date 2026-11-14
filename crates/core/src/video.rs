@@ -767,13 +767,15 @@ pub fn grain_draws_stage(
         layout,
         panel_grid,
         None,
+        0,
         panel_grid.is_some(),
     )
 }
 
 /// [`grain_draws_stage`] with optional per-frame dense active-slot remap
-/// (`slot_remap`) and foreground-presence flag (`has_fg_panels` so solo washes
-/// in `Layout::Split` fill the stage brightly instead of dimming to `30%`).
+/// (`slot_remap`), active cell count (`active_count`, spanning cell 3 full-width
+/// when `active_count == 3` in a `2×2` `Layout::Tile` grid), and foreground-presence
+/// flag (`has_fg_panels` so solo washes in `Layout::Split` fill the stage brightly).
 #[allow(clippy::too_many_arguments)]
 pub fn grain_draws_stage_mapped(
     events: &[GrainEvent],
@@ -787,6 +789,7 @@ pub fn grain_draws_stage_mapped(
     layout: crate::tile::Layout,
     panel_grid: Option<(u32, u32)>,
     slot_remap: Option<&[u8; crate::tile::MAX_TILES]>,
+    active_count: usize,
     has_fg_panels: bool,
 ) -> Vec<GrainDraw> {
     let mut out = Vec::new();
@@ -873,7 +876,11 @@ pub fn grain_draws_stage_mapped(
                     let (sr, fe) = crate::tile::split_rect(slot as usize, cols, rows);
                     (sr, fe, false)
                 } else {
-                    (crate::tile::tile_rect(slot as usize, cols, rows, aspect), [false; 4], true)
+                    (
+                        crate::tile::tile_rect_for_count(slot as usize, cols, rows, active_count, aspect),
+                        [false; 4],
+                        true,
+                    )
                 };
                 let tile_ar = r.w * aspect / r.h.max(1e-6);
                 let patch = focus_cover_patch(tile_ar, aspect, ev.tag.focus, zoom * crop_zoom);
@@ -1206,12 +1213,13 @@ pub fn composite_grains_frame_stage(
         layout,
         panel_grid,
         None,
+        0,
         panel_grid.is_some(),
     );
 }
 
 /// [`composite_grains_frame_stage`] with optional per-frame dense active-slot remap
-/// (`slot_remap`) and foreground-presence flag (`has_fg_panels`).
+/// (`slot_remap`), active cell count (`active_count`), and foreground-presence flag (`has_fg_panels`).
 #[allow(clippy::too_many_arguments)]
 pub fn composite_grains_frame_stage_mapped(
     clip: &VideoClip,
@@ -1227,6 +1235,7 @@ pub fn composite_grains_frame_stage_mapped(
     layout: crate::tile::Layout,
     panel_grid: Option<(u32, u32)>,
     slot_remap: Option<&[u8; crate::tile::MAX_TILES]>,
+    active_count: usize,
     has_fg_panels: bool,
 ) {
     let ow = out.width as f32;
@@ -1247,6 +1256,7 @@ pub fn composite_grains_frame_stage_mapped(
         layout,
         panel_grid,
         slot_remap,
+        active_count,
         has_fg_panels,
     );
 

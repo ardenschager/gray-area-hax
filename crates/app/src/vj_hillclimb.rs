@@ -1113,7 +1113,7 @@ fn build_piece2_lemon_and_string() -> Project {
         AutoPoint { beat: 23.4, value: 0.22 },
         AutoPoint { beat: 32.0, value: 0.10 },
     ];
-    p.tracks[t_cello].eq.push(EqBand { freq: 265.0, q: 1.3, gain_db: -6.5 });
+    p.tracks[t_cello].eq.push(EqBand { freq: 265.0, q: 1.3, gain_db: -8.5 });
     p.tracks[t_cello].eq.push(EqBand { freq: 4400.0, q: 1.0, gain_db: 2.8 });
     p.tracks[t_cello].effects.push(AvEffect {
         kind: EffectKind::Reverb { size: 0.64, damp: 0.46, mix: 0.22 },
@@ -1200,7 +1200,7 @@ fn build_piece3_kinetic_prism() -> Project {
         layout_pan: true,
         studio_bus: true,
         captions_on: false,
-        master_gain_db: 2.8,
+        master_gain_db: 3.8,
         master_bloom: 0.20,
         ..Default::default()
     };
@@ -1392,22 +1392,27 @@ fn build_piece3_kinetic_prism() -> Project {
 
     let pid_anv = p.add_pattern(pat_anv);
     let t_anv = p.add_track("anvil ukg percussion");
-    p.tracks[t_anv].level = 0.92;
+    p.tracks[t_anv].level = 1.15;
+    p.tracks[t_anv].eq.push(EqBand { freq: 265.0, q: 1.3, gain_db: -5.0 });
+    p.tracks[t_anv].eq.push(EqBand { freq: 1950.0, q: 0.9, gain_db: 4.8 });
     p.tracks[t_anv].clips.push(Clip::new_pattern(pid_anv, 0.0, 40.0));
 
     // Track 2: Aphex Bouncing-Ball Ratchet Handpan (`×3 / ×4 / ×6` + High-Q Resonant Sweeps!)
-    // Build 6 steep resonant cutoff stages (`680 -> 1550 -> 3400 -> 6800 -> 1950 -> 5200 Hz` @ `Q = 5.4`)
-    // across the 40-beat timeline so the high-Q acid/IDM filter unmistakably sweeps!
+    // Build 6 steep resonant cutoff stages (`1350 -> 2400 -> 4200 -> 7200 -> 2600 -> 5800 Hz` @ `Q = 5.4`)
+    // across the 40-beat timeline so crisp 800 Hz-4.5 kHz acid/IDM ratchets cut right through!
     let cutoffs = [
-        (0.0, 6.0, 680.0f32),
-        (6.0, 6.0, 1550.0),
-        (12.0, 8.0, 3400.0),
-        (20.0, 8.0, 6800.0),
-        (28.0, 8.0, 1950.0),
-        (36.0, 4.0, 5200.0),
+        (0.0, 6.0, 1350.0f32),
+        (6.0, 6.0, 2400.0),
+        (12.0, 8.0, 4200.0),
+        (20.0, 8.0, 7200.0),
+        (28.0, 8.0, 2600.0),
+        (36.0, 4.0, 5800.0),
     ];
     let t_pan = p.add_track("aphex ratchet handpan");
-    p.tracks[t_pan].level = 1.18;
+    p.tracks[t_pan].level = 1.25;
+    p.tracks[t_pan].eq.push(EqBand { freq: 275.0, q: 1.3, gain_db: -8.5 });
+    p.tracks[t_pan].eq.push(EqBand { freq: 1650.0, q: 0.85, gain_db: 6.2 });
+    p.tracks[t_pan].eq.push(EqBand { freq: 3400.0, q: 1.0, gain_db: 4.5 });
     p.tracks[t_pan].duck = Some(DuckSpec {
         source_track: t_ukg,
         amount: 0.45,
@@ -1434,10 +1439,10 @@ fn build_piece3_kinetic_prism() -> Project {
         pat_p.rows[rp].sculpt = VoiceSculpt {
             comb_mix: 0.54,
             comb_feedback: 0.92,
-            hpf_hz: 185.0,
+            hpf_hz: 320.0,
             lpf_hz: lpf,
             resonance_q: 5.4, // Singing high-Q acid/IDM resonant filter sweep!
-            drive_db: 5.2,
+            drive_db: 5.5,
             pocket_carve: true,
             ..VoiceSculpt::preset(Stamp::Pluck)
         };
@@ -1484,12 +1489,12 @@ fn build_piece3_kinetic_prism() -> Project {
         ..Adsr::default()
     });
     pat_crt.rows[rc].sculpt = VoiceSculpt {
-        pitch_semitones: -12.0,
+        pitch_semitones: 0.0, // Crystalline 440-880 Hz mid register (zero 220 Hz mud!)
         chord: ChordVoicing::Min9,
-        shimmer: 0.24,
-        hpf_hz: 230.0,
-        lpf_hz: 8400.0,
-        resonance_q: 2.4,
+        shimmer: 0.28,
+        hpf_hz: 380.0,
+        lpf_hz: 9600.0,
+        resonance_q: 2.6,
         pocket_carve: true,
         ..VoiceSculpt::preset(Stamp::Chord)
     };
@@ -1515,7 +1520,9 @@ fn build_piece3_kinetic_prism() -> Project {
     }
     let pid_crt = p.add_pattern(pat_crt);
     let t_crt = p.add_track("crt oscilloscope chords");
-    p.tracks[t_crt].level = 0.96;
+    p.tracks[t_crt].level = 1.02;
+    p.tracks[t_crt].eq.push(EqBand { freq: 270.0, q: 1.2, gain_db: -8.5 });
+    p.tracks[t_crt].eq.push(EqBand { freq: 1850.0, q: 1.0, gain_db: 3.8 });
     p.tracks[t_crt].duck = Some(DuckSpec {
         source_track: t_ukg,
         amount: 0.48,
@@ -1525,19 +1532,21 @@ fn build_piece3_kinetic_prism() -> Project {
     });
     p.tracks[t_crt].clips.push(Clip::new_pattern(pid_crt, 0.0, 40.0));
     // Bright full-canvas sunlit handpan + CRT dual prism bed across `beats 20..36` so the 6-fold
-    // spinning polar `Kaleido` folds vibrant warm color + glowing neon vector geometry on every frame!
+    // spinning polar `Kaleido` folds vibrant warm color + glowing neon vector geometry (high-passed
+    // >= 520 Hz at whisper audio gain so zero 180-450 Hz mud enters the mix!).
     let t_prism = p.add_track("kaleido prism bed");
-    p.tracks[t_prism].level = 0.82;
+    p.tracks[t_prism].level = 0.85;
     let mut c_prism = Clip::new_snippet(id_pan, 20.0, 16.0);
     c_prism.key = Some(key);
     c_prism.grains.position = 5.5 / 30.0;
-    c_prism.grains.pitch = 0.0;
-    c_prism.grains.gain = 0.36;
+    c_prism.grains.pitch = 12.0;
+    c_prism.grains.gain = 0.08;
+    c_prism.link.gain_to_opacity = 0.0;
     c_prism.visual.additive = 0.35;
     c_prism.grains.sculpt = VoiceSculpt {
         free_loop_secs: Some(3.2),
         shimmer: 0.45,
-        hpf_hz: 320.0,
+        hpf_hz: 540.0,
         lpf_hz: 9500.0,
         pocket_carve: true,
         ..VoiceSculpt::preset(Stamp::TapeLoop)
@@ -1831,7 +1840,7 @@ fn build_piece5_modell5_pulse() -> Project {
         layout_pan: true,
         studio_bus: true,
         captions_on: false,
-        master_gain_db: 2.2,
+        master_gain_db: 1.1,
         master_bloom: 0.16,
         ..Default::default()
     };
@@ -1920,8 +1929,8 @@ fn build_piece5_modell5_pulse() -> Project {
             duration: 0.032,
             duration_jitter: 0.0, // Synchronous pulse train!
             position: pos_pts[0].1 as f32,
-            spray: 0.008, // Micro-frozen vocal vowel/expression!
-            scan_speed: 0.05,
+            spray: 0.004, // Micro-frozen vocal vowel/expression (never drifts across cuts)!
+            scan_speed: 0.0,
             pitch: 0.0,
             quantize_amount: 0.0,
             gain: 0.98,
@@ -2051,10 +2060,10 @@ fn build_piece5_modell5_pulse() -> Project {
         29.8,
         1.65,
         &[
-            (0.0, 14.88 / 28.0),
-            (8.0, 15.22 / 28.0),
-            (15.0, 15.56 / 28.0),
-            (23.0, 15.05 / 28.0),
+            (0.0, 14.84 / 28.0),
+            (8.0, 15.05 / 28.0),
+            (15.0, 15.25 / 28.0),
+            (23.0, 14.95 / 28.0),
         ],
         &[
             (0.0, 14.0),
@@ -2321,9 +2330,40 @@ fn harness_isol8_showcase(opts: &RecordOpts) -> Harness<'static, Film> {
         "20260618",
         959,
         "https://www.youtube.com/watch?v=Bldi_Ph-oDw",
-        (49.5, 28.0),
+        (49.5, 17.8),
     );
-    let _ = push_slice(&mut s0, 19.32, 19.55, SliceRole::Kick, "", Some((0.68, 0.46)));
+    // Trim off 17.8..28.0s YouTuber spoken outro ("smashing that like button" + SUBSCRIBE banner)
+    // and crop frames to [0.45, 0.08, 0.50, 0.76] past "RECAP / YOUR ANGLE" & bottom captions!
+    if let Some(a_arc) = s0.audio.as_mut() {
+        let mut a = (**a_arc).clone();
+        let keep = ((17.8 * a.sample_rate as f64) as usize).min(a.samples.len());
+        a.samples.truncate(keep);
+        if let Some(side) = a.side.as_mut() {
+            side.truncate(keep);
+        }
+        *a_arc = std::sync::Arc::new(a);
+    }
+    if let Some(v_arc) = s0.video.as_mut() {
+        let mut v = (**v_arc).clone();
+        let keep_vf = ((17.8 * v.fps as f64) as usize).min(v.frames.len()).max(1);
+        v.frames.truncate(keep_vf);
+        for f in &mut v.frames {
+            let x0 = ((f.width as f32 * 0.45) as u32).min(f.width.saturating_sub(2));
+            let y0 = ((f.height as f32 * 0.08) as u32).min(f.height.saturating_sub(2));
+            let cw = (((f.width as f32 * 0.50) as u32) & !1).clamp(2, f.width - x0);
+            let ch = (((f.height as f32 * 0.76) as u32) & !1).clamp(2, f.height - y0);
+            let mut cropped = chromagrain_core::video::Frame::black(cw, ch);
+            for y in 0..ch {
+                for x in 0..cw {
+                    cropped.put(x, y, f.get(x0 + x, y0 + y));
+                }
+            }
+            *f = cropped;
+        }
+        *v_arc = std::sync::Arc::new(v);
+    }
+    s0.slices = s0.auto_slices(16);
+    let _ = push_slice(&mut s0, 17.28, 17.55, SliceRole::Kick, "", Some((0.50, 0.50)));
 
     let s1_raw = load_yt(
         "p1_funk_drums_fnTaVyzWYjI.mp4",
@@ -2610,15 +2650,17 @@ fn mux_showcase_hd(
     wav: &Path,
     out: &Path,
     fade_from: f64,
-    len: f64,
+    _len: f64,
 ) -> Result<(), String> {
     let comp = "acompressor=threshold=-25dB:ratio=2.2:attack=25:release=300:knee=6";
+    // Clean fade-out finishing BEFORE `end_card` (`48.8s`) + hard mute after `48.78s` so the
+    // closing `chromagrain` title card (`0:48.8..0:52.5`) has zero audio bleed!
+    let fade_st = (fade_from - 1.25).max(1.0);
     let fade = format!(
-        "afade=t=out:st={:.2}:d={:.2}",
-        fade_from,
-        (len - fade_from - 0.35).max(0.5)
+        "afade=t=out:st={:.2}:d=1.05,volume=enable='gte(t,{:.2})':volume=0",
+        fade_st,
+        fade_st + 1.08
     );
-    // 4x oversampled 192 kHz true-peak ceiling at -1.4 dBTP (0.8128) so post-AAC TP <= -1.0 dBTP!
     let af = format!(
         "{comp},{fade},loudnorm=I=-14.6:TP=-2.4:LRA=9,aresample=192000,alimiter=limit=0.7328:attack=1.5:release=35:level=false,aresample=48000"
     );

@@ -18,7 +18,9 @@ use chromagrain_core::fx::{AvEffect, EffectKind};
 use chromagrain_core::grain::GrainEvent;
 use chromagrain_core::render::ClipPlan;
 use chromagrain_core::timeline::{ClipKind, Project};
-use chromagrain_core::video::{grain_draws_layout, ColorFilterMode, GrainDraw, VisualGrainStyle};
+use chromagrain_core::video::{
+    grain_draws_stage_mapped, ColorFilterMode, GrainDraw, VisualGrainStyle, OPTICAL_CARRY_SECS,
+};
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -73,8 +75,14 @@ pub fn effective_stage_mode(scene: &Scene) -> StageMode {
 }
 
 /// The frame's tile grid (`Layout::Tile` / `StageMode::Grid`), as the CPU
-/// compositor computes it (`render::frame_tile_grids` / `tile::frame_grid`).
+/// compositor computes it (`render::frame_tile_grids_stage`).
 pub fn tile_grid(scene: &Scene) -> Option<(u32, u32)> {
+    tile_grid_and_remap(scene).map(|(g, _, _)| g)
+}
+
+fn tile_grid_and_remap(
+    scene: &Scene,
+) -> Option<((u32, u32), usize, [u8; chromagrain_core::tile::MAX_TILES])> {
     if effective_stage_mode(scene) != StageMode::Grid {
         return None;
     }
@@ -84,7 +92,18 @@ pub fn tile_grid(scene: &Scene) -> Option<(u32, u32)> {
             return;
         }
         if let Some(slot) = e.tag.tile {
-            if t >= e.onset && t < e.end() && e.tag.picture_at(t) > 0.0 && !slots.contains(&slot) {
+            let carry = if !scene.parked
+                && !e.tag.hard_burst
+                && e.tag.env.is_none()
+                && e.tag.choke_at.is_none()
+                && e.duration > 0.085
+                && e.duration < 0.35
+            {
+                OPTICAL_CARRY_SECS
+            } else {
+                0.0
+            };
+            if t >= e.onset && t < e.end() + carry && e.tag.picture_at(t) > 0.0 && !slots.contains(&slot) {
                 slots.push(slot);
             }
         }
@@ -102,7 +121,14 @@ pub fn tile_grid(scene: &Scene) -> Option<(u32, u32)> {
     for (_, _, e) in &scene.live {
         see(e, scene.live_t);
     }
-    Some(chromagrain_core::tile::frame_grid(slots))
+    let aspect = scene.project.width.max(1) as f32 / scene.project.height.max(1) as f32;
+    let (cnt, remap) = chromagrain_core::tile::dense_slot_remap(&slots);
+    let grid = if aspect < 0.85 {
+        chromagrain_core::tile::portrait_grid_for(cnt, aspect)
+    } else {
+        chromagrain_core::tile::grid_for(cnt)
+    };
+    Some((grid, cnt, remap))
 }
 
 /// Cover-crop normalized `[x, y, w, h]` patch around `focus = (cx, cy)` with
@@ -1754,7 +1780,15 @@ impl GpuPreview {
         if stage_mode == StageMode::Split {
             any_drawn |= self.render_split_stage(scene, aspect, fps);
         } else {
-            let tgrid = tile_grid(scene);
+            let tinfo = tile_grid_and_remap(scene);
+            let tgrid = tinfo.map(|(g, _, _)| g);
+            let tcount = tinfo.map(|(_, c, _)| c).unwrap_or(0);
+            let tremap = tinfo.map(|(_, _, r)| r);
+            let layout_for_draws = if tgrid.is_some() {
+                chromagrain_core::tile::Layout::Tile
+            } else {
+                chromagrain_core::tile::Layout::Stack
+            };
             let is_bleed = stage_mode == StageMode::Bleed;
 
             for (ti, track) in scene.project.tracks.iter().enumerate() {
@@ -1768,13 +1802,16 @@ impl GpuPreview {
                 self.pass(TRACK, Some([0.0; 4]));
                 let mut track_any = !track.effects.is_empty();
                 let oxide = track.tape.age.clamp(0.0, 1.0);
+                let carry_pad = if tgrid.is_some() { OPTICAL_CARRY_SECS } else { 0.0 };
 
                 for cp in &plans {
                     let Some(clip) = track.clips.get(cp.clip_index) else { continue };
-                    let any_active = cp
-                        .parts
-                        .iter()
-                        .any(|(_, evs)| evs.iter().any(|e| t >= e.onset && t < e.onset + cp.style.visual_duration(e.duration)));
+                    let any_active = cp.parts.iter().any(|(_, evs)| {
+                        evs.iter().any(|e| {
+                            t >= e.onset
+                                && t < e.onset + cp.style.visual_duration(e.duration).max(e.duration as f64 + carry_pad)
+                        })
+                    });
                     if !any_active && clip.effects.is_empty() {
                         continue;
                     }
@@ -1789,7 +1826,7 @@ impl GpuPreview {
                             } else {
                                 cp.style
                             };
-                            let raw_draws = grain_draws_layout(
+                            let raw_draws = grain_draws_stage_mapped(
                                 evs,
                                 &style,
                                 &clip.link,
@@ -1798,7 +1835,11 @@ impl GpuPreview {
                                 t,
                                 aspect,
                                 scene.parked,
+                                layout_for_draws,
                                 tgrid,
+                                tremap.as_ref(),
+                                tcount,
+                                tgrid.is_some(),
                             );
                             let focus_opt = scene.focus_overrides.get(sid).copied();
                             let ext_draws: Vec<(GrainDraw, bool, u32, f32)> = raw_draws
@@ -1877,7 +1918,7 @@ impl GpuPreview {
                     let dur = gsrc.duration.max(1e-6);
                     let src_ar = gsrc.src_aspect;
                     let eff_style = if is_bleed { VisualGrainStyle::full_frame(0.0) } else { style };
-                    let raw_draws = grain_draws_layout(
+                    let raw_draws = grain_draws_stage_mapped(
                         std::slice::from_ref(ev),
                         &eff_style,
                         &link,
@@ -1886,7 +1927,11 @@ impl GpuPreview {
                         scene.live_t,
                         aspect,
                         false,
+                        layout_for_draws,
                         tgrid,
+                        tremap.as_ref(),
+                        tcount,
+                        tgrid.is_some(),
                     );
                     let focus_opt = scene.focus_overrides.get(sid).copied();
                     let dt = (scene.live_t - ev.onset).max(0.0);

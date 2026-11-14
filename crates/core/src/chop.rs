@@ -619,12 +619,14 @@ pub fn build_kit_across_sources_opt(sources: &[Source], key: Option<Key>) -> Vec
     #[derive(Clone)]
     struct Cand {
         sid: SourceId,
+        src_dur: f64,
         slice: Slice,
         used: bool,
     }
     let mut pool: Vec<Cand> = Vec::new();
     for (sid, src) in sources.iter().enumerate() {
-        if src.duration() < MIN_SLICE {
+        let src_dur = src.duration();
+        if src_dur < MIN_SLICE {
             continue;
         }
         let mut sls = if !src.slices.is_empty() {
@@ -636,9 +638,9 @@ pub fn build_kit_across_sources_opt(sources: &[Source], key: Option<Key>) -> Vec
         } else {
             analyze_source_slices(src, 24)
         };
-        if sls.len() < 4 && src.duration() >= 0.4 {
+        if sls.len() < 4 && src_dur >= 0.4 {
             // Subdivide long steady clips so even 1 smooth clip can yield a multi-pad kit.
-            let mut extra = equal_slices(src.duration(), 8);
+            let mut extra = equal_slices(src_dur, 8);
             enrich_slices(&mut extra, src.audio.as_deref(), src.video.as_deref());
             for es in extra {
                 if !sls.iter().any(|x| (x.start - es.start).abs() < 0.04) {
@@ -648,7 +650,7 @@ pub fn build_kit_across_sources_opt(sources: &[Source], key: Option<Key>) -> Vec
         }
         for slice in sls {
             if slice.rms_db > -68.0 || src.audio.is_none() {
-                pool.push(Cand { sid, slice, used: false });
+                pool.push(Cand { sid, src_dur, slice, used: false });
             }
         }
     }
@@ -878,15 +880,46 @@ pub fn build_kit_across_sources_opt(sources: &[Source], key: Option<Key>) -> Vec
         });
     }
 
-    // 6. Texture / TapeLoop pads (pads 14..16).
+    // 6. Texture / TapeLoop pads (pads 14..16): penalize late-clip YouTuber outro segments
+    // (last 20% of >=8s clips) and syllabic 1-3.5 kHz speech chatter in favor of sustained harmonics!
     let loop_lengths = [5.3f32, 7.9];
     let mut tex_idx = 0usize;
     while out.len() < 16 {
-        let Some((sid, mut sl)) = pick_best(&mut pool, &mut src_counts, &|s| {
-            (s.len().min(4.0) as f32) * (1.15 - 0.5 * s.punch) + 0.1
-        }) else {
-            break;
-        };
+        let mut best_i = None;
+        let mut best_s = f32::NEG_INFINITY;
+        for (i, c) in pool.iter().enumerate() {
+            if c.used {
+                continue;
+            }
+            let s = &c.slice;
+            let outro_guard = if c.src_dur >= 8.0 && s.end > 0.80 * c.src_dur {
+                0.08
+            } else {
+                1.0
+            };
+            let speech_guard = if s.role_hint == SliceRole::Phrase
+                || (s.bands[2] > 0.36 && s.pitch_confidence < 0.62)
+            {
+                0.12
+            } else {
+                1.0
+            };
+            let tonal_bonus = 0.65 + 0.95 * s.pitch_confidence;
+            let base = ((s.len().min(4.0) as f32) * (1.15 - 0.5 * s.punch) + 0.1)
+                * tonal_bonus
+                * outro_guard
+                * speech_guard;
+            let div_bonus = 1.0 / (1.0 + 0.35 * src_counts[c.sid] as f32);
+            let sc = base * div_bonus;
+            if sc > best_s {
+                best_s = sc;
+                best_i = Some(i);
+            }
+        }
+        let Some(idx) = best_i else { break };
+        pool[idx].used = true;
+        src_counts[pool[idx].sid] += 1;
+        let (sid, mut sl) = (pool[idx].sid, pool[idx].slice);
         sl.role_hint = SliceRole::Texture;
         let is_tape = tex_idx == 1;
         let stamp = if is_tape { Stamp::TapeLoop } else { Stamp::Wash };
@@ -951,14 +984,16 @@ pub fn build_tape_loops_across_sources(sources: &[Source], key: Option<Key>) -> 
                 let mut sl = Slice::new(s0, s1);
                 analyze_slice_features(&mut sl, src.audio.as_deref(), src.video.as_deref());
                 sl.role_hint = SliceRole::Texture;
-                let warmth = sl.bands[0] * 0.5 + sl.bands[1] * 1.1 + sl.bands[2] * 1.0;
+                let warmth = sl.bands[0] * 0.5 + sl.bands[1] * 1.1 + sl.bands[2] * 0.65;
                 let calm = 1.2 - 0.55 * sl.punch;
-                let tonal = 0.7 + 0.6 * sl.pitch_confidence;
+                let tonal = 0.7 + 0.85 * sl.pitch_confidence;
+                let outro_guard = if dur >= 8.0 && s1 > 0.80 * dur { 0.10 } else { 1.0 };
+                let speech_guard = if sl.bands[2] > 0.38 && sl.pitch_confidence < 0.60 { 0.15 } else { 1.0 };
                 let audible = if sl.rms_db > -62.0 || src.audio.is_none() { 1.0 } else { 0.05 };
                 cands.push(LoopCand {
                     sid,
                     slice: sl,
-                    score: warmth * calm * tonal * audible * (sl.len().min(12.0) as f32),
+                    score: warmth * calm * tonal * outro_guard * speech_guard * audible * (sl.len().min(12.0) as f32),
                 });
             }
             if s1 >= dur - 1e-3 {
