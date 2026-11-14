@@ -616,7 +616,7 @@ impl KitPadSpec {
         slot
     }
 
-    /// Convert into a [`crate::seq::SeqRow`] ready for [`crate::seq::StepPattern::seed_ukg_2step`].
+    /// Convert into a [`crate::seq::SeqRow`] ready for [`crate::seq::StepPattern::apply_preset`].
     pub fn to_seq_row(&self, n_steps: usize, src_len: f64) -> crate::seq::SeqRow {
         let mut row = crate::seq::SeqRow::new(self.source, n_steps);
         row.grains.position = if src_len > 0.0 {
@@ -630,7 +630,14 @@ impl KitPadSpec {
         row.grains.pan = self.pan;
         row.grains.pan_spread = 0.06;
         row.grains.envelope = 0.04;
-        row.grains.adsr = Some(self.adsr.unwrap_or_else(hard_cut_adsr));
+        row.grains.adsr = if matches!(
+            self.stamp,
+            Stamp::Kick | Stamp::Snare | Stamp::VoxPerc | Stamp::Hat
+        ) {
+            None
+        } else {
+            Some(self.adsr.unwrap_or_else(hard_cut_adsr))
+        };
         row.sculpt = self.sculpt;
         row.grains.sculpt = self.sculpt;
         row.choke_group = self.choke_group;
@@ -1164,10 +1171,10 @@ pub fn build_ukg_vox_kit_across_sources_opt<S: AsRef<Source>>(
         }
     }
 
-    // 3. Pads 4..8: `VoxPerc` (`28..55 ms` crisp sibilants/plosives/micro-vowels `"t"`, `"k"`, `"s"`, `"uh"`).
-    let vox_durs = [0.032f64, 0.038, 0.045, 0.052];
-    let vox_pans = [-0.24f32, 0.22, -0.14, 0.28];
-    let vox_pitches = [0.0f32, 2.0, -1.5, 3.5];
+    // 3. Pads 4..8: `VoxPerc` (`32..58 ms` crisp sibilants/plosives/micro-vowels `"t"`, `"k"`, `"s"`, `"uh"`).
+    let vox_durs = [0.036f64, 0.042, 0.048, 0.054];
+    let vox_pans = [-0.34f32, 0.34, -0.26, 0.28];
+    let vox_pitches = [0.0f32, 2.0, -1.5, 3.0];
     let vox_labels = ["Vox T", "Vox K", "Vox S", "Vox Uh"];
     for k in 0..4 {
         if let Some((sid, src_dur, mut sl)) = pick_or_reuse(&mut pool, &mut src_counts, &|c| {
@@ -1225,6 +1232,10 @@ pub fn build_ukg_vox_kit_across_sources_opt<S: AsRef<Source>>(
                 sl.end = (sl.start + sl.len().clamp(0.24, 0.58)).min(src_dur);
                 let mut sculpt = VoiceSculpt::preset(Stamp::Chord);
                 sculpt.chord = if k == 0 { ChordVoicing::Min7 } else { ChordVoicing::Sus4 };
+                sculpt.hpf_hz = 305.0;
+                sculpt.lpf_hz = 3600.0;
+                sculpt.shimmer = 0.0;
+                sculpt.pocket_carve = true;
                 out.push(KitPadSpec {
                     pad_index: out.len(),
                     source: sid,
@@ -1232,8 +1243,8 @@ pub fn build_ukg_vox_kit_across_sources_opt<S: AsRef<Source>>(
                     stamp: Stamp::Chord,
                     sculpt,
                     pitch_semitones: tune_st + if k == 0 { 0.0 } else { 5.0 },
-                    gain: 0.84,
-                    pan: if k == 0 { -0.12 } else { 0.14 },
+                    gain: 0.80,
+                    pan: if k == 0 { -0.14 } else { 0.14 },
                     choke_group: 4,
                     one_shot: true,
                     adsr: Some(hard_cut_adsr()),
@@ -1244,10 +1255,10 @@ pub fn build_ukg_vox_kit_across_sources_opt<S: AsRef<Source>>(
                 sl.end = (sl.start + sl.len().clamp(0.22, 0.50)).min(src_dur);
                 let mut sculpt = VoiceSculpt::preset(Stamp::Pluck);
                 sculpt.pitch_semitones = -12.0;
-                sculpt.sub_exciter = 0.78;
+                sculpt.sub_exciter = 0.82;
                 sculpt.drive_db = 5.5;
-                sculpt.hpf_hz = 32.0;
-                sculpt.lpf_hz = 260.0;
+                sculpt.hpf_hz = 30.0;
+                sculpt.lpf_hz = 155.0;
                 sculpt.comb_mix = 0.36;
                 sculpt.pocket_carve = false;
                 out.push(KitPadSpec {
@@ -1259,7 +1270,7 @@ pub fn build_ukg_vox_kit_across_sources_opt<S: AsRef<Source>>(
                     pitch_semitones: tune_st,
                     gain: 0.92,
                     pan: 0.0,
-                    choke_group: 0,
+                    choke_group: 2,
                     one_shot: true,
                     adsr: Some(hard_cut_adsr()),
                     link: default_kit_pad_link(),
@@ -1298,14 +1309,18 @@ pub fn build_ukg_vox_kit_across_sources_opt<S: AsRef<Source>>(
             analyze_slice_features(&mut sl, src_obj.audio.as_deref(), src_obj.video.as_deref());
         }
         sl.role_hint = SliceRole::Phrase;
+        let mut phrase_sculpt = VoiceSculpt::preset(Stamp::Phrase);
+        phrase_sculpt.hpf_hz = 215.0;
+        phrase_sculpt.drive_db = 2.4;
+        phrase_sculpt.pocket_carve = true;
         out.push(KitPadSpec {
             pad_index: out.len(),
             source: sid,
             slice: sl,
             stamp: Stamp::Phrase,
-            sculpt: VoiceSculpt::preset(Stamp::Phrase),
+            sculpt: phrase_sculpt,
             pitch_semitones: 0.0,
-            gain: 0.96,
+            gain: 1.24,
             pan: 0.0,
             choke_group: 1,
             one_shot: true,

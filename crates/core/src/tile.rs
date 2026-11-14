@@ -302,6 +302,37 @@ pub fn split_rect(slot: usize, cols: u32, rows: u32) -> (TileRect, [bool; 4]) {
     )
 }
 
+/// Like [`split_rect`], expanding any incomplete bottom row (`active_count < cols * rows`)
+/// across the full canvas width and collapsing unused empty trailing rows so `1..=9`
+/// active voices always pack 100% of the canvas with zero empty black cells.
+pub fn split_rect_for_count(
+    slot: usize,
+    cols: u32,
+    rows: u32,
+    active_count: usize,
+) -> (TileRect, [bool; 4]) {
+    let (cols, rows) = (cols.max(1), rows.max(1));
+    let cap = (cols * rows) as usize;
+    if active_count > 0 && active_count < cap {
+        let eff_rows = active_count.div_ceil(cols as usize).max(1) as u32;
+        let clamped = slot.min(active_count - 1);
+        let r = (clamped / cols as usize) as u32;
+        let c = (clamped % cols as usize) as u32;
+        let row_cols = if r + 1 == eff_rows {
+            (active_count - (r as usize * cols as usize)).max(1) as u32
+        } else {
+            cols
+        };
+        let w = 1.0 / row_cols as f32;
+        let h = 1.0 / eff_rows as f32;
+        return (
+            TileRect { x: c as f32 * w, y: r as f32 * h, w, h },
+            [false; 4],
+        );
+    }
+    split_rect(slot, cols, rows)
+}
+
 /// Grid (cols, rows) that holds `n` tiles: 1 → 1×1, 2 → 2×1, 3–4 → 2×2,
 /// 5–9 → 3×3.
 pub fn grid_for(n: usize) -> (u32, u32) {
@@ -343,9 +374,10 @@ pub fn tile_rect(slot: usize, cols: u32, rows: u32, aspect: f32) -> TileRect {
     TileRect { x: c as f32 * (w + gx), y: r as f32 * (h + gy), w, h }
 }
 
-/// Like [`tile_rect`], spanning the 3rd active cell (`slot == 2`) full-width
-/// across the bottom row when `active_count == 3` in a `2×2` grid so 3 active
-/// voices fill 100% of the canvas with zero empty black quadrants!
+/// Like [`tile_rect`], expanding any incomplete bottom row (`active_count < cols * rows`,
+/// e.g. `3` in `2×2`, `5` in `3×2` or `3×3`, `7..8` in `3×3`) across 100% of the canvas
+/// width and collapsing unused trailing rows so `1..=9` active voices always fill 100%
+/// of the stage with zero empty black cells!
 pub fn tile_rect_for_count(
     slot: usize,
     cols: u32,
@@ -353,9 +385,27 @@ pub fn tile_rect_for_count(
     active_count: usize,
     aspect: f32,
 ) -> TileRect {
-    if active_count == 3 && cols == 2 && rows == 2 && slot >= 2 {
-        let r = tile_rect(2, 2, 2, aspect);
-        return TileRect { x: 0.0, y: r.y, w: 1.0, h: r.h };
+    let (cols, rows) = (cols.max(1), rows.max(1));
+    let cap = (cols * rows) as usize;
+    if active_count > 0 && active_count < cap {
+        let eff_rows = active_count.div_ceil(cols as usize).max(1) as u32;
+        let clamped = slot.min(active_count - 1);
+        let r = (clamped / cols as usize) as u32;
+        let c = (clamped % cols as usize) as u32;
+        let row_cols = if r + 1 == eff_rows {
+            (active_count - (r as usize * cols as usize)).max(1) as u32
+        } else {
+            cols
+        };
+        let aspect = if aspect.is_finite() && aspect > 0.0 { aspect } else { 1.0 };
+        let (gx, gy) = if aspect >= 1.0 {
+            (TILE_GAP / aspect, TILE_GAP)
+        } else {
+            (TILE_GAP, TILE_GAP * aspect)
+        };
+        let w = (1.0 - gx * (row_cols - 1) as f32) / row_cols as f32;
+        let h = (1.0 - gy * (eff_rows - 1) as f32) / eff_rows as f32;
+        return TileRect { x: c as f32 * (w + gx), y: r as f32 * (h + gy), w, h };
     }
     tile_rect(slot, cols, rows, aspect)
 }
@@ -440,6 +490,9 @@ pub struct TileAssigner {
     slots: [Option<(u64, f64, f64)>; MAX_TILES],
     /// Affinity key of each slot's latest voice (see [`TileAssigner::assign_keyed`]).
     keys: [Option<u64>; MAX_TILES],
+    /// Earliest release horizon carried when an overlapping voice with the same `key`
+    /// shares an already-active slot (`0.0` when none).
+    min_end: [f64; MAX_TILES],
 }
 
 impl TileAssigner {
@@ -449,9 +502,10 @@ impl TileAssigner {
 
     /// Free the slots of voices that ended at or before `t`.
     pub fn expire(&mut self, t: f64) {
-        for s in self.slots.iter_mut() {
+        for (i, s) in self.slots.iter_mut().enumerate() {
             if s.is_some_and(|(_, _, end)| end <= t) {
                 *s = None;
+                self.min_end[i] = 0.0;
             }
         }
     }
@@ -467,6 +521,7 @@ impl TileAssigner {
         match self.slots.iter().position(|s| s.is_none()) {
             Some(i) => {
                 self.slots[i] = Some((voice, t, f64::INFINITY));
+                self.min_end[i] = 0.0;
                 i as u8
             }
             None => (voice % MAX_TILES as u64) as u8,
@@ -492,6 +547,11 @@ impl TileAssigner {
             .or_else(|| (0..MAX_TILES).find(free));
         match i {
             Some(i) => {
+                let prev_end = self.slots[i]
+                    .filter(|_| self.keys[i] == Some(key))
+                    .map(|(_, _, e)| if e.is_finite() { e } else { 0.0 })
+                    .unwrap_or(0.0);
+                self.min_end[i] = self.min_end[i].max(prev_end);
                 self.slots[i] = Some((voice, t, f64::INFINITY));
                 self.keys[i] = Some(key);
                 i as u8
@@ -528,6 +588,11 @@ impl TileAssigner {
             .or_else(|| (0..MAX_TILES).find(free));
         match i {
             Some(i) => {
+                let prev_end = self.slots[i]
+                    .filter(|_| self.keys[i] == Some(key))
+                    .map(|(_, _, e)| if e.is_finite() { e } else { 0.0 })
+                    .unwrap_or(0.0);
+                self.min_end[i] = self.min_end[i].max(prev_end);
                 self.slots[i] = Some((voice, t, f64::INFINITY));
                 self.keys[i] = Some(key);
                 i as u8
@@ -540,7 +605,7 @@ impl TileAssigner {
     pub fn release(&mut self, voice: u64, end: f64) {
         if let Some(i) = self.slot_of(voice) {
             if let Some(s) = self.slots[i].as_mut() {
-                s.2 = end;
+                s.2 = end.max(self.min_end[i]);
             }
         }
     }
@@ -565,6 +630,7 @@ impl TileAssigner {
     pub fn clear(&mut self) {
         self.slots = [None; MAX_TILES];
         self.keys = [None; MAX_TILES];
+        self.min_end = [0.0; MAX_TILES];
     }
 }
 

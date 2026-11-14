@@ -714,6 +714,39 @@ impl Project {
         self.patterns.len() - 1
     }
 
+    /// 1-click zero-AI 4-Section Song Expander (`Intro -> Drop -> Break -> Climax`):
+    /// expands `self.patterns[pattern_idx]` via [`crate::seq::StepPattern::expand_four_sections`],
+    /// appends the 4 scene patterns to `self.patterns`, and sequences a complete 12-bar
+    /// dramatic arc (`Bars 1–2 Intro` -> `Bars 3–6 Drop` -> `Bars 7–8 Break` -> `Bars 9–12 Climax + Dry Punchline Outro`)
+    /// onto the track hosting `pattern_idx` (or a new `"song_seq"` track if none).
+    pub fn arrange_four_section_song(&mut self, pattern_idx: usize) -> [usize; 4] {
+        let Some(base_pat) = self.patterns.get(pattern_idx).cloned() else {
+            return [0, 0, 0, 0];
+        };
+        let secs = base_pat.expand_four_sections();
+        let ids = [
+            self.add_pattern(secs[0].clone()),
+            self.add_pattern(secs[1].clone()),
+            self.add_pattern(secs[2].clone()),
+            self.add_pattern(secs[3].clone()),
+        ];
+        let tid = self
+            .tracks
+            .iter()
+            .position(|tr| {
+                tr.clips
+                    .iter()
+                    .any(|c| matches!(c.kind, ClipKind::Pattern(pid) if pid == pattern_idx))
+            })
+            .unwrap_or_else(|| self.add_track("song_seq"));
+        self.tracks[tid].clips.clear();
+        let spans = [(ids[0], 0.0, 8.0), (ids[1], 8.0, 16.0), (ids[2], 24.0, 8.0), (ids[3], 32.0, 16.0)];
+        for (pid, start_b, len_b) in spans {
+            self.tracks[tid].clips.push(Clip::new_pattern(pid, start_b, len_b));
+        }
+        ids
+    }
+
     /// Last beat covered by any clip.
     pub fn end_beat(&self) -> f64 {
         self.tracks
