@@ -1125,11 +1125,8 @@ pub fn grain_draws_stage_mapped(
                 let slot = slot_remap
                     .map(|m| m[(raw_slot as usize).min(crate::tile::MAX_TILES - 1)])
                     .unwrap_or(raw_slot);
-                let carry_fade = if dt <= dur_f64 || ev.tag.visual_hold > 0.0 {
+                let carry_fade = if dt <= dur_f64 + carry || ev.tag.visual_hold > 0.0 {
                     1.0
-                } else if carry > 1e-6 {
-                    let u = ((dt - dur_f64) / carry).clamp(0.0, 1.0) as f32;
-                    0.5 * (1.0 + (std::f32::consts::PI * u).cos())
                 } else {
                     continue;
                 };
@@ -2013,27 +2010,69 @@ pub fn composite_collage_foreground(
                 }
             }
 
-            // Despeckle isolated 1–2px mask crumbs before `3px` Euclidean sticker border dilation
-            // so stray background pixels never inflate into visible cream dots.
-            let raw_fg_a = fg_a.clone();
-            for by in 1..bh.saturating_sub(1) {
-                for bx in 1..bw.saturating_sub(1) {
-                    let i = by * bw + bx;
-                    if raw_fg_a[i] == 0 {
+            // Despeckle sub-visibility alpha haze (`< 28`) and floating Vision dust islands
+            // via 4-connected BFS component filtering before `3px` Euclidean `#F2EDE0` dilation
+            // so stray 2–12px background mask specks never inflate into visible cream dots!
+            for a in fg_a.iter_mut() {
+                if *a < 28 {
+                    *a = 0;
+                }
+            }
+            {
+                let total_px = bw * bh;
+                let mut visited = vec![false; total_px];
+                let mut comps: Vec<Vec<usize>> = Vec::new();
+                let mut max_comp_len = 0usize;
+                let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+                for start in 0..total_px {
+                    if fg_a[start] == 0 || visited[start] {
                         continue;
                     }
-                    let mut nb = 0u8;
-                    for dy in -1isize..=1 {
-                        for dx in -1isize..=1 {
-                            if (dx != 0 || dy != 0)
-                                && raw_fg_a[(by as isize + dy) as usize * bw + (bx as isize + dx) as usize] >= 64
-                            {
-                                nb += 1;
+                    visited[start] = true;
+                    queue.push_back(start);
+                    let mut comp = Vec::new();
+                    while let Some(cur) = queue.pop_front() {
+                        comp.push(cur);
+                        let cy = cur / bw;
+                        let cx = cur % bw;
+                        if cy > 0 {
+                            let nb = cur - bw;
+                            if fg_a[nb] > 0 && !visited[nb] {
+                                visited[nb] = true;
+                                queue.push_back(nb);
+                            }
+                        }
+                        if cy + 1 < bh {
+                            let nb = cur + bw;
+                            if fg_a[nb] > 0 && !visited[nb] {
+                                visited[nb] = true;
+                                queue.push_back(nb);
+                            }
+                        }
+                        if cx > 0 {
+                            let nb = cur - 1;
+                            if fg_a[nb] > 0 && !visited[nb] {
+                                visited[nb] = true;
+                                queue.push_back(nb);
+                            }
+                        }
+                        if cx + 1 < bw {
+                            let nb = cur + 1;
+                            if fg_a[nb] > 0 && !visited[nb] {
+                                visited[nb] = true;
+                                queue.push_back(nb);
                             }
                         }
                     }
-                    if nb < 2 {
-                        fg_a[i] = 0;
+                    max_comp_len = max_comp_len.max(comp.len());
+                    comps.push(comp);
+                }
+                let min_keep = (max_comp_len / 50).clamp(24, 950);
+                for comp in comps {
+                    if comp.len() < max_comp_len && comp.len() < min_keep {
+                        for idx in comp {
+                            fg_a[idx] = 0;
+                        }
                     }
                 }
             }

@@ -150,7 +150,8 @@ impl SeqRow {
     }
 }
 
-/// 1-click zero-AI sequencer groove presets modeled on classic hardware sampler pockets.
+/// 1-click zero-AI sequencer groove presets modeled on classic hardware sampler pockets
+/// and lush Eno / Boards of Canada video-to-chord ambient washes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum PatternPreset {
     #[default]
@@ -161,10 +162,11 @@ pub enum PatternPreset {
     DillaDrunk,
     Footwork332,
     TapeDisintegration,
+    AmbientWash,
 }
 
 impl PatternPreset {
-    pub const ALL: [PatternPreset; 7] = [
+    pub const ALL: [PatternPreset; 8] = [
         PatternPreset::Ukg2Step,
         PatternPreset::DiscoFilterPump,
         PatternPreset::BoomBapDialogue,
@@ -172,6 +174,7 @@ impl PatternPreset {
         PatternPreset::DillaDrunk,
         PatternPreset::Footwork332,
         PatternPreset::TapeDisintegration,
+        PatternPreset::AmbientWash,
     ];
 
     pub fn label(self) -> &'static str {
@@ -183,6 +186,7 @@ impl PatternPreset {
             PatternPreset::DillaDrunk => "Dilla Drunk",
             PatternPreset::Footwork332 => "Footwork 3-3-2",
             PatternPreset::TapeDisintegration => "Tape Loop",
+            PatternPreset::AmbientWash => "Wash",
         }
     }
 
@@ -195,6 +199,7 @@ impl PatternPreset {
             PatternPreset::DillaDrunk => 92.0,
             PatternPreset::Footwork332 => 152.0,
             PatternPreset::TapeDisintegration => 74.0,
+            PatternPreset::AmbientWash => 68.0,
         }
     }
 
@@ -207,6 +212,7 @@ impl PatternPreset {
             PatternPreset::DillaDrunk => 0.62,
             PatternPreset::Footwork332 => 0.54,
             PatternPreset::TapeDisintegration => 0.54,
+            PatternPreset::AmbientWash => 0.50,
         }
     }
 
@@ -229,6 +235,8 @@ impl PatternPreset {
             "tape" | "tapeloop" | "tape loop" | "disintegration" | "tapedisintegration" => {
                 Some(PatternPreset::TapeDisintegration)
             }
+            "wash" | "ambient" | "ambient wash" | "ambientwash" | "chords" | "chord wash"
+            | "cathedral" => Some(PatternPreset::AmbientWash),
             _ => None,
         }
     }
@@ -381,6 +389,47 @@ impl StepPattern {
                     .map(|(idx, _)| idx as u16)
             });
 
+            let vox_pool: Vec<u16> = sources
+                .get(row.source)
+                .map(|src| {
+                    let is_hat_role = role == Stamp::Hat;
+                    let mut cands: Vec<u16> = src
+                        .slices
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, sl)| {
+                            if is_hat_role {
+                                sl.role_hint == crate::chop::SliceRole::Hat
+                            } else {
+                                !matches!(
+                                    sl.role_hint,
+                                    crate::chop::SliceRole::Kick
+                                        | crate::chop::SliceRole::Phrase
+                                        | crate::chop::SliceRole::Tonal
+                                )
+                            }
+                        })
+                        .map(|(i, _)| i as u16)
+                        .collect();
+                    if cands.is_empty() && !src.slices.is_empty() {
+                        let mut by_air: Vec<(usize, f32)> = src
+                            .slices
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, sl)| sl.len() <= 0.45)
+                            .map(|(i, sl)| (i, sl.bands[4] + 0.7 * sl.bands[3]))
+                            .collect();
+                        by_air.sort_by(|a, b| b.1.total_cmp(&a.1));
+                        cands = by_air.into_iter().take(4).map(|(i, _)| i as u16).collect();
+                    }
+                    if cands.is_empty() {
+                        (0..src.slices.len() as u16).collect()
+                    } else {
+                        cands
+                    }
+                })
+                .unwrap_or_default();
+
             let put_vox_steps = |row: &mut SeqRow, spec: &[(usize, f32, f32, u8, f32)]| {
                 let norm_fb = [0.11f32, 0.24, 0.37, 0.51, 0.63, 0.76, 0.88];
                 let bars = (row.steps.len() / 16).max(1);
@@ -395,8 +444,9 @@ impl StepPattern {
                                 pitch,
                                 offset: off,
                                 length: 0.85,
-                                slice: if n_slices == 0 { norm_fb[k % norm_fb.len()] } else { -1.0 },
-                                slice_index: (n_slices > 0).then_some(((k + b) % n_slices) as u16),
+                                slice: if vox_pool.is_empty() { norm_fb[k % norm_fb.len()] } else { -1.0 },
+                                slice_index: (!vox_pool.is_empty())
+                                    .then(|| vox_pool[(k + b) % vox_pool.len()]),
                                 ratchet: ratch,
                                 ratchet_pitch: if ratch > 1 { 2.0 } else { 0.0 },
                                 ..Default::default()
@@ -498,40 +548,71 @@ impl StepPattern {
                 (PatternPreset::DiscoFilterPump, Stamp::Kick) => {
                     row.choke_group = 2;
                     row.sculpt.lpf_hz = row.sculpt.lpf_hz.min(158.0);
+                    row.sculpt.sub_exciter = row.sculpt.sub_exciter.min(0.76);
                     row.grains.sculpt = row.sculpt;
                     row.grains.duration = row.grains.duration.min(0.20);
                     for b in 0..bars {
                         let o = b * 16;
                         for &st_i in &[0usize, 4, 8, 12] {
-                            row.steps[o + st_i] = Step { on: true, gain: 0.98, ..Default::default() };
+                            row.steps[o + st_i] = Step { on: true, gain: 0.88, ..Default::default() };
                         }
                     }
                 }
                 (PatternPreset::DiscoFilterPump, Stamp::Snare) => {
+                    row.sculpt.lpf_hz = 16_500.0;
+                    row.sculpt.drive_db = row.sculpt.drive_db.max(4.0);
+                    row.grains.sculpt = row.sculpt;
                     row.grains.duration = row.grains.duration.min(0.19);
                     for b in 0..bars {
                         let o = b * 16;
-                        row.steps[o + 4] = Step { on: true, gain: 0.95, ..Default::default() };
-                        row.steps[o + 12] = Step { on: true, gain: 0.96, ..Default::default() };
+                        row.steps[o + 4] = Step { on: true, gain: 0.98, ..Default::default() };
+                        row.steps[o + 12] = Step { on: true, gain: 1.00, ..Default::default() };
                     }
                 }
                 (PatternPreset::DiscoFilterPump, Stamp::VoxPerc | Stamp::Hat) => {
-                    row.sculpt = VoiceSculpt::preset(Stamp::VoxPerc);
+                    let is_hat = row.sculpt.stamp == Stamp::Hat;
+                    row.sculpt = VoiceSculpt {
+                        stamp: row.sculpt.stamp,
+                        pitch_semitones: if is_hat { 6.0 } else { 4.0 },
+                        drive_db: if is_hat { 9.5 } else { 6.0 },
+                        hpf_hz: if is_hat { 3200.0 } else { 2300.0 },
+                        lpf_hz: 16_500.0,
+                        resonance_q: if is_hat { 1.35 } else { 1.05 },
+                        pocket_carve: true,
+                        ..VoiceSculpt::preset(Stamp::VoxPerc)
+                    };
                     row.grains.sculpt = row.sculpt;
-                    row.grains.duration = 0.046;
-                    row.choke_group = 3;
-                    put_vox_steps(
-                        row,
-                        &[
-                            (2, 0.86, 2.0, 1, 0.0),
-                            (3, 0.62, 0.0, 1, 0.0),
-                            (6, 0.88, 2.0, 1, 0.0),
-                            (7, 0.64, -1.0, 1, 0.0),
-                            (10, 0.86, 2.0, 1, 0.0),
-                            (14, 0.90, 3.0, 2, 0.0),
-                            (15, 0.66, 0.0, 1, 0.0),
-                        ],
-                    );
+                    row.grains.gain = if is_hat { row.grains.gain.max(1.25) } else { row.grains.gain.max(1.0) };
+                    row.grains.duration = if is_hat { 0.075 } else { 0.058 };
+                    row.choke_group = if is_hat { 5 } else { 3 };
+                    if is_hat {
+                        put_vox_steps(
+                            row,
+                            &[
+                                (0, 0.90, 2.0, 1, 0.0),
+                                (2, 1.42, 4.0, 1, 0.0),
+                                (4, 0.86, 2.0, 1, 0.0),
+                                (6, 1.45, 4.0, 1, 0.0),
+                                (8, 0.90, 2.0, 1, 0.0),
+                                (10, 1.42, 4.0, 1, 0.0),
+                                (12, 0.86, 2.0, 1, 0.0),
+                                (14, 1.46, 5.0, 2, 0.0),
+                            ],
+                        );
+                    } else {
+                        put_vox_steps(
+                            row,
+                            &[
+                                (2, 1.12, 3.0, 1, 0.0),
+                                (3, 0.80, 1.0, 1, 0.0),
+                                (6, 1.16, 3.0, 1, 0.0),
+                                (7, 0.82, 0.0, 1, 0.0),
+                                (10, 1.12, 3.0, 1, 0.0),
+                                (14, 1.20, 4.0, 2, 0.0),
+                                (15, 0.84, 1.0, 1, 0.0),
+                            ],
+                        );
+                    }
                 }
                 (PatternPreset::DiscoFilterPump, Stamp::Chord) => {
                     row.choke_group = 4;
@@ -553,8 +634,8 @@ impl StepPattern {
                 }
                 (PatternPreset::DiscoFilterPump, Stamp::Pluck) => {
                     row.sculpt.pitch_semitones = -12.0;
-                    row.sculpt.sub_exciter = 0.85;
-                    row.sculpt.lpf_hz = 155.0;
+                    row.sculpt.sub_exciter = 0.62;
+                    row.sculpt.lpf_hz = 152.0;
                     row.grains.sculpt = row.sculpt;
                     row.choke_group = 2;
                     row.grains.duration = 0.24;
@@ -562,7 +643,7 @@ impl StepPattern {
                     for b in 0..bars {
                         let o = b * 16;
                         let rt = roots[b % roots.len()];
-                        for &(st_i, oct, gn) in &[(2usize, 0.0f32, 0.94f32), (6, 12.0, 0.88), (10, 0.0, 0.94), (14, 7.0, 0.86)] {
+                        for &(st_i, oct, gn) in &[(2usize, 0.0f32, 0.76f32), (6, 12.0, 0.74), (10, 0.0, 0.76), (14, 7.0, 0.72)] {
                             row.steps[o + st_i] = Step { on: true, pitch: rt + oct, gain: gn, length: 0.82, ..Default::default() };
                         }
                     }
@@ -910,7 +991,201 @@ impl StepPattern {
                     row.grains.gain = 0.62;
                 }
 
-                // ---------------- HERO PHRASE LANE (ALL 7 PRESETS) ----------------
+                // ---------------- 8. AMBIENT WASH (`68 BPM`, `0.50` swing) ----------------
+                (PatternPreset::AmbientWash, Stamp::Kick) => {
+                    row.choke_group = 2;
+                    row.sculpt = VoiceSculpt {
+                        stamp: Stamp::Kick,
+                        pitch_semitones: -14.0,
+                        sub_exciter: 0.48,
+                        lpf_hz: 112.0,
+                        hpf_hz: 28.0,
+                        wow_flutter: 0.08,
+                        ..VoiceSculpt::preset(Stamp::Kick)
+                    };
+                    row.grains.sculpt = row.sculpt;
+                    row.grains.envelope = 0.68;
+                    row.grains.duration = 0.55;
+                    row.steps[0] = Step {
+                        on: true,
+                        gain: 0.42,
+                        length: 1.25,
+                        every_n: 2,
+                        ..Default::default()
+                    };
+                }
+                (PatternPreset::AmbientWash, Stamp::Snare) => {
+                    row.muted = true;
+                }
+                (PatternPreset::AmbientWash, Stamp::VoxPerc | Stamp::Hat) => {
+                    row.mode = RowMode::Loop;
+                    row.sculpt = VoiceSculpt {
+                        stamp: Stamp::Wash,
+                        chord: ChordVoicing::Fifths,
+                        pitch_semitones: 7.0,
+                        comb_mix: 0.48,
+                        comb_feedback: 0.88,
+                        shimmer: 0.36,
+                        wow_flutter: 0.18,
+                        ebb_flow: 0.40,
+                        free_loop_secs: Some(6.8),
+                        hpf_hz: 260.0,
+                        lpf_hz: 3600.0,
+                        pocket_carve: true,
+                        ..VoiceSculpt::preset(Stamp::Wash)
+                    };
+                    row.grains.sculpt = row.sculpt;
+                    row.grains.envelope = 0.85;
+                    row.grains.gain = 0.46;
+                    row.grains.adsr = Some(crate::envelope::Adsr {
+                        attack: 0.48,
+                        decay: 0.35,
+                        sustain: 0.90,
+                        release: 1.10,
+                        picture: crate::envelope::PictureCut::Fade,
+                        cut_threshold: 0.01,
+                    });
+                }
+                (PatternPreset::AmbientWash, Stamp::Chord | Stamp::Wash) => {
+                    row.choke_group = 0;
+                    row.sculpt = VoiceSculpt {
+                        stamp: Stamp::Wash,
+                        chord: ChordVoicing::Min9,
+                        comb_mix: 0.52,
+                        comb_feedback: 0.89,
+                        shimmer: 0.28,
+                        wow_flutter: 0.16,
+                        ebb_flow: 0.32,
+                        hpf_hz: 165.0,
+                        lpf_hz: 3400.0,
+                        pocket_carve: true,
+                        ..VoiceSculpt::preset(Stamp::Wash)
+                    };
+                    row.grains.sculpt = row.sculpt;
+                    row.grains.envelope = 0.84;
+                    row.grains.duration = 2.45;
+                    row.grains.adsr = Some(crate::envelope::Adsr {
+                        attack: 0.46,
+                        decay: 0.38,
+                        sustain: 0.92,
+                        release: 1.15,
+                        picture: crate::envelope::PictureCut::Fade,
+                        cut_threshold: 0.01,
+                    });
+                    // Slow overlapping 2-bar `Min9 -> Maj7 -> Sus4 -> Fifths` cathedral swells!
+                    let chord_seq = [
+                        (0.0f32, ChordVoicing::Min9, 0.86f32),
+                        (-4.0, ChordVoicing::Maj7, 0.84),
+                        (5.0, ChordVoicing::Sus4, 0.85),
+                        (7.0, ChordVoicing::Fifths, 0.82),
+                    ];
+                    for b in 0..bars {
+                        let o = b * 16;
+                        let (rt_a, vc_a, gn_a) = chord_seq[(b * 2) % chord_seq.len()];
+                        let (rt_b, vc_b, gn_b) = chord_seq[(b * 2 + 1) % chord_seq.len()];
+                        row.steps[o] = Step {
+                            on: true,
+                            pitch: rt_a,
+                            gain: gn_a,
+                            length: 1.65,
+                            chord: vc_a,
+                            ..Default::default()
+                        };
+                        row.steps[o + 8] = Step {
+                            on: true,
+                            pitch: rt_b,
+                            gain: gn_b,
+                            length: 1.65,
+                            chord: vc_b,
+                            ..Default::default()
+                        };
+                    }
+                }
+                (PatternPreset::AmbientWash, Stamp::Pluck) => {
+                    row.choke_group = 0;
+                    row.sculpt = VoiceSculpt {
+                        stamp: Stamp::Wash,
+                        chord: ChordVoicing::Octaves,
+                        pitch_semitones: -12.0,
+                        comb_mix: 0.46,
+                        comb_feedback: 0.88,
+                        shimmer: 0.16,
+                        wow_flutter: 0.14,
+                        ebb_flow: 0.30,
+                        hpf_hz: 68.0,
+                        lpf_hz: 1550.0,
+                        ..VoiceSculpt::preset(Stamp::Wash)
+                    };
+                    row.grains.sculpt = row.sculpt;
+                    row.grains.envelope = 0.82;
+                    row.grains.duration = 2.25;
+                    row.grains.adsr = Some(crate::envelope::Adsr {
+                        attack: 0.45,
+                        decay: 0.35,
+                        sustain: 0.90,
+                        release: 1.05,
+                        picture: crate::envelope::PictureCut::Fade,
+                        cut_threshold: 0.01,
+                    });
+                    let bass_roots = [0.0f32, -4.0, 5.0, 7.0];
+                    for b in 0..bars {
+                        let o = b * 16;
+                        row.steps[o] = Step {
+                            on: true,
+                            pitch: bass_roots[(b * 2) % bass_roots.len()],
+                            gain: 0.72,
+                            length: 1.60,
+                            chord: ChordVoicing::Octaves,
+                            ..Default::default()
+                        };
+                        row.steps[o + 8] = Step {
+                            on: true,
+                            pitch: bass_roots[(b * 2 + 1) % bass_roots.len()],
+                            gain: 0.68,
+                            length: 1.60,
+                            chord: ChordVoicing::Fifths,
+                            ..Default::default()
+                        };
+                    }
+                }
+                (PatternPreset::AmbientWash, Stamp::Phrase | Stamp::Raw | Stamp::TapeLoop | Stamp::Disintegrate) => {
+                    row.sculpt = VoiceSculpt {
+                        stamp: Stamp::Wash,
+                        chord: ChordVoicing::Fifths,
+                        comb_mix: 0.36,
+                        comb_feedback: 0.86,
+                        shimmer: 0.24,
+                        wow_flutter: 0.18,
+                        hpf_hz: 210.0,
+                        lpf_hz: 3100.0,
+                        pocket_carve: true,
+                        ..VoiceSculpt::preset(Stamp::Wash)
+                    };
+                    row.grains.sculpt = row.sculpt;
+                    row.grains.envelope = 0.78;
+                    row.grains.duration = row.grains.duration.clamp(1.10, 2.20);
+                    row.grains.adsr = Some(crate::envelope::Adsr {
+                        attack: 0.38,
+                        decay: 0.30,
+                        sustain: 0.88,
+                        release: 0.95,
+                        picture: crate::envelope::PictureCut::Fade,
+                        cut_threshold: 0.01,
+                    });
+                    if 6 < row.steps.len() {
+                        row.steps[6] = Step {
+                            on: true,
+                            gain: 0.64,
+                            length: 1.35,
+                            slice_index: hook_slice,
+                            every_n: 2,
+                            every_offset: 1,
+                            ..Default::default()
+                        };
+                    }
+                }
+
+                // ---------------- HERO PHRASE LANE (RHYTHMIC PRESETS) ----------------
                 (_, Stamp::Phrase | Stamp::Raw | Stamp::Wash | Stamp::TapeLoop | Stamp::Disintegrate) => {
                     let mut sc = VoiceSculpt::preset(Stamp::Phrase);
                     sc.hpf_hz = 215.0;
@@ -2110,7 +2385,7 @@ mod tests {
         ];
         let sources = vec![src];
 
-        assert_eq!(PatternPreset::ALL.len(), 7);
+        assert_eq!(PatternPreset::ALL.len(), 8);
         for preset in PatternPreset::ALL {
             assert_eq!(PatternPreset::parse(preset.label()), Some(preset));
             let mut pat = StepPattern::new(preset.label());
@@ -2133,7 +2408,10 @@ mod tests {
             assert!(intro.rows[0].muted, "{preset:?} Intro mutes Kick");
             assert!(!drop_s.rows[0].muted, "{preset:?} Drop unmutes Kick");
             assert!(brk.rows[0].muted, "{preset:?} Break drops Kick");
-            if preset != PatternPreset::TapeDisintegration {
+            if !matches!(
+                preset,
+                PatternPreset::TapeDisintegration | PatternPreset::AmbientWash
+            ) {
                 let n = climax.rows[0].steps.len();
                 assert!(
                     climax.rows[0].steps[n - 8..].iter().all(|s| !s.on),

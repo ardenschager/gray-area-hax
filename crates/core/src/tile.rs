@@ -601,6 +601,19 @@ impl TileAssigner {
         }
     }
 
+    /// Directly share an already-active `slot` for an overlapping voice carrying the same
+    /// underlying video clip (`key`), extending `slot`'s release horizon to `end`.
+    pub fn force_share_slot(&mut self, voice: u64, key: u64, slot: u8, t: f64, end: f64) {
+        let i = (slot as usize).min(MAX_TILES - 1);
+        let prev_end = self.slots[i]
+            .map(|(_, _, e)| if e.is_finite() { e } else { 0.0 })
+            .unwrap_or(0.0);
+        let merged_end = end.max(prev_end).max(self.min_end[i]);
+        self.min_end[i] = merged_end;
+        self.slots[i] = Some((voice, t, merged_end));
+        self.keys[i] = Some(key);
+    }
+
     /// The voice ends (fully silent) at `t`: its slot frees from then on.
     pub fn release(&mut self, voice: u64, end: f64) {
         if let Some(i) = self.slot_of(voice) {

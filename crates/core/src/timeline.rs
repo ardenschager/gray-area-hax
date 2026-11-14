@@ -8,6 +8,7 @@ use crate::music::Key;
 use crate::video::{AvLink, ColorFilter, VideoClip, VisualGrainStyle};
 
 pub use crate::chop::{
+    build_chord_washes_across_sources, build_chord_washes_across_sources_opt,
     build_kit_across_sources, build_tape_loops_across_sources, build_ukg_vox_kit_across_sources,
     CuratedPad, KitPadSpec,
 };

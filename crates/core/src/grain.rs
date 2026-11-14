@@ -431,11 +431,15 @@ impl VoiceSculpt {
                 ..base
             },
             Stamp::Wash => VoiceSculpt {
-                shimmer: 0.55,
-                wow_flutter: 0.22,
-                ebb_flow: 0.45,
-                hpf_hz: 220.0,
-                lpf_hz: 8500.0,
+                chord: ChordVoicing::Min9,
+                comb_mix: 0.52,
+                comb_feedback: 0.88,
+                shimmer: 0.28,
+                wow_flutter: 0.16,
+                ebb_flow: 0.34,
+                hpf_hz: 125.0,
+                lpf_hz: 3400.0,
+                resonance_q: 0.78,
                 pocket_carve: true,
                 ..base
             },
@@ -608,6 +612,31 @@ impl GrainSettings {
             _ => return Err(()),
         }
         Ok(())
+    }
+
+    /// Stamp a musical [`Stamp`] role onto these grain settings (preserving any
+    /// user-chosen non-`Off` [`ChordVoicing`] on [`Stamp::Wash`] or [`Stamp::Chord`],
+    /// and configuring lush overlapping Hann/Tukey `PictureCut::Fade` envelopes on [`Stamp::Wash`]).
+    pub fn apply_stamp(&mut self, stamp: Stamp) {
+        let keep_chord = self.sculpt.chord;
+        let mut sc = VoiceSculpt::preset(stamp);
+        if matches!(stamp, Stamp::Wash | Stamp::Chord) && keep_chord != ChordVoicing::Off {
+            sc.chord = keep_chord;
+        }
+        self.sculpt = sc;
+        if stamp == Stamp::Wash {
+            self.duration = self.duration.max(1.55);
+            self.density = self.density.clamp(5.5, 11.0);
+            self.envelope = 0.82;
+            self.adsr = Some(crate::envelope::Adsr {
+                attack: 0.42,
+                decay: 0.35,
+                sustain: 0.90,
+                release: 0.95,
+                picture: crate::envelope::PictureCut::Fade,
+                cut_threshold: 0.01,
+            });
+        }
     }
 }
 

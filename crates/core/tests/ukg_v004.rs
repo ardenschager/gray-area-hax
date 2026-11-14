@@ -43,6 +43,7 @@ use std::sync::Arc;
 const PIECE1_BEATS: f64 = 44.0; // 11 bars @ 134 BPM = 19.701s
 const PIECE2_BEATS: f64 = 44.0; // 11 bars @ 136 BPM = 19.412s
 const PIECE3_BEATS: f64 = 40.0; // 10 bars @ 124 BPM = 19.355s
+const PIECE4_BEATS: f64 = 24.0; // 6 bars @ 68 BPM = 21.176s
 
 fn crate_root() -> PathBuf {
     if let Ok(p) = std::env::var("CHROMAGRAIN_UKG_ROOT") {
@@ -60,7 +61,7 @@ fn crate_root() -> PathBuf {
 }
 
 fn version_tag() -> String {
-    std::env::var("CHROMAGRAIN_UKG_VERSION").unwrap_or_else(|_| "v005".into())
+    std::env::var("CHROMAGRAIN_UKG_VERSION").unwrap_or_else(|_| "v006".into())
 }
 
 fn out_dir() -> PathBuf {
@@ -98,6 +99,14 @@ struct DiscoCrateSources {
     beatbox: Source,
     tap: Source,
     encab_cut: Source,
+}
+
+struct AmbientCrateSources {
+    omnichord: Source,
+    soul_vox: Source,
+    zeon: Source,
+    rhodes: Source,
+    pinball: Source,
 }
 
 fn load_yt(
@@ -405,7 +414,7 @@ fn load_disco_crate_real() -> DiscoCrateSources {
         (74.0, 29.0),
         83.5,
     );
-    let encab_cut = media::cutout_source(&encab_raw, "person");
+    let encab_cut = media::cutout_source(&encab_raw, "subject");
     DiscoCrateSources { bass, rhodes, beatbox, tap, encab_cut }
 }
 
@@ -416,6 +425,101 @@ fn load_disco_crate_stub() -> DiscoCrateSources {
         beatbox: stub_source("beatbox_stub", 33.5, 138.6, false),
         tap: stub_source("tap_stub", 34.0, 138.6, false),
         encab_cut: stub_source("encab_cut_stub", 29.0, 83.5, true),
+    }
+}
+
+fn load_ambient_crate_real() -> AmbientCrateSources {
+    let omnichord = load_yt(
+        "wA7_suzuki_omnichord_chords_j-z1lO9v24M.mp4",
+        "Suzuki Omnichord OM-36",
+        "Michael Dicken",
+        712,
+        "https://www.youtube.com/watch?v=j-z1lO9v24M",
+        (18.0, 34.0),
+        66.8,
+    );
+    let soul_vox = load_yt(
+        "wB1_soul_stutter_acapella_XUaVI90fs5w.mp4",
+        "Soul Stutter Acapella",
+        "MissChyna520",
+        125,
+        "https://www.youtube.com/watch?v=XUaVI90fs5w",
+        (9.0, 36.0),
+        326.5,
+    );
+    let zeon = load_yt(
+        "wA3_omnibot_zeon_robot_E8d7kbbrvQU.mp4",
+        "Tomy Omnibot Zeon",
+        "Rare Coins & Collectibles",
+        558,
+        "https://www.youtube.com/watch?v=E8d7kbbrvQU",
+        (0.5, 35.0),
+        191.2,
+    );
+    let rhodes = load_yt(
+        "wB4_solo_rhodes_improv_MxOzUVFZwCs.mp4",
+        "Solo Rhodes Improv",
+        "j_dublay",
+        944,
+        "https://www.youtube.com/watch?v=MxOzUVFZwCs",
+        (1.0, 26.5),
+        139.1,
+    );
+    let pinball = load_yt(
+        "wB7_pinball_solenoids_5zJ7D1DNPFY.mp4",
+        "Stern STARS Pinball Solenoids",
+        "Pinballmania LLC",
+        129,
+        "https://www.youtube.com/watch?v=5zJ7D1DNPFY",
+        (2.0, 22.5),
+        640.0,
+    );
+    AmbientCrateSources { omnichord, soul_vox, zeon, rhodes, pinball }
+}
+
+fn load_ambient_crate_stub() -> AmbientCrateSources {
+    AmbientCrateSources {
+        omnichord: stub_source("omnichord_stub", 34.0, 66.8, false),
+        soul_vox: stub_source("soul_stub", 36.0, 326.5, false),
+        zeon: stub_source("zeon_stub", 35.0, 191.2, false),
+        rhodes: stub_source("rhodes_stub", 26.5, 139.1, false),
+        pinball: stub_source("pinball_stub", 22.5, 640.0, false),
+    }
+}
+
+fn excerpt_source(src: &Source, start_s: f64, end_s: f64) -> Source {
+    let dur = src.duration().max(0.1);
+    let s0 = start_s.clamp(0.0, (dur - 0.1).max(0.0));
+    let s1 = end_s.clamp(s0 + 0.1, dur);
+    let audio = src.audio.as_ref().map(|a| {
+        let sr = a.sample_rate.max(1);
+        let n = a.samples.len();
+        let f0 = ((s0 * sr as f64) as usize).min(n.saturating_sub(1));
+        let f1 = ((s1 * sr as f64) as usize).clamp(f0 + 1, n.max(1));
+        if a.is_stereo() {
+            let (l, r) = a.left_right();
+            Arc::new(AudioClip::stereo(&l[f0..f1.min(l.len())], &r[f0..f1.min(r.len())], sr))
+        } else {
+            Arc::new(AudioClip::new(a.samples[f0..f1].to_vec(), sr))
+        }
+    });
+    let video = src.video.as_ref().map(|v| {
+        let fps = v.fps.max(1.0);
+        let i0 = ((s0 * fps as f64) as usize).min(v.frames.len().saturating_sub(1));
+        let i1 = ((s1 * fps as f64).ceil() as usize).clamp(i0 + 1, v.frames.len().max(1));
+        let frames = if v.frames.is_empty() {
+            Vec::new()
+        } else {
+            v.frames[i0..i1].to_vec()
+        };
+        Arc::new(VideoClip { frames, fps })
+    });
+    Source {
+        name: format!("{} [{:.1}..{:.1}s]", src.name, s0, s1),
+        audio,
+        video,
+        base_hz: src.base_hz,
+        ..Default::default()
     }
 }
 
@@ -1649,7 +1753,7 @@ fn build_piece3_disco_pump_auto_kit(mut s: DiscoCrateSources) -> Project {
         layout_pan: true,
         studio_bus: true,
         captions_on: false,
-        master_gain_db: 2.2,
+        master_gain_db: 2.4,
         master_bloom: 0.0,
         ..Project::new()
     };
@@ -1699,6 +1803,24 @@ fn build_piece3_disco_pump_auto_kit(mut s: DiscoCrateSources) -> Project {
             base_pat.rows.push(row);
         }
     }
+    // Pair the `VoxPerc` lane with a crisp sibilant `Hat` lane curated from the kit (`beatbox` `"ts"` / `tap` brush)
+    // so `DiscoFilterPump` sparkles in `> 3.5 kHz` air right alongside Pieces 1 & 2!
+    if let Some(hat_pad) = kit
+        .iter()
+        .filter(|k| k.stamp == Stamp::VoxPerc && (k.source == 0 || k.source == 1))
+        .max_by(|a, b| {
+            (a.slice.bands[4] + 0.6 * a.slice.bands[3])
+                .partial_cmp(&(b.slice.bands[4] + 0.6 * b.slice.bands[3]))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .or_else(|| kit.iter().filter(|k| k.stamp == Stamp::VoxPerc).nth(1))
+    {
+        let src_len = p.sources[hat_pad.source].duration();
+        let mut hat_row = hat_pad.to_seq_row(32, src_len);
+        hat_row.sculpt.stamp = Stamp::Hat;
+        hat_row.grains.sculpt.stamp = Stamp::Hat;
+        base_pat.rows.push(hat_row);
+    }
     // 1-Click Preset Application + 1-Click 4-Section Song Expansion!
     base_pat.apply_preset(preset, &p.sources);
     let base_pid = p.add_pattern(base_pat);
@@ -1739,11 +1861,240 @@ fn build_piece3_disco_pump_auto_kit(mut s: DiscoCrateSources) -> Project {
         start_beat: 24.0,
         end_beat: 30.0,
         action: PunchAction::Isolator(BandIsolator {
-            mute: [true, false, false, false, true],
+            mute: [true, false, false, false, false],
             output_db: 2.0,
             ..BandIsolator::default()
         }),
     });
+
+    p
+}
+
+// ============================================================================
+// PIECE 4 (`v006`) — `261114_videograin_zeon-cathedral_ambient-chord-wash_v006.mp4`
+// (`1920x1080 @ 60fps` `16:9`, `68.0 BPM`, `24 beats` = `21.176s`)
+// Proves the EXACT SAME obscure YouTube crate (`Omnichord`, `Soul Stutter` vowels,
+// `Omnibot Zeon`, `Solo Rhodes`, `Pinball` chimes) effortlessly blooms into an
+// emotional Eno / Boards of Canada / Grouper cathedral ambient chord wash via
+// `chop::build_chord_washes_across_sources` + `PatternPreset::AmbientWash` +
+// `stretch::paulstretch_source` + `Tune` + `Reverb` optical frame persistence!
+// ============================================================================
+
+fn build_piece4_zeon_cathedral_ambient_wash(mut s: AmbientCrateSources) -> Project {
+    let preset = PatternPreset::AmbientWash;
+    let key = Key::new(0, ScaleKind::Minor); // C Minor cathedral harmony
+    let mut p = Project {
+        bpm: preset.default_bpm() as f64, // 68.0 BPM
+        sample_rate: 48_000,
+        fps: 60.0,
+        layout: Layout::Stack,
+        layout_pan: true,
+        studio_bus: true,
+        captions_on: false,
+        master_gain_db: 1.8,
+        master_bloom: 0.0,
+        ..Project::new()
+    };
+    p.set_aspect_hd(AspectRatio::Wide16x9);
+    p.master_tape.warmth = 0.26;
+    p.master_tape.wow = 0.07;
+
+    // Seed pure sustained tonal & vowel windows on the exact same YouTube crate clips:
+    let _ = push_slice(&mut s.omnichord, 6.20, 8.90, SliceRole::Tonal, (0.48, 0.52));
+    let _ = push_slice(&mut s.omnichord, 18.40, 21.10, SliceRole::Tonal, (0.52, 0.48));
+    // Pure sustained `F4` singing vowel (`11.35..11.85s`) — zero syllabic chatter!
+    let _ = push_slice(&mut s.soul_vox, 11.35, 11.85, SliceRole::Tonal, (0.50, 0.30));
+    let _ = push_slice(&mut s.rhodes, 16.32, 18.90, SliceRole::Tonal, (0.38, 0.56));
+    let _ = push_slice(&mut s.rhodes, 21.46, 23.90, SliceRole::Tonal, (0.40, 0.56));
+    let _ = push_slice(&mut s.pinball, 5.20, 6.90, SliceRole::Tonal, (0.52, 0.48));
+    let _ = push_slice(&mut s.zeon, 15.54, 16.92, SliceRole::Phrase, (0.50, 0.44));
+
+    // Audiovisual Paulstretch (`6x`–`8x`) on pure Rhodes & Soul vowel excerpts -> velvet optical-smear pads!
+    let soul_paul = chromagrain_core::stretch::paulstretch_source(
+        &excerpt_source(&s.soul_vox, 11.35, 11.88),
+        8.0,
+    );
+    let rhodes_paul = chromagrain_core::stretch::paulstretch_source(
+        &excerpt_source(&s.rhodes, 16.32, 18.40),
+        5.0,
+    );
+
+    let _id_omni = p.add_source(s.omnichord);
+    let _id_soul = p.add_source(s.soul_vox);
+    let id_rhodes = p.add_source(s.rhodes);
+    let id_pin = p.add_source(s.pinball);
+    let id_zeon = p.add_source(s.zeon);
+
+    // 1. Curate 16-pad Video-to-Chord Wash progression (`i min9 -> VI maj7 -> iv min9 -> v sus4 -> III maj7 -> Fifths`)!
+    let washes = chop::build_chord_washes_across_sources(&p.sources, key);
+
+    let id_soul_paul = p.add_source(soul_paul);
+    let id_rhodes_paul = p.add_source(rhodes_paul);
+
+    // Track 1: `PatternPreset::AmbientWash` cathedral progression seeded directly from `washes`!
+    let mut wash_pat = StepPattern::new("zeon_cathedral_wash");
+    wash_pat.set_grid(8.0, 4);
+    for (pad_i, role_override) in [
+        (7usize, Stamp::Kick),
+        (0, Stamp::Chord),
+        (4, Stamp::Wash),
+        (13, Stamp::Hat),
+        (5, Stamp::Pluck),
+    ] {
+        if let Some(spec) = washes.get(pad_i) {
+            let src_len = p.sources[spec.source].duration();
+            let mut row = spec.to_seq_row(32, src_len);
+            row.sculpt.stamp = role_override;
+            row.grains.sculpt.stamp = role_override;
+            row.key = Some(key);
+            wash_pat.rows.push(row);
+        }
+    }
+    wash_pat.apply_preset(preset, &p.sources);
+    let pid_wash = p.add_pattern(wash_pat);
+
+    let t_chords = p.add_track("cathedral_chord_progression");
+    p.tracks[t_chords].level = 0.84;
+    p.tracks[t_chords].eq.push(EqBand { freq: 275.0, gain_db: -4.5, q: 1.1 });
+    p.tracks[t_chords].effects.push(AvEffect {
+        kind: EffectKind::Tune {
+            root: 0.0,
+            scale: ScaleKind::Minor,
+            amount: 0.45,
+            focus: 0.62,
+        },
+        audio: 0.55,
+        video: 0.0,
+    });
+    p.tracks[t_chords].effects.push(AvEffect {
+        kind: EffectKind::Reverb {
+            size: 0.86,
+            damp: 0.48,
+            mix: 0.42,
+        },
+        audio: 1.0,
+        video: 0.0,
+    });
+    let mut c_prog = Clip::new_pattern(pid_wash, 0.0, PIECE4_BEATS);
+    c_prog.loop_beats = Some(8.0);
+    c_prog.visual.feather = 0.18;
+    c_prog.visual.additive = 0.0;
+    c_prog.visual.min_size = 1.0;
+    c_prog.visual.max_size = 1.0;
+    c_prog.link.envelope_to_opacity = 0.85;
+    c_prog.link.gain_to_opacity = 0.25;
+    p.tracks[t_chords].clips.push(c_prog);
+
+    // Track 2: Paulstretched Rhodes + Soul Pure-Vowel Choir Swells (soft alpha-over optical dissolves, zero whiteout!)
+    let t_paul = p.add_track("paulstretch_vowel_choir");
+    p.tracks[t_paul].level = 0.70;
+    p.tracks[t_paul].level_to_opacity = 1.0;
+    p.tracks[t_paul].eq.push(EqBand { freq: 265.0, gain_db: -4.5, q: 1.2 });
+    p.tracks[t_paul].effects.push(AvEffect {
+        kind: EffectKind::Reverb {
+            size: 0.90,
+            damp: 0.46,
+            mix: 0.46,
+        },
+        audio: 1.0,
+        video: 0.0,
+    });
+    for &(src_id, b0, len_b, chord_v, pitch_st, pan) in &[
+        (id_rhodes_paul, 0.0f64, 8.5f64, ChordVoicing::Min9, 0.0f32, -0.16f32),
+        (id_soul_paul, 4.5, 7.5, ChordVoicing::Maj7, -4.0, 0.16),
+        (id_rhodes_paul, 11.5, 8.5, ChordVoicing::Sus4, 5.0, -0.12),
+        (id_soul_paul, 16.5, 7.5, ChordVoicing::Min9, 0.0, 0.12),
+    ] {
+        let mut sw = Clip::new_snippet(src_id, b0, len_b);
+        sw.key = Some(key);
+        sw.grains.apply_stamp(Stamp::Wash);
+        sw.grains.sculpt.chord = chord_v;
+        sw.grains.sculpt.shimmer = 0.26;
+        sw.grains.sculpt.comb_mix = 0.36;
+        sw.grains.sculpt.lpf_hz = 2400.0;
+        sw.grains.pitch = pitch_st;
+        sw.grains.gain = 0.68;
+        sw.grains.pan = pan;
+        sw.visual.feather = 0.22;
+        sw.visual.additive = 0.0;
+        sw.link.envelope_to_opacity = 0.85;
+        sw.link.gain_to_opacity = 0.25;
+        p.tracks[t_paul].clips.push(sw);
+    }
+
+    // Track 3: Pitched Pinball Vibraphone Bell Swell + Boards-of-Canada Zeon Memory (`"My name is Zeon"`)
+    let t_mem = p.add_track("zeon_memory_whisper");
+    p.tracks[t_mem].level = 0.76;
+    p.tracks[t_mem].level_to_opacity = 0.85;
+    p.tracks[t_mem].effects.push(AvEffect {
+        kind: EffectKind::Delay {
+            time: 0.66,
+            feedback: 0.40,
+            mix: 0.30,
+            shift_x: 0.0,
+            shift_y: 0.0,
+        },
+        audio: 1.0,
+        video: 0.0,
+    });
+    let mut pin_bell = Clip::new_snippet(id_pin, 2.0, 5.5);
+    let pin_dur = p.sources[id_pin].duration().max(1.0);
+    pin_bell.grains.position = (5.20 / pin_dur).clamp(0.0, 0.99) as f32;
+    pin_bell.key = Some(key);
+    pin_bell.grains.apply_stamp(Stamp::Wash);
+    pin_bell.grains.sculpt.chord = ChordVoicing::Fifths;
+    pin_bell.grains.sculpt.pitch_semitones = -12.0;
+    pin_bell.grains.sculpt.lpf_hz = 2600.0;
+    pin_bell.grains.gain = 0.56;
+    pin_bell.visual.additive = 0.0;
+    pin_bell.link.envelope_to_opacity = 0.85;
+    p.tracks[t_mem].clips.push(pin_bell);
+
+    let mut z_mem = Clip::new_snippet(id_zeon, 9.5, 2.4);
+    let z_dur = p.sources[id_zeon].duration().max(1.0);
+    z_mem.grains.position = (15.54 / z_dur).clamp(0.0, 0.99) as f32;
+    z_mem.grains.gain = 0.78;
+    z_mem.grains.envelope = 0.38;
+    z_mem.grains.sculpt = VoiceSculpt {
+        stamp: Stamp::Phrase,
+        wow_flutter: 0.14,
+        hpf_hz: 230.0,
+        lpf_hz: 3600.0,
+        pocket_carve: true,
+        ..VoiceSculpt::default()
+    };
+    z_mem.grains.adsr = Some(Adsr {
+        attack: 0.22,
+        decay: 0.20,
+        sustain: 0.92,
+        release: 0.60,
+        picture: PictureCut::Fade,
+        cut_threshold: 0.01,
+    });
+    z_mem.visual.additive = 0.0;
+    z_mem.link.envelope_to_opacity = 0.85;
+    p.tracks[t_mem].clips.push(z_mem);
+
+    let mut rh_tail = Clip::new_snippet(id_rhodes, 17.5, 6.5);
+    let rh_dur = p.sources[id_rhodes].duration().max(1.0);
+    rh_tail.grains.position = (16.32 / rh_dur).clamp(0.0, 0.99) as f32;
+    rh_tail.key = Some(key);
+    rh_tail.grains.apply_stamp(Stamp::Wash);
+    rh_tail.grains.sculpt.chord = ChordVoicing::Min9;
+    rh_tail.grains.sculpt.lpf_hz = 2500.0;
+    rh_tail.grains.gain = 0.62;
+    rh_tail.visual.additive = 0.0;
+    rh_tail.link.envelope_to_opacity = 0.85;
+    p.tracks[t_mem].clips.push(rh_tail);
+
+    // Breathe between full-canvas soft `Stack` optical crossfades and `Split` triptychs with 30% wash bleed!
+    for &(b0, b1) in &[(4.5, 9.2), (13.5, 19.0)] {
+        p.master_punches.push(MasterPunch {
+            start_beat: b0,
+            end_beat: b1,
+            action: PunchAction::Layout(Layout::Split),
+        });
+    }
 
     p
 }
@@ -1789,16 +2140,29 @@ fn ukg_v004_compositions_structural_sanity() {
     let p1 = build_piece1_flowbee_zeon(load_world_a_stub());
     let p2 = build_piece2_bid_stutter(load_world_b_stub());
     let p3 = build_piece3_disco_pump_auto_kit(load_disco_crate_stub());
+    let p4 = build_piece4_zeon_cathedral_ambient_wash(load_ambient_crate_stub());
 
     let dur1 = p1.beats_to_secs(PIECE1_BEATS);
     let dur2 = p2.beats_to_secs(PIECE2_BEATS);
     let dur3 = p3.beats_to_secs(PIECE3_BEATS);
+    let dur4 = p4.beats_to_secs(PIECE4_BEATS);
     assert!((18.0..=21.5).contains(&dur1), "Piece 1 duration {dur1:.2}s out of 18..21.5s");
     assert!((18.0..=21.5).contains(&dur2), "Piece 2 duration {dur2:.2}s out of 18..21.5s");
     assert!((18.0..=21.5).contains(&dur3), "Piece 3 duration {dur3:.2}s out of 18..21.5s");
+    assert!((19.5..=24.0).contains(&dur4), "Piece 4 duration {dur4:.2}s out of 19.5..24.0s");
     assert_eq!((p1.width, p1.height, p1.fps as u32), (1080, 1920, 60));
     assert_eq!((p2.width, p2.height, p2.fps as u32), (1080, 1080, 60));
     assert_eq!((p3.width, p3.height, p3.fps as u32), (1920, 1080, 60));
+    assert_eq!((p4.width, p4.height, p4.fps as u32), (1920, 1080, 60));
+    assert!(p4.synth_parts.is_empty(), "Piece 4: must have 0 synth oscillators");
+    let plans4 = plan_project(&p4);
+    assert!(
+        plans4
+            .iter()
+            .flat_map(|cp| cp.parts.iter().flat_map(|(_, e)| e))
+            .any(|e| e.sculpt.stamp == Stamp::Wash && e.tag.chord_harmony),
+        "Piece 4: must expand polyphonic Stamp::Wash cathedral chords"
+    );
 
     for (label, prj) in [("Piece 1", &p1), ("Piece 2", &p2), ("Piece 3", &p3)] {
         assert!(prj.synth_parts.is_empty(), "{label}: must have 0 synth oscillators");
@@ -1858,6 +2222,67 @@ fn ukg_v004_compositions_structural_sanity() {
                 .iter()
                 .any(|e| e.onset > 15.0 && e.sculpt.stamp == Stamp::VoxPerc && e.tag.picture_at(e.onset + 0.02) > 0.9),
             "{label}: VoxPerc grid must stay 100% live and visible through closing section"
+        );
+    }
+
+    // Fast low-res pixel gate across all 3 compositions (`64x64 @ 10fps` stub video):
+    // verify ZERO pure-black frames AND ZERO empty `#111314` stage quadrants!
+    for (label, mut prj, beats) in [
+        ("Piece 1", p1, PIECE1_BEATS),
+        ("Piece 2", p2, PIECE2_BEATS),
+        ("Piece 3", p3, PIECE3_BEATS),
+    ] {
+        let ar = prj.width as f32 / prj.height as f32;
+        prj.width = if ar < 0.85 { 54 } else if ar > 1.3 { 96 } else { 64 };
+        prj.height = if ar < 0.85 { 96 } else if ar > 1.3 { 54 } else { 64 };
+        prj.fps = 10.0;
+        prj.sample_rate = 16_000;
+        let out = chromagrain_core::render::render_project(&prj, 0.0, beats);
+        let mut empty_quads = Vec::new();
+        for (fi, fr) in out.frames.iter().enumerate() {
+            let max_rgb = fr
+                .data
+                .chunks_exact(4)
+                .map(|px| px[0].max(px[1]).max(px[2]))
+                .max()
+                .unwrap_or(0);
+            assert!(max_rgb > 0, "{label} frame {fi} is pure black");
+            // Check 4 quadrant centers `(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)`
+            // so no active grid cell is ever left empty (`[17, 19, 20]` or `[0, 0, 0]`)!
+            let beat = (fi as f64 / prj.fps as f64) * prj.bpm / 60.0;
+            let in_sub_iso = prj.master_punches.iter().any(|mp| {
+                beat >= mp.start_beat
+                    && beat <= mp.end_beat
+                    && matches!(mp.action, PunchAction::Isolator(iso) if iso.mute[2] && iso.mute[3])
+            });
+            if !in_sub_iso {
+                for &(qx0, qy0) in &[(0.08f32, 0.08f32), (0.58, 0.08), (0.08, 0.58), (0.58, 0.58)] {
+                    let mut quad_all_ink = true;
+                    for &oy in &[0.0f32, 0.16, 0.32] {
+                        for &ox in &[0.0f32, 0.16, 0.32] {
+                            let x = (((qx0 + ox) * fr.width as f32) as u32).min(fr.width - 1);
+                            let y = (((qy0 + oy) * fr.height as f32) as u32).min(fr.height - 1);
+                            let px = fr.get(x, y);
+                            if px[0] > 22 || px[1] > 24 || px[2] > 25 {
+                                quad_all_ink = false;
+                            }
+                        }
+                    }
+                    if quad_all_ink {
+                        let px = fr.get(
+                            ((qx0 + 0.16) * fr.width as f32) as u32,
+                            ((qy0 + 0.16) * fr.height as f32) as u32,
+                        );
+                        empty_quads.push((fi, (fi as f32 / 10.0), qx0, qy0, px));
+                    }
+                }
+            }
+        }
+        assert!(
+            empty_quads.is_empty(),
+            "{label} had {} empty ink/black quadrant samples (first 8: {:?})",
+            empty_quads.len(),
+            &empty_quads[..empty_quads.len().min(8)]
         );
     }
 }
@@ -1926,4 +2351,73 @@ fn render_all_ukg_v005() {
     render_piece1_flowbee_zeon_ukg_sticker_collage_v005();
     render_piece2_bid_stutter_vox_percussion_grid_v005();
     render_piece3_disco_pump_auto_kit_four_section_v005();
+}
+
+#[test]
+#[ignore]
+fn render_piece4_zeon_cathedral_ambient_chord_wash_v006() {
+    let dir = out_dir();
+    std::fs::create_dir_all(&dir).expect("create out dir");
+    let tag = version_tag();
+    let mp4 = dir.join(format!(
+        "261114_videograin_zeon-cathedral_ambient-chord-wash_{tag}.mp4"
+    ));
+    let p = build_piece4_zeon_cathedral_ambient_wash(load_ambient_crate_real());
+    render_and_assert("Piece 4", &p, PIECE4_BEATS, &mp4);
+}
+
+#[test]
+#[ignore]
+fn refresh_piece3_piece4_audio_only_v006() {
+    let dir = out_dir();
+    let tag = version_tag();
+    for (label, p, beats, stem) in [
+        (
+            "Piece 3",
+            build_piece3_disco_pump_auto_kit(load_disco_crate_real()),
+            PIECE3_BEATS,
+            format!("261114_videograin_disco-pump_auto-kit-four-section_{tag}"),
+        ),
+        (
+            "Piece 4",
+            build_piece4_zeon_cathedral_ambient_wash(load_ambient_crate_real()),
+            PIECE4_BEATS,
+            format!("261114_videograin_zeon-cathedral_ambient-chord-wash_{tag}"),
+        ),
+    ] {
+        let mp4 = dir.join(format!("{stem}.mp4"));
+        let wav = dir.join(format!("{stem}.tmp_remux.wav"));
+        let tmp_mp4 = dir.join(format!("{stem}.tmp_remux.mp4"));
+        let audio = chromagrain_core::render::render_project_audio(&p, 0.0, beats);
+        let (rms_db, peak_db, mud_pct, sub_pct) = analyze_mix_telemetry(&audio);
+        eprintln!(
+            "[{label} audio] RMS {rms_db:.2} dBFS | Peak {peak_db:.2} dBFS | Mud {mud_pct:.1}% | Sub {sub_pct:.1}%"
+        );
+        chromagrain_core::media::save_wav_f32(&wav, &audio).expect("save wav");
+        let st = std::process::Command::new("ffmpeg")
+            .args([
+                "-y", "-v", "error", "-i",
+                mp4.to_str().unwrap(),
+                "-i",
+                wav.to_str().unwrap(),
+                "-map", "0:v:0", "-map", "1:a:0",
+                "-c:v", "copy",
+                "-af", "aresample=192000,alimiter=limit=0.640:attack=1.5:release=35:level=false,aresample=48000",
+                "-c:a", "aac", "-b:a", "256k",
+                "-movflags", "+faststart",
+                tmp_mp4.to_str().unwrap(),
+            ])
+            .status()
+            .expect("ffmpeg remux");
+        assert!(st.success());
+        let _ = std::fs::remove_file(&wav);
+        std::fs::rename(&tmp_mp4, &mp4).expect("replace mp4");
+    }
+}
+
+#[test]
+#[ignore]
+fn render_all_ukg_v006() {
+    render_all_ukg_v005();
+    render_piece4_zeon_cathedral_ambient_chord_wash_v006();
 }

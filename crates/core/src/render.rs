@@ -875,6 +875,18 @@ pub fn plan_project(project: &Project) -> Vec<ClipPlan> {
                     }
                 }
             }
+            for (sid, evs) in parts.iter_mut().chain(video_parts.iter_mut().flatten()) {
+                let src_alpha = project
+                    .sources
+                    .get(*sid)
+                    .and_then(|s| s.video.as_deref())
+                    .is_some_and(|v| v.has_alpha());
+                if clip.collage_cutout || src_alpha {
+                    for e in evs.iter_mut() {
+                        e.tag.collage_cutout = true;
+                    }
+                }
+            }
             plans.push(ClipPlan { track: ti, clip_index: ci, parts, video_parts, style });
         }
     }
@@ -897,18 +909,17 @@ pub fn plan_project(project: &Project) -> Vec<ClipPlan> {
             && !project.master_punches.iter().any(|mp| {
                 matches!(mp.action, PunchAction::Layout(crate::tile::Layout::Tile))
             });
-        let is_pure_collage = project.layout == crate::tile::Layout::Collage
-            && !project.master_punches.iter().any(|mp| {
-                matches!(
-                    mp.action,
-                    PunchAction::Layout(crate::tile::Layout::Tile | crate::tile::Layout::Split)
-                )
-            });
+        let is_collage_or_split_only = matches!(
+            project.layout,
+            crate::tile::Layout::Collage | crate::tile::Layout::Split
+        ) && !project.master_punches.iter().any(|mp| {
+            matches!(mp.action, PunchAction::Layout(crate::tile::Layout::Tile))
+        });
         assign_tiles_where_opts(
             &mut plans,
             Some(&project.sources),
             project.layout_pan,
-            is_pure_collage,
+            is_collage_or_split_only,
             |cp| {
                 if muted(cp) {
                     return false;
@@ -1097,11 +1108,7 @@ fn assign_tiles_where_opts(
                     e.tag.voice = clip_voice_salted(cp.track, cp.clip_index, salt);
                 }
                 let base_end = e.tag.env.map_or(e.end(), |v| v.end().min(e.end()));
-                let end = if e.tag.visual_hold > 0.0 {
-                    base_end.max(e.visual_tile_end(false, 0.0))
-                } else {
-                    base_end
-                };
+                let end = base_end.max(e.visual_tile_end(false, OPTICAL_CARRY_SECS));
                 let s = spans
                     .entry(e.tag.voice)
                     .or_insert((e.onset, end, cp.track, e.pitch_ratio, salt, vid_aff));
@@ -1147,6 +1154,7 @@ fn assign_tiles_where_opts(
         .key()
     };
     let mut key_end: BTreeMap<u64, f64> = BTreeMap::new();
+    let mut active_vid_slot: BTreeMap<u64, (u8, f64)> = BTreeMap::new();
     let mut g = 0;
     while g < order.len() {
         let start = order[g].1;
@@ -1171,8 +1179,31 @@ fn assign_tiles_where_opts(
         for &(voice, start, end, track, _, salt, vid_aff) in group.iter() {
             let key = key_of(voice, track, salt, vid_aff);
             let base_key = key_of(voice, track, 0, vid_aff);
-            let slot = tiles.assign_keyed_salted(voice, key, base_key, salt, start);
-            tiles.release(voice, end);
+            let chord_sub = if (voice >> 60) == 0xD { ((voice & 0xF) + 1) as u8 } else { 0 };
+            let shared_existing = if salt == 0 && chord_sub <= 1 {
+                vid_aff.and_then(|vk| {
+                    active_vid_slot
+                        .get(&vk)
+                        .copied()
+                        .filter(|&(_, until)| until > start - 1e-6)
+                })
+            } else {
+                None
+            };
+            let slot = if let Some((s_act, until)) = shared_existing {
+                tiles.force_share_slot(voice, key, s_act, start, end.max(until));
+                s_act
+            } else {
+                let s_new = tiles.assign_keyed_salted(voice, key, base_key, salt, start);
+                tiles.release(voice, end);
+                s_new
+            };
+            if salt == 0 && chord_sub <= 1 {
+                if let Some(vk) = vid_aff {
+                    let prev_u = active_vid_slot.get(&vk).map_or(0.0, |&(_, u)| u);
+                    active_vid_slot.insert(vk, (slot, end.max(prev_u)));
+                }
+            }
             slot_of.insert(voice, slot);
             spans.push((slot, start, end));
             let e = key_end.entry(key).or_insert(end);
@@ -1326,7 +1357,7 @@ fn frame_split_grids_and_maps(
     n_frames: usize,
     aspect: f32,
 ) -> Vec<((u32, u32), [u8; crate::tile::MAX_TILES], usize)> {
-    collect_frame_panel_slots(plans, t0, fps, n_frames, true, false)
+    collect_frame_panel_slots(plans, t0, fps, n_frames, true, true)
         .into_iter()
         .map(|s| {
             let (cnt, remap) = crate::tile::dense_slot_remap(&s);
@@ -1349,6 +1380,126 @@ fn frame_collage_grids_and_maps(
             (crate::tile::collage_grid_for(cnt, aspect), Some(remap), cnt)
         })
         .collect()
+}
+
+/// Collapse any simultaneous non-ratchet (`cell_salt == 0`) slots sharing the same
+/// underlying video clip (`vk`) on frame `fi` onto a single canonical slot in `remap`
+/// and recompute `cnt` + `(cols, rows)` so twin panels of one video clip can never
+/// appear side-by-side in multi-video projects (`distinct_videos >= 2`).
+#[allow(clippy::too_many_arguments)]
+fn dedup_frame_grids_by_video(
+    plans: &[ClipPlan],
+    sources: &[Source],
+    t0: f64,
+    fps: f32,
+    n_frames: usize,
+    skip_wash: bool,
+    skip_collage_fg: bool,
+    grids: &mut [((u32, u32), Option<[u8; crate::tile::MAX_TILES]>, usize)],
+    grid_fn: impl Fn(usize) -> (u32, u32),
+) {
+    use std::collections::BTreeSet;
+    let mut distinct = BTreeSet::new();
+    for s in sources {
+        if s.video.as_deref().is_some_and(|v| !v.has_alpha()) {
+            if let Some(id) = raw_source_video_id(s) {
+                distinct.insert(id);
+            }
+        }
+    }
+    if distinct.len() < 2 {
+        return;
+    }
+    let fps_f = fps.max(1e-3) as f64;
+    // Per frame: list of `(raw_slot, vid_id, cell_salt)` active on `fi`.
+    let mut frame_entries: Vec<Vec<(u8, Option<u64>, u8)>> = vec![Vec::new(); n_frames];
+    for cp in plans {
+        let vparts = cp.video_parts.as_deref().unwrap_or(&cp.parts);
+        for (sid, evs) in vparts {
+            let vid_id = sources.get(*sid).and_then(raw_source_video_id);
+            for e in evs {
+                if e.tag.chord_harmony
+                    || (skip_wash && e.tag.is_wash)
+                    || (skip_collage_fg && e.tag.collage_cutout)
+                {
+                    continue;
+                }
+                let Some(slot) = e.tag.tile else { continue };
+                let s_clamped = slot.min((crate::tile::MAX_TILES - 1) as u8);
+                let vis_end = e.visual_tile_end(false, OPTICAL_CARRY_SECS);
+                let f0 = ((e.onset - t0) * fps_f).floor().max(0.0) as usize;
+                let f1 = (((vis_end - t0) * fps_f).ceil().max(0.0) as usize).min(n_frames);
+                for (fi, list) in frame_entries.iter_mut().enumerate().take(f1).skip(f0) {
+                    let ft = t0 + fi as f64 / fps_f;
+                    if ft >= e.onset && ft < vis_end && e.tag.picture_at(ft) > 0.0 {
+                        let tup = (s_clamped, vid_id, e.tag.cell_salt);
+                        if !list.contains(&tup) {
+                            list.push(tup);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for (fi, entries) in frame_entries.into_iter().enumerate() {
+        if entries.is_empty() || fi >= grids.len() {
+            continue;
+        }
+        // Map each pure `(vid_id, salt == 0)` raw_slot to the lowest active slot holding `vid_id`,
+        // then derive `unique_canon` STRICTLY from resolved `canon_for_raw[raw_s]` so every cell
+        // `0..cnt` is guaranteed to have >= 1 active event drawing into it (zero empty quadrants!).
+        let mut canon_for_raw = [0u8; crate::tile::MAX_TILES];
+        for (i, c) in canon_for_raw.iter_mut().enumerate() {
+            *c = i as u8;
+        }
+        let mut raw_can_merge = [true; crate::tile::MAX_TILES];
+        let mut raw_single_vk: [Option<u64>; crate::tile::MAX_TILES] =
+            [None; crate::tile::MAX_TILES];
+        for &(raw_s, vk_opt, salt) in &entries {
+            let ri = raw_s as usize;
+            if salt > 0 || vk_opt.is_none() {
+                raw_can_merge[ri] = false;
+            } else if let Some(vk) = vk_opt {
+                match raw_single_vk[ri] {
+                    None => raw_single_vk[ri] = Some(vk),
+                    Some(prev) if prev != vk => raw_can_merge[ri] = false,
+                    _ => {}
+                }
+            }
+        }
+        let mut vid_rep: std::collections::BTreeMap<u64, u8> = std::collections::BTreeMap::new();
+        let mut sorted = entries;
+        sorted.sort_by_key(|&(s, _, salt)| (salt > 0, s));
+        for &(raw_s, vk_opt, salt) in &sorted {
+            if salt == 0 && !raw_can_merge[raw_s as usize] {
+                if let Some(vk) = vk_opt {
+                    vid_rep.entry(vk).or_insert(raw_s);
+                }
+            }
+        }
+        for &(raw_s, vk_opt, salt) in &sorted {
+            if salt == 0 && raw_can_merge[raw_s as usize] {
+                if let Some(vk) = vk_opt {
+                    let rep = *vid_rep.entry(vk).or_insert(raw_s);
+                    canon_for_raw[raw_s as usize] = rep;
+                }
+            }
+        }
+        let mut unique_canon: Vec<u8> = Vec::new();
+        for &(raw_s, _, _) in &sorted {
+            let c = canon_for_raw[raw_s as usize];
+            if !unique_canon.contains(&c) {
+                unique_canon.push(c);
+            }
+        }
+        let (cnt, dense) = crate::tile::dense_slot_remap(&unique_canon);
+        let mut packed_remap = [0u8; crate::tile::MAX_TILES];
+        for r in 0..crate::tile::MAX_TILES {
+            let c = canon_for_raw[r] as usize;
+            packed_remap[r] = dense[c.min(crate::tile::MAX_TILES - 1)];
+        }
+        grids[fi] = (grid_fn(cnt), Some(packed_remap), cnt);
+    }
 }
 
 fn collect_frame_panel_slots(
@@ -1432,6 +1583,13 @@ pub fn render_project(project: &Project, from_beat: f64, to_beat: f64) -> Render
     }))
     .expect("in-memory frame sink is infallible");
     RenderOutput { audio, frames, fps: project.fps, events }
+}
+
+/// Render only the stereo master audio `[from_beat, to_beat)` of `project` without rasterizing video frames.
+pub fn render_project_audio(project: &Project, from_beat: f64, to_beat: f64) -> StereoBuffer {
+    render_project_with_frames(project, from_beat, to_beat, None)
+        .expect("audio-only sink is infallible")
+        .0
 }
 
 /// Render `[from_beat, to_beat)` of the project directly to an MP4 file on disk,
@@ -1519,13 +1677,68 @@ fn render_project_core(
     let has_collage_layout = project.layout == crate::tile::Layout::Collage
         || project.master_punches.iter().any(|p| matches!(p.action, PunchAction::Layout(crate::tile::Layout::Collage)));
     let tile_grids_opt = has_tile_layout.then(|| {
-        frame_tile_grids_and_maps_stage(&plan, t0, project.fps, n_frames, aspect, project.portrait_columns)
+        let mut g = frame_tile_grids_and_maps_stage(
+            &plan,
+            t0,
+            project.fps,
+            n_frames,
+            aspect,
+            project.portrait_columns,
+        );
+        if !project.portrait_columns {
+            dedup_frame_grids_by_video(
+                &plan,
+                &project.sources,
+                t0,
+                project.fps,
+                n_frames,
+                false,
+                false,
+                &mut g,
+                |cnt| {
+                    if aspect.is_finite() && aspect < 0.85 {
+                        crate::tile::portrait_grid_for(cnt, aspect)
+                    } else {
+                        crate::tile::grid_for(cnt)
+                    }
+                },
+            );
+        }
+        g
     });
     let split_grids_opt = has_split_layout.then(|| {
-        frame_split_grids_and_maps(&plan, t0, project.fps, n_frames, aspect)
+        let mut g: Vec<((u32, u32), Option<[u8; crate::tile::MAX_TILES]>, usize)> =
+            frame_split_grids_and_maps(&plan, t0, project.fps, n_frames, aspect)
+                .into_iter()
+                .map(|(gr, rm, cnt)| (gr, Some(rm), cnt))
+                .collect();
+        dedup_frame_grids_by_video(
+            &plan,
+            &project.sources,
+            t0,
+            project.fps,
+            n_frames,
+            true,
+            true,
+            &mut g,
+            |cnt| crate::tile::split_grid_for(cnt, aspect),
+        );
+        g
     });
     let collage_grids_opt = has_collage_layout.then(|| {
-        frame_collage_grids_and_maps(&plan, t0, project.fps, n_frames, aspect)
+        let mut g = frame_collage_grids_and_maps(&plan, t0, project.fps, n_frames, aspect);
+        dedup_frame_grids_by_video(
+            &plan,
+            &project.sources,
+            t0,
+            project.fps,
+            n_frames,
+            true,
+            true,
+            &mut g,
+            |cnt| crate::tile::collage_grid_for(cnt, aspect),
+        );
+        g
     });
 
     let n_tracks = project.tracks.len();
@@ -1916,9 +2129,31 @@ fn render_project_core(
         })
         .collect();
 
+    // Active song window `[song_t0, song_t1]` across unmuted clips so sub-beat sample-and-hold
+    // eliminates mid-groove `0x000000` black strobes on tiled stages without lighting empty post-song windows!
+    let mut song_t0 = f64::INFINITY;
+    let mut song_t1 = f64::NEG_INFINITY;
+    for (ti, track) in project.tracks.iter().enumerate() {
+        if track.muted {
+            continue;
+        }
+        let _ = ti;
+        for clip in &track.clips {
+            let c0 = project.beats_to_secs(clip.start_beat);
+            let c1 = project.beats_to_secs(clip.end_beat());
+            if c1 > c0 {
+                song_t0 = song_t0.min(c0);
+                song_t1 = song_t1.max(c1);
+            }
+        }
+    }
+    let mut last_lit_bg: Option<(f64, Frame)> = None;
+    let mut last_lit_full: Option<(f64, Frame)> = None;
+
     let mut render_one_frame = |fi: usize, frame: &mut Frame| {
         let ft = t0 + fi as f64 / project.fps as f64;
         let frame_beat = ft * project.bpm / 60.0;
+        let in_song_span = song_t1 > song_t0 && ft >= song_t0 && ft <= song_t1 + 0.05;
         let cur_layout = layout_at(frame_beat);
         let (grid_fi, remap_fi, active_cnt_fi, has_fg_fi) = match cur_layout {
             crate::tile::Layout::Tile => match tile_grids_opt.as_ref().map(|g| g[fi]) {
@@ -1926,7 +2161,7 @@ fn render_project_core(
                 None => (None, None, 0, false),
             },
             crate::tile::Layout::Split => match split_grids_opt.as_ref().map(|g| g[fi]) {
-                Some((grid, remap, cnt)) => (Some(grid), Some(remap), cnt, cnt > 0),
+                Some((grid, remap, cnt)) => (Some(grid), remap, cnt, cnt > 0),
                 None => (None, None, 0, false),
             },
             crate::tile::Layout::Collage => match collage_grids_opt.as_ref().map(|g| g[fi]) {
@@ -1940,6 +2175,7 @@ fn render_project_core(
         {
             fill_stage_ink(frame);
         }
+        let mut drew_any_bg = false;
         let mut collage_fg_layers: Vec<(Frame, f32)> = Vec::new();
         for ctx in track_ctxs.iter_mut() {
             let ti = ctx.ti;
@@ -1991,10 +2227,12 @@ fn render_project_core(
                         if let Some(video) =
                             project.sources.get(*sid).and_then(|s| s.video.as_ref())
                         {
-                            let part_is_collage_fg = cur_layout == crate::tile::Layout::Collage
-                                && (clip.collage_cutout
-                                    || video.has_alpha()
-                                    || evs.iter().any(|e| e.tag.collage_cutout));
+                            let part_is_collage_fg = matches!(
+                                cur_layout,
+                                crate::tile::Layout::Collage | crate::tile::Layout::Split
+                            ) && (clip.collage_cutout
+                                || video.has_alpha()
+                                || evs.iter().any(|e| e.tag.collage_cutout));
                             if part_is_collage_fg {
                                 let fg_dst = clip_fg_layer.get_or_insert_with(|| {
                                     Frame::transparent(project.width, project.height)
@@ -2077,6 +2315,15 @@ fn render_project_core(
                 let track_add = track
                     .additive
                     .unwrap_or_else(|| active_add.unwrap_or(ctx.fallback_add));
+                if opacity > 0.01
+                    && tl
+                        .data
+                        .chunks_exact(4)
+                        .step_by(13)
+                        .any(|px| px[3] > 4 && (px[0] | px[1] | px[2]) > 0)
+                {
+                    drew_any_bg = true;
+                }
                 blend_stage_layer(frame, &tl, cur_layout, track_add, opacity, track_is_wash);
             }
             if let Some(fg_tl) = track_collage_fg {
@@ -2094,9 +2341,32 @@ fn render_project_core(
             }
         }
 
+        // Sample-and-hold `last_lit_bg` across staccato `VoxPerc` & breakdown gaps (`<= 1.25s`)
+        // so tiled grids and foreground cutouts never blink to a dead `0x000000` black screen!
+        if drew_any_bg {
+            last_lit_bg = Some((ft, frame.clone()));
+        } else if in_song_span && (cur_layout.uses_tiles() || !collage_fg_layers.is_empty()) {
+            if let Some((prev_t, ref prev_bg)) = last_lit_bg {
+                if ft >= prev_t && (ft - prev_t) <= 1.25 {
+                    frame.data.copy_from_slice(&prev_bg.data);
+                    drew_any_bg = true;
+                }
+            }
+        }
+
         // Composite die-cut paper/sticker cutouts & framed zine photo-cards OVER the grid!
         for (fg_tl, fg_op) in &collage_fg_layers {
             blend_layer(frame, fg_tl, 0.0, *fg_op);
+        }
+
+        if drew_any_bg || !collage_fg_layers.is_empty() {
+            last_lit_full = Some((ft, frame.clone()));
+        } else if in_song_span && cur_layout.uses_tiles() {
+            if let Some((prev_t, ref prev_full)) = last_lit_full {
+                if ft >= prev_t && (ft - prev_t) <= 1.25 {
+                    frame.data.copy_from_slice(&prev_full.data);
+                }
+            }
         }
 
         fx::apply_video_chain(frame, &project.master_effects, &mut master_states);
@@ -3639,5 +3909,86 @@ mod tests {
             let rect = crate::tile::tile_rect_for_count(k, 3, 3, 5, 1.0);
             assert!(rect.w > 0.30 && rect.h > 0.45, "slot {k} in 5-cell grid fills 2-row packed layout: {rect:?}");
         }
+    }
+
+    #[test]
+    fn v006_tiled_staccato_sample_and_hold_and_frame_video_dedup() {
+        let mut p = Project {
+            bpm: 120.0,
+            fps: 30.0,
+            width: 64,
+            height: 64,
+            layout: crate::tile::Layout::Split,
+            ..Project::new()
+        };
+        let s_a = p.add_source(crate::timeline::Source {
+            name: "a".into(),
+            audio: Some(std::sync::Arc::new(crate::audio::AudioClip::sine(220.0, 2.0, p.sample_rate))),
+            video: Some(std::sync::Arc::new(solid_video(220, 60, 40))),
+            base_hz: 220.0,
+            ..Default::default()
+        });
+        let s_b = p.add_source(crate::timeline::Source {
+            name: "b".into(),
+            audio: Some(std::sync::Arc::new(crate::audio::AudioClip::sine(330.0, 2.0, p.sample_rate))),
+            video: Some(std::sync::Arc::new(solid_video(40, 180, 220))),
+            base_hz: 330.0,
+            ..Default::default()
+        });
+
+        // Track 1: sparse staccato `0.045s` hits on beat 0.0 and beat 1.5 (`0.75s` apart > `0.45s`!)
+        let mut pat = crate::seq::StepPattern::new("sparse");
+        pat.set_grid(4.0, 4);
+        let r0 = pat.add_row(s_a);
+        pat.rows[r0].grains.duration = 0.045;
+        pat.rows[r0].steps[0].on = true;
+        pat.rows[r0].steps[6].on = true;
+        let r1 = pat.add_row(s_b);
+        pat.rows[r1].grains.duration = 0.045;
+        pat.rows[r1].steps[0].on = true;
+        let pid = p.add_pattern(pat);
+        let t0 = p.add_track("grid");
+        p.tracks[t0].clips.push(Clip::new_pattern(pid, 0.0, 2.0));
+
+        // Track 2: separate Snippet clip ALSO using `s_a` (`salt == 0`) overlapping beat 0.0:
+        let t1 = p.add_track("twin_test");
+        let mut sn = Clip::new_snippet(s_a, 0.0, 0.5);
+        sn.grains.gain = 0.25;
+        p.tracks[t1].clips.push(sn);
+
+        let out = render_project(&p, 0.0, 2.0);
+        assert!(!out.frames.is_empty());
+        for (fi, fr) in out.frames.iter().enumerate() {
+            let max_rgb = fr
+                .data
+                .chunks_exact(4)
+                .map(|px| px[0].max(px[1]).max(px[2]))
+                .max()
+                .unwrap_or(0);
+            assert!(
+                max_rgb > 0,
+                "frame {fi} blinked to pure black (max_rgb = 0) during active tiled song span"
+            );
+        }
+        // At frame 0 (`t = 0.0`), `s_a` (2 overlapping `salt == 0` voices across 2 tracks) + `s_b`
+        // must deduplicate to `2` cells (`2x1`), NOT `3` cells (`2x2` twin panel)!
+        let plans = plan_project(&p);
+        let mut split_grids: Vec<((u32, u32), Option<[u8; crate::tile::MAX_TILES]>, usize)> =
+            frame_split_grids_and_maps(&plans, 0.0, p.fps, out.frames.len(), 1.0)
+                .into_iter()
+                .map(|(g, m, c)| (g, Some(m), c))
+                .collect();
+        dedup_frame_grids_by_video(
+            &plans,
+            &p.sources,
+            0.0,
+            p.fps,
+            out.frames.len(),
+            true,
+            false,
+            &mut split_grids,
+            |cnt| crate::tile::split_grid_for(cnt, 1.0),
+        );
+        assert_eq!(split_grids[0].0, (2, 1), "overlapping same-video salt=0 voices must share 1 slot");
     }
 }
