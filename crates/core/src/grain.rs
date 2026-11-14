@@ -685,6 +685,11 @@ pub struct VoiceTag {
     /// full-cell / full-frame (`size = 1.0`, `feather = 0.0`, sharp cut).
     #[serde(default)]
     pub hard_burst: bool,
+    /// Secondary harmony voice (`c > 0`) spawned by [`expand_chord_grain_inline`]:
+    /// plays in stereo audio while letting the root voice (`c == 0`) own the single
+    /// visual panel in `Split` / `Tile` stage layouts (no duplicate cloned panels).
+    #[serde(default)]
+    pub chord_harmony: bool,
 }
 
 impl Default for VoiceTag {
@@ -702,6 +707,7 @@ impl Default for VoiceTag {
             choke_at: None,
             caption: crate::chop::Caption::default(),
             hard_burst: false,
+            chord_harmony: false,
         }
     }
 }
@@ -829,14 +835,9 @@ pub fn expand_chord_grain_inline(
         // Chord-root HPF law: keep chord stacks >= 210 Hz so stacked room tone never muddies 180-400 Hz.
         ev.sculpt.hpf_hz = ev.sculpt.hpf_hz.max(210.0);
         ev.id = base.id.wrapping_mul(31).wrapping_add(c as u64);
-        if base.tag.voice != 0 {
-            if c > 0 {
-                ev.tag.voice = base.tag.voice ^ ((c as u64 + 1) * 0x0001_0000_0000_0007);
-            }
-        } else {
-            ev.tag.voice = 0xD000_0000_0000_0000
-                | ((base.id & 0x0FFF_FFFF_FFFF) << 4)
-                | (c as u64 & 0xF);
+        ev.tag.chord_harmony = c > 0;
+        if base.tag.voice == 0 {
+            ev.tag.voice = 0xD000_0000_0000_0000 | ((base.id & 0x0FFF_FFFF_FFFF) << 4);
         }
         if ev.sculpt.comb_mix > 0.001 || base.comb_hz > 0.0 {
             let root_hz = if base.comb_hz > 0.0 { base.comb_hz } else { base_hz.max(65.4) * base.pitch_ratio };

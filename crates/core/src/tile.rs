@@ -151,31 +151,55 @@ impl Layout {
 
 /// Architectural split grid `(cols, rows)` for [`Layout::Split`]:
 /// `1 -> 1x1`, `2 -> 2x1` (`1x2` in portrait `9:16`), `3 -> 3x1` triptych
-/// (`1x3` in portrait), `4 -> 2x2`, `5..=9 -> 3x3`.
+/// (`1x3` in portrait), `4 -> 4x1` wide / `2x2` portrait-or-square,
+/// `5..=6 -> 3x2` (`2x3` in portrait), `7..=9 -> 3x3`.
 pub fn split_grid_for(n: usize, aspect: f32) -> (u32, u32) {
     let portrait = aspect.is_finite() && aspect < 0.85;
+    let wide = !aspect.is_finite() || aspect > 1.3;
     match n {
         0 | 1 => (1, 1),
         2 => if portrait { (1, 2) } else { (2, 1) },
         3 => if portrait { (1, 3) } else { (3, 1) },
-        4 => (2, 2),
+        4 => if wide { (4, 1) } else { (2, 2) },
+        5 | 6 => if portrait { (2, 3) } else { (3, 2) },
         _ => (3, 3),
     }
 }
 
-/// Split-grid `(cols, rows)` for one frame from active discrete voice slots.
+/// Pack active sparse voice slots into contiguous indices `0..count` (sorted by
+/// original slot so voice left→right / top→bottom order stays deterministic with
+/// zero empty black quadrants).
+pub fn dense_slot_remap(slots: &[u8]) -> (usize, [u8; MAX_TILES]) {
+    let mut seen = [false; MAX_TILES];
+    for &s in slots {
+        seen[(s as usize).min(MAX_TILES - 1)] = true;
+    }
+    let mut remap = [0u8; MAX_TILES];
+    let mut count = 0usize;
+    for (s, &active) in seen.iter().enumerate() {
+        if active {
+            remap[s] = count as u8;
+            count += 1;
+        } else {
+            remap[s] = s as u8;
+        }
+    }
+    (count, remap)
+}
+
+/// Split-grid `(cols, rows)` for one frame from active discrete voice slots
+/// (densely packed so `N` active voices fill `N` panels without empty cells).
 pub fn frame_split_grid(slots: impl IntoIterator<Item = u8>, aspect: f32) -> (u32, u32) {
-    let (mut n, mut hi) = (0usize, 0usize);
+    let mut n = 0usize;
     let mut seen = [false; MAX_TILES];
     for s in slots {
         let s = (s as usize).min(MAX_TILES - 1);
         if !seen[s] {
             seen[s] = true;
             n += 1;
-            hi = hi.max(s + 1);
         }
     }
-    split_grid_for(n.max(hi), aspect)
+    split_grid_for(n, aspect)
 }
 
 /// *MODELL 5* (Hentschläger & Langheinrich, 1994) vertical portrait-column grid

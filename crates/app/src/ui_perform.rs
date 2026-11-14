@@ -74,12 +74,21 @@ impl App {
         self.prev_launch_t = None;
         let first_time = {
             let mut p = self.project.lock().unwrap();
+            if self.mode == AppMode::Perform && p.tracks.len() > PADS {
+                p.tracks.truncate(PADS);
+            }
             std::mem::swap(&mut p.tracks, &mut self.other_tracks);
             let first = m == AppMode::Perform && p.tracks.is_empty();
             if first {
-                // Seed the pads with the arrangement's clips so there's
-                // something to play straight away.
-                let seeds: Vec<_> = self.other_tracks.iter().flat_map(|t| t.clips.iter().cloned()).take(PADS).collect();
+                // Seed the pads with the arrangement's non-pattern media clips so there's
+                // something to play straight away while keeping any active SET sequence live.
+                let seeds: Vec<_> = self
+                    .other_tracks
+                    .iter()
+                    .filter(|t| t.name != "sequence")
+                    .flat_map(|t| t.clips.iter().cloned())
+                    .take(PADS)
+                    .collect();
                 for i in 0..PADS {
                     let ti = p.add_track(&format!("pad {}", i + 1));
                     p.tracks[ti].muted = true;
@@ -89,6 +98,29 @@ impl App {
                             c.length_beats = pow2_beats(c.length_beats);
                         }
                         p.tracks[ti].clips.push(c);
+                    }
+                }
+            }
+            if m == AppMode::Perform {
+                if p.tracks.len() > PADS {
+                    p.tracks.truncate(PADS);
+                }
+                let seq_has_steps = p.patterns.iter().any(|pat| {
+                    pat.rows.iter().any(|r| !r.muted && r.steps.iter().any(|s| s.on))
+                });
+                if seq_has_steps {
+                    if let Some(seq_tr) = self
+                        .other_tracks
+                        .iter()
+                        .find(|t| t.name == "sequence" && !t.muted && !t.clips.is_empty())
+                        .cloned()
+                    {
+                        while p.tracks.len() < PADS {
+                            let n = p.tracks.len();
+                            let ti = p.add_track(&format!("pad {}", n + 1));
+                            p.tracks[ti].muted = true;
+                        }
+                        p.tracks.push(seq_tr);
                     }
                 }
             }
@@ -148,7 +180,7 @@ impl App {
                 let ti = p.add_track(&format!("pad {}", n + 1));
                 p.tracks[ti].muted = true;
             }
-            for t in &mut p.tracks {
+            for t in p.tracks.iter_mut().take(PADS) {
                 t.clips.truncate(1);
                 let track_free = t.sculpt.free_loop_secs;
                 if let Some(c0) = t.clips.first_mut() {
@@ -164,7 +196,25 @@ impl App {
                     }
                 }
             }
-            for t in &mut p.tracks {
+            let base_seq_clips: Option<(Vec<chromagrain_core::timeline::Clip>, f64)> = self
+                .other_tracks
+                .iter()
+                .find(|t| t.name == "sequence" && !t.clips.is_empty())
+                .map(|t| {
+                    let span = t
+                        .clips
+                        .iter()
+                        .map(|c| c.start_beat + c.length_beats)
+                        .fold(0.0f64, f64::max)
+                        .max(4.0);
+                    (t.clips.clone(), span)
+                });
+            if let Some((_, seq_span)) = &base_seq_clips {
+                if p.tracks.get(PADS).is_some_and(|t| t.name == "sequence" && !t.muted) {
+                    loop_len = loop_len.max(*seq_span);
+                }
+            }
+            for t in p.tracks.iter_mut().take(PADS) {
                 let is_free = t.sculpt.free_loop_secs.is_some()
                     || t.clips
                         .first()
@@ -182,6 +232,26 @@ impl App {
                         t.clips.push(c);
                     }
                 }
+            }
+            if let (Some((base_clips, seq_span)), Some(seq_tr)) =
+                (base_seq_clips, p.tracks.get_mut(PADS).filter(|t| t.name == "sequence"))
+            {
+                let reps = ((loop_len / seq_span.max(1.0)).ceil() as usize).max(1);
+                let mut tiled = Vec::with_capacity(base_clips.len() * reps);
+                for r in 0..reps {
+                    let off = r as f64 * seq_span;
+                    if off >= loop_len - 1e-6 {
+                        break;
+                    }
+                    for mut c in base_clips.iter().cloned() {
+                        if off + c.start_beat < loop_len - 1e-6 {
+                            c.start_beat += off;
+                            c.length_beats = c.length_beats.min(loop_len - c.start_beat);
+                            tiled.push(c);
+                        }
+                    }
+                }
+                seq_tr.clips = tiled;
             }
         }
         self.fill_rev = self.project_rev;
@@ -252,7 +322,7 @@ impl App {
                     picture: chromagrain_core::envelope::PictureCut::Cut,
                     ..Default::default()
                 });
-                Some((c.source, t0, dur, adsr, p.layout == chromagrain_core::tile::Layout::Tile, p.layout_pan))
+                Some((c.source, t0, dur, adsr, p.layout.uses_tiles(), p.layout_pan))
             })
         };
         if let Some((source, t0, dur, adsr, is_tile, pan_by_tile)) = slice_hit {

@@ -80,6 +80,9 @@ pub fn tile_grid(scene: &Scene) -> Option<(u32, u32)> {
     }
     let mut slots: Vec<u8> = Vec::new();
     let mut see = |e: &GrainEvent, t: f64| {
+        if e.tag.chord_harmony {
+            return;
+        }
         if let Some(slot) = e.tag.tile {
             if t >= e.onset && t < e.end() && e.tag.picture_at(t) > 0.0 && !slots.contains(&slot) {
                 slots.push(slot);
@@ -1511,6 +1514,9 @@ impl GpuPreview {
                     // Pick the strongest active event for this `(track, clip, sid, pitch)` voice.
                     let mut best: Option<&GrainEvent> = None;
                     for ev in evs {
+                        if ev.tag.chord_harmony {
+                            continue;
+                        }
                         let vis_end = ev.onset + cp.style.visual_duration(ev.duration);
                         if t >= ev.onset && t < vis_end && ev.tag.picture_at(t) > 0.01 {
                             if best.is_none_or(|b| ev.onset > b.onset) {
@@ -1560,6 +1566,9 @@ impl GpuPreview {
         // Live voices (pads & emitters).
         let mut by_voice: HashMap<(u8, u64), (usize, &GrainEvent)> = HashMap::new();
         for (sid, bus, ev) in &scene.live {
+            if ev.tag.chord_harmony {
+                continue;
+            }
             if scene.live_t >= ev.onset && scene.live_t < ev.end() && ev.tag.picture_at(scene.live_t) > 0.01 {
                 let vk = (
                     *bus,

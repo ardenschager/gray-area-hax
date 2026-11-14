@@ -18,7 +18,8 @@ use crate::seq::pattern_events;
 use crate::timeline::{Clip, ClipKind, DuckState, Project, PunchAction, Source};
 use crate::video::{
     apply_video_tape, apply_video_tape_stop, blend_layer_over, blend_stage_layer,
-    composite_grains_frame_stage, draw_stage_caption, Frame, VisualGrainStyle, OPTICAL_CARRY_SECS,
+    composite_grains_frame_stage_mapped, draw_stage_caption, Frame, VisualGrainStyle,
+    OPTICAL_CARRY_SECS,
 };
 
 pub struct RenderOutput {
@@ -911,7 +912,7 @@ pub fn assign_tiles_where(plans: &mut [ClipPlan], layout_pan: bool, include: imp
         let fallback = clip_voice(cp.track, cp.clip_index);
         for (_, evs) in cp.parts.iter_mut().chain(cp.video_parts.iter_mut().flatten()) {
             for e in evs.iter_mut() {
-                if is_wash_only_in_split(e) {
+                if is_wash_only_in_split(e) || e.tag.chord_harmony {
                     continue;
                 }
                 if e.tag.voice == 0 {
@@ -975,6 +976,10 @@ pub fn assign_tiles_where(plans: &mut [ClipPlan], layout_pan: bool, include: imp
         }
         for (_, evs) in cp.parts.iter_mut().chain(cp.video_parts.iter_mut().flatten()) {
             for e in evs.iter_mut() {
+                if e.tag.chord_harmony {
+                    e.tag.tile = None;
+                    continue;
+                }
                 if let Some(&slot) = slot_of.get(&e.tag.voice) {
                     e.tag.tile = Some(slot);
                     if layout_pan && !e.tag.is_wash {
@@ -996,7 +1001,8 @@ fn is_wash_only_in_split(_e: &GrainEvent) -> bool {
 
 /// Stage-aware `Layout::Tile` grid timeline: uses *MODELL 5* vertical portrait columns
 /// (`2×1` / `3×1` / `4×1` on wide `aspect > 1.3`) when `portrait_columns` is set OR
-/// when active grains on that frame carry `hard_burst`.
+/// when active grains on that frame carry `hard_burst`, and packs `9:16` (`aspect < 0.85`)
+/// into dense horizontal bands (`1×1` / `1×2` / `1×3`) with zero empty quadrants.
 pub fn frame_tile_grids_stage(
     plans: &[ClipPlan],
     t0: f64,
@@ -1005,21 +1011,59 @@ pub fn frame_tile_grids_stage(
     aspect: f32,
     portrait_columns: bool,
 ) -> Vec<(u32, u32)> {
+    frame_tile_grids_and_maps_stage(plans, t0, fps, n_frames, aspect, portrait_columns)
+        .into_iter()
+        .map(|(g, _)| g)
+        .collect()
+}
+
+fn frame_tile_grids_and_maps_stage(
+    plans: &[ClipPlan],
+    t0: f64,
+    fps: f32,
+    n_frames: usize,
+    aspect: f32,
+    portrait_columns: bool,
+) -> Vec<((u32, u32), Option<[u8; crate::tile::MAX_TILES]>)> {
     let slots = collect_frame_panel_slots(plans, t0, fps, n_frames, false);
+    if aspect.is_finite() && aspect < 0.85 {
+        return slots
+            .into_iter()
+            .map(|s| {
+                let (cnt, remap) = crate::tile::dense_slot_remap(&s);
+                (crate::tile::portrait_grid_for(cnt, aspect), Some(remap))
+            })
+            .collect();
+    }
     if aspect <= 1.3 {
-        return slots.into_iter().map(crate::tile::frame_grid).collect();
+        return slots
+            .into_iter()
+            .map(|s| {
+                let (cnt, remap) = crate::tile::dense_slot_remap(&s);
+                (crate::tile::grid_for(cnt), Some(remap))
+            })
+            .collect();
+    }
+    if portrait_columns {
+        // Architectural *MODELL 5* installation monoliths: hold the piece-wide column
+        // count (`3×1` triptych, `2×1` diptych, etc.) with fixed column assignments!
+        let max_hi = slots
+            .iter()
+            .flat_map(|s| s.iter().map(|&x| (x as usize) + 1))
+            .max()
+            .unwrap_or(1);
+        let fixed_grid = crate::tile::portrait_grid_for(max_hi, aspect);
+        return vec![(fixed_grid, None); n_frames];
     }
     let fps_f = fps.max(1e-3) as f64;
-    let mut burst_frame = vec![portrait_columns; n_frames];
-    if !portrait_columns {
-        for cp in plans {
-            for (_, evs) in &cp.parts {
-                for e in evs.iter().filter(|e| e.tag.hard_burst) {
-                    let f0 = ((e.onset - t0) * fps_f).floor().max(0.0) as usize;
-                    let f1 = (((e.end() - t0) * fps_f).ceil().max(0.0) as usize).min(n_frames);
-                    for bf in burst_frame.iter_mut().take(f1).skip(f0) {
-                        *bf = true;
-                    }
+    let mut burst_frame = vec![false; n_frames];
+    for cp in plans {
+        for (_, evs) in &cp.parts {
+            for e in evs.iter().filter(|e| e.tag.hard_burst) {
+                let f0 = ((e.onset - t0) * fps_f).floor().max(0.0) as usize;
+                let f1 = (((e.end() - t0) * fps_f).ceil().max(0.0) as usize).min(n_frames);
+                for bf in burst_frame.iter_mut().take(f1).skip(f0) {
+                    *bf = true;
                 }
             }
         }
@@ -1029,9 +1073,9 @@ pub fn frame_tile_grids_stage(
         .enumerate()
         .map(|(fi, s)| {
             if burst_frame[fi] {
-                crate::tile::frame_portrait_grid(s, aspect)
+                (crate::tile::frame_portrait_grid(s, aspect), None)
             } else {
-                crate::tile::frame_grid(s)
+                (crate::tile::frame_grid(s), None)
             }
         })
         .collect()
@@ -1056,9 +1100,25 @@ pub fn frame_split_grids(
     n_frames: usize,
     aspect: f32,
 ) -> Vec<(u32, u32)> {
+    frame_split_grids_and_maps(plans, t0, fps, n_frames, aspect)
+        .into_iter()
+        .map(|(g, _, _)| g)
+        .collect()
+}
+
+fn frame_split_grids_and_maps(
+    plans: &[ClipPlan],
+    t0: f64,
+    fps: f32,
+    n_frames: usize,
+    aspect: f32,
+) -> Vec<((u32, u32), [u8; crate::tile::MAX_TILES], bool)> {
     collect_frame_panel_slots(plans, t0, fps, n_frames, true)
         .into_iter()
-        .map(|s| crate::tile::frame_split_grid(s, aspect))
+        .map(|s| {
+            let (cnt, remap) = crate::tile::dense_slot_remap(&s);
+            (crate::tile::split_grid_for(cnt, aspect), remap, cnt > 0)
+        })
         .collect()
 }
 
@@ -1075,7 +1135,7 @@ fn collect_frame_panel_slots(
         let vparts = cp.video_parts.as_deref().unwrap_or(&cp.parts);
         for (_, evs) in vparts {
             for e in evs {
-                if skip_wash && e.tag.is_wash {
+                if e.tag.chord_harmony || (skip_wash && e.tag.is_wash) {
                     continue;
                 }
                 let Some(slot) = e.tag.tile else { continue };
@@ -1234,10 +1294,10 @@ fn render_project_core(
     let has_split_layout = project.layout == crate::tile::Layout::Split
         || project.master_punches.iter().any(|p| matches!(p.action, PunchAction::Layout(crate::tile::Layout::Split)));
     let tile_grids_opt = has_tile_layout.then(|| {
-        frame_tile_grids_stage(&plan, t0, project.fps, n_frames, aspect, project.portrait_columns)
+        frame_tile_grids_and_maps_stage(&plan, t0, project.fps, n_frames, aspect, project.portrait_columns)
     });
     let split_grids_opt = has_split_layout.then(|| {
-        frame_split_grids(&plan, t0, project.fps, n_frames, aspect)
+        frame_split_grids_and_maps(&plan, t0, project.fps, n_frames, aspect)
     });
 
     let n_tracks = project.tracks.len();
@@ -1632,10 +1692,16 @@ fn render_project_core(
         let ft = t0 + fi as f64 / project.fps as f64;
         let frame_beat = ft * project.bpm / 60.0;
         let cur_layout = layout_at(frame_beat);
-        let grid_fi = match cur_layout {
-            crate::tile::Layout::Tile => tile_grids_opt.as_ref().map(|g| g[fi]),
-            crate::tile::Layout::Split => split_grids_opt.as_ref().map(|g| g[fi]),
-            crate::tile::Layout::Stack | crate::tile::Layout::Bleed => None,
+        let (grid_fi, remap_fi, has_fg_fi) = match cur_layout {
+            crate::tile::Layout::Tile => match tile_grids_opt.as_ref().map(|g| g[fi]) {
+                Some((grid, remap)) => (Some(grid), remap, true),
+                None => (None, None, false),
+            },
+            crate::tile::Layout::Split => match split_grids_opt.as_ref().map(|g| g[fi]) {
+                Some((grid, remap, has_fg)) => (Some(grid), Some(remap), has_fg),
+                None => (None, None, false),
+            },
+            crate::tile::Layout::Stack | crate::tile::Layout::Bleed => (None, None, false),
         };
         for ctx in track_ctxs.iter_mut() {
             let ti = ctx.ti;
@@ -1684,7 +1750,7 @@ fn render_project_core(
                         if let Some(video) =
                             project.sources.get(*sid).and_then(|s| s.video.as_ref())
                         {
-                            composite_grains_frame_stage(
+                            composite_grains_frame_stage_mapped(
                                 video,
                                 evs,
                                 &cp.style,
@@ -1697,6 +1763,8 @@ fn render_project_core(
                                 hue_override,
                                 cur_layout,
                                 grid_fi,
+                                remap_fi.as_ref(),
+                                has_fg_fi,
                             );
                         }
                     }

@@ -899,9 +899,9 @@ mod desktop {
         let wav_path: PathBuf = path.with_extension("chromagrain-tmp.wav");
         save_wav_f32(&wav_path, audio)?;
 
-        // 4× oversampled true-peak ceiling at -1.80 dBTP (0.8128) before AAC
-        // guarantees post-AAC True Peak <= -1.4 dBTP with zero clipped samples.
-        let af_chain = "aresample=192000,alimiter=limit=0.8128:attack=1.5:release=35:level=false,aresample=48000";
+        // 4× oversampled true-peak ceiling at -2.70 dBTP (0.7328) before AAC MDCT
+        // guarantees post-AAC True Peak <= -1.4 dBTP even on dense sub-bass transients.
+        let af_chain = "aresample=192000,alimiter=limit=0.7328:attack=1.5:release=35:level=false,aresample=48000";
 
         let mut child = Command::new("ffmpeg")
             .args([

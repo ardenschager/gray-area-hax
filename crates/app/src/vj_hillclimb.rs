@@ -123,7 +123,7 @@ fn build_piece1_frontier_therapy() -> Project {
     p.set_aspect_hd(AspectRatio::Vertical9x16);
     p.master_tape.warmth = 0.22;
 
-    // 1. Real YouTube Sources
+    // 1. Real YouTube Sources (every visual panel shows clean moving human/instrument footage!)
     let mut s_foot = load_yt(
         "p3_house_footwork_Bldi_Ph-oDw.mp4",
         "House Footwork Stomp",
@@ -133,10 +133,10 @@ fn build_piece1_frontier_therapy() -> Project {
         "https://www.youtube.com/watch?v=Bldi_Ph-oDw",
         (49.5, 28.0),
     );
-    let sl_kick_a = push_slice(&mut s_foot, 19.32, 19.54, SliceRole::Kick, "", None);
-    let sl_kick_b = push_slice(&mut s_foot, 17.32, 17.56, SliceRole::Kick, "", None);
+    let sl_kick_a = push_slice(&mut s_foot, 19.32, 19.54, SliceRole::Kick, "", Some((0.68, 0.46)));
+    let sl_kick_b = push_slice(&mut s_foot, 17.32, 17.56, SliceRole::Kick, "", Some((0.68, 0.46)));
 
-    let mut s_funk = load_yt(
+    let s_funk_raw = load_yt(
         "p1_funk_drums_fnTaVyzWYjI.mp4",
         "Funk Groove Drums",
         "TIMTIM RECORDS",
@@ -145,10 +145,8 @@ fn build_piece1_frontier_therapy() -> Project {
         "https://www.youtube.com/watch?v=fnTaVyzWYjI",
         (19.5, 28.0),
     );
-    let sl_snare_a = push_slice(&mut s_funk, 8.31, 8.45, SliceRole::Snare, "", None);
-    let sl_snare_b = push_slice(&mut s_funk, 5.30, 5.43, SliceRole::Snare, "", None);
 
-    let mut s_room = load_yt(
+    let s_room_raw = load_yt(
         "p1_room_drums_NqoBtAsByLI.mp4",
         "Drum Room Shootout",
         "Geoff Bosco",
@@ -157,8 +155,6 @@ fn build_piece1_frontier_therapy() -> Project {
         "https://www.youtube.com/watch?v=NqoBtAsByLI",
         (7.5, 26.0),
     );
-    let sl_hat_closed = push_slice(&mut s_room, 24.08, 24.22, SliceRole::Hat, "", None);
-    let sl_hat_open = push_slice(&mut s_room, 6.10, 6.38, SliceRole::Hat, "", None);
 
     let mut s_brass = load_yt(
         "p1_trumpet_fanfare_T_Kj30n-g9E.mp4",
@@ -170,8 +166,8 @@ fn build_piece1_frontier_therapy() -> Project {
         (6.0, 30.0),
     );
     s_brass.base_hz = 493.88; // B4
-    let sl_brass_b4 = push_slice(&mut s_brass, 16.12, 16.56, SliceRole::Tonal, "", None);
-    let sl_brass_high = push_slice(&mut s_brass, 26.42, 26.92, SliceRole::Tonal, "", None);
+    let sl_brass_b4 = push_slice(&mut s_brass, 16.12, 16.56, SliceRole::Tonal, "", Some((0.50, 0.42)));
+    let sl_brass_high = push_slice(&mut s_brass, 26.42, 26.92, SliceRole::Tonal, "", Some((0.50, 0.42)));
 
     let mut s_scratch = load_yt(
         "p1_turntable_scratch_rtqTmUVjsuY.mp4",
@@ -182,8 +178,8 @@ fn build_piece1_frontier_therapy() -> Project {
         "https://www.youtube.com/watch?v=rtqTmUVjsuY",
         (150.5, 30.0),
     );
-    let sl_scr_a = push_slice(&mut s_scratch, 5.86, 6.38, SliceRole::Phrase, "", None);
-    let sl_scr_b = push_slice(&mut s_scratch, 15.67, 16.12, SliceRole::Phrase, "", None);
+    let sl_scr_a = push_slice(&mut s_scratch, 5.86, 6.38, SliceRole::Phrase, "", Some((0.52, 0.52)));
+    let sl_scr_b = push_slice(&mut s_scratch, 15.67, 16.12, SliceRole::Phrase, "", Some((0.52, 0.52)));
 
     let mut s_angry = load_yt(
         "p1_angry_boy_1950_vwVHhrj-doE.mp4",
@@ -194,30 +190,32 @@ fn build_piece1_frontier_therapy() -> Project {
         "https://www.youtube.com/watch?v=vwVHhrj-doE",
         (296.0, 40.0),
     );
-    let sl_stut_help = push_slice(&mut s_angry, 0.88, 1.32, SliceRole::Phrase, "WE THINK—", None);
+    // Word-exact VTT local timestamps (w0=296.0s):
+    // [0.44] We [0.64] think [0.84] it [0.96] calls [1.28] for [1.40] professional [2.08] help.
+    let sl_stut_help = push_slice(&mut s_angry, 0.44, 1.02, SliceRole::Phrase, "WE THINK—", Some((0.48, 0.40)));
     let sl_full_help = push_slice(
         &mut s_angry,
-        0.88,
-        3.62,
+        0.44,
+        2.95,
         SliceRole::Phrase,
         "CALLS FOR PROFESSIONAL HELP",
-        None,
+        Some((0.48, 0.40)),
     );
     let sl_pine_st = push_slice(
         &mut s_angry,
-        4.10,
-        7.65,
+        3.82,
+        6.95,
         SliceRole::Phrase,
-        "GUIDANCE CLINIC ON PINE STREET?",
-        None,
+        "GUIDANCE CLINIC ON PINE ST?",
+        Some((0.52, 0.38)),
     );
     let sl_take_tommy = push_slice(
         &mut s_angry,
-        13.35,
-        15.42,
+        18.40,
+        20.68,
         SliceRole::Phrase,
-        "TAKE TOMMY OVER THERE",
-        None,
+        "PSYCHIATRIC SOCIAL WORKER",
+        Some((0.50, 0.38)),
     );
 
     let mut s_mental = load_yt(
@@ -229,21 +227,23 @@ fn build_piece1_frontier_therapy() -> Project {
         "https://www.youtube.com/watch?v=uC9B2F-l5V8",
         (2.0, 42.0),
     );
+    // Word-exact VTT local timestamps (w0=2.0s):
+    // [35.68] in [35.92] a [36.16] mental [36.56] institution. [38.00] My job...
     let sl_stut_mental = push_slice(
         &mut s_mental,
-        37.95,
-        38.35,
+        36.10,
+        36.55,
         SliceRole::Phrase,
         "MENTAL—",
-        None,
+        Some((0.50, 0.42)),
     );
     let sl_full_mental = push_slice(
         &mut s_mental,
-        36.85,
-        39.85,
+        35.64,
+        37.86,
         SliceRole::Phrase,
-        "A MENTAL INSTITUTION",
-        None,
+        "IN A MENTAL INSTITUTION",
+        Some((0.50, 0.42)),
     );
 
     let mut s_crazy = load_yt(
@@ -255,21 +255,24 @@ fn build_piece1_frontier_therapy() -> Project {
         "https://www.youtube.com/watch?v=wewsuLjJpEo",
         (13.5, 45.0),
     );
+    // Word-exact VTT local timestamps (w0=13.5s):
+    // [10.98] one-way [11.46] ticket [11.86] to [12.34] the [12.66] answering [13.14] machine [13.62] zone.
+    // [14.34] Nobody's [14.82] home. / [16.90] Nobody's [17.46] home.
     let sl_answering = push_slice(
         &mut s_crazy,
-        12.40,
-        16.10,
+        10.95,
+        14.18,
         SliceRole::Phrase,
         "ANSWERING MACHINE ZONE",
-        None,
+        Some((0.50, 0.48)),
     );
     let sl_nobody = push_slice(
         &mut s_crazy,
-        16.35,
-        18.25,
+        16.85,
+        18.85,
         SliceRole::Phrase,
         "NOBODY'S HOME!",
-        None,
+        Some((0.50, 0.48)),
     );
 
     let mut s_deviant = load_yt(
@@ -283,11 +286,11 @@ fn build_piece1_frontier_therapy() -> Project {
     );
     let sl_sloppy = push_slice(
         &mut s_deviant,
-        26.35,
-        29.10,
+        26.34,
+        29.38,
         SliceRole::Phrase,
-        "RUT WITH A BAD HABIT",
-        None,
+        "IN A RUT WITH A BAD HABIT",
+        Some((0.50, 0.42)),
     );
 
     let mut s_horse = load_yt(
@@ -299,22 +302,32 @@ fn build_piece1_frontier_therapy() -> Project {
         "https://www.youtube.com/watch?v=Y4kY-Rx47VM",
         (200.5, 34.0),
     );
+    // Pure high-centroid horse whinnies (verified ZCR 1792-3392 Hz, zero narrator voice!):
     let sl_whinny_long = push_slice(
         &mut s_horse,
-        14.74,
-        16.48,
+        26.15,
+        27.45,
         SliceRole::Phrase,
-        "[HORSE WHINNY]",
-        None,
+        "[HORSE WHINNY!]",
+        Some((0.46, 0.50)),
     );
     let sl_whinny_stab = push_slice(
         &mut s_horse,
-        27.17,
-        27.64,
+        11.22,
+        11.80,
         SliceRole::Phrase,
         "[NEIGH!]",
-        None,
+        Some((0.50, 0.48)),
     );
+
+    // Pair static-card drum recordings with kinetic turntable & 1950s film visuals so 0 text cards appear!
+    let mut s_funk = s_funk_raw.pair(&s_scratch);
+    let sl_snare_a = push_slice(&mut s_funk, 8.31, 8.45, SliceRole::Snare, "", Some((0.52, 0.52)));
+    let sl_snare_b = push_slice(&mut s_funk, 5.30, 5.43, SliceRole::Snare, "", Some((0.52, 0.52)));
+
+    let mut s_room = s_room_raw.pair(&s_deviant);
+    let sl_hat_closed = push_slice(&mut s_room, 24.08, 24.22, SliceRole::Hat, "", Some((0.50, 0.42)));
+    let sl_hat_open = push_slice(&mut s_room, 6.10, 6.38, SliceRole::Hat, "", Some((0.50, 0.42)));
 
     let id_foot = p.add_source(s_foot);
     let id_funk = p.add_source(s_funk);
@@ -374,9 +387,13 @@ fn build_piece1_frontier_therapy() -> Project {
     }
     let pid_kick = p.add_pattern(pat_kick);
     let t_kick = p.add_track("boom-bap kick");
-    p.tracks[t_kick].level = 1.08;
-    p.tracks[t_kick].clips.push(Clip::new_pattern(pid_kick, 0.0, 15.0));
-    p.tracks[t_kick].clips.push(Clip::new_pattern(pid_kick, 24.0, 8.0));
+    p.tracks[t_kick].level = 1.06;
+    let mut ck1 = Clip::new_pattern(pid_kick, 0.0, 15.0);
+    ck1.transform.scale = 1.85;
+    let mut ck2 = Clip::new_pattern(pid_kick, 24.0, 8.0);
+    ck2.transform.scale = 1.85;
+    p.tracks[t_kick].clips.push(ck1);
+    p.tracks[t_kick].clips.push(ck2);
 
     // Track 1: Crisp Funk Snare + Swung Room Hats + Vinyl Scratches
     let mut pat_top = StepPattern::new("snare + hats + scratch");
@@ -476,7 +493,14 @@ fn build_piece1_frontier_therapy() -> Project {
 
     let pid_top = p.add_pattern(pat_top);
     let t_top = p.add_track("funk kit + scratches");
-    p.tracks[t_top].level = 0.94;
+    p.tracks[t_top].level = 0.90;
+    p.tracks[t_top].level_points = vec![
+        AutoPoint { beat: 0.0, value: 0.92 },
+        AutoPoint { beat: 15.2, value: 0.92 },
+        AutoPoint { beat: 16.0, value: 0.34 }, // Strip drums down for AM Radio Break dynamic contrast!
+        AutoPoint { beat: 23.5, value: 0.34 },
+        AutoPoint { beat: 24.0, value: 0.96 }, // Full-band Grid drop!
+    ];
     p.tracks[t_top].clips.push(Clip::new_pattern(pid_top, 0.0, 15.2));
     p.tracks[t_top].clips.push(Clip::new_pattern(pid_top, 16.5, 15.5));
 
@@ -525,20 +549,14 @@ fn build_piece1_frontier_therapy() -> Project {
     }
     let pid_brass = p.add_pattern(pat_brass);
     let t_brass = p.add_track("brass chord stabs");
-    p.tracks[t_brass].level = 0.82;
-    p.tracks[t_brass].duck = Some(DuckSpec {
-        source_track: t_kick,
-        amount: 0.52,
-        attack: 0.006,
-        release: 0.17,
-        key_hz: 155.0,
-    });
+    p.tracks[t_brass].level = 0.62;
+    p.tracks[t_brass].clips.push(Clip::new_pattern(pid_brass, 0.0, 15.0));
+    p.tracks[t_brass].clips.push(Clip::new_pattern(pid_brass, 24.0, 8.0));
     p.tracks[t_brass].effects.push(AvEffect {
-        kind: EffectKind::Reverb { size: 0.58, damp: 0.48, mix: 0.22 },
+        kind: EffectKind::Reverb { size: 0.58, damp: 0.48, mix: 0.20 },
         audio: 1.0,
-        video: 0.25,
+        video: 0.20,
     });
-    p.tracks[t_brass].clips.push(Clip::new_pattern(pid_brass, 0.0, 32.0));
 
     // Track 3: `Choke Group 1` Absurdist Dialogue Call-and-Response (`0 st` natural speech + Captions!)
     // One 32-beat (128-sixteenth-step) non-looping theatrical dialogue pattern so every punchline
@@ -681,10 +699,18 @@ fn build_piece1_frontier_therapy() -> Project {
 
     let pid_vox = p.add_pattern(pat_vox);
     let t_vox = p.add_track("dialogue call-and-response");
-    p.tracks[t_vox].level = 1.12;
+    p.tracks[t_vox].level = 1.22;
     p.tracks[t_vox].choke_group = 1;
-    p.tracks[t_vox].eq.push(EqBand { freq: 3100.0, q: 1.1, gain_db: 2.2 }); // Clear speech presence
+    p.tracks[t_vox].eq.push(EqBand { freq: 2900.0, q: 1.0, gain_db: 2.8 }); // Clear speech presence
     p.tracks[t_vox].clips.push(Clip::new_pattern(pid_vox, 0.0, 32.0));
+    // Duck brass chords under spoken dialogue so every punchline cuts through crystal-clearly!
+    p.tracks[t_brass].duck = Some(DuckSpec {
+        source_track: t_vox,
+        amount: 0.62,
+        attack: 0.006,
+        release: 0.22,
+        key_hz: 3500.0,
+    });
 
     // Timed Master-Bus Performance Punches:
     // 1. Turntable Tape-Stop brake right after the Horse Whinny before the Radio Break!
@@ -733,14 +759,14 @@ fn build_piece2_lemon_and_string() -> Project {
         layout_pan: true,
         studio_bus: true,
         captions_on: true,
-        master_gain_db: 1.8,
+        master_gain_db: 3.1,
         master_bloom: 0.10,
         ..Default::default()
     };
     p.set_aspect_hd(AspectRatio::Wide16x9);
-    p.master_tape.warmth = 0.24;
+    p.master_tape.warmth = 0.22;
 
-    let mut s_wood = load_yt(
+    let s_wood_raw = load_yt(
         "p2_wooden_board_eup71wodKY8.mp4",
         "Chopping On Wooden Board",
         "Sound Effect Database",
@@ -749,9 +775,6 @@ fn build_piece2_lemon_and_string() -> Project {
         "https://www.youtube.com/watch?v=eup71wodKY8",
         (4.0, 28.0),
     );
-    let sl_wood_a = push_slice(&mut s_wood, 4.28, 4.38, SliceRole::Snare, "", None);
-    let sl_wood_b = push_slice(&mut s_wood, 7.48, 7.56, SliceRole::Snare, "", None);
-    let sl_wood_c = push_slice(&mut s_wood, 10.38, 10.46, SliceRole::Snare, "", None);
 
     let mut s_pages = load_yt(
         "p2_book_pages_WZhetc795TA.mp4",
@@ -762,9 +785,15 @@ fn build_piece2_lemon_and_string() -> Project {
         "https://www.youtube.com/watch?v=WZhetc795TA",
         (180.0, 32.0),
     );
-    let sl_page_turn = push_slice(&mut s_pages, 6.63, 6.88, SliceRole::Hat, "", None);
-    let sl_page_tap = push_slice(&mut s_pages, 11.65, 11.90, SliceRole::Snare, "", None);
-    let sl_page_riffle = push_slice(&mut s_pages, 30.65, 30.84, SliceRole::Hat, "", None);
+    let sl_page_turn = push_slice(&mut s_pages, 6.63, 6.88, SliceRole::Hat, "", Some((0.50, 0.56)));
+    let sl_page_tap = push_slice(&mut s_pages, 11.65, 11.90, SliceRole::Snare, "", Some((0.50, 0.56)));
+    let sl_page_riffle = push_slice(&mut s_pages, 30.65, 30.84, SliceRole::Hat, "", Some((0.50, 0.56)));
+
+    // Pair wooden cutting-board foley audio with real page-turning hands video (zero static text card!)
+    let mut s_wood = s_wood_raw.pair(&s_pages);
+    let sl_wood_a = push_slice(&mut s_wood, 4.28, 4.38, SliceRole::Snare, "", Some((0.48, 0.54)));
+    let sl_wood_b = push_slice(&mut s_wood, 7.48, 7.56, SliceRole::Snare, "", Some((0.52, 0.56)));
+    let sl_wood_c = push_slice(&mut s_wood, 10.38, 10.46, SliceRole::Snare, "", Some((0.50, 0.52)));
 
     let mut s_fgtr = load_yt(
         "p2_fingerpick_guitar_EfZyjGF64wA.mp4",
@@ -866,7 +895,7 @@ fn build_piece2_lemon_and_string() -> Project {
         ..VoiceSculpt::preset(Stamp::Kick)
     };
     pat_perc.rows[r_body].choke_group = 2;
-    for &(st, g) in &[(0usize, 0.92f32), (6, 0.68), (10, 0.84)] {
+    for &(st, g) in &[(0usize, 0.56f32), (6, 0.42), (10, 0.52)] {
         pat_perc.rows[r_body].steps[st] = Step {
             on: true,
             gain: g,
@@ -933,7 +962,19 @@ fn build_piece2_lemon_and_string() -> Project {
 
     let pid_perc = p.add_pattern(pat_perc);
     let t_perc = p.add_track("polymetric wood & pages");
-    p.tracks[t_perc].level = 0.95;
+    p.tracks[t_perc].level = 0.92;
+    // Macro 3-second EBU R128 chamber dynamic arc (`LRA >= 3.8 LU`):
+    // 0..8.5b: whisper solo intro + Jenny 1 -> 8.8..22.8b: full polymetric chamber bloom -> 23..32b: intimate cassette hush!
+    p.tracks[t_perc].level_points = vec![
+        AutoPoint { beat: 0.0, value: 0.14 },
+        AutoPoint { beat: 8.2, value: 0.16 },
+        AutoPoint { beat: 9.0, value: 1.00 },
+        AutoPoint { beat: 22.6, value: 1.00 },
+        AutoPoint { beat: 23.2, value: 0.16 },
+        AutoPoint { beat: 32.0, value: 0.10 },
+    ];
+    p.tracks[t_perc].eq.push(EqBand { freq: 290.0, q: 1.4, gain_db: -5.5 });
+    p.tracks[t_perc].eq.push(EqBand { freq: 5800.0, q: 0.9, gain_db: 2.8 });
     p.tracks[t_perc].clips.push(Clip::new_pattern(pid_perc, 0.0, 32.0));
 
     // Track 1: Interlocking Key-Locked Karplus-Strong `Pluck` Guitar Melodies (10-step vs 16-step!)
@@ -1001,17 +1042,31 @@ fn build_piece2_lemon_and_string() -> Project {
 
     let pid_gtr = p.add_pattern(pat_gtr);
     let t_gtr = p.add_track("karplus acoustic guitars");
-    p.tracks[t_gtr].level = 0.88;
+    p.tracks[t_gtr].level = 0.86;
+    p.tracks[t_gtr].level_points = vec![
+        AutoPoint { beat: 0.0, value: 0.34 },
+        AutoPoint { beat: 8.2, value: 0.34 },
+        AutoPoint { beat: 9.0, value: 1.00 },
+        AutoPoint { beat: 13.0, value: 0.58 },
+        AutoPoint { beat: 16.2, value: 0.58 },
+        AutoPoint { beat: 17.0, value: 1.05 },
+        AutoPoint { beat: 22.6, value: 1.00 },
+        AutoPoint { beat: 23.4, value: 0.32 },
+        AutoPoint { beat: 32.0, value: 0.18 },
+    ];
+    // Carve 220-380 Hz bedroom guitar resonance so Cello + Jenny voice breathe with zero mud!
+    p.tracks[t_gtr].eq.push(EqBand { freq: 295.0, q: 1.35, gain_db: -7.5 });
+    p.tracks[t_gtr].eq.push(EqBand { freq: 5200.0, q: 0.95, gain_db: 3.4 });
     p.tracks[t_gtr].effects.push(AvEffect {
         kind: EffectKind::Delay {
             time: 60.0 / 103.0 * 0.75,
-            feedback: 0.28,
-            mix: 0.18,
+            feedback: 0.24,
+            mix: 0.15,
             shift_x: 0.015,
             shift_y: 0.0,
         },
         audio: 1.0,
-        video: 0.2,
+        video: 0.18,
     });
     p.tracks[t_gtr].clips.push(Clip::new_pattern(pid_gtr, 0.0, 32.0));
 
@@ -1048,27 +1103,39 @@ fn build_piece2_lemon_and_string() -> Project {
     let pid_cello = p.add_pattern(pat_cello);
     let t_cello = p.add_track("baroque cello");
     p.tracks[t_cello].level = 0.84;
+    p.tracks[t_cello].level_points = vec![
+        AutoPoint { beat: 8.5, value: 0.0 },
+        AutoPoint { beat: 9.2, value: 0.94 },
+        AutoPoint { beat: 13.0, value: 0.45 },
+        AutoPoint { beat: 16.2, value: 0.45 },
+        AutoPoint { beat: 17.0, value: 1.00 },
+        AutoPoint { beat: 22.6, value: 0.96 },
+        AutoPoint { beat: 23.4, value: 0.22 },
+        AutoPoint { beat: 32.0, value: 0.10 },
+    ];
+    p.tracks[t_cello].eq.push(EqBand { freq: 265.0, q: 1.3, gain_db: -6.5 });
+    p.tracks[t_cello].eq.push(EqBand { freq: 4400.0, q: 1.0, gain_db: 2.8 });
     p.tracks[t_cello].effects.push(AvEffect {
-        kind: EffectKind::Reverb { size: 0.68, damp: 0.42, mix: 0.26 },
+        kind: EffectKind::Reverb { size: 0.64, damp: 0.46, mix: 0.22 },
         audio: 1.0,
-        video: 0.3,
+        video: 0.25,
     });
-    p.tracks[t_cello].clips.push(Clip::new_pattern(pid_cello, 2.0, 30.0));
+    p.tracks[t_cello].clips.push(Clip::new_pattern(pid_cello, 8.5, 23.5));
 
     // Subtle full-bleed cello shimmer wash (`is_wash == true` so it bleeds softly at 30% in `Layout::Split`)
     let t_wash = p.add_track("cello harmonic bleed");
-    p.tracks[t_wash].level = 0.40;
-    let mut c_wash = Clip::new_snippet(id_cello, 0.0, 32.0);
+    p.tracks[t_wash].level = 0.20;
+    let mut c_wash = Clip::new_snippet(id_cello, 8.5, 15.0);
     c_wash.key = Some(key);
     c_wash.grains.position = 22.61 / 32.0;
-    c_wash.grains.gain = 0.55;
+    c_wash.grains.gain = 0.42;
     c_wash.grains.sculpt = VoiceSculpt {
         free_loop_secs: Some(5.8),
-        shimmer: 0.52,
+        shimmer: 0.56,
         wow_flutter: 0.18,
-        ebb_flow: 0.45,
-        hpf_hz: 260.0,
-        lpf_hz: 6800.0,
+        ebb_flow: 0.55,
+        hpf_hz: 420.0,
+        lpf_hz: 7200.0,
         pocket_carve: true,
         ..VoiceSculpt::preset(Stamp::Wash)
     };
@@ -1081,9 +1148,9 @@ fn build_piece2_lemon_and_string() -> Project {
     pat_jenny.rows[rj].choke_group = 1;
     pat_jenny.rows[rj].grains.quantize_amount = 0.0;
     pat_jenny.rows[rj].sculpt = VoiceSculpt {
-        drive_db: 1.8,
-        hpf_hz: 185.0,
-        lpf_hz: 11_500.0,
+        drive_db: 2.2,
+        hpf_hz: 220.0,
+        lpf_hz: 12_500.0,
         pocket_carve: true,
         ..VoiceSculpt::preset(Stamp::Phrase)
     };
@@ -1091,27 +1158,29 @@ fn build_piece2_lemon_and_string() -> Project {
         on: true,
         slice_index: Some(sl_jenny_crisp),
         length: 1.0,
-        gain: 0.92,
+        gain: 0.72,
         ..Step::default()
     };
     pat_jenny.rows[rj].steps[52] = Step {
         on: true,
         slice_index: Some(sl_jenny_weather),
         length: 1.0,
-        gain: 0.92,
+        gain: 1.15,
         ..Step::default()
     };
-    pat_jenny.rows[rj].steps[92] = Step {
+    pat_jenny.rows[rj].steps[96] = Step {
         on: true,
         slice_index: Some(sl_jenny_windy),
         length: 1.0,
-        gain: 0.95,
+        gain: 0.76,
         ..Step::default()
     };
     let pid_jenny = p.add_pattern(pat_jenny);
     let t_jenny = p.add_track("found cassette voice");
-    p.tracks[t_jenny].level = 0.94;
+    p.tracks[t_jenny].level = 0.96;
     p.tracks[t_jenny].choke_group = 1;
+    p.tracks[t_jenny].eq.push(EqBand { freq: 290.0, q: 1.4, gain_db: -3.5 });
+    p.tracks[t_jenny].eq.push(EqBand { freq: 3200.0, q: 1.0, gain_db: 3.2 });
     p.tracks[t_jenny].clips.push(Clip::new_pattern(pid_jenny, 0.0, 32.0));
 
     p
@@ -1131,8 +1200,8 @@ fn build_piece3_kinetic_prism() -> Project {
         layout_pan: true,
         studio_bus: true,
         captions_on: false,
-        master_gain_db: 1.6,
-        master_bloom: 0.18,
+        master_gain_db: 2.8,
+        master_bloom: 0.20,
         ..Default::default()
     };
     p.set_aspect_hd(AspectRatio::Square1x1);
@@ -1146,8 +1215,8 @@ fn build_piece3_kinetic_prism() -> Project {
         "https://www.youtube.com/watch?v=Bldi_Ph-oDw",
         (49.5, 28.0),
     );
-    let sl_sub_a = push_slice(&mut s_foot, 19.32, 19.52, SliceRole::Kick, "", None);
-    let sl_sub_b = push_slice(&mut s_foot, 20.32, 20.58, SliceRole::Kick, "", None);
+    let sl_sub_a = push_slice(&mut s_foot, 19.32, 19.52, SliceRole::Kick, "", Some((0.68, 0.46)));
+    let sl_sub_b = push_slice(&mut s_foot, 20.32, 20.58, SliceRole::Kick, "", Some((0.68, 0.46)));
 
     let mut s_anvil = load_yt(
         "p3_anvil_rhythm_uQVeyOplSj0.mp4",
@@ -1158,9 +1227,9 @@ fn build_piece3_kinetic_prism() -> Project {
         "https://www.youtube.com/watch?v=uQVeyOplSj0",
         (2.0, 26.0),
     );
-    let sl_anv_snare = push_slice(&mut s_anvil, 3.60, 3.84, SliceRole::Snare, "", None);
-    let sl_anv_hat = push_slice(&mut s_anvil, 12.47, 12.62, SliceRole::Hat, "", None);
-    let sl_anv_ping = push_slice(&mut s_anvil, 16.23, 16.48, SliceRole::Snare, "", None);
+    let sl_anv_snare = push_slice(&mut s_anvil, 3.60, 3.84, SliceRole::Snare, "", Some((0.50, 0.52)));
+    let sl_anv_hat = push_slice(&mut s_anvil, 12.47, 12.62, SliceRole::Hat, "", Some((0.50, 0.52)));
+    let sl_anv_ping = push_slice(&mut s_anvil, 16.23, 16.48, SliceRole::Snare, "", Some((0.50, 0.52)));
 
     let mut s_pan = load_yt(
         "p3_handpan_slap_X3xMP7zyq3M.mp4",
@@ -1172,8 +1241,9 @@ fn build_piece3_kinetic_prism() -> Project {
         (295.5, 30.0),
     );
     s_pan.base_hz = 164.81;
-    let sl_pan_low = push_slice(&mut s_pan, 3.55, 4.08, SliceRole::Tonal, "", None);
-    let sl_pan_hi = push_slice(&mut s_pan, 26.84, 27.42, SliceRole::Tonal, "", None);
+    // Strictly inside 3.5..19.5s live performance window (zero Patreon end-credits!)
+    let sl_pan_low = push_slice(&mut s_pan, 3.55, 4.08, SliceRole::Tonal, "", Some((0.54, 0.46)));
+    let sl_pan_hi = push_slice(&mut s_pan, 13.45, 14.05, SliceRole::Tonal, "", Some((0.54, 0.46)));
 
     let mut s_crt = load_yt(
         "p3_crt_lissajous_p5Wi2hcncHg.mp4",
@@ -1238,8 +1308,14 @@ fn build_piece3_kinetic_prism() -> Project {
     }
     let pid_ukg = p.add_pattern(pat_ukg);
     let t_ukg = p.add_track("ukg footwork sub");
-    p.tracks[t_ukg].level = 1.10;
-    p.tracks[t_ukg].clips.push(Clip::new_pattern(pid_ukg, 0.0, 40.0));
+    p.tracks[t_ukg].level = 0.78;
+    // 8-beat UKG club breakdown (`beats 14..22`, ~3.4s) before the Kaleido sub-drop (`LRA >= 3.2 LU`)!
+    let mut c_ukg1 = Clip::new_pattern(pid_ukg, 0.0, 14.0);
+    c_ukg1.transform.scale = 1.85;
+    let mut c_ukg2 = Clip::new_pattern(pid_ukg, 22.0, 18.0);
+    c_ukg2.transform.scale = 1.85;
+    p.tracks[t_ukg].clips.push(c_ukg1);
+    p.tracks[t_ukg].clips.push(c_ukg2);
 
     // Track 1: Anvil UKG Rim/Snare + Ratcheting Metallic Hats (`×3`, `×4`)
     let mut pat_anv = StepPattern::new("anvil ukg tops");
@@ -1320,16 +1396,18 @@ fn build_piece3_kinetic_prism() -> Project {
     p.tracks[t_anv].clips.push(Clip::new_pattern(pid_anv, 0.0, 40.0));
 
     // Track 2: Aphex Bouncing-Ball Ratchet Handpan (`×3 / ×4 / ×6` + High-Q Resonant Sweeps!)
-    // Build 4 distinct resonant cutoff stages (`1150 Hz -> 2600 Hz -> 5800 Hz -> 1850 Hz` @ `Q = 4.2`)
-    // across the 40-beat timeline so the high-Q filter visibly & audibly sweeps!
+    // Build 6 steep resonant cutoff stages (`680 -> 1550 -> 3400 -> 6800 -> 1950 -> 5200 Hz` @ `Q = 5.4`)
+    // across the 40-beat timeline so the high-Q acid/IDM filter unmistakably sweeps!
     let cutoffs = [
-        (0.0, 10.0, 1150.0f32),
-        (10.0, 10.0, 2850.0),
-        (20.0, 16.0, 6200.0),
-        (36.0, 4.0, 1750.0),
+        (0.0, 6.0, 680.0f32),
+        (6.0, 6.0, 1550.0),
+        (12.0, 8.0, 3400.0),
+        (20.0, 8.0, 6800.0),
+        (28.0, 8.0, 1950.0),
+        (36.0, 4.0, 5200.0),
     ];
     let t_pan = p.add_track("aphex ratchet handpan");
-    p.tracks[t_pan].level = 0.90;
+    p.tracks[t_pan].level = 1.18;
     p.tracks[t_pan].duck = Some(DuckSpec {
         source_track: t_ukg,
         amount: 0.45,
@@ -1347,19 +1425,19 @@ fn build_piece3_kinetic_prism() -> Project {
         pat_p.rows[rp].grains.adsr = Some(Adsr {
             attack: 0.002,
             decay: 0.18,
-            sustain: 0.15,
-            release: 0.06,
+            sustain: 0.18,
+            release: 0.07,
             picture: PictureCut::Cut,
             cut_threshold: 0.08,
             ..Adsr::default()
         });
         pat_p.rows[rp].sculpt = VoiceSculpt {
-            comb_mix: 0.56,
+            comb_mix: 0.54,
             comb_feedback: 0.92,
             hpf_hz: 185.0,
             lpf_hz: lpf,
-            resonance_q: 4.2, // High-Q acid/IDM filter peak!
-            drive_db: 4.0,
+            resonance_q: 5.4, // Singing high-Q acid/IDM resonant filter sweep!
+            drive_db: 5.2,
             pocket_carve: true,
             ..VoiceSculpt::preset(Stamp::Pluck)
         };
@@ -1437,33 +1515,57 @@ fn build_piece3_kinetic_prism() -> Project {
     }
     let pid_crt = p.add_pattern(pat_crt);
     let t_crt = p.add_track("crt oscilloscope chords");
-    p.tracks[t_crt].level = 0.76;
+    p.tracks[t_crt].level = 0.96;
     p.tracks[t_crt].duck = Some(DuckSpec {
         source_track: t_ukg,
-        amount: 0.55,
+        amount: 0.48,
         attack: 0.005,
         release: 0.16,
         key_hz: 155.0,
     });
     p.tracks[t_crt].clips.push(Clip::new_pattern(pid_crt, 0.0, 40.0));
+    // Bright full-canvas sunlit handpan + CRT dual prism bed across `beats 20..36` so the 6-fold
+    // spinning polar `Kaleido` folds vibrant warm color + glowing neon vector geometry on every frame!
+    let t_prism = p.add_track("kaleido prism bed");
+    p.tracks[t_prism].level = 0.82;
+    let mut c_prism = Clip::new_snippet(id_pan, 20.0, 16.0);
+    c_prism.key = Some(key);
+    c_prism.grains.position = 5.5 / 30.0;
+    c_prism.grains.pitch = 0.0;
+    c_prism.grains.gain = 0.36;
+    c_prism.visual.additive = 0.35;
+    c_prism.grains.sculpt = VoiceSculpt {
+        free_loop_secs: Some(3.2),
+        shimmer: 0.45,
+        hpf_hz: 320.0,
+        lpf_hz: 9500.0,
+        pocket_carve: true,
+        ..VoiceSculpt::preset(Stamp::TapeLoop)
+    };
+    p.tracks[t_prism].clips.push(c_prism);
 
     // Master Punches:
-    // 1. Mid-track `ISOL8` Sub-Drop teaser (`LF + HF SOLO` hollow scoop for 2 beats before Kaleido!)
+    // 1. Mid-track `ISOL8` Breakdown (`LMF + MF + HMF SOLO` resonant acid focus during `beats 15..20`!)
     let mut scoop_iso = BandIsolator::default();
-    scoop_iso.solo = [true, false, false, true, true];
+    scoop_iso.solo = [false, true, true, true, false];
     p.master_punches.push(MasterPunch {
-        start_beat: 18.0,
+        start_beat: 15.0,
         end_beat: 20.0,
         action: PunchAction::Isolator(scoop_iso),
     });
-    // 2. Spinning 6-fold Polar `Kaleido` AV Prism Section (`beats 20.0..36.0`) -> snaps back to crisp `Grid` (`36..40`)!
+    // 2. Switch to feathered `Split` + Spinning 6-fold Polar `Kaleido` AV Prism (`beats 20.0..36.0`) -> crisp `Grid` (`36..40`)!
+    p.master_punches.push(MasterPunch {
+        start_beat: 20.0,
+        end_beat: 36.0,
+        action: PunchAction::Layout(Layout::Split),
+    });
     p.master_punches.push(MasterPunch {
         start_beat: 20.0,
         end_beat: 36.0,
         action: PunchAction::Effect(AvEffect {
-            kind: EffectKind::Kaleido { folds: 6.0, spin: 0.28 },
+            kind: EffectKind::Kaleido { folds: 6.0, spin: 0.38 },
             audio: 0.65,
-            video: 0.92,
+            video: 0.98,
         }),
     });
 
@@ -1489,9 +1591,9 @@ fn build_piece4_oxide_ballroom() -> Project {
         ..Default::default()
     };
     p.set_aspect_hd(AspectRatio::Wide16x9);
-    p.master_tape.warmth = 0.42;
-    p.master_tape.wow = 0.28;
-    p.master_tape.age = 0.32;
+    p.master_tape.warmth = 0.38;
+    p.master_tape.wow = 0.26;
+    p.master_tape.age = 0.16; // Clear golden opening exposure before progressive oxide decay!
 
     let mut s_hol = load_yt(
         "p4_victrola_holiday_0YQ-Ya-LYPU.mp4",
@@ -1504,18 +1606,19 @@ fn build_piece4_oxide_ballroom() -> Project {
     );
     s_hol.base_hz = 311.13; // Eb4
 
+    // Watermark-free 1920 sunlit lawn waltz archival film (2,020 views, zero timecodes or archive logos!)
     let mut s_ball = load_yt(
-        "p4_ballroom_1930s_MHExYQdDvoE.mp4",
-        "1930s Ballroom Dancers",
-        "My Footage",
-        "20190408",
-        686,
-        "https://www.youtube.com/watch?v=MHExYQdDvoE",
-        (1.0, 22.0),
+        "p4_waltz_1920_HnBT-jPRNBU.mp4",
+        "People Dance a Waltz on a Lawn in 1920",
+        "Walter Nelson (Wallywood Pictures)",
+        "20210510",
+        2_020,
+        "https://www.youtube.com/watch?v=HnBT-jPRNBU",
+        (12.0, 34.0),
     );
     s_ball.base_hz = 207.65; // Ab3
 
-    let mut s_pno = load_yt(
+    let mut s_pno_raw = load_yt(
         "p4_detuned_piano_wAhwj_kNZIA.mp4",
         "Antique Out-of-Tune Piano",
         "Stringless Piano",
@@ -1524,7 +1627,9 @@ fn build_piece4_oxide_ballroom() -> Project {
         "https://www.youtube.com/watch?v=wAhwj_kNZIA",
         (142.5, 34.0),
     );
-    s_pno.base_hz = 246.94;
+    s_pno_raw.base_hz = 246.94;
+    // Pair antique out-of-tune piano audio with clean 1920 waltz film so zero channel text appears!
+    let s_pno = s_pno_raw.pair(&s_ball);
 
     let s_sup8 = load_yt(
         "p4_super8_projector_4rWesEobV38.mp4",
@@ -1586,18 +1691,19 @@ fn build_piece4_oxide_ballroom() -> Project {
     };
     p.tracks[t0].clips.push(c0);
 
-    // Loop 2 (`5.1s` free-running period — ~5.0 passes): 1930s Sepia Ballroom Couple
+    // Loop 2 (`5.1s` free-running period — ~5.0 passes): 1920s Sunlit Lawn Waltz Couple
     let t1 = p.add_track("ballroom dancers 5.1s loop");
-    p.tracks[t1].level = 0.82;
+    p.tracks[t1].level = 0.90;
     p.tracks[t1].level_points = vec![
-        AutoPoint { beat: 0.0, value: 0.45 },
-        AutoPoint { beat: 3.0, value: 0.84 },
-        AutoPoint { beat: 29.0, value: 0.80 },
-        AutoPoint { beat: 32.0, value: 0.10 },
+        AutoPoint { beat: 0.0, value: 0.85 },
+        AutoPoint { beat: 2.5, value: 1.00 },
+        AutoPoint { beat: 14.0, value: 0.96 },
+        AutoPoint { beat: 26.0, value: 0.58 },
+        AutoPoint { beat: 32.0, value: 0.12 },
     ];
     let mut c1 = Clip::new_snippet(id_ball, 0.0, 32.0);
     c1.key = Some(key);
-    c1.grains.position = 6.55 / 22.0;
+    c1.grains.position = 5.5 / 34.0;
     c1.grains.pitch = -3.0;
     c1.grains.varispeed = true;
     c1.grains.pan = 0.24;
@@ -1605,7 +1711,7 @@ fn build_piece4_oxide_ballroom() -> Project {
     c1.grains.sculpt = VoiceSculpt {
         free_loop_secs: Some(5.1),
         wow_flutter: 0.52,
-        disintegrate: 0.78,
+        disintegrate: 0.82,
         ebb_flow: 0.72,
         shimmer: 0.44,
         drive_db: 2.5,
@@ -1614,6 +1720,12 @@ fn build_piece4_oxide_ballroom() -> Project {
         pocket_carve: true,
         ..VoiceSculpt::preset(Stamp::Disintegrate)
     };
+    c1.visual.additive = 0.22;
+    c1.effects.push(AvEffect {
+        kind: EffectKind::Tint { hue: 36.0, amount: 0.24 },
+        audio: 0.0,
+        video: 1.0,
+    });
     p.tracks[t1].clips.push(c1);
 
     // Loop 3 (`7.3s` free-running period — ~3.5 passes): Out-of-tune Antique Upright Piano + `+12/+7st` Shimmer
@@ -1692,7 +1804,7 @@ fn build_piece4_oxide_ballroom() -> Project {
         end_beat: 23.5,
         action: PunchAction::Isolator(hf_mute),
     });
-    // Stage 2 (`beats 23.5..32.0`): `HF + HMF MUTE` — deep Caretaker memory submersion
+    // Stage 2 (`beats 23.5..32.0`): `HF + HMF MUTE` — deep Caretaker memory submersion + optical darkening
     let mut deep_mute = BandIsolator::default();
     deep_mute.mute = [false, false, false, true, true];
     p.master_punches.push(MasterPunch {
@@ -1714,18 +1826,18 @@ fn build_piece5_modell5_pulse() -> Project {
         bpm: 120.0, // 33 beats = 16.50s (2 beats = 1.00s!)
         sample_rate: 48_000,
         fps: 60.0,
-        layout: Layout::Split, // 3 active tracks on 16:9 -> 3x1 Portrait Triptych!
+        layout: Layout::Tile, // Crisp architectural 3x1 Portrait Triptych with 1.5px obsidian dividers!
         portrait_columns: true,
         layout_pan: true,
         studio_bus: true,
         captions_on: false,
-        master_gain_db: 1.4,
+        master_gain_db: 2.2,
         master_bloom: 0.16,
         ..Default::default()
     };
     p.set_aspect_hd(AspectRatio::Wide16x9);
 
-    let mut s_bari = load_yt(
+    let mut s_bari_raw = load_yt(
         "p5_closeup_baritone_Vpv8jFV_-ZI.mp4",
         "Baritone Close-Up",
         "The Song Company",
@@ -1734,9 +1846,20 @@ fn build_piece5_modell5_pulse() -> Project {
         "https://www.youtube.com/watch?v=Vpv8jFV_-ZI",
         (72.0, 28.0),
     );
-    s_bari.base_hz = 110.0; // A2
-    let _ = push_slice(&mut s_bari, 2.16, 3.12, SliceRole::Tonal, "", Some((0.50, 0.38)));
-    let _ = push_slice(&mut s_bari, 14.32, 16.26, SliceRole::Tonal, "", Some((0.50, 0.38)));
+    s_bari_raw.base_hz = 110.0; // A2
+
+    let s_opera_vis = load_yt(
+        "p5_opera_closeup_XPCANtdso1Q.mp4",
+        "Opera Close-Up Portrait",
+        "Opera Parallèle",
+        "20210324",
+        293,
+        "https://www.youtube.com/watch?v=XPCANtdso1Q",
+        (12.0, 32.0),
+    );
+    // Pair deep 110 Hz baritone voice with front-facing close-up singer portrait (`3.5..5.4s`, `focus = (0.65, 0.23)`)
+    let mut s_bari = s_bari_raw.pair(&s_opera_vis);
+    let _ = push_slice(&mut s_bari, 0.0, 28.0, SliceRole::Tonal, "", Some((0.65, 0.23)));
 
     let mut s_drama = load_yt(
         "p5_closeup_drama_nbBruTwcxvs.mp4",
@@ -1748,8 +1871,7 @@ fn build_piece5_modell5_pulse() -> Project {
         (156.0, 32.0),
     );
     s_drama.base_hz = 220.0; // A3
-    let _ = push_slice(&mut s_drama, 9.89, 10.55, SliceRole::Phrase, "", Some((0.50, 0.36)));
-    let _ = push_slice(&mut s_drama, 20.27, 21.28, SliceRole::Tonal, "", Some((0.50, 0.36)));
+    let _ = push_slice(&mut s_drama, 6.0, 28.0, SliceRole::Phrase, "", Some((0.50, 0.36)));
 
     let mut s_sop = load_yt(
         "p5_closeup_soprano_xGz_lKfLFdg.mp4",
@@ -1761,8 +1883,8 @@ fn build_piece5_modell5_pulse() -> Project {
         (275.5, 28.0),
     );
     s_sop.base_hz = 293.66; // D4
-    let _ = push_slice(&mut s_sop, 6.39, 8.62, SliceRole::Tonal, "", Some((0.50, 0.35)));
-    let _ = push_slice(&mut s_sop, 15.18, 16.78, SliceRole::Tonal, "", Some((0.50, 0.35)));
+    // Lock strictly to tight bearded face close-up window (`14.85..15.68s`) & zoom past corner TV logo!
+    let _ = push_slice(&mut s_sop, 0.0, 28.0, SliceRole::Tonal, "", Some((0.50, 0.50)));
 
     let id_bari = p.add_source(s_bari);
     let id_drama = p.add_source(s_drama);
@@ -1779,9 +1901,11 @@ fn build_piece5_modell5_pulse() -> Project {
     };
 
     // Helper to build one MODELL 5 synchronous audio-rate portrait monolith
+    #[allow(clippy::too_many_arguments)]
     let make_monolith = |src_id: usize,
                          start_beat: f64,
                          len_beats: f64,
+                         face_zoom: f32,
                          pos_pts: &[(f64, f64)],
                          dens_pts: &[(f64, f64)],
                          dur_pts: &[(f64, f64)],
@@ -1790,16 +1914,17 @@ fn build_piece5_modell5_pulse() -> Project {
                          seed: u64|
      -> Clip {
         let mut c = Clip::new(src_id, start_beat, len_beats);
+        c.transform.scale = face_zoom;
         c.grains = GrainSettings {
             density: 18.0,
-            duration: 0.028,
+            duration: 0.032,
             duration_jitter: 0.0, // Synchronous pulse train!
             position: pos_pts[0].1 as f32,
             spray: 0.008, // Micro-frozen vocal vowel/expression!
             scan_speed: 0.05,
             pitch: 0.0,
             quantize_amount: 0.0,
-            gain: 0.92,
+            gain: 0.98,
             envelope: 0.14,
             env_skew: -0.45,
             seed,
@@ -1833,38 +1958,39 @@ fn build_piece5_modell5_pulse() -> Project {
 
     // Monolith 0 (Left): Baritone (`sub_exciter` gives physical chest impact to every frame cut!)
     let t0 = p.add_track("monolith left · baritone");
-    p.tracks[t0].level = 0.94;
+    p.tracks[t0].level = 0.98;
     p.tracks[t0].clips.push(make_monolith(
         id_bari,
         0.0,
         32.8,
+        2.35,
         &[
-            (0.0, 2.22 / 28.0),
-            (10.0, 2.68 / 28.0),
-            (18.0, 14.45 / 28.0),
-            (26.0, 15.58 / 28.0),
+            (0.0, 3.65 / 28.0),
+            (10.0, 4.15 / 28.0),
+            (18.0, 4.55 / 28.0),
+            (26.0, 3.85 / 28.0),
         ],
         &[
-            (0.0, 7.5),    // Isolated staccato machine shutter
-            (4.0, 18.0),   // Threshold of pitch!
+            (0.0, 12.0),   // Crisp authoritative machine shutter from beat 0!
+            (4.0, 19.5),   // Threshold of pitch!
             (10.0, 27.5),  // A0 audio-rate buzz
             (16.0, 36.71), // D1 harmonic buzz
             (22.0, 27.5),  // 5:6:7.5 polyrhythmic beating
             (27.0, 41.20), // E1 climax buzz
-            (31.5, 6.0),   // De-escalation back to discrete breath clicks
+            (31.5, 7.5),   // De-escalation back to discrete breath clicks
         ],
         &[
-            (0.0, 0.042),
-            (4.0, 0.030),
-            (10.0, 0.024),
-            (16.0, 0.019),
-            (27.0, 0.017),
-            (31.5, 0.044),
+            (0.0, 0.048),
+            (4.0, 0.032),
+            (10.0, 0.025),
+            (16.0, 0.020),
+            (27.0, 0.018),
+            (31.5, 0.046),
         ],
         &[(0.0, 0.0), (16.0, -2.0), (24.0, 0.0), (28.0, -5.0)],
         VoiceSculpt {
-            sub_exciter: 0.44,
-            drive_db: 4.2,
+            sub_exciter: 0.48,
+            drive_db: 4.6,
             hpf_hz: 36.0,
             lpf_hz: 12_500.0,
             pocket_carve: true,
@@ -1875,37 +2001,38 @@ fn build_piece5_modell5_pulse() -> Project {
 
     // Monolith 1 (Center): Dramatic Close-Up (`enters beat 1.5`, phases against Left!)
     let t1 = p.add_track("monolith center · drama");
-    p.tracks[t1].level = 0.94;
+    p.tracks[t1].level = 0.98;
     p.tracks[t1].clips.push(make_monolith(
         id_drama,
         1.5,
         31.3,
+        1.42,
         &[
             (0.0, 9.92 / 32.0),
             (8.5, 15.42 / 32.0),
             (16.5, 20.72 / 32.0),
-            (24.5, 31.48 / 32.0),
+            (24.5, 21.10 / 32.0),
         ],
         &[
-            (0.0, 9.0),
-            (4.5, 20.6),   // Phasing against 18 Hz!
+            (0.0, 13.5),
+            (4.5, 22.0),   // Phasing against 19.5 Hz!
             (10.5, 33.0),  // C1
             (16.5, 43.65), // F1 audio-rate vocal buzz!
             (20.5, 33.0),  // 6-ratio beating
             (25.5, 44.0),  // A1 octave lock!
-            (30.0, 5.5),
+            (30.0, 6.5),
         ],
         &[
-            (0.0, 0.038),
+            (0.0, 0.042),
             (4.5, 0.028),
-            (10.5, 0.021),
-            (16.5, 0.016),
-            (25.5, 0.016),
-            (30.0, 0.042),
+            (10.5, 0.022),
+            (16.5, 0.017),
+            (25.5, 0.017),
+            (30.0, 0.044),
         ],
         &[(0.0, 0.0), (12.0, 3.0), (20.0, -2.0), (26.0, 5.0)],
         VoiceSculpt {
-            drive_db: 3.8,
+            drive_db: 4.2,
             hpf_hz: 130.0,
             lpf_hz: 13_500.0,
             resonance_q: 1.6,
@@ -1917,25 +2044,26 @@ fn build_piece5_modell5_pulse() -> Project {
 
     // Monolith 2 (Right): Operatic Close-Up (`enters beat 3.0` -> locks full 3x1 Portrait Triptych!)
     let t2 = p.add_track("monolith right · opera");
-    p.tracks[t2].level = 0.90;
+    p.tracks[t2].level = 0.95;
     p.tracks[t2].clips.push(make_monolith(
         id_sop,
         3.0,
         29.8,
+        1.65,
         &[
-            (0.0, 6.45 / 28.0),
-            (8.0, 15.20 / 28.0),
-            (15.0, 16.25 / 28.0),
-            (23.0, 7.42 / 28.0),
+            (0.0, 14.88 / 28.0),
+            (8.0, 15.22 / 28.0),
+            (15.0, 15.56 / 28.0),
+            (23.0, 15.05 / 28.0),
         ],
         &[
-            (0.0, 11.0),
-            (3.0, 22.0),
+            (0.0, 14.0),
+            (3.0, 24.0),
             (9.0, 36.71),
             (15.0, 45.0), // Peak 45 Hz audio-rate frame oscillation!
             (19.0, 41.25),
             (24.0, 38.5),
-            (28.5, 5.0),
+            (28.5, 6.0),
         ],
         &[
             (0.0, 0.034),
@@ -2045,18 +2173,18 @@ fn prepare_real_yt_stub_dir() -> PathBuf {
 }
 
 fn p6_after_yt_import(app: &mut App) {
-    // Enrich the freshly fetched Angry Boy (1950) clip on Column 4 with our caption slice
+    // Enrich the freshly fetched Angry Boy (1950) clip on Column 4 with our word-exact caption slice
     // so `Kit -> pads` harvests `"CALLS FOR PROFESSIONAL HELP"` onto a Perform phrase pad!
     let mut p = app.project.lock().unwrap();
     if let Some((idx, s)) = p.sources.iter_mut().enumerate().last() {
         s.name = "Angry Boy 1950".into();
         let sl_idx = push_slice(
             s,
-            0.88,
-            3.62,
+            0.44,
+            2.95,
             SliceRole::Phrase,
             "CALLS FOR PROFESSIONAL HELP",
-            None,
+            Some((0.48, 0.40)),
         ) as usize;
         drop(p);
         app.studio
@@ -2068,8 +2196,89 @@ fn p6_after_yt_import(app: &mut App) {
     }
 }
 
+fn p6_pause_for_audition(app: &mut App) {
+    if app.playback.is_playing() {
+        chromagrain_ui::Host::toggle_play(app);
+    }
+}
+
+fn p6_fire_stamp_audition(app: &mut App, stamp: Stamp, dur_s: f32) {
+    let now = app.app_clock.secs();
+    app.live_id += 1;
+    let voice = 0x57A0_0000_0000 | (app.live_id & 0xFFFF_FFFF);
+    let (src_idx, t0, base_hz) = {
+        let p = app.project.lock().unwrap();
+        let idx = p.sources.len().saturating_sub(1);
+        let hz = p.sources.get(idx).map(|s| s.effective_base_hz()).unwrap_or(220.0);
+        let pos = match stamp {
+            Stamp::Kick => 0.55,
+            Stamp::Chord => 1.15,
+            Stamp::Disintegrate => 0.44,
+            _ => 0.44,
+        };
+        (idx, pos, hz)
+    };
+    let mut sculpt = VoiceSculpt::preset(stamp);
+    if stamp == Stamp::Chord {
+        sculpt.chord = ChordVoicing::Min9;
+        sculpt.pitch_semitones = -5.0;
+    } else if stamp == Stamp::Disintegrate {
+        sculpt.wow_flutter = 0.62;
+        sculpt.disintegrate = 0.85;
+        sculpt.shimmer = 0.42;
+    }
+    let adsr = Adsr {
+        attack: 0.004,
+        decay: 0.16,
+        sustain: 0.85,
+        release: 0.22,
+        picture: PictureCut::Fade,
+        ..Adsr::default()
+    };
+    let off = now + (dur_s as f64 - 0.18).max(0.18);
+    let ev = chromagrain_core::grain::GrainEvent {
+        onset: now,
+        source_pos: t0,
+        duration: dur_s,
+        pitch_ratio: chromagrain_core::music::semitones_to_ratio(sculpt.pitch_semitones),
+        gain: 0.96,
+        pan: 0.0,
+        envelope: 0.02,
+        id: voice,
+        tag: chromagrain_core::grain::VoiceTag {
+            voice,
+            env: Some(chromagrain_core::envelope::VoiceEnv { adsr, on: now, off }),
+            focus: (0.48, 0.40),
+            oxide_dropout: if stamp == Stamp::Disintegrate { 0.65 } else { 0.0 },
+            zoom_punch: if stamp == Stamp::Kick { 0.16 } else { 0.05 },
+            ..Default::default()
+        },
+        sculpt,
+        ..Default::default()
+    };
+    let key = app.studio.key;
+    let (chord_evs, chord_n) =
+        chromagrain_core::grain::expand_chord_grain_inline(&ev, sculpt.chord, base_hz, Some(&key));
+    for cev in chord_evs.into_iter().take(chord_n) {
+        chromagrain_ui::Host::fire(app, 0, src_idx, cev);
+    }
+}
+
+fn p6_audition_kick(app: &mut App) {
+    p6_fire_stamp_audition(app, Stamp::Kick, 0.95);
+}
+
+fn p6_audition_chord(app: &mut App) {
+    p6_fire_stamp_audition(app, Stamp::Chord, 1.15);
+}
+
+fn p6_audition_disintegrate(app: &mut App) {
+    p6_fire_stamp_audition(app, Stamp::Disintegrate, 1.85);
+}
+
 fn p6_prime_perform_groove(app: &mut App) {
-    // Ensure immediate pad launch (`LaunchQ::Now`), start transport on our 2-cue VJ set,
+    // Immediate pad launch (`LaunchQ::Now`), unmute looping Perform pads (15 & 16) so multi-clip
+    // video & tape loops run continuously alongside the live `SET` sequence (`p.tracks[PADS]`),
     // and ensure Pad 11 carries our spoken hook caption!
     app.launch_q = crate::LaunchQ::Now;
     for i in 10..14 {
@@ -2078,6 +2287,20 @@ fn p6_prime_perform_groove(app: &mut App) {
             break;
         }
     }
+    {
+        let mut p = app.project.lock().unwrap();
+        for loop_pad in [14usize, 15] {
+            if let Some(tr) = p.tracks.get_mut(loop_pad) {
+                if !tr.clips.is_empty() {
+                    tr.muted = false;
+                }
+            }
+        }
+        if let Some(seq_tr) = p.tracks.get_mut(crate::PADS) {
+            seq_tr.muted = false;
+        }
+    }
+    app.mark_now();
     if !app.playback.is_playing() {
         chromagrain_ui::Host::toggle_play(app);
     }
@@ -2100,9 +2323,9 @@ fn harness_isol8_showcase(opts: &RecordOpts) -> Harness<'static, Film> {
         "https://www.youtube.com/watch?v=Bldi_Ph-oDw",
         (49.5, 28.0),
     );
-    let _ = push_slice(&mut s0, 19.32, 19.55, SliceRole::Kick, "", None);
+    let _ = push_slice(&mut s0, 19.32, 19.55, SliceRole::Kick, "", Some((0.68, 0.46)));
 
-    let mut s1 = load_yt(
+    let s1_raw = load_yt(
         "p1_funk_drums_fnTaVyzWYjI.mp4",
         "Funk Groove",
         "TIMTIM RECORDS",
@@ -2111,7 +2334,18 @@ fn harness_isol8_showcase(opts: &RecordOpts) -> Harness<'static, Film> {
         "https://www.youtube.com/watch?v=fnTaVyzWYjI",
         (19.5, 28.0),
     );
-    let _ = push_slice(&mut s1, 8.31, 8.45, SliceRole::Snare, "", None);
+    let s1_vis = load_yt(
+        "p1_turntable_scratch_rtqTmUVjsuY.mp4",
+        "Vinyl Scratches",
+        "ScratchDJAcademy",
+        "20140819",
+        1_160_631,
+        "https://www.youtube.com/watch?v=rtqTmUVjsuY",
+        (150.5, 30.0),
+    );
+    // Pair Funk Groove snare audio with live turntable hands video so every stage panel moves!
+    let mut s1 = s1_raw.pair(&s1_vis);
+    let _ = push_slice(&mut s1, 8.31, 8.45, SliceRole::Snare, "", Some((0.52, 0.52)));
 
     let mut s2 = load_yt(
         "p1_trumpet_fanfare_T_Kj30n-g9E.mp4",
@@ -2231,7 +2465,21 @@ fn harness_isol8_showcase(opts: &RecordOpts) -> Harness<'static, Film> {
 
                 let pid1 = p.add_pattern(pat1);
                 let pid2 = p.add_pattern(pat2);
+                let ti = p.add_track("sequence");
+                let mut sc1 = Clip::new_pattern(pid1, 0.0, 16.0);
+                sc1.visual.feather = 0.3;
+                sc1.visual.additive = 0.3;
+                let mut sc2 = Clip::new_pattern(pid2, 16.0, 16.0);
+                sc2.visual.feather = 0.3;
+                sc2.visual.additive = 0.3;
+                p.tracks[ti].clips = vec![sc1, sc2];
                 drop(p);
+
+                app.loop_on = true;
+                app.loop_start = 0.0;
+                app.loop_end = 32.0;
+                app.playback.set_loop(app.loop_region());
+                app.studio.source_focus.insert(0, (0.68, 0.46));
 
                 for c in 0..3 {
                     app.studio.columns[c] = Some(c);
@@ -2272,12 +2520,13 @@ fn tour_isol8_showcase() -> Tour {
             .collect()
     };
 
-    // Act 1 (0.0..5.8s): Anodized sand console · multi-touch real YouTube footage in Split mode
-    at(0.35, Touch(rows(0, &[(0.0, 0.0), (0.03, 0.8), (0.0, 1.5)]), 4.9));
-    at(1.45, Touch(rows(1, &[(0.0, 0.0), (-0.03, 0.7), (0.0, 1.3)]), 3.8));
-    say(2.1, 5.2, "touch real youtube clips · sound and split-screen picture");
+    // Act 1 (0.0..5.5s): Anodized sand console · multi-touch real YouTube footage -> start live groove!
+    at(0.35, Touch(rows(0, &[(0.0, 0.0), (0.03, 0.8), (0.0, 1.5)]), 4.3));
+    at(1.35, Touch(rows(1, &[(0.0, 0.0), (-0.03, 0.7), (0.0, 1.3)]), 3.3));
+    say(2.0, 5.1, "touch real youtube clips · sound and split-screen picture");
+    at(4.85, Tap(lab("play"))); // Keep live 3-lane YouTube groove rolling while crate-digging!
 
-    // Act 2 (5.8..15.2s): Add -> YouTube `<500 views` crate digger
+    // Act 2 (5.8..14.4s): Add -> YouTube `<500 views` crate digger over the live beat!
     at(5.8, Tap(lab("column 4")));
     say(6.1, 9.6, "add -> youtube · crate-dig under 500 views");
     at(6.5, Tap(lab("add Link")));
@@ -2285,58 +2534,65 @@ fn tour_isol8_showcase() -> Tour {
     at(7.6, Paste("1950 guidance clinic"));
     at(8.1, Tap(lab("low views")));
     at(8.7, Tap(lab("search youtube")));
-    say(10.4, 14.2, "79 views · trimmed & sliced with zero ai");
+    say(10.4, 14.1, "79 views · trimmed & sliced with zero ai");
     at(10.5, Tap(lab("youtube result 1")));
     at(12.2, Custom(p6_after_yt_import));
     at(13.2, Tap(lab("close sheet")));
 
-    // Act 3 (14.8..24.6s): Open Clip -> Sculpt & Tape (`Kick`, `Chord`, `Disintegrate`) -> `Kit -> pads`
+    // Act 3 (14.6..22.2s): Open Clip -> Audible `Sculpt & Tape` stamps (`Kick`, `Chord`, `Disintegrate`) -> `Kit -> pads`
+    at(14.55, Custom(p6_pause_for_audition));
     at(14.8, Tap(lab("open clip")));
-    say(15.1, 19.2, "sculpt & tape · kick, chord & disintegrate stamps");
+    say(15.1, 19.3, "sculpt & tape · kick, chord & disintegrate stamps");
     at(16.0, Tap(lab("sculpt Kick")));
+    at(16.05, Custom(p6_audition_kick));
     at(17.4, Tap(lab("sculpt Chord")));
+    at(17.45, Custom(p6_audition_chord));
     at(18.8, Tap(lab("sculpt Disintegrate")));
+    at(18.85, Custom(p6_audition_disintegrate));
     say(20.1, 23.8, "kit -> pads · 16 pure-sample pads across every clip");
     at(21.4, Tap(lab("kit to pads")));
-    at(22.1, Custom(p6_prime_perform_groove));
+    at(22.0, Custom(p6_prime_perform_groove));
 
-    // Act 4 (24.0..41.2s): Perform pads + `ISOL8` hardware monitor + `Kaleido` / `Stutter` / `Tape Stop`
-    at(23.2, Tap(lab("pad 1")));
-    at(24.0, Tap(lab("pad 3")));
-    at(24.8, Tap(lab("pad 7")));
+    // Act 4 (23.0..41.2s): Continuous Perform groove + looping video pads + `ISOL8` + `Kaleido` / `Stutter` / `Tape Stop`
+    at(23.1, Tap(lab("pad 1")));
+    at(24.0, Tap(lab("pad 7")));
     say(24.7, 28.4, "spoken hook pads · choke group 1 + stage captions");
-    at(25.8, Tap(lab("pad 11")));
+    at(25.2, Tap(lab("pad 11")));
+    at(27.8, Tap(lab("pad 7")));
 
     // Punch `ISOL8` 24 dB/Oct Linkwitz-Riley switches (`LMF + MF + HMF SOLO` -> `LF SOLO` -> full band)
     say(29.2, 33.4, "isol8 · 24 db/oct mid-band radio solo & deep sub solo");
     at(29.3, Tap(lab("isol8 solo lmf")));
     at(29.65, Tap(lab("isol8 solo mf")));
     at(30.0, Tap(lab("isol8 solo hmf")));
+    at(30.4, Tap(lab("pad 11"))); // Spoken 1950 dialogue right through the mid-band radio solo!
     // Release mid solos & punch LF SOLO for deep sub check!
-    at(31.5, Tap(lab("isol8 solo lmf")));
-    at(31.8, Tap(lab("isol8 solo mf")));
-    at(32.1, Tap(lab("isol8 solo hmf")));
-    at(32.4, Tap(lab("isol8 solo lf")));
+    at(31.7, Tap(lab("isol8 solo lmf")));
+    at(32.0, Tap(lab("isol8 solo mf")));
+    at(32.3, Tap(lab("isol8 solo hmf")));
+    at(32.6, Tap(lab("isol8 solo lf")));
     // Release LF SOLO -> full spectrum slams back!
     at(33.7, Tap(lab("isol8 solo lf")));
 
-    // Backlit Amber VJ Punch-In FX: Shimmer (polar Kaleido!), Stutter, and real varispeed Tape Stop!
+    // Backlit Amber VJ Punch-In FX: Shimmer (6-fold spinning polar Kaleido!), Stutter, and varispeed Tape Stop!
     say(34.3, 38.8, "polar kaleido · beat-repeat stutter · varispeed tape stop");
-    at(34.4, Tap(lab("punch shimmer")));
+    at(34.35, Tap(lab("punch shimmer")));
+    at(34.9, Tap(lab("pad 7")));
     at(35.8, Hold(lab("punch stutter"), 0.85));
-    at(37.2, Hold(lab("punch tape stop"), 1.05));
-    at(38.8, Tap(lab("punch shimmer"))); // Disengage Kaleido cleanly
+    at(37.15, Hold(lab("punch tape stop"), 1.05));
+    at(38.75, Tap(lab("punch shimmer"))); // Disengage Kaleido cleanly
 
     // Act 5 (39.6..52.5s): Launch Cue 2 on `SET` bar -> `Grid` -> Fullscreen -> HUD strip-back -> End card
     say(39.7, 42.9, "set cues · launch the climax & cut to fullscreen");
     at(39.8, Tap(lab("chain 2")));
     at(40.7, Tap(lab("layout tile")));
-    at(41.8, Tap(lab("pad 11")));
+    at(41.6, Tap(lab("pad 11")));
     at(42.8, Tap(lab("Fullscreen")));
 
     say(44.8, 48.0, "tap for the hud · trigger pads over the live projection");
     at(45.0, Tap(Aim::Screen(0.5, 0.44)));
-    at(46.0, Tap(lab("mini pad 8")));
+    at(45.9, Tap(lab("mini pad 7")));
+    at(47.0, Tap(lab("mini pad 11")));
 
     Tour {
         cues,
@@ -2364,7 +2620,7 @@ fn mux_showcase_hd(
     );
     // 4x oversampled 192 kHz true-peak ceiling at -1.4 dBTP (0.8128) so post-AAC TP <= -1.0 dBTP!
     let af = format!(
-        "{comp},{fade},loudnorm=I=-15.5:TP=-1.6:LRA=9,aresample=192000,alimiter=limit=0.8128:attack=1.5:release=35:level=false,aresample=48000"
+        "{comp},{fade},loudnorm=I=-14.6:TP=-2.4:LRA=9,aresample=192000,alimiter=limit=0.7328:attack=1.5:release=35:level=false,aresample=48000"
     );
     let st = std::process::Command::new("ffmpeg")
         .args([

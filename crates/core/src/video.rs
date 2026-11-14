@@ -755,13 +755,55 @@ pub fn grain_draws_stage(
     layout: crate::tile::Layout,
     panel_grid: Option<(u32, u32)>,
 ) -> Vec<GrainDraw> {
+    grain_draws_stage_mapped(
+        events,
+        style,
+        link,
+        transform,
+        source_duration,
+        t,
+        aspect,
+        parked,
+        layout,
+        panel_grid,
+        None,
+        panel_grid.is_some(),
+    )
+}
+
+/// [`grain_draws_stage`] with optional per-frame dense active-slot remap
+/// (`slot_remap`) and foreground-presence flag (`has_fg_panels` so solo washes
+/// in `Layout::Split` fill the stage brightly instead of dimming to `30%`).
+#[allow(clippy::too_many_arguments)]
+pub fn grain_draws_stage_mapped(
+    events: &[GrainEvent],
+    style: &VisualGrainStyle,
+    link: &AvLink,
+    transform: &crate::timeline::ClipTransform,
+    source_duration: f64,
+    t: f64,
+    aspect: f32,
+    parked: bool,
+    layout: crate::tile::Layout,
+    panel_grid: Option<(u32, u32)>,
+    slot_remap: Option<&[u8; crate::tile::MAX_TILES]>,
+    has_fg_panels: bool,
+) -> Vec<GrainDraw> {
     let mut out = Vec::new();
     let rot = transform.rotation.to_radians();
     let (sin_r, cos_r) = rot.sin_cos();
     let tscale = transform.scale.max(0.01);
+    let crop_zoom = if (transform.scale - 1.0).abs() > 1e-3 {
+        transform.scale.clamp(0.5, 4.0)
+    } else {
+        1.0
+    };
     let aspect = aspect.max(0.01);
     let fl = style.flicker.clamp(0.0, 1.0);
     for ev in events {
+        if ev.tag.chord_harmony && layout.uses_tiles() {
+            continue;
+        }
         let dur_f64 = ev.duration.max(0.001) as f64;
         // *MODELL 5* staccato micro-bursts (`<= 85 ms` or `hard_burst`) cut sharply
         // on their exact frame boundary; rhythmic drum/phrase stabs (`85..350 ms`)
@@ -802,8 +844,11 @@ pub fn grain_draws_stage(
         let oxide_alpha = 1.0 - 0.82 * oxide;
 
         // 1. Crisp architectural `Layout::Tile` or feathered `Layout::Split` panel.
-        if let (Some((cols, rows)), Some(slot)) = (panel_grid, ev.tag.tile) {
+        if let (Some((cols, rows)), Some(raw_slot)) = (panel_grid, ev.tag.tile) {
             if layout == crate::tile::Layout::Tile || (layout == crate::tile::Layout::Split && !ev.tag.is_wash) {
+                let slot = slot_remap
+                    .map(|m| m[(raw_slot as usize).min(crate::tile::MAX_TILES - 1)])
+                    .unwrap_or(raw_slot);
                 let carry_fade = if dt <= dur_f64 {
                     1.0
                 } else if carry > 1e-6 {
@@ -831,7 +876,7 @@ pub fn grain_draws_stage(
                     (crate::tile::tile_rect(slot as usize, cols, rows, aspect), [false; 4], true)
                 };
                 let tile_ar = r.w * aspect / r.h.max(1e-6);
-                let patch = focus_cover_patch(tile_ar, aspect, ev.tag.focus, zoom);
+                let patch = focus_cover_patch(tile_ar, aspect, ev.tag.focus, zoom * crop_zoom);
                 out.push(GrainDraw {
                     dest: [r.x, r.y, r.w, r.h],
                     rotation: 0.0,
@@ -862,7 +907,11 @@ pub fn grain_draws_stage(
             };
             let env_part = 1.0 + (env - 1.0) * link.envelope_to_opacity;
             let gain_part = 1.0 + (ev.gain.min(1.5) - 1.0) * link.gain_to_opacity;
-            let wash_scale = if layout == crate::tile::Layout::Split { 0.30 } else { 0.88 };
+            let wash_scale = if layout == crate::tile::Layout::Split {
+                if has_fg_panels { 0.30 } else { 0.85 }
+            } else {
+                0.88
+            };
             let alpha = (env_part * gain_part * picture * oxide_alpha * wash_scale).clamp(0.0, 1.0);
             if alpha <= 0.003 {
                 continue;
@@ -874,7 +923,7 @@ pub fn grain_draws_stage(
             } else {
                 ev.source_pos + local
             };
-            let patch = focus_cover_patch(aspect, aspect, ev.tag.focus, zoom);
+            let patch = focus_cover_patch(aspect, aspect, ev.tag.focus, zoom * crop_zoom);
             out.push(GrainDraw {
                 dest: [0.0, 0.0, 1.0, 1.0],
                 rotation: rot,
@@ -901,7 +950,7 @@ pub fn grain_draws_stage(
             } else {
                 ev.source_pos + local
             };
-            let patch = focus_cover_patch(aspect, aspect, ev.tag.focus, zoom);
+            let patch = focus_cover_patch(aspect, aspect, ev.tag.focus, zoom * crop_zoom);
             out.push(GrainDraw {
                 dest: [0.0, 0.0, 1.0, 1.0],
                 rotation: 0.0,
@@ -1143,13 +1192,50 @@ pub fn composite_grains_frame_stage(
     layout: crate::tile::Layout,
     panel_grid: Option<(u32, u32)>,
 ) {
+    composite_grains_frame_stage_mapped(
+        clip,
+        events,
+        style,
+        link,
+        transform,
+        color_filter,
+        out,
+        t,
+        blend_frames,
+        hue_override,
+        layout,
+        panel_grid,
+        None,
+        panel_grid.is_some(),
+    );
+}
+
+/// [`composite_grains_frame_stage`] with optional per-frame dense active-slot remap
+/// (`slot_remap`) and foreground-presence flag (`has_fg_panels`).
+#[allow(clippy::too_many_arguments)]
+pub fn composite_grains_frame_stage_mapped(
+    clip: &VideoClip,
+    events: &[GrainEvent],
+    style: &VisualGrainStyle,
+    link: &AvLink,
+    transform: &crate::timeline::ClipTransform,
+    color_filter: Option<&ColorFilter>,
+    out: &mut Frame,
+    t: f64,
+    blend_frames: bool,
+    hue_override: Option<f32>,
+    layout: crate::tile::Layout,
+    panel_grid: Option<(u32, u32)>,
+    slot_remap: Option<&[u8; crate::tile::MAX_TILES]>,
+    has_fg_panels: bool,
+) {
     let ow = out.width as f32;
     let oh = out.height as f32;
     let aspect = ow / oh.max(1.0);
     let add = style.additive.clamp(0.0, 1.0);
     let feath = style.feather.clamp(0.0, 1.0);
     let shad = style.shadow.clamp(0.0, 1.0);
-    let draws = grain_draws_stage(
+    let draws = grain_draws_stage_mapped(
         events,
         style,
         link,
@@ -1160,6 +1246,8 @@ pub fn composite_grains_frame_stage(
         false,
         layout,
         panel_grid,
+        slot_remap,
+        has_fg_panels,
     );
 
     for d in draws {
@@ -1475,44 +1563,59 @@ fn glyph_5x7(ch: char) -> [u8; 7] {
 
 /// Render a high-contrast kinetic VJ stage caption (`text`) onto `frame`.
 /// `opacity` (`0..1`) fades the caption card cleanly with the active vocal grain.
+/// Auto-scales to fit `9:16`, `1:1`, and `16:9` stages so long hooks never drop.
 pub fn draw_stage_caption(frame: &mut Frame, text: &str, opacity: f32) {
     let trimmed = text.trim();
     let op = opacity.clamp(0.0, 1.0);
     if trimmed.is_empty() || op <= 0.02 || frame.width < 16 || frame.height < 16 {
         return;
     }
-    let chars: Vec<char> = trimmed.chars().take(32).collect();
-    let scale = ((frame.height / 150).max(1)).min(6);
+    let chars: Vec<char> = trimmed.chars().take(42).collect();
+    let n_ch = chars.len() as u32;
+    let max_scale_h = (frame.height / 155).clamp(1, 6);
+    // Each glyph + gap takes `6 * scale - scale_end` px; reserve margin for pill + accent bar.
+    let avail_w = frame.width.saturating_sub(24).max(8);
+    let max_scale_w = (avail_w / (n_ch * 6).max(1)).max(1);
+    let scale = max_scale_h.min(max_scale_w).max(1);
     let glyph_w = 5 * scale;
     let glyph_h = 7 * scale;
     let gap = scale;
-    let total_w = chars.len() as u32 * (glyph_w + gap) - gap;
+    let total_w = n_ch * (glyph_w + gap) - gap;
     if total_w + 4 >= frame.width {
         return;
     }
     let x0 = (frame.width - total_w) / 2;
-    let y0 = ((frame.height as f32 * 0.83) as u32).min(frame.height.saturating_sub(glyph_h + 4 * scale));
-    let pad_x = (2 * scale).min(x0);
-    let pad_y = scale.min(y0);
+    let y0 = ((frame.height as f32 * 0.84) as u32).min(frame.height.saturating_sub(glyph_h + 4 * scale));
+    let pad_x = (3 * scale).min(x0);
+    let pad_y = (2 * scale).min(y0);
 
-    // Subtle smoked obsidian backing plate for legibility over bright footage.
+    // High-contrast smoked-obsidian pill (`#0A0A0D` @ 82%) + warm amber accent bar (`#F0B432`).
     let bx0 = x0.saturating_sub(pad_x);
     let bx1 = (x0 + total_w + pad_x).min(frame.width);
     let by0 = y0.saturating_sub(pad_y);
     let by1 = (y0 + glyph_h + pad_y).min(frame.height);
-    let plate_a = 0.58 * op;
+    let plate_a = 0.82 * op;
+    let accent_w = scale.clamp(2, 5);
     for y in by0..by1 {
         for x in bx0..bx1 {
             let mut px = frame.get(x, y);
-            px[0] = (px[0] as f32 * (1.0 - plate_a) + 10.0 * plate_a) as u8;
-            px[1] = (px[1] as f32 * (1.0 - plate_a) + 10.0 * plate_a) as u8;
-            px[2] = (px[2] as f32 * (1.0 - plate_a) + 12.0 * plate_a) as u8;
+            if x < bx0 + accent_w {
+                let aa = 0.92 * op;
+                px[0] = (px[0] as f32 * (1.0 - aa) + 240.0 * aa) as u8;
+                px[1] = (px[1] as f32 * (1.0 - aa) + 180.0 * aa) as u8;
+                px[2] = (px[2] as f32 * (1.0 - aa) + 50.0 * aa) as u8;
+            } else {
+                px[0] = (px[0] as f32 * (1.0 - plate_a) + 10.0 * plate_a) as u8;
+                px[1] = (px[1] as f32 * (1.0 - plate_a) + 10.0 * plate_a) as u8;
+                px[2] = (px[2] as f32 * (1.0 - plate_a) + 13.0 * plate_a) as u8;
+            }
             frame.put(x, y, px);
         }
     }
 
-    // Crisp warm-cream studio lettering (`#F4F0E8`) with 95% max blend.
-    let fg_a = 0.95 * op;
+    // Crisp warm-cream studio lettering (`#FAF6EE`) with subtle 1px drop shadow.
+    let fg_a = 0.98 * op;
+    let sh_a = 0.65 * op;
     for (ci, &ch) in chars.iter().enumerate() {
         let rows = glyph_5x7(ch);
         let gx0 = x0 + ci as u32 * (glyph_w + gap);
@@ -1522,15 +1625,24 @@ pub fn draw_stage_caption(frame: &mut Frame, text: &str, opacity: f32) {
             }
             for rx in 0..5u32 {
                 if (bits >> (4 - rx)) & 1 == 1 {
+                    let sh_x = gx0 + rx * scale + scale;
+                    let sh_y = y0 + ry as u32 * scale + scale;
+                    if scale >= 2 && sh_x < frame.width && sh_y < frame.height {
+                        let mut spx = frame.get(sh_x, sh_y);
+                        spx[0] = (spx[0] as f32 * (1.0 - sh_a)) as u8;
+                        spx[1] = (spx[1] as f32 * (1.0 - sh_a)) as u8;
+                        spx[2] = (spx[2] as f32 * (1.0 - sh_a)) as u8;
+                        frame.put(sh_x, sh_y, spx);
+                    }
                     for sy in 0..scale {
                         for sx in 0..scale {
                             let px_x = gx0 + rx * scale + sx;
                             let px_y = y0 + ry as u32 * scale + sy;
                             if px_x < frame.width && px_y < frame.height {
                                 let mut px = frame.get(px_x, px_y);
-                                px[0] = (px[0] as f32 * (1.0 - fg_a) + 244.0 * fg_a) as u8;
-                                px[1] = (px[1] as f32 * (1.0 - fg_a) + 240.0 * fg_a) as u8;
-                                px[2] = (px[2] as f32 * (1.0 - fg_a) + 232.0 * fg_a) as u8;
+                                px[0] = (px[0] as f32 * (1.0 - fg_a) + 250.0 * fg_a) as u8;
+                                px[1] = (px[1] as f32 * (1.0 - fg_a) + 246.0 * fg_a) as u8;
+                                px[2] = (px[2] as f32 * (1.0 - fg_a) + 238.0 * fg_a) as u8;
                                 frame.put(px_x, px_y, px);
                             }
                         }

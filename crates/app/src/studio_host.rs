@@ -142,10 +142,75 @@ impl Host for App {
         (self.plan_project.width, self.plan_project.height)
     }
     fn sequence_changed(&mut self, layout: &[(usize, f64, f64)]) -> bool {
-        if self.mode != AppMode::Arrange {
-            return false;
-        }
+        let clips_for = |lay: &[(usize, f64, f64)]| -> Vec<Clip> {
+            lay.iter()
+                .map(|(pid, at, len)| {
+                    let mut c = Clip::new_pattern(*pid, *at, *len);
+                    // Hits glow in with soft edges instead of hard blocks.
+                    c.visual.feather = 0.3;
+                    c.visual.additive = 0.3;
+                    c
+                })
+                .collect()
+        };
         let total: f64 = layout.iter().map(|l| l.2).sum();
+        if self.mode != AppMode::Arrange {
+            let has_active_steps = {
+                let p = self.project.lock().unwrap();
+                layout.iter().any(|(pid, _, _)| {
+                    p.patterns.get(*pid).is_some_and(|pat| {
+                        pat.rows.iter().any(|r| !r.muted && r.steps.iter().any(|s| s.on))
+                    })
+                })
+            };
+            // Keep canonical Arrange `"sequence"` track updated in `other_tracks` too.
+            let o_ti = match self.other_tracks.iter().position(|t| t.name == "sequence") {
+                Some(t) => t,
+                None => {
+                    self.other_tracks.insert(0, Track { name: "sequence".into(), ..Default::default() });
+                    0
+                }
+            };
+            self.other_tracks[o_ti].clips = clips_for(layout);
+            self.other_loop = (true, 0.0, total.max(4.0));
+
+            let existing_perf_seq = self
+                .project
+                .lock()
+                .unwrap()
+                .tracks
+                .iter()
+                .skip(PADS)
+                .any(|t| t.name == "sequence");
+            if !has_active_steps && !existing_perf_seq {
+                return false;
+            }
+            {
+                let mut p = self.project.lock().unwrap();
+                while p.tracks.len() < PADS {
+                    let n = p.tracks.len();
+                    let ti = p.add_track(&format!("pad {}", n + 1));
+                    p.tracks[ti].muted = true;
+                }
+                let ti = match p
+                    .tracks
+                    .iter()
+                    .enumerate()
+                    .skip(PADS)
+                    .find(|(_, t)| t.name == "sequence")
+                    .map(|(i, _)| i)
+                {
+                    Some(i) => i,
+                    None => p.add_track("sequence"),
+                };
+                p.tracks[ti].muted = !has_active_steps;
+                p.tracks[ti].clips = clips_for(layout);
+            }
+            self.fill_rev = 0;
+            self.perform_fill();
+            App::mark_now(self);
+            return true;
+        }
         {
             let mut p = self.project.lock().unwrap();
             let ti = match p.tracks.iter().position(|t| t.name == "sequence") {
@@ -155,16 +220,7 @@ impl Host for App {
                     0
                 }
             };
-            p.tracks[ti].clips = layout
-                .iter()
-                .map(|(pid, at, len)| {
-                    let mut c = Clip::new_pattern(*pid, *at, *len);
-                    // Hits glow in with soft edges instead of hard blocks.
-                    c.visual.feather = 0.3;
-                    c.visual.additive = 0.3;
-                    c
-                })
-                .collect();
+            p.tracks[ti].clips = clips_for(layout);
         }
         self.loop_on = true;
         self.loop_start = 0.0;
