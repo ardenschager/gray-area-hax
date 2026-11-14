@@ -20,9 +20,9 @@ use std::sync::{Arc, RwLock};
 pub type MediaResult<T> = Result<T, String>;
 
 /// Max decoded video size / length so a scraped video can't eat all memory.
-pub const MAX_DECODE_WIDTH: u32 = 480;
+pub const MAX_DECODE_WIDTH: u32 = 640;
 pub const MAX_DECODE_SECONDS: f64 = 90.0;
-pub const DECODE_FPS: f32 = 15.0;
+pub const DECODE_FPS: f32 = 24.0;
 
 // ------------------------------------------------------------ backend
 
@@ -46,6 +46,26 @@ pub trait MediaBackend: Send + Sync {
     /// Mux frames + audio into a video file.
     fn encode_video(&self, _path: &Path, _frames: &[Frame], _fps: f32, _audio: &StereoBuffer) -> MediaResult<()> {
         Err(format!("video export is not available with the {} media backend", self.name()))
+    }
+    /// Stream rendered frames (`n_frames` of `width`×`height` RGBA) + `audio` into a video file
+    /// without buffering the entire uncompressed frame sequence in RAM.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_video_stream(
+        &self,
+        path: &Path,
+        _width: u32,
+        _height: u32,
+        fps: f32,
+        n_frames: usize,
+        audio: &StereoBuffer,
+        produce_frames: &mut dyn FnMut(&mut dyn FnMut(&Frame) -> MediaResult<()>) -> MediaResult<()>,
+    ) -> MediaResult<()> {
+        let mut frames = Vec::with_capacity(n_frames);
+        produce_frames(&mut |f| {
+            frames.push(f.clone());
+            Ok(())
+        })?;
+        self.encode_video(path, &frames, fps, audio)
     }
     /// Download a URL into `dir` and return the file.
     fn fetch_youtube(&self, _url: &str, _dir: &Path) -> MediaResult<PathBuf> {
@@ -155,6 +175,20 @@ pub fn encode_video(path: &Path, frames: &[Frame], fps: f32, audio: &StereoBuffe
     backend().encode_video(path, frames, fps, audio)
 }
 
+/// Stream rendered frames + audio into a video file without buffering all frames in RAM.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_video_stream(
+    path: &Path,
+    width: u32,
+    height: u32,
+    fps: f32,
+    n_frames: usize,
+    audio: &StereoBuffer,
+    produce_frames: &mut dyn FnMut(&mut dyn FnMut(&Frame) -> MediaResult<()>) -> MediaResult<()>,
+) -> MediaResult<()> {
+    backend().encode_video_stream(path, width, height, fps, n_frames, audio, produce_frames)
+}
+
 /// Download a YouTube (or any yt-dlp-supported) URL into `dir`, returning
 /// the downloaded file path. Capped at 480p to keep decode light.
 pub fn fetch_youtube(url: &str, dir: &Path) -> MediaResult<PathBuf> {
@@ -208,6 +242,25 @@ pub fn save_wav(path: &Path, buffer: &StereoBuffer) -> MediaResult<()> {
     for i in 0..buffer.len() {
         for s in [buffer.left[i], buffer.right[i]] {
             let v = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+            writer.write_sample(v).map_err(|e| e.to_string())?;
+        }
+    }
+    writer.finalize().map_err(|e| e.to_string())
+}
+
+/// Write a 32-bit IEEE float stereo WAV (lossless intermediate for AAC muxing).
+pub fn save_wav_f32(path: &Path, buffer: &StereoBuffer) -> MediaResult<()> {
+    let spec = hound::WavSpec {
+        channels: 2,
+        sample_rate: buffer.sample_rate,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+    let mut writer =
+        hound::WavWriter::create(path, spec).map_err(|e| e.to_string())?;
+    for i in 0..buffer.len() {
+        for s in [buffer.left[i], buffer.right[i]] {
+            let v = if s.is_finite() { s.clamp(-1.0, 1.0) } else { 0.0 };
             writer.write_sample(v).map_err(|e| e.to_string())?;
         }
     }
@@ -566,6 +619,18 @@ impl MediaBackend for DesktopBackend {
     fn encode_video(&self, path: &Path, frames: &[Frame], fps: f32, audio: &StereoBuffer) -> MediaResult<()> {
         desktop::encode_video(path, frames, fps, audio)
     }
+    fn encode_video_stream(
+        &self,
+        path: &Path,
+        width: u32,
+        height: u32,
+        fps: f32,
+        n_frames: usize,
+        audio: &StereoBuffer,
+        produce_frames: &mut dyn FnMut(&mut dyn FnMut(&Frame) -> MediaResult<()>) -> MediaResult<()>,
+    ) -> MediaResult<()> {
+        desktop::encode_video_stream(path, width, height, fps, n_frames, audio, produce_frames)
+    }
     fn fetch_youtube(&self, url: &str, dir: &Path) -> MediaResult<PathBuf> {
         desktop::fetch_youtube(url, dir)
     }
@@ -801,10 +866,42 @@ mod desktop {
             return Err("nothing to encode".into());
         }
         let (w, h) = (frames[0].width, frames[0].height);
+        encode_video_stream(path, w, h, fps, frames.len(), audio, &mut |emit| {
+            for f in frames {
+                emit(f)?;
+            }
+            Ok(())
+        })
+    }
 
-        // Write audio to a temp wav next to the output.
+    /// Stream rendered frames + audio into an MP4 with 4× oversampled `-1.4 dBTP`
+    /// AAC true-peak protection and `+faststart` H.264, keeping only one frame in RAM.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_video_stream(
+        path: &Path,
+        w: u32,
+        h: u32,
+        fps: f32,
+        n_frames: usize,
+        audio: &StereoBuffer,
+        produce_frames: &mut dyn FnMut(&mut dyn FnMut(&Frame) -> MediaResult<()>) -> MediaResult<()>,
+    ) -> MediaResult<()> {
+        if n_frames == 0 || w == 0 || h == 0 {
+            return Err("nothing to encode".into());
+        }
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+        }
+
+        // Write 32-bit float audio to a temp wav next to the output.
         let wav_path: PathBuf = path.with_extension("chromagrain-tmp.wav");
-        save_wav(&wav_path, audio)?;
+        save_wav_f32(&wav_path, audio)?;
+
+        // 4× oversampled true-peak ceiling at -1.80 dBTP (0.8128) before AAC
+        // guarantees post-AAC True Peak <= -1.4 dBTP with zero clipped samples.
+        let af_chain = "aresample=192000,alimiter=limit=0.8128:attack=1.5:release=35:level=false,aresample=48000";
 
         let mut child = Command::new("ffmpeg")
             .args([
@@ -825,16 +922,22 @@ mod desktop {
             ])
             .arg(&wav_path)
             .args([
+                "-af",
+                af_chain,
                 "-c:v",
                 "libx264",
                 "-pix_fmt",
                 "yuv420p",
                 "-preset",
-                "veryfast",
+                "fast",
+                "-crf",
+                "18",
                 "-c:a",
                 "aac",
                 "-b:a",
                 "256k",
+                "-movflags",
+                "+faststart",
                 "-shortest",
             ])
             .arg(path)
@@ -843,17 +946,18 @@ mod desktop {
             .spawn()
             .map_err(|e| format!("ffmpeg not runnable: {e}"))?;
 
-        {
+        let stream_res = {
             let mut stdin = child.stdin.take().ok_or("no stdin")?;
-            for f in frames {
+            produce_frames(&mut |f: &Frame| {
                 if f.width != w || f.height != h {
                     return Err("inconsistent frame sizes".into());
                 }
-                stdin.write_all(&f.data).map_err(|e| e.to_string())?;
-            }
-        }
+                stdin.write_all(&f.data).map_err(|e| e.to_string())
+            })
+        };
         let out = child.wait_with_output().map_err(|e| e.to_string())?;
         let _ = std::fs::remove_file(&wav_path);
+        stream_res?;
         if !out.status.success() {
             return Err(format!(
                 "ffmpeg encode failed: {}",

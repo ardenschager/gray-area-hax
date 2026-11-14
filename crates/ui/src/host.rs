@@ -827,4 +827,6 @@ pub trait Host {
         None
     }
     fn set_isolator(&mut self, _iso: chromagrain_core::dsp::BandIsolator) {}
+    /// Live varispeed turntable / capstan brake (`0..1`).
+    fn set_tape_stop(&mut self, _amt: f32) {}
 }

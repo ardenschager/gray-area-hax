@@ -9,14 +9,16 @@
 //!
 //! Track order is the video z-order: later tracks composite on top.
 
-use crate::audio::{render_grains_audio_spatial, StereoBuffer, StudioBusState, TapeState};
+use crate::audio::{
+    render_grains_audio_spatial, StereoBuffer, StudioBusState, TapeState, TapeStopState,
+};
 use crate::fx;
 use crate::grain::{schedule_grains_auto, ChordVoicing, GrainEvent, VoiceSculpt};
 use crate::seq::pattern_events;
-use crate::timeline::{Clip, ClipKind, DuckState, Project, Source};
+use crate::timeline::{Clip, ClipKind, DuckState, Project, PunchAction, Source};
 use crate::video::{
-    apply_video_tape, blend_layer_over, blend_stage_layer, composite_grains_frame_stage,
-    draw_stage_caption, Frame, VisualGrainStyle, OPTICAL_CARRY_SECS,
+    apply_video_tape, apply_video_tape_stop, blend_layer_over, blend_stage_layer,
+    composite_grains_frame_stage, draw_stage_caption, Frame, VisualGrainStyle, OPTICAL_CARRY_SECS,
 };
 
 pub struct RenderOutput {
@@ -80,6 +82,38 @@ fn wsola_align(audio: &crate::audio::AudioClip, ref_pos: f64, nominal_pos: f64) 
         d += 2;
     }
     (nominal_pos + best_off as f64 / sr as f64).rem_euclid(n as f64 / sr as f64)
+}
+
+/// Smart `(cx, cy)` visual subject focus at `pos_secs` from `source.slices` (falls back to `(0.5, 0.5)`).
+fn source_focus_at(source: &Source, pos_secs: f64) -> (f32, f32) {
+    if source.slices.is_empty() {
+        return (0.5, 0.5);
+    }
+    if let Some(sl) = source
+        .slices
+        .iter()
+        .find(|sl| pos_secs >= sl.start - 0.02 && pos_secs <= sl.end + 0.02)
+    {
+        return sl.focus;
+    }
+    source
+        .slices
+        .iter()
+        .min_by(|a, b| {
+            let da = ((a.start + a.end) * 0.5 - pos_secs).abs();
+            let db = ((b.start + b.end) * 0.5 - pos_secs).abs();
+            da.total_cmp(&db)
+        })
+        .map_or((0.5, 0.5), |sl| sl.focus)
+}
+
+/// Optional stage caption when a snippet clip starts right at a captioned slice (`±35 ms`).
+fn source_caption_at_start(source: &Source, pos_secs: f64) -> crate::chop::Caption {
+    source
+        .slices
+        .iter()
+        .find(|sl| !sl.caption.is_empty() && (sl.start - pos_secs).abs() <= 0.035)
+        .map_or_else(crate::chop::Caption::default, |sl| sl.caption)
 }
 
 /// Events for a snippet clip. When `speed` matches the pitch ratio
@@ -639,7 +673,7 @@ pub fn plan_project(project: &Project) -> Vec<ClipPlan> {
                     let mut g_cfg = clip.grains.clone();
                     g_cfg.sculpt = eff_sculpt;
                     g_cfg.choke_group = eff_choke;
-                    let events = schedule_grains_auto(
+                    let mut events = schedule_grains_auto(
                         &g_cfg,
                         &clip.automation,
                         secs_per_beat,
@@ -649,6 +683,11 @@ pub fn plan_project(project: &Project) -> Vec<ClipPlan> {
                         source.effective_base_hz(),
                         clip.key.as_ref(),
                     );
+                    if !source.slices.is_empty() {
+                        for e in &mut events {
+                            e.tag.focus = source_focus_at(source, e.source_pos);
+                        }
+                    }
                     (vec![(clip.source, events)], None, clip.visual)
                 }
                 ClipKind::Snippet => {
@@ -656,7 +695,10 @@ pub fn plan_project(project: &Project) -> Vec<ClipPlan> {
                     if source.duration() <= 0.0 {
                         continue;
                     }
-                    let evs = snippet_events(
+                    let start_pos = (clip.grains.position as f64 * source.duration()).min(source.duration());
+                    let snip_focus = source_focus_at(source, start_pos);
+                    let snip_cap = source_caption_at_start(source, start_pos);
+                    let mut evs = snippet_events(
                         clip,
                         source,
                         clip_t0,
@@ -665,6 +707,12 @@ pub fn plan_project(project: &Project) -> Vec<ClipPlan> {
                         eff_sculpt,
                         eff_choke,
                     );
+                    for e in &mut evs {
+                        e.tag.focus = snip_focus;
+                        if !snip_cap.is_empty() && (e.onset - clip_t0).abs() < 0.05 {
+                            e.tag.caption = snip_cap;
+                        }
+                    }
                     let vevs = snippet_video_events(
                         clip,
                         source,
@@ -673,7 +721,15 @@ pub fn plan_project(project: &Project) -> Vec<ClipPlan> {
                         eff_sculpt,
                         eff_choke,
                     )
-                    .map(|v| vec![(clip.source, v)]);
+                    .map(|mut v| {
+                        for e in &mut v {
+                            e.tag.focus = snip_focus;
+                            if !snip_cap.is_empty() && (e.onset - clip_t0).abs() < 0.05 {
+                                e.tag.caption = snip_cap;
+                            }
+                        }
+                        vec![(clip.source, v)]
+                    });
                     (
                         vec![(clip.source, evs)],
                         vevs,
@@ -797,13 +853,16 @@ pub fn plan_project(project: &Project) -> Vec<ClipPlan> {
 
     apply_choke_groups(&mut plans, project);
 
-    if project.layout.uses_tiles() {
+    let any_tile_punch = project.master_punches.iter().any(|mp| {
+        matches!(mp.action, PunchAction::Layout(l) if l.uses_tiles())
+    });
+    if project.layout.uses_tiles() || any_tile_punch {
         // Muted tracks aren't heard or drawn, so they get no tile (no
         // holes in the grid; their grains keep `tag.tile == None`).
         // In `Layout::Split`, sustained wash clips (`is_wash`) stay untiled
         // (`tile == None`) so they bleed full-canvas at `30%` screen.
         let muted = |cp: &ClipPlan| project.tracks.get(cp.track).is_some_and(|t| t.muted);
-        let is_split = project.layout == crate::tile::Layout::Split;
+        let is_split = project.layout == crate::tile::Layout::Split && !project.master_punches.iter().any(|mp| matches!(mp.action, PunchAction::Layout(crate::tile::Layout::Tile)));
         assign_tiles_where(&mut plans, project.layout_pan, |cp| {
             if muted(cp) {
                 return false;
@@ -1076,8 +1135,92 @@ fn render_audio_part(
     }
 }
 
-/// Render `[from_beat, to_beat)` of the project.
+/// Render `[from_beat, to_beat)` of the project into an in-memory [`RenderOutput`].
 pub fn render_project(project: &Project, from_beat: f64, to_beat: f64) -> RenderOutput {
+    let mut frames = Vec::new();
+    let (audio, events) = render_project_with_frames(project, from_beat, to_beat, Some(&mut |n_frames, emit_one| {
+        frames.reserve(n_frames);
+        for fi in 0..n_frames {
+            let mut f = Frame::black(project.width, project.height);
+            emit_one(fi, &mut f);
+            frames.push(f);
+        }
+        Ok(())
+    }))
+    .expect("in-memory frame sink is infallible");
+    RenderOutput { audio, frames, fps: project.fps, events }
+}
+
+/// Render `[from_beat, to_beat)` of the project directly to an MP4 file on disk,
+/// streaming one video frame at a time to `ffmpeg` so HD `60 fps` exports use
+/// `< 20 MB` of video RAM instead of buffering gigabytes of uncompressed frames.
+pub fn render_project_to_video(
+    project: &Project,
+    from_beat: f64,
+    to_beat: f64,
+    path: &std::path::Path,
+) -> crate::media::MediaResult<(StereoBuffer, usize)> {
+    let mut streamed_frames = 0usize;
+    let w = project.width;
+    let h = project.height;
+    let fps = project.fps;
+    let (audio, _) = render_project_streaming_mux(project, from_beat, to_beat, path, w, h, fps, &mut streamed_frames)?;
+    Ok((audio, streamed_frames))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_project_streaming_mux(
+    project: &Project,
+    from_beat: f64,
+    to_beat: f64,
+    path: &std::path::Path,
+    w: u32,
+    h: u32,
+    fps: f32,
+    out_count: &mut usize,
+) -> crate::media::MediaResult<(StereoBuffer, Vec<Vec<GrainEvent>>)> {
+    let mut audio_out: Option<StereoBuffer> = None;
+    let res = render_project_core(project, from_beat, to_beat, |audio, n_frames, render_frame| {
+        *out_count = n_frames;
+        let mut scratch = Frame::black(w, h);
+        crate::media::encode_video_stream(path, w, h, fps, n_frames, audio, &mut |emit| {
+            for fi in 0..n_frames {
+                scratch.data.fill(0);
+                for px in scratch.data.chunks_exact_mut(4) {
+                    px[3] = 255;
+                }
+                render_frame(fi, &mut scratch);
+                emit(&scratch)?;
+            }
+            Ok(())
+        })?;
+        audio_out = Some(audio.clone());
+        Ok(())
+    })?;
+    Ok((audio_out.unwrap_or_else(|| res.0), res.1))
+}
+
+#[allow(clippy::type_complexity)]
+fn render_project_with_frames(
+    project: &Project,
+    from_beat: f64,
+    to_beat: f64,
+    sink: Option<&mut dyn FnMut(usize, &mut dyn FnMut(usize, &mut Frame)) -> crate::media::MediaResult<()>>,
+) -> crate::media::MediaResult<(StereoBuffer, Vec<Vec<GrainEvent>>)> {
+    match sink {
+        Some(s) => render_project_core(project, from_beat, to_beat, |_audio, n_frames, render_frame| {
+            s(n_frames, render_frame)
+        }),
+        None => render_project_core(project, from_beat, to_beat, |_audio, _n_frames, _render_frame| Ok(())),
+    }
+}
+
+fn render_project_core(
+    project: &Project,
+    from_beat: f64,
+    to_beat: f64,
+    consume: impl FnOnce(&StereoBuffer, usize, &mut dyn FnMut(usize, &mut Frame)) -> crate::media::MediaResult<()>,
+) -> crate::media::MediaResult<(StereoBuffer, Vec<Vec<GrainEvent>>)> {
     let t0 = project.beats_to_secs(from_beat);
     let t1 = project.beats_to_secs(to_beat.max(from_beat + 0.001));
     let len = t1 - t0;
@@ -1086,20 +1229,16 @@ pub fn render_project(project: &Project, from_beat: f64, to_beat: f64) -> Render
     let mut master_audio = StereoBuffer::new(len, project.sample_rate);
     let n_frames = (len * project.fps as f64).ceil() as usize;
     let aspect = project.width as f32 / project.height.max(1) as f32;
-    let panel_grids: Option<Vec<(u32, u32)>> = match project.layout {
-        crate::tile::Layout::Tile => Some(frame_tile_grids_stage(
-            &plan,
-            t0,
-            project.fps,
-            n_frames,
-            aspect,
-            project.portrait_columns,
-        )),
-        crate::tile::Layout::Split => Some(frame_split_grids(&plan, t0, project.fps, n_frames, aspect)),
-        crate::tile::Layout::Stack | crate::tile::Layout::Bleed => None,
-    };
-    let mut frames: Vec<Frame> =
-        (0..n_frames).map(|_| Frame::black(project.width, project.height)).collect();
+    let has_tile_layout = project.layout == crate::tile::Layout::Tile
+        || project.master_punches.iter().any(|p| matches!(p.action, PunchAction::Layout(crate::tile::Layout::Tile)));
+    let has_split_layout = project.layout == crate::tile::Layout::Split
+        || project.master_punches.iter().any(|p| matches!(p.action, PunchAction::Layout(crate::tile::Layout::Split)));
+    let tile_grids_opt = has_tile_layout.then(|| {
+        frame_tile_grids_stage(&plan, t0, project.fps, n_frames, aspect, project.portrait_columns)
+    });
+    let split_grids_opt = has_split_layout.then(|| {
+        frame_split_grids(&plan, t0, project.fps, n_frames, aspect)
+    });
 
     let n_tracks = project.tracks.len();
     let mut track_buses: Vec<Option<StereoBuffer>> = vec![None; n_tracks];
@@ -1208,176 +1347,81 @@ pub fn render_project(project: &Project, from_beat: f64, to_beat: f64) -> Render
         }
     }
 
-    // ---- Pass 3 (video): clips -> clip fx -> track layer -> track fx -> z ----
-    for (ti, track) in project.tracks.iter().enumerate() {
-        if track.muted {
-            continue;
-        }
-        let clip_plans: Vec<&ClipPlan> = plan.iter().filter(|p| p.track == ti).collect();
-        if clip_plans.is_empty() {
-            continue;
-        }
-        let track_has_video = clip_plans.iter().any(|cp| {
-            let vparts = cp.video_parts.as_deref().unwrap_or(&cp.parts);
-            vparts.iter().any(|(sid, evs)| {
-                !evs.is_empty()
-                    && project.sources.get(*sid).is_some_and(|s| s.video.is_some())
-            })
-        });
-        let track_has_fx = !track.effects.is_empty();
-        if !track_has_video && !track_has_fx {
-            continue;
-        }
-        let mut clip_vstates: Vec<Vec<fx::VideoFxState>> = clip_plans
-            .iter()
-            .map(|cp| fx::video_chain_states(&track.clips[cp.clip_index].effects, project.fps))
-            .collect();
-        let mut track_vstates = fx::video_chain_states(&track.effects, project.fps);
-        let fallback_add = clip_plans
-            .iter()
-            .map(|cp| cp.style.additive)
-            .fold(0.0f32, f32::max);
-        let track_rms_env: Vec<f32> = if track.rms_to_opacity > 1e-4 {
-            if let Some(bus) = &track_buses[ti] {
-                let mut out_env = vec![0.0f32; n_frames];
-                let sr = project.sample_rate.max(1) as f32;
-                let att_c = (-1.0 / (0.024 * sr)).exp();
-                let rel_c = (-1.0 / (0.175 * sr)).exp();
-                let mut env = 0.0f32;
-                for i in 0..bus.len() {
-                    let x = bus.left[i].abs().max(bus.right[i].abs());
-                    if x > env {
-                        env = att_c * env + (1.0 - att_c) * x;
-                    } else {
-                        env = rel_c * env + (1.0 - rel_c) * x;
-                    }
-                    let fi = ((i as f64 / sr as f64) * project.fps as f64) as usize;
-                    if fi < n_frames {
-                        let d = (env * 4.2).min(6.0);
-                        out_env[fi] = out_env[fi].max(d / (1.0 + d));
-                    }
-                }
-                out_env
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
-
-        for (fi, frame) in frames.iter_mut().enumerate() {
-            let ft = t0 + fi as f64 / project.fps as f64;
-            let mut track_layer: Option<Frame> = None;
-            let mut active_add: Option<f32> = None;
-            let mut track_is_wash = track.sculpt.is_wash();
-
-            for (cpi, cp) in clip_plans.iter().enumerate() {
-                let clip = &track.clips[cp.clip_index];
-                let vparts = cp.video_parts.as_deref().unwrap_or(&cp.parts);
-                let is_stretched_snippet = cp.video_parts.is_some();
-                let carry_pad = if project.layout.uses_tiles() { OPTICAL_CARRY_SECS } else { 0.0 };
-                let any_active = vparts.iter().any(|(_, evs)| {
-                    evs.iter().any(|e| {
-                        ft >= e.onset && ft < e.onset + cp.style.visual_duration(e.duration).max(e.duration as f64 + carry_pad)
-                    })
-                });
-                if !any_active && clip.effects.is_empty() {
-                    continue;
-                }
-                let mut clip_layer = Frame::transparent(project.width, project.height);
-                if any_active {
-                    active_add = Some(active_add.unwrap_or(0.0).max(cp.style.additive));
-                    if vparts.iter().any(|(_, evs)| evs.iter().any(|e| e.tag.is_wash && ft >= e.onset && ft < e.end())) {
-                        track_is_wash = true;
-                    }
-                    let hue_override = if is_stretched_snippet {
-                        let bh = project
-                            .sources
-                            .get(clip.source)
-                            .map(|s| s.effective_base_hz())
-                            .unwrap_or(440.0);
-                        let br = crate::music::effective_ratio(
-                            clip.grains.pitch,
-                            clip.key.as_ref(),
-                            bh,
-                            clip.grains.quantize_amount,
-                            clip.grains.detune_cents,
-                        );
-                        Some(crate::music::ratio_to_semitones(br) * clip.link.pitch_to_hue)
-                    } else {
-                        None
-                    };
-                    let grid_fi = panel_grids.as_ref().map(|g| g[fi]);
-                    for (sid, evs) in vparts {
-                        if let Some(video) =
-                            project.sources.get(*sid).and_then(|s| s.video.as_ref())
-                        {
-                            composite_grains_frame_stage(
-                                video,
-                                evs,
-                                &cp.style,
-                                &clip.link,
-                                &clip.transform,
-                                clip.color_filter.as_ref(),
-                                &mut clip_layer,
-                                ft,
-                                is_stretched_snippet,
-                                hue_override,
-                                project.layout,
-                                grid_fi,
-                            );
-                        }
-                    }
-                }
-                fx::apply_video_chain(&mut clip_layer, &clip.effects, &mut clip_vstates[cpi]);
-                let tl = track_layer
-                    .get_or_insert_with(|| Frame::transparent(project.width, project.height));
-                blend_layer_over(tl, &clip_layer, cp.style.additive);
-            }
-
-            if track_layer.is_none() && !track_has_fx {
-                continue;
-            }
-            let mut tl = track_layer
-                .unwrap_or_else(|| Frame::transparent(project.width, project.height));
-            fx::apply_video_chain(&mut tl, &track.effects, &mut track_vstates);
-            if track.tape.is_active() {
-                apply_video_tape(&mut tl, &track.tape, fi, project.fps, 0x5452_4B00 ^ ti as u64);
-            }
-            let mut opacity =
-                track.opacity_at((t0 + fi as f64 / project.fps as f64) * project.bpm / 60.0);
-            if track.rms_to_opacity > 1e-4 {
-                let r_amt = track.rms_to_opacity.clamp(0.0, 1.0);
-                let env_v = track_rms_env.get(fi).copied().unwrap_or(0.0);
-                opacity *= ((1.0 - r_amt) + r_amt * env_v).clamp(0.0, 1.0);
-            }
-            if let (Some(&shaped), Some(spec)) = (track_duck_shaped[ti].get(fi), &track.duck) {
-                let raw_link = track.duck_to_opacity.clamp(-1.0, 1.0);
-                let v_amt = if spec.amount <= 1e-4 {
-                    raw_link
-                } else {
-                    spec.amount.clamp(0.0, 1.0) * raw_link
-                };
-                if v_amt >= 0.0 {
-                    opacity *= (1.0 - v_amt * shaped).clamp(0.0, 1.0);
-                } else {
-                    let pulse = (-v_amt).clamp(0.0, 1.0);
-                    opacity = (opacity * (1.0 - 0.55 * pulse) + pulse * shaped).clamp(0.0, 1.0);
+    let layout_at = |beat: f64| -> crate::tile::Layout {
+        let mut lay = project.layout;
+        for mp in &project.master_punches {
+            if beat >= mp.start_beat && beat < mp.end_beat {
+                if let PunchAction::Layout(l) = mp.action {
+                    lay = l;
                 }
             }
-            let track_add = track
-                .additive
-                .unwrap_or_else(|| active_add.unwrap_or(fallback_add));
-            blend_stage_layer(frame, &tl, project.layout, track_add, opacity, track_is_wash);
         }
-    }
+        lay
+    };
+    let isolator_at = |beat: f64| -> crate::dsp::BandIsolator {
+        let mut iso = project.isolator;
+        for mp in &project.master_punches {
+            if beat >= mp.start_beat && beat < mp.end_beat {
+                if let PunchAction::Isolator(i) = mp.action {
+                    iso = i;
+                }
+            }
+        }
+        iso
+    };
+    let tape_stop_at = |beat: f64| -> f32 {
+        let mut brk = project.tape_stop.clamp(0.0, 1.0);
+        for mp in &project.master_punches {
+            if let PunchAction::TapeStop { spin_down_beats, spin_up_beats } = mp.action {
+                let sd = spin_down_beats.max(0.05);
+                let su = spin_up_beats.max(0.02);
+                if beat >= mp.start_beat && beat < mp.end_beat {
+                    let u = ((beat - mp.start_beat) / sd).clamp(0.0, 1.0) as f32;
+                    brk = brk.max(0.5 - 0.5 * (std::f32::consts::PI * u).cos());
+                } else if beat >= mp.end_beat && beat < mp.end_beat + su {
+                    let u = ((beat - mp.end_beat) / su).clamp(0.0, 1.0) as f32;
+                    brk = brk.max(0.5 + 0.5 * (std::f32::consts::PI * u).cos());
+                }
+            }
+        }
+        brk
+    };
+    let punch_fx_weight = |start_b: f64, end_b: f64, beat: f64| -> f32 {
+        if beat < start_b || beat >= end_b {
+            return 0.0;
+        }
+        let fade_b = (0.018 * project.bpm / 60.0).clamp(0.01, ((end_b - start_b) * 0.35).max(0.01));
+        let w_in = ((beat - start_b) / fade_b).clamp(0.0, 1.0) as f32;
+        let w_out = ((end_b - beat) / fade_b).clamp(0.0, 1.0) as f32;
+        let w = w_in.min(w_out);
+        0.5 - 0.5 * (std::f32::consts::PI * w).cos()
+    };
 
-    // ---- master chain ----
+    // ---- Master audio chain (computed before video frames so bloom & streaming mux have finished audio) ----
     if project.studio_bus {
         let mut studio_bus = StudioBusState::new(project.sample_rate);
         studio_bus.process_eq(&mut master_audio.left, &mut master_audio.right);
     }
     fx::apply_audio_chain_opts(&mut master_audio, &project.master_effects, project.studio_bus);
+
+    // Timed master effect punches (`PunchAction::Effect`), click-free crossfaded.
+    for mp in &project.master_punches {
+        if let PunchAction::Effect(efx) = mp.action {
+            let mut wet = master_audio.clone();
+            fx::apply_audio_chain_opts(&mut wet, &[efx], project.studio_bus);
+            let sr = project.sample_rate as f64;
+            let bps = project.bpm / 60.0;
+            for i in 0..master_audio.len() {
+                let beat = (t0 + i as f64 / sr) * bps;
+                let w = punch_fx_weight(mp.start_beat, mp.end_beat, beat);
+                if w > 1e-4 {
+                    master_audio.left[i] = master_audio.left[i] * (1.0 - w) + wet.left[i] * w;
+                    master_audio.right[i] = master_audio.right[i] * (1.0 - w) + wet.right[i] * w;
+                }
+            }
+        }
+    }
+
     if project.master_tape.is_active() {
         let mut master_tape = TapeState::new(0x4D41_5354);
         master_tape.process_block(
@@ -1387,6 +1431,29 @@ pub fn render_project(project: &Project, from_beat: f64, to_beat: f64) -> Render
             project.sample_rate,
         );
     }
+
+    // Varispeed turntable / capstan `Tape Stop` (project-wide or timed `PunchAction::TapeStop`).
+    let any_tape_stop = project.tape_stop > 1e-4
+        || project.master_punches.iter().any(|p| matches!(p.action, PunchAction::TapeStop { .. }));
+    if any_tape_stop {
+        let mut ts = TapeStopState::new(project.sample_rate);
+        let sr = project.sample_rate as f64;
+        let bps = project.bpm / 60.0;
+        let mut pos = 0usize;
+        while pos < master_audio.len() {
+            let b = 64.min(master_audio.len() - pos);
+            let beat = (t0 + (pos + b / 2) as f64 / sr) * bps;
+            let brk = tape_stop_at(beat);
+            ts.process_block(
+                &mut master_audio.left[pos..pos + b],
+                &mut master_audio.right[pos..pos + b],
+                brk,
+                project.sample_rate,
+            );
+            pos += b;
+        }
+    }
+
     if project.master_gain_db.abs() > 1e-4 {
         let g = 10.0f32.powf(project.master_gain_db.clamp(-24.0, 24.0) / 20.0);
         for s in &mut master_audio.left {
@@ -1396,14 +1463,34 @@ pub fn render_project(project: &Project, from_beat: f64, to_beat: f64) -> Render
             *s *= g;
         }
     }
-    if project.isolator.is_active() {
+
+    let any_iso_punch = project.master_punches.iter().any(|p| matches!(p.action, PunchAction::Isolator(_)));
+    if project.isolator.is_active() || any_iso_punch {
         let mut iso_state = crate::dsp::IsolatorState::new(project.sample_rate);
-        iso_state.process_block(
-            &mut master_audio.left,
-            &mut master_audio.right,
-            &project.isolator,
-            project.sample_rate,
-        );
+        if !any_iso_punch {
+            iso_state.process_block(
+                &mut master_audio.left,
+                &mut master_audio.right,
+                &project.isolator,
+                project.sample_rate,
+            );
+        } else {
+            let sr = project.sample_rate as f64;
+            let bps = project.bpm / 60.0;
+            let mut pos = 0usize;
+            while pos < master_audio.len() {
+                let b = 128.min(master_audio.len() - pos);
+                let beat = (t0 + (pos + b / 2) as f64 / sr) * bps;
+                let iso = isolator_at(beat);
+                iso_state.process_block(
+                    &mut master_audio.left[pos..pos + b],
+                    &mut master_audio.right[pos..pos + b],
+                    &iso,
+                    project.sample_rate,
+                );
+                pos += b;
+            }
+        }
     }
     let bloom_luma: Vec<f32> = if project.master_bloom > 1e-4 && n_frames > 0 && !master_audio.left.is_empty() {
         let b_amt = project.master_bloom.clamp(0.0, 1.0);
@@ -1438,15 +1525,243 @@ pub fn render_project(project: &Project, from_beat: f64, to_beat: f64) -> Render
     } else {
         Vec::new()
     };
+    if project.studio_bus {
+        StudioBusState::process_ceiling(&mut master_audio.left, &mut master_audio.right);
+    } else {
+        master_audio.soft_clip();
+    }
+
+    // ---- Pass 3 (video, streaming per frame `fi`): clips -> clip fx -> track layer -> track fx -> master ----
+    struct TrackVideoCtx<'a> {
+        ti: usize,
+        track: &'a crate::timeline::Track,
+        clip_plans: Vec<&'a ClipPlan>,
+        track_has_fx: bool,
+        clip_vstates: Vec<Vec<fx::VideoFxState>>,
+        track_vstates: Vec<fx::VideoFxState>,
+        fallback_add: f32,
+        track_rms_env: Vec<f32>,
+    }
+
+    let mut track_ctxs: Vec<TrackVideoCtx<'_>> = Vec::new();
+    for (ti, track) in project.tracks.iter().enumerate() {
+        if track.muted {
+            continue;
+        }
+        let clip_plans: Vec<&ClipPlan> = plan.iter().filter(|p| p.track == ti).collect();
+        if clip_plans.is_empty() {
+            continue;
+        }
+        let track_has_video = clip_plans.iter().any(|cp| {
+            let vparts = cp.video_parts.as_deref().unwrap_or(&cp.parts);
+            vparts.iter().any(|(sid, evs)| {
+                !evs.is_empty()
+                    && project.sources.get(*sid).is_some_and(|s| s.video.is_some())
+            })
+        });
+        let track_has_fx = !track.effects.is_empty();
+        if !track_has_video && !track_has_fx {
+            continue;
+        }
+        let clip_vstates: Vec<Vec<fx::VideoFxState>> = clip_plans
+            .iter()
+            .map(|cp| fx::video_chain_states(&track.clips[cp.clip_index].effects, project.fps))
+            .collect();
+        let track_vstates = fx::video_chain_states(&track.effects, project.fps);
+        let fallback_add = clip_plans
+            .iter()
+            .map(|cp| cp.style.additive)
+            .fold(0.0f32, f32::max);
+        let track_rms_env: Vec<f32> = if track.rms_to_opacity > 1e-4 {
+            if let Some(bus) = &track_buses[ti] {
+                let mut out_env = vec![0.0f32; n_frames];
+                let sr = project.sample_rate.max(1) as f32;
+                let att_c = (-1.0 / (0.024 * sr)).exp();
+                let rel_c = (-1.0 / (0.175 * sr)).exp();
+                let mut env = 0.0f32;
+                for i in 0..bus.len() {
+                    let x = bus.left[i].abs().max(bus.right[i].abs());
+                    if x > env {
+                        env = att_c * env + (1.0 - att_c) * x;
+                    } else {
+                        env = rel_c * env + (1.0 - rel_c) * x;
+                    }
+                    let fi = ((i as f64 / sr as f64) * project.fps as f64) as usize;
+                    if fi < n_frames {
+                        let d = (env * 4.2).min(6.0);
+                        out_env[fi] = out_env[fi].max(d / (1.0 + d));
+                    }
+                }
+                out_env
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+        track_ctxs.push(TrackVideoCtx {
+            ti,
+            track,
+            clip_plans,
+            track_has_fx,
+            clip_vstates,
+            track_vstates,
+            fallback_add,
+            track_rms_env,
+        });
+    }
+    // Release per-track audio buses before streaming video frames.
+    drop(track_buses);
+
     let mut master_states = fx::video_chain_states(&project.master_effects, project.fps);
-    for (fi, frame) in frames.iter_mut().enumerate() {
+    let mut punch_fx_vstates: Vec<(f64, f64, crate::fx::AvEffect, Vec<fx::VideoFxState>)> = project
+        .master_punches
+        .iter()
+        .filter_map(|mp| match mp.action {
+            PunchAction::Effect(efx) => Some((
+                mp.start_beat,
+                mp.end_beat,
+                efx,
+                fx::video_chain_states(&[efx], project.fps),
+            )),
+            _ => None,
+        })
+        .collect();
+
+    let mut render_one_frame = |fi: usize, frame: &mut Frame| {
         let ft = t0 + fi as f64 / project.fps as f64;
+        let frame_beat = ft * project.bpm / 60.0;
+        let cur_layout = layout_at(frame_beat);
+        let grid_fi = match cur_layout {
+            crate::tile::Layout::Tile => tile_grids_opt.as_ref().map(|g| g[fi]),
+            crate::tile::Layout::Split => split_grids_opt.as_ref().map(|g| g[fi]),
+            crate::tile::Layout::Stack | crate::tile::Layout::Bleed => None,
+        };
+        for ctx in track_ctxs.iter_mut() {
+            let ti = ctx.ti;
+            let track = ctx.track;
+            let mut track_layer: Option<Frame> = None;
+            let mut active_add: Option<f32> = None;
+            let mut track_is_wash = track.sculpt.is_wash();
+
+            for (cpi, cp) in ctx.clip_plans.iter().enumerate() {
+                let clip = &track.clips[cp.clip_index];
+                let vparts = cp.video_parts.as_deref().unwrap_or(&cp.parts);
+                let is_stretched_snippet = cp.video_parts.is_some();
+                let carry_pad = if cur_layout.uses_tiles() { OPTICAL_CARRY_SECS } else { 0.0 };
+                let any_active = vparts.iter().any(|(_, evs)| {
+                    evs.iter().any(|e| {
+                        ft >= e.onset && ft < e.onset + cp.style.visual_duration(e.duration).max(e.duration as f64 + carry_pad)
+                    })
+                });
+                if !any_active && clip.effects.is_empty() {
+                    continue;
+                }
+                let mut clip_layer = Frame::transparent(project.width, project.height);
+                if any_active {
+                    active_add = Some(active_add.unwrap_or(0.0).max(cp.style.additive));
+                    if vparts.iter().any(|(_, evs)| evs.iter().any(|e| e.tag.is_wash && ft >= e.onset && ft < e.end())) {
+                        track_is_wash = true;
+                    }
+                    let hue_override = if is_stretched_snippet {
+                        let bh = project
+                            .sources
+                            .get(clip.source)
+                            .map(|s| s.effective_base_hz())
+                            .unwrap_or(440.0);
+                        let br = crate::music::effective_ratio(
+                            clip.grains.pitch,
+                            clip.key.as_ref(),
+                            bh,
+                            clip.grains.quantize_amount,
+                            clip.grains.detune_cents,
+                        );
+                        Some(crate::music::ratio_to_semitones(br) * clip.link.pitch_to_hue)
+                    } else {
+                        None
+                    };
+                    for (sid, evs) in vparts {
+                        if let Some(video) =
+                            project.sources.get(*sid).and_then(|s| s.video.as_ref())
+                        {
+                            composite_grains_frame_stage(
+                                video,
+                                evs,
+                                &cp.style,
+                                &clip.link,
+                                &clip.transform,
+                                clip.color_filter.as_ref(),
+                                &mut clip_layer,
+                                ft,
+                                is_stretched_snippet,
+                                hue_override,
+                                cur_layout,
+                                grid_fi,
+                            );
+                        }
+                    }
+                }
+                fx::apply_video_chain(&mut clip_layer, &clip.effects, &mut ctx.clip_vstates[cpi]);
+                let tl = track_layer
+                    .get_or_insert_with(|| Frame::transparent(project.width, project.height));
+                blend_layer_over(tl, &clip_layer, cp.style.additive);
+            }
+
+            if track_layer.is_none() && !ctx.track_has_fx {
+                continue;
+            }
+            let mut tl = track_layer
+                .unwrap_or_else(|| Frame::transparent(project.width, project.height));
+            fx::apply_video_chain(&mut tl, &track.effects, &mut ctx.track_vstates);
+            if track.tape.is_active() {
+                apply_video_tape(&mut tl, &track.tape, fi, project.fps, 0x5452_4B00 ^ ti as u64);
+            }
+            let mut opacity =
+                track.opacity_at((t0 + fi as f64 / project.fps as f64) * project.bpm / 60.0);
+            if track.rms_to_opacity > 1e-4 {
+                let r_amt = track.rms_to_opacity.clamp(0.0, 1.0);
+                let env_v = ctx.track_rms_env.get(fi).copied().unwrap_or(0.0);
+                opacity *= ((1.0 - r_amt) + r_amt * env_v).clamp(0.0, 1.0);
+            }
+            if let (Some(&shaped), Some(spec)) = (track_duck_shaped[ti].get(fi), &track.duck) {
+                let raw_link = track.duck_to_opacity.clamp(-1.0, 1.0);
+                let v_amt = if spec.amount <= 1e-4 {
+                    raw_link
+                } else {
+                    spec.amount.clamp(0.0, 1.0) * raw_link
+                };
+                if v_amt >= 0.0 {
+                    opacity *= (1.0 - v_amt * shaped).clamp(0.0, 1.0);
+                } else {
+                    let pulse = (-v_amt).clamp(0.0, 1.0);
+                    opacity = (opacity * (1.0 - 0.55 * pulse) + pulse * shaped).clamp(0.0, 1.0);
+                }
+            }
+            let track_add = track
+                .additive
+                .unwrap_or_else(|| active_add.unwrap_or(ctx.fallback_add));
+            blend_stage_layer(frame, &tl, cur_layout, track_add, opacity, track_is_wash);
+        }
+
         fx::apply_video_chain(frame, &project.master_effects, &mut master_states);
+        for (sb, eb, efx, vst) in punch_fx_vstates.iter_mut() {
+            let w = punch_fx_weight(*sb, *eb, frame_beat);
+            if w > 0.01 {
+                let mut scaled = *efx;
+                scaled.video *= w;
+                fx::apply_video_chain(frame, &[scaled], vst);
+            }
+        }
         if project.master_tape.is_active() {
             apply_video_tape(frame, &project.master_tape, fi, project.fps, 0x4D41_5354);
         }
-        if project.isolator.is_active() {
-            fx::apply_video_isolator(frame, &project.isolator, 1.0);
+        let brk = tape_stop_at(frame_beat);
+        if brk > 0.002 {
+            apply_video_tape_stop(frame, brk, ft);
+        }
+        let cur_iso = isolator_at(frame_beat);
+        if cur_iso.is_active() {
+            fx::apply_video_isolator(frame, &cur_iso, 1.0);
         }
         if let Some(&bl) = bloom_luma.get(fi) {
             if bl > 0.02 {
@@ -1480,15 +1795,12 @@ pub fn render_project(project: &Project, from_beat: f64, to_beat: f64) -> Render
                 draw_stage_caption(frame, cap, pic);
             }
         }
-    }
+    };
 
-    if project.studio_bus {
-        StudioBusState::process_ceiling(&mut master_audio.left, &mut master_audio.right);
-    } else {
-        master_audio.soft_clip();
-    }
+    consume(&master_audio, n_frames, &mut render_one_frame)?;
+    drop(track_ctxs);
     let events = plan.into_iter().map(|p| p.parts.into_iter().flat_map(|(_, e)| e).collect()).collect();
-    RenderOutput { audio: master_audio, frames, fps: project.fps, events }
+    Ok((master_audio, events))
 }
 
 #[cfg(test)]

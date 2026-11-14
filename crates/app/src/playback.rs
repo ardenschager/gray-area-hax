@@ -39,6 +39,8 @@ struct Shared {
     buses_dirty: AtomicBool,
     /// Click-free live `ISOL8` isolator punch update (applied without swapping the engine).
     isolator_cmd: Mutex<Option<chromagrain_core::dsp::BandIsolator>>,
+    /// Click-free live varispeed `Tape Stop` brake update (applied without swapping the engine).
+    tape_stop_cmd: Mutex<Option<f32>>,
     /// One-shot preview sounds (instrument note auditions), mixed in after
     /// the engine at the project rate: (samples, read position).
     auditions: Mutex<Vec<(Arc<Vec<f32>>, usize)>>,
@@ -106,6 +108,7 @@ impl Playback {
             live_buses: Mutex::new(Vec::new()),
             buses_dirty: AtomicBool::new(false),
             isolator_cmd: Mutex::new(None),
+            tape_stop_cmd: Mutex::new(None),
             auditions: Mutex::new(Vec::new()),
         });
         let (producer, consumer) = rtrb::RingBuffer::<f32>::new(RING_CAPACITY);
@@ -279,6 +282,10 @@ impl Playback {
         *self.shared.isolator_cmd.lock().unwrap() = Some(iso);
     }
 
+    pub fn set_tape_stop(&self, amt: f32) {
+        *self.shared.tape_stop_cmd.lock().unwrap() = Some(amt);
+    }
+
     /// Handle for playing one-shot preview sounds (see [`Auditioner`]).
     pub fn auditioner(&self) -> Auditioner {
         Auditioner(self.shared.clone())
@@ -395,6 +402,10 @@ impl Driver {
         if let Some(iso) = shared.isolator_cmd.lock().unwrap().take() {
             self.project.isolator = iso;
             self.engine.set_isolator(iso);
+        }
+        if let Some(ts) = shared.tape_stop_cmd.lock().unwrap().take() {
+            self.project.tape_stop = ts;
+            self.engine.set_tape_stop(ts);
         }
         if shared.buses_dirty.swap(false, Ordering::Relaxed) {
             for (i, chain) in shared.live_buses.lock().unwrap().iter().enumerate() {

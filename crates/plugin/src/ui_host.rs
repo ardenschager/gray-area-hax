@@ -468,6 +468,10 @@ impl Host for PluginHost {
         self.project.lock().unwrap().isolator = iso;
         self.shared.live(Live::Isolator(iso));
     }
+    fn set_tape_stop(&mut self, amt: f32) {
+        self.project.lock().unwrap().tape_stop = amt;
+        self.shared.live(Live::TapeStop(amt));
+    }
 }
 
 impl PerformHost for PluginHost {

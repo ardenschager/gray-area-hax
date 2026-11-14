@@ -1189,6 +1189,110 @@ impl TapeState {
     }
 }
 
+/// Real-time / offline varispeed turntable & reel-to-reel capstan brake (`Tape Stop`).
+/// Pre-allocates its circular history ring on construction so realtime / VST3 / CLAP
+/// audio blocks perform zero heap allocations, and stays warm during bypass so
+/// punching `Tape Stop` engages instantaneously with zero click.
+#[derive(Debug, Clone)]
+pub struct TapeStopState {
+    buf_l: Vec<f32>,
+    buf_r: Vec<f32>,
+    write_pos: usize,
+    lag: f64,
+    smooth_brake: f32,
+    lp: [f32; 2],
+}
+
+impl TapeStopState {
+    pub fn new(sample_rate: u32) -> Self {
+        let cap = (sample_rate.max(8_000) as usize * 3).max(24_000);
+        TapeStopState {
+            buf_l: vec![0.0; cap],
+            buf_r: vec![0.0; cap],
+            write_pos: 0,
+            lag: 0.0,
+            smooth_brake: 0.0,
+            lp: [0.0; 2],
+        }
+    }
+
+    #[inline]
+    fn hermite_ring(buf: &[f32], read_pos: f64) -> f32 {
+        let cap = buf.len();
+        let wrapped = read_pos.rem_euclid(cap as f64);
+        let i0 = wrapped.floor() as usize;
+        let frac = (wrapped - i0 as f64) as f32;
+        let im1 = if i0 == 0 { cap - 1 } else { i0 - 1 };
+        let i1 = (i0 + 1) % cap;
+        let i2 = (i0 + 2) % cap;
+        let (xm1, x0, x1, x2) = (buf[im1], buf[i0], buf[i1], buf[i2]);
+        let c = (x1 - xm1) * 0.5;
+        let v = x0 - x1;
+        let w = c + v;
+        let a = w + v + (x2 - x0) * 0.5;
+        let b = w + a;
+        ((a * frac - b) * frac + c) * frac + x0
+    }
+
+    pub fn process_block(&mut self, left: &mut [f32], right: &mut [f32], target_brake: f32, sample_rate: u32) {
+        let cap = self.buf_l.len();
+        if cap < 16 {
+            return;
+        }
+        let n = left.len().min(right.len());
+        let sr = sample_rate.max(1) as f32;
+        let target = if target_brake.is_finite() { target_brake.clamp(0.0, 1.0) } else { 0.0 };
+        let slew_a = 1.0 - (-1.0 / (0.008 * sr)).exp();
+        let spinup_decay = (-1.0 / (0.042 * sr as f64)).exp();
+        let max_lag = (cap - 8) as f64;
+
+        for i in 0..n {
+            let w = self.write_pos;
+            let dry_l = left[i];
+            let dry_r = right[i];
+            self.buf_l[w] = dry_l;
+            self.buf_r[w] = dry_r;
+            self.write_pos = (w + 1) % cap;
+
+            self.smooth_brake += slew_a * (target - self.smooth_brake);
+            if target <= 1e-4 && self.smooth_brake <= 1e-4 && self.lag <= 0.05 {
+                self.smooth_brake = 0.0;
+                self.lag = 0.0;
+                self.lp = [dry_l, dry_r];
+                continue;
+            }
+
+            if target > 0.015 || self.smooth_brake > 0.04 {
+                let speed = ((1.0 - self.smooth_brake).max(0.0)).powf(2.15);
+                self.lag = (self.lag + (1.0 - speed as f64)).clamp(0.0, max_lag);
+                let rpos = w as f64 - self.lag;
+                let sl = Self::hermite_ring(&self.buf_l, rpos);
+                let sr_v = Self::hermite_ring(&self.buf_r, rpos);
+
+                // Progressive warm capstan HF rolloff as tape slows down.
+                let fc = (520.0 + 17_500.0 * speed.powf(1.3)).min(sr * 0.45);
+                let lp_a = 1.0 - (-2.0 * std::f32::consts::PI * fc / sr).exp();
+                self.lp[0] += lp_a * (sl - self.lp[0]);
+                self.lp[1] += lp_a * (sr_v - self.lp[1]);
+
+                let stop_env = (speed / 0.055).clamp(0.0, 1.0).sqrt();
+                left[i] = self.lp[0] * stop_env;
+                right[i] = self.lp[1] * stop_env;
+            } else {
+                // Smooth capstan spin-up catch-up back to real-time dry head.
+                self.lag *= spinup_decay;
+                let rpos = w as f64 - self.lag;
+                let sl = Self::hermite_ring(&self.buf_l, rpos);
+                let sr_v = Self::hermite_ring(&self.buf_r, rpos);
+                let wet = (self.lag / 96.0).clamp(0.0, 1.0) as f32;
+                left[i] = dry_l * (1.0 - wet) + sl * wet;
+                right[i] = dry_r * (1.0 - wet) + sr_v * wet;
+                self.lp = [left[i], right[i]];
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

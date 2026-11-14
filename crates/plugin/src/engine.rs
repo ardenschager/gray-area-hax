@@ -64,6 +64,8 @@ pub enum Live {
     StopPads,
     /// Update the 5-Band `ISOL8` Frequency Isolator on the audio thread (0 allocations).
     Isolator(chromagrain_core::dsp::BandIsolator),
+    /// Update the live varispeed turntable / capstan brake (`0..1`, 0 allocations).
+    TapeStop(f32),
 }
 
 /// Audio -> loader: replaced things, to be dropped off the audio thread.
@@ -413,6 +415,7 @@ impl AudioSide {
                 Live::TogglePad(n) => self.inst.toggle_pad(n),
                 Live::StopPads => self.inst.stop_pads(),
                 Live::Isolator(iso) => self.inst.set_isolator(iso),
+                Live::TapeStop(amt) => self.inst.set_tape_stop(amt),
             }
         }
     }

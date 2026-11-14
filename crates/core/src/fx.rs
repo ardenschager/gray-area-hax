@@ -1480,50 +1480,96 @@ fn video_reverb(frame: &mut Frame, acc: &mut Vec<f32>, size: f32, damp: f32, mix
     }
 }
 
-/// Separable box blur over an RGBA f32 buffer.
+/// Separable O(1)-per-pixel cache-friendly box blur over an RGBA f32 buffer.
 fn box_blur(data: &mut [f32], w: usize, h: usize, radius: usize) {
-    let mut tmp = data.to_vec();
-    // Horizontal.
+    if w == 0 || h == 0 || radius == 0 {
+        return;
+    }
+    let mut tmp = vec![0.0f32; data.len()];
+    // Horizontal pass (row-contiguous, 4 channels together).
     for y in 0..h {
-        for c in 0..4 {
-            let mut sum = 0.0f32;
-            let row = y * w;
-            for x in 0..w.min(radius + 1) {
-                sum += data[(row + x) * 4 + c];
+        let row = y * w * 4;
+        let init_n = w.min(radius + 1);
+        let mut sum = [0.0f32; 4];
+        for x in 0..init_n {
+            let p = row + x * 4;
+            sum[0] += data[p];
+            sum[1] += data[p + 1];
+            sum[2] += data[p + 2];
+            sum[3] += data[p + 3];
+        }
+        let mut count = init_n as f32;
+        for x in 0..w {
+            let p = row + x * 4;
+            let inv = 1.0 / count;
+            tmp[p] = sum[0] * inv;
+            tmp[p + 1] = sum[1] * inv;
+            tmp[p + 2] = sum[2] * inv;
+            tmp[p + 3] = sum[3] * inv;
+            if x + radius + 1 < w {
+                let pa = row + (x + radius + 1) * 4;
+                sum[0] += data[pa];
+                sum[1] += data[pa + 1];
+                sum[2] += data[pa + 2];
+                sum[3] += data[pa + 3];
+                count += 1.0;
             }
-            let mut count = w.min(radius + 1) as f32;
-            for x in 0..w {
-                tmp[(row + x) * 4 + c] = sum / count;
-                if x + radius + 1 < w {
-                    sum += data[(row + x + radius + 1) * 4 + c];
-                    count += 1.0;
-                }
-                if x >= radius {
-                    sum -= data[(row + x - radius) * 4 + c];
-                    count -= 1.0;
-                }
+            if x >= radius {
+                let ps = row + (x - radius) * 4;
+                sum[0] -= data[ps];
+                sum[1] -= data[ps + 1];
+                sum[2] -= data[ps + 2];
+                sum[3] -= data[ps + 3];
+                count -= 1.0;
             }
         }
     }
-    // Vertical.
-    for x in 0..w {
-        for c in 0..4 {
-            let mut sum = 0.0f32;
-            for y in 0..h.min(radius + 1) {
-                sum += tmp[(y * w + x) * 4 + c];
+    // Vertical pass (row-major outer `y` loop with L1-resident column accumulators!).
+    let init_h = h.min(radius + 1);
+    let mut col_sums = vec![[0.0f32; 4]; w];
+    for y in 0..init_h {
+        let row = y * w * 4;
+        for x in 0..w {
+            let p = row + x * 4;
+            col_sums[x][0] += tmp[p];
+            col_sums[x][1] += tmp[p + 1];
+            col_sums[x][2] += tmp[p + 2];
+            col_sums[x][3] += tmp[p + 3];
+        }
+    }
+    let mut count = init_h as f32;
+    for y in 0..h {
+        let row = y * w * 4;
+        let inv = 1.0 / count;
+        for x in 0..w {
+            let p = row + x * 4;
+            let s = col_sums[x];
+            data[p] = s[0] * inv;
+            data[p + 1] = s[1] * inv;
+            data[p + 2] = s[2] * inv;
+            data[p + 3] = s[3] * inv;
+        }
+        if y + radius + 1 < h {
+            let add_row = (y + radius + 1) * w * 4;
+            for x in 0..w {
+                let p = add_row + x * 4;
+                col_sums[x][0] += tmp[p];
+                col_sums[x][1] += tmp[p + 1];
+                col_sums[x][2] += tmp[p + 2];
+                col_sums[x][3] += tmp[p + 3];
             }
-            let mut count = h.min(radius + 1) as f32;
-            for y in 0..h {
-                data[(y * w + x) * 4 + c] = sum / count;
-                if y + radius + 1 < h {
-                    sum += tmp[((y + radius + 1) * w + x) * 4 + c];
-                    count += 1.0;
-                }
-                if y >= radius {
-                    sum -= tmp[((y - radius) * w + x) * 4 + c];
-                    count -= 1.0;
-                }
+            count += 1.0;
+        }
+        if y >= radius {
+            let sub_row = (y - radius) * w * 4;
+            for x in 0..w {
+                let p = sub_row + x * 4;
+                col_sums[x][0] -= tmp[p];
+                col_sums[x][1] -= tmp[p + 1];
+                col_sums[x][2] -= tmp[p + 2];
+                col_sums[x][3] -= tmp[p + 3];
             }
+            count -= 1.0;
         }
     }
 }
@@ -1681,7 +1727,6 @@ pub fn isolator_video_uniforms(iso: &BandIsolator, amount: f32) -> ([f32; 5], u3
 
 fn box_blur_rgb(src: &[u8], w: usize, h: usize, radius: usize) -> Vec<[f32; 3]> {
     let n = w * h;
-    let mut tmp = vec![[0.0f32; 3]; n];
     let mut out = vec![[0.0f32; 3]; n];
     if n == 0 || radius == 0 {
         for i in 0..n {
@@ -1694,37 +1739,77 @@ fn box_blur_rgb(src: &[u8], w: usize, h: usize, radius: usize) -> Vec<[f32; 3]> 
         }
         return out;
     }
-    let r = radius as isize;
+    let mut tmp = vec![[0.0f32; 3]; n];
+    // O(1)-per-pixel horizontal sliding sum.
+    let init_w = w.min(radius + 1);
     for y in 0..h {
         let row = y * w;
+        let mut acc = [0i32; 3];
+        for x in 0..init_w {
+            let p = (row + x) * 4;
+            acc[0] += src[p] as i32;
+            acc[1] += src[p + 1] as i32;
+            acc[2] += src[p + 2] as i32;
+        }
+        let mut count = init_w as f32;
         for x in 0..w {
-            let x0 = (x as isize - r).max(0) as usize;
-            let x1 = (x as isize + r).min(w as isize - 1) as usize;
-            let inv = 1.0 / (x1 - x0 + 1) as f32;
-            let mut acc = [0.0f32; 3];
-            for xx in x0..=x1 {
-                let p = (row + xx) * 4;
-                acc[0] += src[p] as f32;
-                acc[1] += src[p + 1] as f32;
-                acc[2] += src[p + 2] as f32;
+            let scale = 1.0 / (count * 255.0);
+            tmp[row + x] = [acc[0] as f32 * scale, acc[1] as f32 * scale, acc[2] as f32 * scale];
+            if x + radius + 1 < w {
+                let pa = (row + x + radius + 1) * 4;
+                acc[0] += src[pa] as i32;
+                acc[1] += src[pa + 1] as i32;
+                acc[2] += src[pa + 2] as i32;
+                count += 1.0;
             }
-            let scale = inv / 255.0;
-            tmp[row + x] = [acc[0] * scale, acc[1] * scale, acc[2] * scale];
+            if x >= radius {
+                let ps = (row + x - radius) * 4;
+                acc[0] -= src[ps] as i32;
+                acc[1] -= src[ps + 1] as i32;
+                acc[2] -= src[ps + 2] as i32;
+                count -= 1.0;
+            }
         }
     }
-    for y in 0..h {
-        let y0 = (y as isize - r).max(0) as usize;
-        let y1 = (y as isize + r).min(h as isize - 1) as usize;
-        let inv = 1.0 / (y1 - y0 + 1) as f32;
+    // O(1)-per-pixel row-major vertical sliding sum (L1 cache friendly!).
+    let init_h = h.min(radius + 1);
+    let mut col_sums = vec![[0.0f32; 3]; w];
+    for y in 0..init_h {
+        let row = y * w;
         for x in 0..w {
-            let mut acc = [0.0f32; 3];
-            for yy in y0..=y1 {
-                let c = tmp[yy * w + x];
-                acc[0] += c[0];
-                acc[1] += c[1];
-                acc[2] += c[2];
+            let c = tmp[row + x];
+            col_sums[x][0] += c[0];
+            col_sums[x][1] += c[1];
+            col_sums[x][2] += c[2];
+        }
+    }
+    let mut count = init_h as f32;
+    for y in 0..h {
+        let row = y * w;
+        let inv = 1.0 / count;
+        for x in 0..w {
+            let s = col_sums[x];
+            out[row + x] = [s[0] * inv, s[1] * inv, s[2] * inv];
+        }
+        if y + radius + 1 < h {
+            let add_row = (y + radius + 1) * w;
+            for x in 0..w {
+                let c = tmp[add_row + x];
+                col_sums[x][0] += c[0];
+                col_sums[x][1] += c[1];
+                col_sums[x][2] += c[2];
             }
-            out[y * w + x] = [acc[0] * inv, acc[1] * inv, acc[2] * inv];
+            count += 1.0;
+        }
+        if y >= radius {
+            let sub_row = (y - radius) * w;
+            for x in 0..w {
+                let c = tmp[sub_row + x];
+                col_sums[x][0] -= c[0];
+                col_sums[x][1] -= c[1];
+                col_sums[x][2] -= c[2];
+            }
+            count -= 1.0;
         }
     }
     out

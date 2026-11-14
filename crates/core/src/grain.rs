@@ -1025,13 +1025,24 @@ pub fn schedule_grains_auto(
             k += 1;
         }
     } else {
-        // Free: classic asynchronous cloud with jittered inter-onset times.
+        // Free: classic asynchronous cloud with jittered inter-onset times;
+        // when *MODELL 5* hard micro-burst mode is active (`PictureCut::Cut` +
+        // tight `spray <= 0.08`), `duration_jitter` scales onset jitter down to
+        // `0.0` so `density` (`18..45 Hz`) produces true synchronous audio-rate
+        // pulse trains crossing rhythm into pitched formant buzz!
         let mut t = 0.0f64;
         while t < clip_len {
             let s = eff_at(t);
             let mean_interval = 1.0 / s.density.max(0.01) as f64;
-            // Jitter inter-onset interval +-50% for an organic cloud.
-            let interval = mean_interval * (0.5 + rng.next_f32() as f64);
+            let is_hard_cut = s.spray <= 0.08
+                && s.duration <= 0.095
+                && s.adsr.is_some_and(|a| a.picture == crate::envelope::PictureCut::Cut);
+            let interval = if is_hard_cut {
+                let j = s.duration_jitter.clamp(0.0, 1.0) as f64 * 0.5;
+                (mean_interval * (1.0 + j * rng.bipolar() as f64)).max(1e-4)
+            } else {
+                mean_interval * (0.5 + rng.next_f32() as f64)
+            };
             emit(t, clip_start, source_len, base_hz, key, &s, &mut rng, &mut events, &mut id);
             t += interval;
         }

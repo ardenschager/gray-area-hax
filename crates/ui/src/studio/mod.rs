@@ -425,6 +425,7 @@ impl Studio {
     /// onto the master effect chain & tape processor while preserving the user's base FX.
     fn sync_punch_fx(&mut self, host: &mut dyn Host, ctx: &egui::Context) {
         let dt = ctx.input(|i| i.stable_dt.clamp(0.001, 0.1));
+        let prev_ts = self.tape_stop_amt;
         if self.punch_fx[1] {
             self.tape_stop_amt = (self.tape_stop_amt + dt * 1.65).clamp(0.0, 1.0);
             ctx.request_repaint();
@@ -432,9 +433,16 @@ impl Studio {
             self.tape_stop_amt = (self.tape_stop_amt - dt * 3.2).max(0.0);
             ctx.request_repaint();
         }
+        if (self.tape_stop_amt - prev_ts).abs() > 1e-4 {
+            host.set_tape_stop(self.tape_stop_amt);
+        }
 
-        let any = self.punch_fx.iter().any(|&on| on) || self.tape_stop_amt > 0.005;
-        if !any {
+        let any_chain = self.punch_fx[0]
+            || self.punch_fx[2]
+            || self.punch_fx[3]
+            || self.punch_fx[4]
+            || self.punch_fx[5];
+        if !any_chain {
             if let Some((base_fx, base_age, base_wow)) = self.base_master_fx.take() {
                 {
                     let mut p = host.project().lock().unwrap();
@@ -477,23 +485,7 @@ impl Studio {
                 video: 0.90,
             });
         }
-        // 1: Tape Stop — varispeed wow/age spin-down + VHS vertical roll.
-        if self.tape_stop_amt > 0.005 {
-            let a = self.tape_stop_amt;
-            wow = wow.max(0.85 * a);
-            age = age.max(0.75 * a);
-            chain.push(AvEffect {
-                kind: EffectKind::Delay {
-                    time: (0.04 + 0.24 * a).clamp(0.04, 0.35),
-                    feedback: 0.45 * a,
-                    mix: 0.65 * a,
-                    shift_x: 0.015 * a,
-                    shift_y: 0.08 * a,
-                },
-                audio: a,
-                video: a,
-            });
-        }
+        // 1: Tape Stop — streamed directly via `host.set_tape_stop` (true varispeed capstan brake + wgpu VHS roll, zero engine swaps!).
         // 2: Comb — scale-locked Karplus/Tune resonator wash.
         if self.punch_fx[2] {
             chain.push(AvEffect {

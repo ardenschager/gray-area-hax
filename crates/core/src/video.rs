@@ -1216,106 +1216,123 @@ pub fn composite_grains_frame_stage(
 
         let sw = src.width as f32;
         let sh = src.height as f32;
-        for y in y_min..=y_max {
-            for x in x_min..=x_max {
-                // Inverse-rotate the pixel offset into rect space.
-                let dx = x as f32 + 0.5 - cx;
+        let out_w = out.width as usize;
+        let src_ref: &Frame = &src;
+        let raster_rows = |y_base: usize, band: &mut [u8]| {
+            let band_h = band.len() / (out_w * 4).max(1);
+            let by0 = (y_min as usize).max(y_base);
+            let by1 = (y_max as usize).min(y_base + band_h.saturating_sub(1));
+            if by0 > by1 {
+                return;
+            }
+            for y in by0..=by1 {
+                let row_off = (y - y_base) * out_w * 4;
                 let dy = y as f32 + 0.5 - cy;
-                let ux = dx * cos_r + dy * sin_r;
-                let uy = -dx * sin_r + dy * cos_r;
-                let qx = ux / rw * 0.5 + 0.5;
-                let qy = uy / rh * 0.5 + 0.5;
-                if !(0.0..1.0).contains(&qx) || !(0.0..1.0).contains(&qy) {
-                    continue;
-                }
-                let sample_qx = if d.flip_x { 1.0 - qx } else { qx };
-                let sx = ((patch[0] + sample_qx * patch[2]) * (sw - 1.0)) as u32;
-                let sy = ((patch[1] + qy * patch[3]) * (sh - 1.0)) as u32;
-                let [mut r, mut g, mut b, ta] =
-                    src.get(sx.min(src.width - 1), sy.min(src.height - 1));
+                for x in x_min..=x_max {
+                    let dx = x as f32 + 0.5 - cx;
+                    let ux = dx * cos_r + dy * sin_r;
+                    let uy = -dx * sin_r + dy * cos_r;
+                    let qx = ux / rw * 0.5 + 0.5;
+                    let qy = uy / rh * 0.5 + 0.5;
+                    if !(0.0..1.0).contains(&qx) || !(0.0..1.0).contains(&qy) {
+                        continue;
+                    }
+                    let sample_qx = if d.flip_x { 1.0 - qx } else { qx };
+                    let sx = ((patch[0] + sample_qx * patch[2]) * (sw - 1.0)) as u32;
+                    let sy = ((patch[1] + qy * patch[3]) * (sh - 1.0)) as u32;
+                    let [mut r, mut g, mut b, ta] =
+                        src_ref.get(sx.min(src_ref.width - 1), sy.min(src_ref.height - 1));
 
-                // The source frame's own alpha participates: segmented
-                // (masked) sources composite only where the object is.
-                let seam_f = split_edge_feather(qx, qy, d.feather_edges);
-                let mut a = alpha
-                    * (ta as f32 / 255.0)
-                    * border_feather(qx, qy, feath)
-                    * seam_f;
-                if a <= 0.003 {
-                    continue;
-                }
-                if let Some(cf) = color_filter {
-                    a *= cf.mask(r, g, b);
+                    let seam_f = split_edge_feather(qx, qy, d.feather_edges);
+                    let mut a = alpha
+                        * (ta as f32 / 255.0)
+                        * border_feather(qx, qy, feath)
+                        * seam_f;
                     if a <= 0.003 {
                         continue;
                     }
-                }
-                if hue_shift.abs() > 0.5 {
-                    let (h, s, v) = rgb_to_hsv(r, g, b);
-                    let (nr, ng, nb) = hsv_to_rgb(h + hue_shift, s, v);
-                    (r, g, b) = (nr, ng, nb);
-                }
-                // Basinski tape oxide chroma wear: desaturates toward warm sepia ferric oxide.
-                if d.oxide_dropout > 0.015 {
-                    let ox = d.oxide_dropout.clamp(0.0, 1.0);
-                    let luma = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
-                    let keep_c = 1.0 - 0.65 * ox;
-                    r = (r as f32 * keep_c + luma * 1.08 * (1.0 - keep_c)).clamp(0.0, 255.0) as u8;
-                    g = (g as f32 * keep_c + luma * 0.94 * (1.0 - keep_c)).clamp(0.0, 255.0) as u8;
-                    b = (b as f32 * keep_c + luma * 0.76 * (1.0 - keep_c)).clamp(0.0, 255.0) as u8;
-                }
-                if shad > 0.002 {
-                    let luma = (0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32) / 255.0;
-                    let sx_c = sx.min(src.width - 1);
-                    let sy_c = sy.min(src.height - 1);
-                    let a_l = src.get(sx_c.saturating_sub(2), sy_c)[3];
-                    let a_r = src.get((sx_c + 2).min(src.width - 1), sy_c)[3];
-                    let a_u = src.get(sx_c, sy_c.saturating_sub(2))[3];
-                    let a_d = src.get(sx_c, (sy_c + 2).min(src.height - 1))[3];
-                    let min_nb = a_l.min(a_r).min(a_u).min(a_d);
-                    let edge_grad = (ta.saturating_sub(min_nb)) as f32 / 255.0;
-                    let ta_n = ta as f32 / 255.0;
-                    let rim = (edge_grad * 1.4 + (ta_n * (1.0 - ta_n) * 2.8)).clamp(0.0, 1.0);
-
-                    let keep = (1.0 - 0.72 * shad) * (0.58 + 0.42 * luma);
-                    let floor_lift = 18.0 * shad * (0.35 + 0.65 * luma);
-                    let rim_boost = 92.0 * shad * rim;
-                    r = (r as f32 * keep + floor_lift + rim_boost * 1.08).clamp(0.0, 255.0) as u8;
-                    g = (g as f32 * keep + floor_lift + rim_boost * 0.90).clamp(0.0, 255.0) as u8;
-                    b = (b as f32 * keep + floor_lift + rim_boost * 0.68).clamp(0.0, 255.0) as u8;
-                }
-
-                let dst = out.get(x as u32, y as u32);
-                let da = dst[3] as f32 / 255.0;
-                let out_a = (a + da * (1.0 - a)).max(1e-6);
-                let blend = |src_c: u8, dst_c: u8| -> u8 {
-                    let s = src_c as f32;
-                    let dd = dst_c as f32;
-                    if use_screen && da > 0.01 {
-                        let sn = (s * a) / 255.0;
-                        let dn = (dd * da) / 255.0;
-                        let scr = 1.0 - (1.0 - sn) * (1.0 - dn);
-                        let over = (s * a + dd * da * (1.0 - a)) / (out_a * 255.0);
-                        let w_scr = if seam_f < 0.999 || d.is_wash { 0.85 } else { 0.35 };
-                        ((over * (1.0 - w_scr) + (scr / out_a).min(1.0) * w_scr) * 255.0)
-                            .clamp(0.0, 255.0) as u8
-                    } else {
-                        let over = (s * a + dd * da * (1.0 - a)) / out_a;
-                        let additive = ((dd * da + s * a) / out_a).min(255.0);
-                        (over * (1.0 - add) + additive * add) as u8
+                    if let Some(cf) = color_filter {
+                        a *= cf.mask(r, g, b);
+                        if a <= 0.003 {
+                            continue;
+                        }
                     }
-                };
-                out.put(
-                    x as u32,
-                    y as u32,
-                    [
-                        blend(r, dst[0]),
-                        blend(g, dst[1]),
-                        blend(b, dst[2]),
-                        (out_a * 255.0) as u8,
-                    ],
-                );
+                    if hue_shift.abs() > 0.5 {
+                        let (h, s, v) = rgb_to_hsv(r, g, b);
+                        let (nr, ng, nb) = hsv_to_rgb(h + hue_shift, s, v);
+                        (r, g, b) = (nr, ng, nb);
+                    }
+                    if d.oxide_dropout > 0.015 {
+                        let ox = d.oxide_dropout.clamp(0.0, 1.0);
+                        let luma = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
+                        let keep_c = 1.0 - 0.65 * ox;
+                        r = (r as f32 * keep_c + luma * 1.08 * (1.0 - keep_c)).clamp(0.0, 255.0) as u8;
+                        g = (g as f32 * keep_c + luma * 0.94 * (1.0 - keep_c)).clamp(0.0, 255.0) as u8;
+                        b = (b as f32 * keep_c + luma * 0.76 * (1.0 - keep_c)).clamp(0.0, 255.0) as u8;
+                    }
+                    if shad > 0.002 {
+                        let luma = (0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32) / 255.0;
+                        let sx_c = sx.min(src_ref.width - 1);
+                        let sy_c = sy.min(src_ref.height - 1);
+                        let a_l = src_ref.get(sx_c.saturating_sub(2), sy_c)[3];
+                        let a_r = src_ref.get((sx_c + 2).min(src_ref.width - 1), sy_c)[3];
+                        let a_u = src_ref.get(sx_c, sy_c.saturating_sub(2))[3];
+                        let a_d = src_ref.get(sx_c, (sy_c + 2).min(src_ref.height - 1))[3];
+                        let min_nb = a_l.min(a_r).min(a_u).min(a_d);
+                        let edge_grad = (ta.saturating_sub(min_nb)) as f32 / 255.0;
+                        let ta_n = ta as f32 / 255.0;
+                        let rim = (edge_grad * 1.4 + (ta_n * (1.0 - ta_n) * 2.8)).clamp(0.0, 1.0);
+
+                        let keep = (1.0 - 0.72 * shad) * (0.58 + 0.42 * luma);
+                        let floor_lift = 18.0 * shad * (0.35 + 0.65 * luma);
+                        let rim_boost = 92.0 * shad * rim;
+                        r = (r as f32 * keep + floor_lift + rim_boost * 1.08).clamp(0.0, 255.0) as u8;
+                        g = (g as f32 * keep + floor_lift + rim_boost * 0.90).clamp(0.0, 255.0) as u8;
+                        b = (b as f32 * keep + floor_lift + rim_boost * 0.68).clamp(0.0, 255.0) as u8;
+                    }
+
+                    let pi = row_off + (x as usize) * 4;
+                    let dst = [band[pi], band[pi + 1], band[pi + 2], band[pi + 3]];
+                    let da = dst[3] as f32 / 255.0;
+                    let out_a = (a + da * (1.0 - a)).max(1e-6);
+                    let blend = |src_c: u8, dst_c: u8| -> u8 {
+                        let s = src_c as f32;
+                        let dd = dst_c as f32;
+                        if use_screen && da > 0.01 {
+                            let sn = (s * a) / 255.0;
+                            let dn = (dd * da) / 255.0;
+                            let scr = 1.0 - (1.0 - sn) * (1.0 - dn);
+                            let over = (s * a + dd * da * (1.0 - a)) / (out_a * 255.0);
+                            let w_scr = if seam_f < 0.999 || d.is_wash { 0.85 } else { 0.35 };
+                            ((over * (1.0 - w_scr) + (scr / out_a).min(1.0) * w_scr) * 255.0)
+                                .clamp(0.0, 255.0) as u8
+                        } else {
+                            let over = (s * a + dd * da * (1.0 - a)) / out_a;
+                            let additive = ((dd * da + s * a) / out_a).min(255.0);
+                            (over * (1.0 - add) + additive * add) as u8
+                        }
+                    };
+                    band[pi] = blend(r, dst[0]);
+                    band[pi + 1] = blend(g, dst[1]);
+                    band[pi + 2] = blend(b, dst[2]);
+                    band[pi + 3] = (out_a * 255.0) as u8;
+                }
             }
+        };
+
+        let area_px = (x_max - x_min + 1) as usize * (y_max - y_min + 1) as usize;
+        if area_px >= 250_000 && out.height >= 64 {
+            let n_bands = 8usize;
+            let rows_per_band = (out.height as usize).div_ceil(n_bands);
+            let chunk_bytes = rows_per_band * out_w * 4;
+            std::thread::scope(|s| {
+                for (bi, band) in out.data.chunks_mut(chunk_bytes).enumerate() {
+                    let y_base = bi * rows_per_band;
+                    s.spawn(move || raster_rows(y_base, band));
+                }
+            });
+        } else {
+            raster_rows(0, &mut out.data);
         }
     }
 }
@@ -1666,6 +1683,46 @@ pub fn apply_video_tape(
                     frame.data[idx + 2] = frame.data[idx + 2].saturating_add((b_add as u16 * 7 / 10) as u8);
                 }
             }
+        }
+    }
+}
+
+/// CPU counterpart of the `wgpu` `fs_tapestop` shader: vertical VHS capstan roll,
+/// horizontal tracking shear, sync bar, and warm lamp dim during `Tape Stop`.
+pub fn apply_video_tape_stop(frame: &mut Frame, brake: f32, time_secs: f64) {
+    let amt = brake.clamp(0.0, 1.0);
+    if amt <= 0.002 || frame.width < 2 || frame.height < 2 {
+        return;
+    }
+    let src = frame.data.clone();
+    let w = frame.width as usize;
+    let h = frame.height as usize;
+    let wf = w as f32;
+    let hf = h as f32;
+    let t = time_secs as f32;
+    let y_off = amt * amt * 0.38 + (t * 3.0).sin() * 0.02 * amt;
+    let dim = 1.0 - 0.22 * amt;
+
+    for y in 0..h {
+        let uvy = (y as f32 + 0.5) / hf;
+        let roll = (uvy + y_off).rem_euclid(1.0);
+        let shear = (roll * 42.0 + t * 9.0).sin() * 0.022 * amt;
+        let d_bar = ((roll - 0.5).abs() * 2.0 - 0.92) / 0.07;
+        let s_t = d_bar.clamp(0.0, 1.0);
+        let bar = s_t * s_t * (3.0 - 2.0 * s_t) * amt * 0.35;
+        let sy = ((roll * hf).floor() as usize).min(h - 1);
+        for x in 0..w {
+            let uvx = ((x as f32 + 0.5) / wf + shear).clamp(0.001, 0.999);
+            let sx = ((uvx * wf).floor() as usize).min(w - 1);
+            let si = (sy * w + sx) * 4;
+            let di = (y * w + x) * 4;
+            let r = src[si] as f32 * dim;
+            let g = src[si + 1] as f32 * dim;
+            let b = src[si + 2] as f32 * dim;
+            frame.data[di] = (r * (1.0 - bar) + 217.0 * bar).clamp(0.0, 255.0) as u8;
+            frame.data[di + 1] = (g * (1.0 - bar) + 214.0 * bar).clamp(0.0, 255.0) as u8;
+            frame.data[di + 2] = (b * (1.0 - bar) + 204.0 * bar).clamp(0.0, 255.0) as u8;
+            frame.data[di + 3] = src[si + 3];
         }
     }
 }

@@ -1230,31 +1230,41 @@ pub fn build_engine(session: Session, log: Arc<Mutex<String>>) -> Engine {
             "render",
             move |s: &mut Session, from_beat: f64, to_beat: f64, out: &str| -> ScriptResult<()> {
                 let path = s.resolve(out);
-                let output = {
-                    let p = s.project.lock().unwrap();
-                    render_project(&p, from_beat, to_beat)
-                };
                 let ext = path
                     .extension()
                     .map(|e| e.to_string_lossy().to_lowercase())
                     .unwrap_or_default();
-                match ext.as_str() {
-                    "wav" => media::save_wav(&path, &output.audio).map_err(rt_err)?,
+                let (dur, n_frames, rms) = match ext.as_str() {
+                    "wav" => {
+                        let output = {
+                            let p = s.project.lock().unwrap();
+                            render_project(&p, from_beat, to_beat)
+                        };
+                        media::save_wav(&path, &output.audio).map_err(rt_err)?;
+                        (output.audio.duration(), output.frames.len(), output.audio.rms())
+                    }
                     "png" => {
+                        let output = {
+                            let p = s.project.lock().unwrap();
+                            render_project(&p, from_beat, to_beat)
+                        };
                         let mid = &output.frames[output.frames.len() / 2];
                         media::save_frame_png(&path, mid).map_err(rt_err)?;
+                        (output.audio.duration(), output.frames.len(), output.audio.rms())
                     }
                     _ => {
-                        media::encode_video(&path, &output.frames, output.fps, &output.audio)
+                        let p = s.project.lock().unwrap().clone();
+                        let (audio, nf) = crate::render::render_project_to_video(&p, from_beat, to_beat, &path)
                             .map_err(rt_err)?;
+                        (audio.duration(), nf, audio.rms())
                     }
-                }
+                };
                 let mut l = log_r.lock().unwrap();
                 l.push_str(&format!(
                     "rendered {:.1}s ({} frames, rms {:.3}) -> {}\n",
-                    output.audio.duration(),
-                    output.frames.len(),
-                    output.audio.rms(),
+                    dur,
+                    n_frames,
+                    rms,
                     path.display()
                 ));
                 Ok(())

@@ -542,6 +542,30 @@ impl Track {
     }
 }
 
+/// Timed master-bus performance punch on a [`Project`] timeline (`ISOL8` band solo/mute,
+/// varispeed `Tape Stop`, master `Kaleido`/stutter `Effect`, or dynamic stage `Layout` switch).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum PunchAction {
+    /// Engage `ISOL8` 5-band isolator settings over `[start_beat, end_beat)` with click-free crossfades.
+    Isolator(crate::dsp::BandIsolator),
+    /// Varispeed turntable / reel capstan spin-down over `[start_beat, end_beat)`.
+    TapeStop {
+        spin_down_beats: f64,
+        spin_up_beats: f64,
+    },
+    /// Master AV effect punch-in (e.g. polar `Kaleido` prism or beat-repeat `Delay`).
+    Effect(AvEffect),
+    /// Dynamic stage layout switch (`Split` <-> `Tile` (`Grid`) <-> `Bleed`) during `[start_beat, end_beat)`.
+    Layout(crate::tile::Layout),
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MasterPunch {
+    pub start_beat: f64,
+    pub end_beat: f64,
+    pub action: PunchAction,
+}
+
 /// A whole chromagrain project.
 #[derive(Debug, Clone)]
 pub struct Project {
@@ -587,6 +611,10 @@ pub struct Project {
     pub portrait_columns: bool,
     /// Master 5-band `24 dB/Oct` Linkwitz-Riley frequency isolator (`ISOL8`).
     pub isolator: crate::dsp::BandIsolator,
+    /// Live varispeed turntable / capstan brake amount (`0..1`, `0 = normal`).
+    pub tape_stop: f32,
+    /// Timed master-bus performance punches (`ISOL8` breaks, `Tape Stop` drops, `Kaleido` sections, `Split/Grid` switches).
+    pub master_punches: Vec<MasterPunch>,
 }
 
 impl Default for Project {
@@ -613,6 +641,8 @@ impl Default for Project {
             captions_on: true,
             portrait_columns: false,
             isolator: crate::dsp::BandIsolator::default(),
+            tape_stop: 0.0,
+            master_punches: Vec::new(),
         }
     }
 }

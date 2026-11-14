@@ -520,6 +520,11 @@ impl Host for App {
         self.plan_project.isolator = iso;
         self.playback.set_isolator(iso);
     }
+    fn set_tape_stop(&mut self, amt: f32) {
+        self.project.lock().unwrap().tape_stop = amt;
+        self.plan_project.tape_stop = amt;
+        self.playback.set_tape_stop(amt);
+    }
 }
 
 impl PerformHost for App {

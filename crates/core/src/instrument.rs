@@ -546,6 +546,8 @@ pub struct Instrument {
     tiles: crate::tile::TileAssigner,
     isolator: crate::dsp::BandIsolator,
     isolator_state: crate::dsp::IsolatorState,
+    tape_stop: f32,
+    tape_stop_state: crate::audio::TapeStopState,
 }
 
 impl Instrument {
@@ -592,6 +594,8 @@ impl Instrument {
             tiles: crate::tile::TileAssigner::new(),
             isolator: crate::dsp::BandIsolator::default(),
             isolator_state: crate::dsp::IsolatorState::new(sample_rate),
+            tape_stop: 0.0,
+            tape_stop_state: crate::audio::TapeStopState::new(sample_rate),
         };
         inst.rebuild_fx();
         inst
@@ -602,6 +606,8 @@ impl Instrument {
         self.sample_rate = sample_rate.max(1);
         self.scratch.sample_rate = self.sample_rate;
         self.isolator_state = crate::dsp::IsolatorState::new(self.sample_rate);
+        self.tape_stop = 0.0;
+        self.tape_stop_state = crate::audio::TapeStopState::new(self.sample_rate);
         self.voices.clear();
         self.grains.clear();
         for p in &mut self.pads {
@@ -1423,6 +1429,8 @@ impl Instrument {
         if let Some(fx) = &self.looks[map.look] {
             fx::process_audio_chain(left, right, std::slice::from_ref(fx), &mut self.look_states[map.look]);
         }
+        self.tape_stop_state
+            .process_block(left, right, self.tape_stop, self.sample_rate);
         // ISOL8 5-band frequency isolator (allocation-free).
         if self.isolator.is_active() {
             self.isolator_state
@@ -1566,6 +1574,11 @@ impl Instrument {
 
     pub fn isolator(&self) -> crate::dsp::BandIsolator {
         self.isolator
+    }
+
+    /// Set the live varispeed turntable / capstan brake (`0..1`, `0` heap allocations).
+    pub fn set_tape_stop(&mut self, amt: f32) {
+        self.tape_stop = if amt.is_finite() { amt.clamp(0.0, 1.0) } else { 0.0 };
     }
 
     /// Start / stop a pad on the next launch-grid line of the host's beat

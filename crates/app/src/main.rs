@@ -38,6 +38,8 @@ mod studio_tests;
 mod studio_tests_v003;
 #[cfg(test)]
 mod studio_tests_vgs;
+#[cfg(test)]
+mod vj_hillclimb;
 mod theme;
 mod ui_browse;
 mod ui_inspector;
@@ -85,20 +87,19 @@ fn main() -> eframe::Result<()> {
     }
     if args.len() >= 3 && args[1] == "--render-demo" {
         let p = Project::demo();
-        let out = render_project(&p, 0.0, p.end_beat());
         let path = PathBuf::from(&args[2]);
         let res = if path.extension().is_some_and(|e| e == "wav") {
-            media::save_wav(&path, &out.audio)
+            let out = render_project(&p, 0.0, p.end_beat());
+            media::save_wav(&path, &out.audio).map(|_| (out.frames.len(), out.audio.duration()))
         } else {
-            media::encode_video(&path, &out.frames, out.fps, &out.audio)
+            chromagrain_core::render::render_project_to_video(&p, 0.0, p.end_beat(), &path)
+                .map(|(a, nf)| (nf, a.duration()))
         };
         match res {
-            Ok(()) => {
+            Ok((nf, dur)) => {
                 println!(
-                    "rendered demo: {} ({} frames, {:.1}s audio)",
+                    "rendered demo: {} ({nf} frames, {dur:.1}s audio)",
                     path.display(),
-                    out.frames.len(),
-                    out.audio.duration()
                 );
                 std::process::exit(0);
             }
@@ -1282,11 +1283,11 @@ impl App {
                 g.clone()
             };
             let end = p.song_end_beat().max(1.0);
-            let out = render_project(&p, 0.0, end);
             let res = if ext == "wav" {
+                let out = render_project(&p, 0.0, end);
                 media::save_wav(&path, &out.audio).map(|_| path.display().to_string())
             } else {
-                media::encode_video(&path, &out.frames, out.fps, &out.audio)
+                chromagrain_core::render::render_project_to_video(&p, 0.0, end, &path)
                     .map(|_| path.display().to_string())
             };
             let _ = tx.send(WorkerMsg::Export(res));

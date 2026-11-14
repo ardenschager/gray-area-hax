@@ -852,7 +852,7 @@ impl Overlay {
 /// The app inside the film: the real `App`, plus the overlay on top.
 pub struct Film {
     pub app: App,
-    overlay: Overlay,
+    pub(crate) overlay: Overlay,
 }
 
 impl eframe::App for Film {
@@ -1099,7 +1099,7 @@ pub fn record_film2(tour: &Tour, opts: &RecordOpts) -> Recording {
     record_with(tour, opts, h, None)
 }
 
-fn record_with(tour: &Tour, opts: &RecordOpts, mut h: Harness<'static, Film>, intro_bed: Option<&Source>) -> Recording {
+pub(crate) fn record_with(tour: &Tour, opts: &RecordOpts, mut h: Harness<'static, Film>, intro_bed: Option<&Source>) -> Recording {
     let sr = h.state().app.project.lock().unwrap().sample_rate;
     let spf = (sr as f64 / FPS).round() as usize;
     let len = opts.max_secs.map_or(tour.len, |m| m.min(tour.len));
@@ -1275,7 +1275,7 @@ fn touch(id: u64, phase: egui::TouchPhase, pos: Pos2) -> egui::Event {
 }
 
 /// Write interleaved stereo f32 as a 16-bit wav.
-fn write_wav(path: &Path, audio: &[f32], sr: u32) {
+pub(crate) fn write_wav(path: &Path, audio: &[f32], sr: u32) {
     use std::io::Write;
     let data_len = (audio.len() * 2) as u32;
     let mut f = std::io::BufWriter::new(std::fs::File::create(path).unwrap());

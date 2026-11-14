@@ -5,7 +5,7 @@
 
 use crate::audio::{
     render_grains_audio, render_grains_audio_spatial, MasterConditioner, StereoBuffer,
-    StudioBusState, TapeState,
+    StudioBusState, TapeState, TapeStopState,
 };
 use crate::fx::{self, AudioFxState};
 use crate::grain::GrainEvent;
@@ -46,6 +46,7 @@ pub struct RealtimeAudio {
     master_cond: MasterConditioner,
     studio_bus_state: StudioBusState,
     isolator_state: crate::dsp::IsolatorState,
+    tape_stop_state: TapeStopState,
     /// Absolute playhead in samples from beat 0.
     sample_pos: u64,
     /// Loop region in beats (start, end), if looping.
@@ -126,6 +127,7 @@ impl RealtimeAudio {
         let master_cond = MasterConditioner::default();
         let studio_bus_state = StudioBusState::new(sr);
         let isolator_state = crate::dsp::IsolatorState::new(sr);
+        let tape_stop_state = TapeStopState::new(sr);
         let tilt_states = plan.iter().map(|_| crate::dsp::TiltState::default()).collect();
         let sample_pos = (project.beats_to_secs(start_beat) * sr as f64).round() as u64;
         RealtimeAudio {
@@ -145,6 +147,7 @@ impl RealtimeAudio {
             master_cond,
             studio_bus_state,
             isolator_state,
+            tape_stop_state,
             sample_pos,
             loop_region,
             transport: true,
@@ -190,6 +193,7 @@ impl RealtimeAudio {
         self.live_buses = std::mem::take(&mut old.live_buses);
         self.live_pos = old.live_pos;
         self.isolator_state = old.isolator_state.clone();
+        self.tape_stop_state = old.tape_stop_state.clone();
     }
 
     /// Update the master 5-band `ISOL8` isolator live with click-free `3 ms` smoothing (`0` allocs).
@@ -199,6 +203,11 @@ impl RealtimeAudio {
 
     pub fn isolator(&self) -> crate::dsp::BandIsolator {
         self.project.isolator
+    }
+
+    /// Update the live varispeed turntable / capstan brake (`0..1`) with zero allocations or swaps.
+    pub fn set_tape_stop(&mut self, amt: f32) {
+        self.project.tape_stop = if amt.is_finite() { amt.clamp(0.0, 1.0) } else { 0.0 };
     }
 
     /// Fire a one-shot live grain (a MIDI pad hit). The event's `onset`
@@ -570,6 +579,12 @@ impl RealtimeAudio {
                 self.project.sample_rate,
             );
         }
+        self.tape_stop_state.process_block(
+            &mut left[at..at + n],
+            &mut right[at..at + n],
+            self.project.tape_stop,
+            self.project.sample_rate,
+        );
         if self.project.master_gain_db.abs() > 1e-4 {
             let g = 10.0f32.powf(self.project.master_gain_db.clamp(-24.0, 24.0) / 20.0);
             for s in &mut left[at..at + n] {
