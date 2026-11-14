@@ -8,10 +8,12 @@ crunchy-out.*
 sequencer-out.*
 seq-out.*
 
-# rendered media in versioned output folders (notes are committed)
+# rendered media in versioned output folders (only NOTES.md is committed)
 outputs/**/*.mp4
 outputs/**/*.wav
 outputs/**/*.png
+outputs/**/*.jpg
+outputs/**/*.json
 outputs/**/work/
 outputs/**/src/
 

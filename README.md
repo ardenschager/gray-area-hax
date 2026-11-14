@@ -1,7 +1,11 @@
-# chromagrain
+# videograin
 
 A native audiovisual sampling & effects compositor / sequencer where **audio
 and visual effects correspond** — built in Rust with rhai scripting.
+**videograin** is the studio: a tactile `VIDEOGRAIN` hardware-console UI for
+digging YouTube, chopping it into kits, and playing sound and picture as one
+instrument. Under the hood the engine crates and the binary are still named
+`chromagrain` (`cargo run --release` → `target/release/chromagrain`).
 
 ![GUI](docs/screenshot.png)
 
@@ -43,7 +47,7 @@ BOTH domains with the same idea:
 | compress | FFT spectral quantization (codec crunch) | JPEG-style 8×8 DCT block quantization — the same transform-domain math |
 | tint     | resonant bandpass narrowing toward the hue's frequency | every hue smushed toward the target color — same axis |
 | kaleido  | stereo-rotating *N*-tap mirror / micro-reverse harmonic prism (`folds` = tap count, `spin` = stereo LFO rotation) | polar radial mirror kaleidoscope (`2..12` wedge folds + continuous angular spin) |
-| isolator | **ISOL8** 5-band `24 dB/Oct` Linkwitz-Riley (`200 · 700 · 2500 · 8000 Hz`) `LF · LMF · MF · HMF · HF` `MUTE`/`SOLO` across `STEREO · MID · SIDE` + `L · R · M · S` monitor & `-18 dB` `DIM` | 5-band 2D spatial-frequency multiscale decomposition (sub/low luminosity, mid form/edges, high grain/detail) soloed or muted in lockstep |
+| isolator | **ISOL8** 5-band `24 dB/Oct` Linkwitz-Riley (`200 · 700 · 2500 · 8000 Hz`) `LF · LMF · MF · HMF · HF` `MUTE`/`SOLO` across `STEREO · MID · SIDE` + `L · R · M · S` monitor & `-18 dB` `DIM` | **zero-blur graphic print**: muting the highs (LF/LMF solo) prints a crisp duotone with an ordered `4×4` Bayer halftone; muting the lows (MF/HMF/HF solo) etches `3×3` Sobel zine-ink edges in `#111314` obsidian ink. Soloed or muted in lockstep with the audio bands, CPU and GPU pixel-matched |
 
 Each effect has independent `audio` and `video` amount dials — that's the
 per-effect correspondence control (video 0 = audio-only effect, and vice
@@ -218,19 +222,43 @@ cargo run --release            # builds (first time takes a few minutes) and ope
 The binary lands at `target/release/chromagrain` if you want to launch it
 directly later. `cargo test` runs the full engine test suite.
 
-### 3. The studio (`ISOL8` hardware console UI)
+### 3. The studio (`VIDEOGRAIN` hardware console UI)
 
-`chromagrain` opens a tactile, **zero-AI** hardware-console sampling & VJ instrument inspired by classic anodized studio isolators: brushed warm sand/olive aluminum chassis (`#B4AC8C → #968E6E`), corner rack screws, recessed `#16191A` CRT stage & scope bezels, machined matte-charcoal pointer knobs with sunken silver LCD readouts, and backlit incandescent-amber (`SOLO` / active), smoked-ruby (`MUTE`), and mint-teal (`L·R·M·S`) switches. Touch-first (targets ≥ 44 px, no hover or right-click needed) across three views (**Play**, **Sequence**, **Perform**) plus unified **Add**, **Clip**, and **Project** sheets. Launch `chromagrain --demo` to open straight into *Night Platform*.
+`chromagrain` opens **videograin**, a tactile, **zero-AI** hardware-console sampling & VJ instrument inspired by classic anodized studio isolators: brushed warm sand/olive aluminum chassis (`#B4AC8C → #968E6E`), corner rack screws, a `VIDEOGRAIN` nameplate with transport, `BPM` and `SWING` LCDs, machined matte-charcoal pointer knobs with sunken silver LCD readouts, and backlit incandescent-amber (`SOLO` / active), smoked-ruby (`MUTE`), and mint-teal (`L·R·M·S`) switches. Touch-first (targets ≥ 44 px, no hover or right-click needed) across three views (**Play**, **Sequence**, **Perform**) plus unified **Add**, **Clip**, and **Project** sheets. Launch `chromagrain --demo` to open straight into *Night Platform*.
+
+**The stage.** Every view shows the live picture in an **unobstructed bezel**: the layout pill (**grid · collage · split · stack**, plus **bleed**) and the aspect pill (**16:9 · 1:1 · 9:16**) sit on the bezel rail, never over the picture.
+- **grid** — architectural cells with crisp `2px` `#111314` dividers, multi-cell transient cuts, and low→high chord panels. Every active cell is filled and voices sharing one video never open twin panels.
+- **collage** — a hairline grid background with **die-cut sticker** cutouts: each subject gets a `3px` `#F2EDE0` cream paper border and a `+5,+5` solid `#111314` print shadow at `1080p`, with zero blur.
+- **split** / **stack** / **bleed** — full-canvas panels, layered opacity, or double-exposure dissolves.
+- Gaps between staccato hits sample-and-hold the last lit frame, so a groove never drops to black.
+
+**Cutout Person / Subject (on-device).** One tap in the Clip sheet (or the `Cutout` punch-in) runs **Apple Vision on-device** (`tools/segment_vision.swift`, no model download). It bakes a feathered, despeckled alpha matte into a derived source, and that source drops into `collage` as a sticker. `person` isolates people. `subject` keeps every salient foreground object: hands, gadgets, signs, even a pair of tap shoes on headless legs.
 
 | view | what you do |
 |------|-------------|
 | **Play** (1) | an 8×8 grid: each column is a clip as 8 frame tiles. Touch the grid and the selected **emitter** (1–4) jumps there and sprays grains while held; grab a ring to play that emitter (multi-touch plays multiple emitters). Below the stage, 4 **on-object emitter cards** draw their **Grain** ring + cloud dots, circumference **Pitch** dot, **Smear** trails, **ADSR** curve, and **Look** chip (`clean`, `tune`, `crush`, `jpeg`, `tint`, `tile`, `kaleido`) — drag directly on the card to shape while playing, or tap **`Clip ›`** for the full Clip sheet. **Rec** bounces what you play into a take. |
-| **Sequence** (2) | nanoloop-style step lanes, one per clip, 16 steps with polymeter (`↺`), per-step **ratchet** (`1..8` rapid subdivisions + pitch slope), pitch in scale degrees, slice lock, and chance. Top **SET** arranger bar chains multi-bar scenes (`1–8`) into playable VJ cues that keep running seamlessly when you jump into **Perform**. |
-| **Perform** (3) | 4×4 sampler/looper pads (one-shot drum/dialogue hits with `1..4` **choke groups**, beat-synced loops, or BPM-independent free-running **tape loops**), live **5-band `24 dB/Oct` `ISOL8` frequency isolator** (`LF · LMF · MF · HMF · HF` `MUTE`/`SOLO` + `STEREO | MID | SIDE` + `L · R · M · S` monitor), 6 momentary VJ punch-ins (**Stutter**, varispeed **Tape Stop**, **Comb**, **Dub**, **Shimmer**, **Wear**), stage layout (**stack | split | grid | bleed**) + aspect (**16:9 · 1:1 · 9:16**), Display 2 output, and Fullscreen (`F`). |
+| **Sequence** (2) | nanoloop-style step lanes, one per clip, 16 steps with polymeter (`↺`), per-step **ratchet** (`1..8` rapid subdivisions + pitch slope), pitch in scale degrees, slice lock, and chance. The **`GROOVE · PRESETS`** bank is a `4 × 2` matrix of 8 one-tap grooves: **2-Step · Disco · Boom-Bap · Ratchet · Dilla · Footwork · Tape · Wash**. Each sets tempo, swing and pocket on your own clips. **`Build Set`** expands the current groove into a 4-section song (**Intro · Drop · Break · Climax**) on the **SET** arranger bar. Its scenes (`1–12`) chain into playable VJ cues that keep running when you jump into **Perform**. |
+| **Perform** (3) | 4×4 sampler/looper pads (one-shot drum/dialogue hits with `1..4` **choke groups**, beat-synced loops, or BPM-independent free-running **tape loops**). The pad bar holds `Build Set`, **`Chord Wash`**, **`Vocal Kit`** and `Cutout`, and a selected-pad **`Chord`** selector sits next to `Now · Beat · Bar` launch. Also here: the live **5-band `24 dB/Oct` `ISOL8` frequency isolator** (`LF · LMF · MF · HMF · HF` `MUTE`/`SOLO` + `STEREO | MID | SIDE` + `L · R · M · S` monitor + `DIM -18`), 6 VJ punch-ins on keys **`5 6 7 8 9 0`** (**Stutter · Grid × · Cutout · Tape Stop · Comb · Crush**; tap to latch, hold for momentary), Display 2 output, and Fullscreen (`F`). |
 
-**Adding media — YouTube, Unseen Dig, Google Drive, Local.** Every `+` opens the zero-AI **Add** sheet:
-- **YouTube**: search directly inside the app via `yt-dlp` (with an **under 500 views** underground filter and Creative Commons toggle), paste any YouTube URL with a start/length trim window, or tap **Dig** / **Dig 4 → Kit** to pull unseen camera-default uploads (`IMG_4821`, `MVI_…`, `< 500` views) straight onto the pads.
+**Adding media — YouTube, Roulette, Dig, Google Drive, Local.** Every `+` opens the zero-AI **Add** sheet:
+- **YouTube pull bar**: **`Roulette (<100v)`** pulls a random upload almost nobody has seen. **`Random 18s`** (on by default) trims each fetch to an energetic 18 s window. **`Pull 2 → Kit`** fetches two contrasting clips and auto-builds a 16-pad kit when they land.
+- **YouTube search**: search inside the app via `yt-dlp` (with an **under 500 views** underground filter and Creative Commons toggle), paste any YouTube URL with a start/length trim window, or tap **Dig** / **Dig 4 → Kit** to pull unseen camera-default uploads (`IMG_4821`, `MVI_…`, `< 500` views) straight onto the pads.
 - **Drive & Local**: browse synced **Google Drive** folders (`~/Library/CloudStorage/GoogleDrive-*`) alongside local machine folders (`~/Movies`, `~/Documents`, `~/Downloads`, `~/Desktop`) or pick files directly. (Plugin hosts expose local Files only.)
+
+**Vocal Kit.** `Vocal Kit → pads` (Clip sheet) / `Vocal Kit` (Perform) builds a 16-pad UKG kit from the voices in your clips:
+- pads 1–2 **Kick**: the chestiest plosives and impacts, with a sample-excited `52 Hz` sub punch
+- pads 3–4 **Snare**: the sharpest consonant cracks
+- pads 5–8 **`Vox Perc`**: `28–55 ms` syllables (`t`, `k`, `s`, `uh`) for shuffled 16ths
+- pads 9–11 **Chord** and sub: `Min7` / `Sus4` vocal-organ stabs and a deep vowel sub
+- pads 12–16 **spotlighted hooks**: the clearest `0.55–1.9 s` spoken phrases, with consonant pre-roll kept. They share `Choke Group 1`, so one hook cuts the next cleanly.
+
+**Optional video-to-chords & ambient washes.** The same crate that makes a UKG groove can melt into harmony:
+- **`Chord Wash`** (Perform, 1 tap) and **`Chords → pads`** (Clip sheet) curate a 16-pad, scale-locked chord & cathedral-drone bank from any pitched or spoken clip (`i min9 → VI maj7 → iv min9 → v sus4 → III maj7 → VII fifths`), with soft `Fade` optical dissolves.
+- The **`Wash`** sculpt stamp is `Min9` voicing + scale-locked Karplus-Strong `comb` + `+12 st` shimmer + a warm `3.4 kHz` low-pass + overlapping Hann swells.
+- **`Stretch ×8`** (Clip sheet header) paulstretches the clip, sound and picture, into a slow wash.
+- The selected-pad **`Chord`** selector (`Off · Octaves · Fifths · Min7 · Min9 · Maj7 · Sus4`) re-voices any pad live.
+
+All of it is optional: leave it alone and videograin stays a percussive collage sampler.
 
 **Clip sheet — 5-band Spectral Chop, Sculpt & Tape, ADSR, Grain, Effects, Links.** Tap **`Clip ›`** or any header/pad **`›`** to shape any clip, emitter, lane, or pad:
 - **Zero-AI Spectral Chopper & Multi-Clip Harvesters:** 5-band weighted log-spectral flux transient detection with asymmetric zero-crossing snap (`[-2.0 ms, +1.8 ms]` and `-30 ms` speech consonant pre-roll), McLeod NSDF `f0` + pitch confidence, `64×36` frame-diff motion focus `(cx, cy)` (auto-centering portrait faces and subjects inside split/grid cells), inline stage **Captions**, **Slices → pads**, **Kit → pads** (auto-curates Kick, Snare, Hat, Pluck, Chord, Dialogue, and Wash/Loop across loaded clips while rejecting outro speech), and **Loops → pads** (curates unsynchronized ambient tape loops).
@@ -561,7 +589,8 @@ crates/core        chromagrain-core (headless, fully tested)
   envelope.rs      A/D/S/R voice envelope + picture Cut/Fade gating
   chop.rs          5-band log-flux transients, zero-crossing snap, motion focus,
                    Kit -> pads & Loops -> pads multi-clip harvesters
-  tile.rs          dense Split/Grid/Bleed/Monolith slot assignment + layout->pan
+  tile.rs          dense Grid/Collage/Split/Bleed/Monolith slot assignment,
+                   per-frame twin-panel dedup + layout->pan
   dig.rs           YouTube search (<500 views) + unseen Dig + yt-dlp window fetch
   audio.rs         AudioClip, sample-excited sculptors, Basinski TapeLoop &
                    Disintegrate wear, varispeed TapeStopState, studio_bus
@@ -585,9 +614,10 @@ crates/core        chromagrain-core (headless, fully tested)
   sc_graph.rs      SuperCollider-style SynthDef builder for plyphon
   script.rs        rhai bindings over all of the above
 crates/ui          chromagrain-ui (shared by the app and the plugin)
-  studio/          ISOL8 hardware console studio UI: Play / Sequence / Perform,
-                   Add (YouTube/Dig/Drive/Local), Clip (Chop + Sculpt & Tape),
-                   5-band ISOL8 strip, VJ punch-ins, Set/Cue arranger
+  studio/          VIDEOGRAIN hardware console studio UI: Play / Sequence / Perform,
+                   Add (YouTube pull bar/Roulette/Dig/Drive/Local), Clip (Chop +
+                   Sculpt & Tape + Cutout + Stretch ×8), 8-preset Groove bank +
+                   Build Set, 5-band ISOL8 strip, VJ punch-ins, Set/Cue arranger
   envelope.rs      4-handle A/D/S/R editor over the clip's own thumbnail
   wave.rs          cached audio peaks + silent-clip picture-energy bars
   host.rs          Host / PerformHost / Caps: what the UI needs from its
@@ -604,6 +634,8 @@ crates/app         chromagrain (desktop app)
   adds.rs          async media jobs (Files, Browse, Drive, YouTube, Dig)
   showcase.rs      headless 1080p30 UX showcase recorder (egui_kittest + wgpu)
   vj_hillclimb.rs  6-piece pure-YouTube AV collage & ISOL8 showcase suite
+  videograin_showcase.rs  headless 1080p30 VIDEOGRAIN console showcase (pull →
+                   Cutout → Vocal Kit → groove presets → Build Set → Chord Wash)
   studio_host.rs   the app as a studio Host (pads, SET cues, output, classic)
   studio_tests*.rs headless kittest snapshots + ISOL8/touch/chop/dig tests
   ui_output.rs     performance output window (second viewport)
