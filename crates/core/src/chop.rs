@@ -624,19 +624,30 @@ impl KitPadSpec {
         } else {
             0.0
         };
-        row.grains.duration = self.slice.len().clamp(0.02, 4.0) as f32;
+        let is_wash_pad = self.stamp == Stamp::Wash;
+        row.grains.duration = if is_wash_pad {
+            self.slice.len().clamp(1.20, 5.50) as f32
+        } else {
+            self.slice.len().clamp(0.02, 4.0) as f32
+        };
         row.grains.pitch = self.pitch_semitones;
         row.grains.gain = self.gain;
         row.grains.pan = self.pan;
-        row.grains.pan_spread = 0.06;
-        row.grains.envelope = 0.04;
+        row.grains.pan_spread = if is_wash_pad { 0.28 } else { 0.06 };
+        row.grains.envelope = if is_wash_pad { 0.82 } else { 0.04 };
         row.grains.adsr = if matches!(
             self.stamp,
             Stamp::Kick | Stamp::Snare | Stamp::VoxPerc | Stamp::Hat
         ) {
             None
         } else {
-            Some(self.adsr.unwrap_or_else(hard_cut_adsr))
+            Some(self.adsr.unwrap_or_else(|| {
+                if is_wash_pad {
+                    wash_fade_adsr()
+                } else {
+                    hard_cut_adsr()
+                }
+            }))
         };
         row.sculpt = self.sculpt;
         row.grains.sculpt = self.sculpt;
@@ -1011,6 +1022,238 @@ pub fn build_kit_across_sources_opt(sources: &[Source], key: Option<Key>) -> Vec
 
     for (i, spec) in out.iter_mut().enumerate() {
         spec.pad_index = i;
+    }
+    out
+}
+
+fn wash_fade_adsr() -> crate::envelope::Adsr {
+    crate::envelope::Adsr {
+        attack: 0.42,
+        decay: 0.35,
+        sustain: 0.90,
+        release: 0.95,
+        picture: crate::envelope::PictureCut::Fade,
+        cut_threshold: 0.01,
+    }
+}
+
+fn ambient_wash_pad_link() -> crate::video::AvLink {
+    crate::video::AvLink {
+        envelope_to_opacity: 0.85,
+        gain_to_opacity: 0.35,
+        ..crate::video::AvLink::default()
+    }
+}
+
+/// Build up to 16 playable **Ambient Chord & Cathedral Wash** pads across loaded [`Source`]s
+/// in `key` (`i min9 -> VI maj7 -> iv min9 -> v sus4 -> III maj7 -> VII fifths` + shimmer swells
+/// + 4 free-running asynchronous cathedral drones):
+/// - Works effortlessly on **both pitched musical clips AND unpitched spoken/ambient YouTube clips**
+///   by combining NSDF pitch alignment (`f0_hz` when `pitch_confidence >= 0.45`) with scale-locked
+///   polyphonic Karplus-Strong `comb` resonance (`0.50..0.54`), `+12st` shimmer (`0.28`), warm
+///   `3.4 kHz` low-pass filtering, and `PictureCut::Fade` (`envelope_to_opacity = 0.85`) optical dissolves!
+pub fn build_chord_washes_across_sources<S: AsRef<Source>>(
+    sources: &[S],
+    key: Key,
+) -> Vec<CuratedPad> {
+    build_chord_washes_across_sources_opt(sources, Some(key))
+}
+
+/// Like [`build_chord_washes_across_sources`], accepting an optional [`Key`] (defaults to C Minor).
+pub fn build_chord_washes_across_sources_opt<S: AsRef<Source>>(
+    sources: &[S],
+    key: Option<Key>,
+) -> Vec<CuratedPad> {
+    let eff_key = key.unwrap_or_else(|| Key::new(0, crate::music::ScaleKind::Minor));
+    #[derive(Clone)]
+    struct WashCand {
+        sid: SourceId,
+        src_dur: f64,
+        slice: Slice,
+        used: bool,
+    }
+    let mut pool: Vec<WashCand> = Vec::new();
+    for (sid, src_ref) in sources.iter().enumerate() {
+        let src = src_ref.as_ref();
+        let src_dur = src.duration();
+        if src_dur < MIN_SLICE {
+            continue;
+        }
+        let mut sls = if !src.slices.is_empty() {
+            let mut v = src.slices.clone();
+            if v.iter().all(|s| s.rms_db <= -95.0 && s.role_hint == SliceRole::Raw) {
+                enrich_slices(&mut v, src.audio.as_deref(), src.video.as_deref());
+            }
+            v
+        } else {
+            analyze_source_slices(src, 16)
+        };
+        if sls.len() < 8 && src_dur >= 0.8 {
+            let mut extra = equal_slices(src_dur, 8);
+            enrich_slices(&mut extra, src.audio.as_deref(), src.video.as_deref());
+            for es in extra {
+                if !sls.iter().any(|x| (x.start - es.start).abs() < 0.08) {
+                    sls.push(es);
+                }
+            }
+        }
+        for mut sl in sls {
+            if sl.rms_db <= -68.0 && src.audio.is_some() {
+                continue;
+            }
+            // Widen short slices into lush `1.4..3.4s` wash windows whenever the clip has room.
+            if sl.len() < 1.4 && src_dur > 0.5 {
+                sl.end = (sl.start + 2.4).min(src_dur);
+                if sl.len() < 1.0 && src_dur >= 1.4 {
+                    sl.start = (sl.end - 1.8).max(0.0);
+                }
+                analyze_slice_features(&mut sl, src.audio.as_deref(), src.video.as_deref());
+            } else if sl.len() > 3.6 {
+                sl.end = sl.start + 3.4;
+            }
+            pool.push(WashCand {
+                sid,
+                src_dur,
+                slice: sl,
+                used: false,
+            });
+        }
+    }
+    if pool.is_empty() {
+        return Vec::new();
+    }
+
+    let is_major_family = matches!(
+        eff_key.scale,
+        crate::music::ScaleKind::Major
+            | crate::music::ScaleKind::Lydian
+            | crate::music::ScaleKind::Mixolydian
+            | crate::music::ScaleKind::MajorPentatonic
+    );
+    // `(label, degree_semitones, voicing, shimmer, comb_mix, lpf_hz, free_loop_secs)`
+    let prog: [(&str, f32, ChordVoicing, f32, f32, f32, Option<f32>); 16] = if is_major_family {
+        [
+            ("I maj7", 0.0, ChordVoicing::Maj7, 0.28, 0.50, 3500.0, None),
+            ("vi min9", -3.0, ChordVoicing::Min9, 0.30, 0.52, 3400.0, None),
+            ("IV maj7", 5.0, ChordVoicing::Maj7, 0.28, 0.50, 3500.0, None),
+            ("V sus4", 7.0, ChordVoicing::Sus4, 0.26, 0.50, 3400.0, None),
+            ("iii min7", 4.0, ChordVoicing::Min7, 0.32, 0.52, 3300.0, None),
+            ("ii min9", 2.0, ChordVoicing::Min9, 0.28, 0.52, 3400.0, None),
+            ("V fifths", -5.0, ChordVoicing::Fifths, 0.24, 0.54, 3000.0, None),
+            ("I octaves", -12.0, ChordVoicing::Octaves, 0.20, 0.44, 1850.0, None),
+            ("Swell I maj7", 0.0, ChordVoicing::Maj7, 0.36, 0.50, 3800.0, None),
+            ("Swell IV sus4", 5.0, ChordVoicing::Sus4, 0.34, 0.50, 3700.0, None),
+            ("Swell vi min9", 9.0, ChordVoicing::Min9, 0.36, 0.52, 3600.0, None),
+            ("Swell V fifths", 7.0, ChordVoicing::Fifths, 0.32, 0.52, 3500.0, None),
+            ("Cathedral Bed I", 0.0, ChordVoicing::Maj7, 0.34, 0.50, 3200.0, Some(6.2)),
+            ("Shimmer Bed IV", 5.0, ChordVoicing::Sus4, 0.38, 0.48, 3600.0, Some(7.9)),
+            ("Fifths Drone", -5.0, ChordVoicing::Fifths, 0.26, 0.54, 2800.0, Some(9.7)),
+            ("Sub Choir", -12.0, ChordVoicing::Octaves, 0.18, 0.42, 1600.0, Some(11.4)),
+        ]
+    } else {
+        [
+            ("i min9", 0.0, ChordVoicing::Min9, 0.28, 0.52, 3400.0, None),
+            ("VI maj7", -4.0, ChordVoicing::Maj7, 0.30, 0.50, 3500.0, None),
+            ("iv min9", 5.0, ChordVoicing::Min9, 0.26, 0.52, 3350.0, None),
+            ("v sus4", 7.0, ChordVoicing::Sus4, 0.28, 0.50, 3400.0, None),
+            ("III maj7", 3.0, ChordVoicing::Maj7, 0.34, 0.50, 3600.0, None),
+            ("VII fifths", -2.0, ChordVoicing::Fifths, 0.24, 0.54, 3100.0, None),
+            ("ii sus4", 2.0, ChordVoicing::Sus4, 0.30, 0.52, 3400.0, None),
+            ("i octaves", -12.0, ChordVoicing::Octaves, 0.20, 0.44, 1850.0, None),
+            ("Swell i min9", 0.0, ChordVoicing::Min9, 0.36, 0.52, 3800.0, None),
+            ("Swell VI maj7", 8.0, ChordVoicing::Maj7, 0.36, 0.50, 3700.0, None),
+            ("Swell iv sus4", 5.0, ChordVoicing::Sus4, 0.34, 0.50, 3600.0, None),
+            ("Swell v fifths", 7.0, ChordVoicing::Fifths, 0.32, 0.52, 3500.0, None),
+            ("Cathedral Bed i", 0.0, ChordVoicing::Min9, 0.34, 0.52, 3200.0, Some(6.2)),
+            ("Shimmer Bed III", 3.0, ChordVoicing::Maj7, 0.38, 0.48, 3600.0, Some(7.9)),
+            ("Fifths Drone", -5.0, ChordVoicing::Fifths, 0.26, 0.54, 2800.0, Some(9.7)),
+            ("Sub Choir", -12.0, ChordVoicing::Octaves, 0.18, 0.42, 1600.0, Some(11.4)),
+        ]
+    };
+
+    let n_sources = sources.len().max(1);
+    let mut src_counts = vec![0usize; n_sources];
+    let mut out: Vec<CuratedPad> = Vec::with_capacity(16);
+
+    for (pi, &(label, deg_st, voicing, shimmer, comb_mix, lpf_hz, loop_secs)) in
+        prog.iter().enumerate()
+    {
+        // Score sustained, warm, non-outro windows; recycle pool cleanly if `< 16` slices exist.
+        if pool.iter().all(|c| c.used) {
+            for c in &mut pool {
+                c.used = false;
+            }
+        }
+        let mut best_i = None;
+        let mut best_sc = f32::NEG_INFINITY;
+        for (i, c) in pool.iter().enumerate() {
+            if c.used {
+                continue;
+            }
+            let s = &c.slice;
+            let outro_guard = if c.src_dur >= 8.0 && s.end > 0.82 * c.src_dur {
+                0.22
+            } else {
+                1.0
+            };
+            let len_bonus = (s.len().min(3.2) as f32).max(0.25);
+            let warmth = 0.45 + 0.85 * s.pitch_confidence + 0.65 * (s.bands[1] + s.bands[2]);
+            let smooth = 1.15 - 0.35 * s.punch.clamp(0.0, 1.0);
+            let div_bonus = 1.0 / (1.0 + 0.55 * src_counts[c.sid] as f32);
+            let sc = len_bonus * warmth * smooth * outro_guard * div_bonus;
+            if sc > best_sc {
+                best_sc = sc;
+                best_i = Some(i);
+            }
+        }
+        let Some(idx) = best_i else { break };
+        pool[idx].used = true;
+        src_counts[pool[idx].sid] += 1;
+        let (sid, mut sl) = (pool[idx].sid, pool[idx].slice);
+        sl.role_hint = if loop_secs.is_some() {
+            SliceRole::Texture
+        } else {
+            SliceRole::Tonal
+        };
+
+        let base_tune = match sl.f0_hz {
+            Some(hz) if sl.pitch_confidence >= 0.45 => compute_key_quantize_semitones(hz, eff_key),
+            _ => 0.0,
+        };
+        let mut sculpt = VoiceSculpt::preset(Stamp::Wash);
+        sculpt.chord = voicing;
+        sculpt.comb_mix = comb_mix;
+        sculpt.comb_feedback = 0.88;
+        sculpt.shimmer = shimmer;
+        sculpt.lpf_hz = lpf_hz;
+        sculpt.hpf_hz = if deg_st <= -10.0 { 75.0 } else { 185.0 };
+        sculpt.free_loop_secs = loop_secs;
+        if loop_secs.is_some() {
+            sculpt.ebb_flow = 0.42;
+            sculpt.wow_flutter = 0.20;
+        }
+
+        let pan = match pi % 4 {
+            0 => -0.18,
+            1 => 0.18,
+            2 => -0.10,
+            _ => 0.10,
+        };
+        out.push(KitPadSpec {
+            pad_index: pi,
+            source: sid,
+            slice: sl,
+            stamp: Stamp::Wash,
+            sculpt,
+            pitch_semitones: (base_tune + deg_st).clamp(-24.0, 24.0),
+            gain: if loop_secs.is_some() { 0.68 } else { 0.84 },
+            pan,
+            choke_group: 0,
+            one_shot: loop_secs.is_none(),
+            adsr: Some(wash_fade_adsr()),
+            link: ambient_wash_pad_link(),
+            label: label.to_string(),
+        });
     }
     out
 }
@@ -1946,5 +2189,15 @@ mod tests {
         assert_eq!(slot0.adsr.unwrap().picture, crate::envelope::PictureCut::Cut);
         assert_eq!(inst.frame().link.gain_to_opacity, 0.0);
         assert_eq!(inst.frame().link.envelope_to_opacity, 0.0);
+
+        // Video-to-Chord & Ambient Wash kit builder (`build_chord_washes_across_sources`):
+        let washes = build_chord_washes_across_sources(&refs, Key::new(0, crate::music::ScaleKind::Minor));
+        assert_eq!(washes.len(), 16, "curates full 16-pad ambient chord & cathedral wash progression");
+        assert!(washes.iter().all(|p| p.stamp == crate::grain::Stamp::Wash));
+        assert!(washes.iter().all(|p| p.sculpt.chord != crate::grain::ChordVoicing::Off));
+        assert!(washes.iter().all(|p| p.sculpt.comb_mix >= 0.40 && p.sculpt.shimmer >= 0.15));
+        assert!(washes.iter().all(|p| p.adsr.unwrap().picture == crate::envelope::PictureCut::Fade));
+        assert!(washes.iter().all(|p| (p.link.envelope_to_opacity - 0.85).abs() < 1e-5));
+        assert!(washes[12..16].iter().all(|p| !p.one_shot && p.sculpt.free_loop_secs.is_some()));
     }
 }
