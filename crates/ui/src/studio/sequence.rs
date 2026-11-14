@@ -709,7 +709,9 @@ impl Studio {
                 }
             }
         }
-        if any_alpha {
+        if preset == chromagrain_core::seq::PatternPreset::AmbientWash {
+            host.set_stage_mode(crate::host::StageMode::Stack);
+        } else if any_alpha {
             host.set_stage_mode(crate::host::StageMode::Collage);
         } else if matches!(
             host.stage_mode(),
@@ -988,24 +990,44 @@ impl Studio {
             if compact { 9.2 } else { 10.2 },
         );
 
-        // Left side: `GROOVE · PRESETS` silkscreen + `4 × 2` bank (`7` zero-AI groove presets + `Clear`).
+        // Left side: `GROOVE · PRESETS` header (+ compact `Clear` pill) + symmetrical `4 × 2` 8-Preset Bank!
         let left_r = Rect::from_min_max(inner.min, egui::pos2(swing_r.left() - if compact { 6.0 } else { 10.0 }, inner.bottom()));
+        let hdr_h = if compact { 14.5 } else { 16.5 };
+        let clr_w = if compact { 36.0 } else { 44.0 };
+        let clr_r = Rect::from_min_size(
+            egui::pos2(left_r.right() - clr_w, left_r.top() - 1.0),
+            egui::vec2(clr_w, hdr_h),
+        );
+        let c_resp = hit(ui, clr_r, id.with("clear-pat"), Sense::click(), "clear pattern");
+        paint_switch_cap(&p, clr_r, SwitchKind::PuttyAmber, false, c_resp.hovered(), c_resp.is_pointer_button_down_on());
+        p.text(
+            clr_r.center(),
+            Align2::CENTER_CENTER,
+            "Clear",
+            font_semibold(if compact { 8.4 } else { 9.2 }),
+            INK,
+        );
+        if c_resp.clicked() {
+            self.active_preset = None;
+            self.clear_active_pattern(host);
+        }
+
         caps(
             &p,
-            egui::pos2(left_r.left() + 1.0, left_r.top() + 5.0),
+            egui::pos2(left_r.left() + 1.0, left_r.top() + hdr_h * 0.45),
             Align2::LEFT_CENTER,
             if compact { "GROOVE" } else { "GROOVE · PRESETS" },
             if compact { 7.6 } else { 8.5 },
         );
-        let grid_top = left_r.top() + if compact { 13.0 } else { 16.0 };
-        let grid_h = (left_r.bottom() - grid_top).max(40.0);
+        let grid_top = left_r.top() + hdr_h + if compact { 1.5 } else { 2.5 };
+        let grid_h = (left_r.bottom() - grid_top).max(38.0);
         let gx = if compact { 3.0 } else { 4.5 };
         let gy = if compact { 3.0 } else { 4.5 };
         let cw = (left_r.width() - gx * 3.0) / 4.0;
         let ch = (grid_h - gy) * 0.5;
         let narrow_caps = cw < 64.0;
 
-        let presets: [(PatternPreset, &str, &str, &str); 7] = [
+        let presets: [(PatternPreset, &str, &str, &str); 8] = [
             (PatternPreset::Ukg2Step, "2-Step", "2-Step", "seed ukg 2step"),
             (PatternPreset::DiscoFilterPump, "Disco", "Disco", "preset disco"),
             (PatternPreset::BoomBapDialogue, "Boom-Bap", "Boom", "preset boombap"),
@@ -1013,6 +1035,7 @@ impl Studio {
             (PatternPreset::DillaDrunk, "Dilla", "Dilla", "preset dilla"),
             (PatternPreset::Footwork332, "Footwork", "Footwk", "preset footwork"),
             (PatternPreset::TapeDisintegration, "Tape", "Tape", "preset tape"),
+            (PatternPreset::AmbientWash, "Wash", "Wash", "preset wash"),
         ];
 
         for (idx, &(preset, full_lbl, short_lbl, a11y)) in presets.iter().enumerate() {
@@ -1023,37 +1046,30 @@ impl Studio {
                 egui::vec2(cw, ch),
             );
             let on = self.active_preset == Some(preset);
+            let kind = if preset == PatternPreset::AmbientWash {
+                SwitchKind::PuttyMint
+            } else {
+                SwitchKind::Amber
+            };
             let resp = hit(ui, rc, id.with(("preset", idx)), Sense::click(), a11y);
-            paint_switch_cap(&p, rc, SwitchKind::Amber, on, resp.hovered(), resp.is_pointer_button_down_on());
+            paint_switch_cap(&p, rc, kind, on, resp.hovered(), resp.is_pointer_button_down_on());
+            let fg = if preset == PatternPreset::AmbientWash {
+                if on { Color32::from_rgb(0x11, 0x2b, 0x1f) } else { INK }
+            } else if on {
+                ON_HI
+            } else {
+                Color32::from_rgb(0x24, 0x1c, 0x09)
+            };
             p.text(
                 rc.center(),
                 Align2::CENTER_CENTER,
                 if narrow_caps { short_lbl } else { full_lbl },
                 font_semibold(if narrow_caps { 9.0 } else { 10.2 }),
-                if on { ON_HI } else { Color32::from_rgb(0x24, 0x1c, 0x09) },
+                fg,
             );
             if resp.clicked() {
                 self.apply_pattern_preset(host, preset);
             }
-        }
-
-        // Slot 8 (col 3, row 1): `Clear` (`"clear pattern"`).
-        let clr_r = Rect::from_min_size(
-            egui::pos2(left_r.left() + 3.0 * (cw + gx), grid_top + (ch + gy)),
-            egui::vec2(cw, ch),
-        );
-        let c_resp = hit(ui, clr_r, id.with("clear-pat"), Sense::click(), "clear pattern");
-        paint_switch_cap(&p, clr_r, SwitchKind::PuttyAmber, false, c_resp.hovered(), c_resp.is_pointer_button_down_on());
-        p.text(
-            clr_r.center(),
-            Align2::CENTER_CENTER,
-            "Clear",
-            font_semibold(if narrow_caps { 9.0 } else { 10.2 }),
-            INK,
-        );
-        if c_resp.clicked() {
-            self.active_preset = None;
-            self.clear_active_pattern(host);
         }
     }
 

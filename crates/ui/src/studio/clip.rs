@@ -560,16 +560,72 @@ impl Studio {
                         "Chop & cutout",
                         9.0,
                     );
-                    // Top-right header rail: `Cutout Person` (`"cutout person"`) + `Cutout Subject` (`"cutout subject"`).
+                    // Top-right header rail: `Stretch ×8` (`"paulstretch clip"`) + `Cutout Person` (`"cutout person"`) + `Cutout Subject` (`"cutout subject"`).
                     let hdr_y = chop_card_r.top() + 4.0;
                     let hdr_h = 24.0;
                     let mut hrx = chop_card_r.right() - 12.0;
-                    let subj_w = if avail_w >= 960.0 { 130.0 } else { 118.0 };
-                    let pers_w = if avail_w >= 960.0 { 126.0 } else { 114.0 };
+                    let subj_w = if avail_w >= 960.0 { 128.0 } else { 114.0 };
+                    let pers_w = if avail_w >= 960.0 { 124.0 } else { 110.0 };
+                    let str_w = if avail_w >= 960.0 { 96.0 } else { 88.0 };
                     let subj_r = Rect::from_min_size(egui::pos2(hrx - subj_w, hdr_y), egui::vec2(subj_w, hdr_h));
                     hrx = subj_r.left() - 6.0;
                     let pers_r = Rect::from_min_size(egui::pos2(hrx - pers_w, hdr_y), egui::vec2(pers_w, hdr_h));
-                    hrx = pers_r.left() - 8.0;
+                    hrx = pers_r.left() - 6.0;
+                    let str_r = Rect::from_min_size(egui::pos2(hrx - str_w, hdr_y), egui::vec2(str_w, hdr_h));
+                    hrx = str_r.left() - 8.0;
+
+                    let s_resp = hit(ui, str_r, id.with(("paulstretch-clip", src)), Sense::click(), "paulstretch clip");
+                    paint_switch_cap(&cp, str_r, SwitchKind::Amber, false, s_resp.hovered(), s_resp.is_pointer_button_down_on());
+                    cp.text(
+                        str_r.center(),
+                        Align2::CENTER_CENTER,
+                        "Stretch ×8",
+                        font_semibold(10.5),
+                        Color32::from_rgb(0x24, 0x1c, 0x09),
+                    );
+                    if s_resp.clicked() {
+                        if let Some(new_src) = host.paulstretch_source(src, 8.0) {
+                            match target {
+                                ClipTarget::Pad(pi) => {
+                                    if let Some(perf) = host.perform() {
+                                        perf.load_pad(pi, new_src);
+                                    }
+                                }
+                                ClipTarget::Lane(l) => {
+                                    let li = l.min(LANES - 1);
+                                    self.seq.lanes[li] = Some(new_src);
+                                    let mut pp = host.project().lock().unwrap();
+                                    for pid in self.seq.scene_pats.iter().flatten() {
+                                        if let Some(r) = pp.patterns.get_mut(*pid).and_then(|pat| pat.rows.get_mut(li)) {
+                                            r.source = new_src;
+                                        }
+                                    }
+                                    self.rev += 1;
+                                }
+                                ClipTarget::Column(c) => {
+                                    self.columns[c.min(COLUMNS - 1)] = Some(new_src);
+                                }
+                                ClipTarget::Emitter(i) => {
+                                    let col = self.emitters[i.min(EMITTERS - 1)].col.min(COLUMNS - 1);
+                                    self.columns[col] = Some(new_src);
+                                }
+                                ClipTarget::Source(_) => {
+                                    switch_target = Some(ClipTarget::Source(new_src));
+                                }
+                            }
+                            let wash_sp = SculptParams::preset(SculptStamp::Wash);
+                            self.set_owner_sculpt(host, owner, wash_sp);
+                            let mut env = self.target_env(host, owner).unwrap_or_default();
+                            env.attack = 0.55;
+                            env.decay = 0.30;
+                            env.sustain = 0.94;
+                            env.release = 1.05;
+                            env.picture = chromagrain_core::envelope::PictureCut::Fade;
+                            self.set_target_env(host, owner, env);
+                            host.set_stage_mode(crate::host::StageMode::Stack);
+                            host.status("paulstretched ×8 into lush ambient chord wash".into());
+                        }
+                    }
 
                     for (btn_r, lbl, a11y, mode, key_id) in [
                         (pers_r, "Cutout Person", "cutout person", "person", "cutout-person"),
@@ -832,6 +888,15 @@ impl Studio {
             );
             if resp.clicked() {
                 sp = SculptParams::preset(st);
+                if st == SculptStamp::Wash {
+                    let mut env = self.target_env(host, owner).unwrap_or_default();
+                    env.attack = 0.45;
+                    env.decay = 0.30;
+                    env.sustain = 0.92;
+                    env.release = 0.95;
+                    env.picture = chromagrain_core::envelope::PictureCut::Fade;
+                    self.set_target_env(host, owner, env);
+                }
             }
             sx = pr.right() + 4.0;
         }
@@ -2008,9 +2073,9 @@ impl Studio {
         let n = self.slices(host, src).len();
         let mut rx = bar.right();
         if has_pads {
-            let sl_w = if compact { 120.0 } else { 138.0 };
+            let sl_w = if compact { 108.0 } else { 132.0 };
             let pb = Rect::from_min_size(egui::pos2(rx - sl_w, bar.top()), egui::vec2(sl_w, bar.height()));
-            rx = pb.left() - 5.0;
+            rx = pb.left() - 4.5;
             if button_named(ui, pb, ui.id().with(("to-pads", src)), "Slices → pads", "slices to pads", n > 0, Some(Icon::Grid), None).clicked()
                 && n > 0
             {
@@ -2025,10 +2090,10 @@ impl Studio {
 
             // `Vocal Kit → pads` (`a11y: "ukg vox kit"`): UKG vocal percussion & chord harvester!
             let vox_lbl = if compact { "Vocal Kit" } else { "Vocal Kit → pads" };
-            let vox_w = if compact { 96.0 } else { 142.0 };
+            let vox_w = if compact { 80.0 } else { 134.0 };
             if rx - vox_w > left_end + 6.0 {
                 let vb = Rect::from_min_size(egui::pos2(rx - vox_w, bar.top()), egui::vec2(vox_w, bar.height()));
-                rx = vb.left() - 5.0;
+                rx = vb.left() - 4.5;
                 if button_named(ui, vb, ui.id().with("ukg-vox-kit"), vox_lbl, "ukg vox kit", true, None, None).clicked() {
                     let k = self.trigger_ukg_kit(host);
                     if k > 0 {
@@ -2041,11 +2106,29 @@ impl Studio {
                 }
             }
 
+            // `Chords → pads` (`a11y: "chords to pads"`): 1-click ambient video-to-chord wash progression!
+            let chd_lbl = if compact { "Chords" } else { "Chords → pads" };
+            let chd_w = if compact { 70.0 } else { 126.0 };
+            if rx - chd_w > left_end + 6.0 {
+                let cb = Rect::from_min_size(egui::pos2(rx - chd_w, bar.top()), egui::vec2(chd_w, bar.height()));
+                rx = cb.left() - 4.5;
+                if button_named(ui, cb, ui.id().with("chords-to-pads"), chd_lbl, "chords to pads", false, None, None).clicked() {
+                    let k = self.trigger_chord_wash(host);
+                    if k > 0 {
+                        self.finish_tap(host);
+                        host.stop_audition();
+                        self.sheet = None;
+                        self.set_view(host, super::View::Perform);
+                        return;
+                    }
+                }
+            }
+
             // `Kit → pads` + `Loops → pads` (multi-clip harvester across standalone & plugin).
-            let kit_w = if compact { 90.0 } else { 104.0 };
+            let kit_w = if compact { 82.0 } else { 98.0 };
             if rx - kit_w > left_end + 6.0 {
                 let kb = Rect::from_min_size(egui::pos2(rx - kit_w, bar.top()), egui::vec2(kit_w, bar.height()));
-                rx = kb.left() - 5.0;
+                rx = kb.left() - 4.5;
                 if button_named(ui, kb, ui.id().with("kit-to-pads"), "Kit → pads", "kit to pads", false, None, None).clicked() {
                     let k = host.build_kit_to_pads();
                     if k > 0 {

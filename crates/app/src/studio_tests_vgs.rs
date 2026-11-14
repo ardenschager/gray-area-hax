@@ -927,7 +927,7 @@ fn v005_videograin_presets_build_set_pull_bar_keys_and_snapshots() {
     });
     h.run_steps(4);
 
-    // 1. 7-Preset Sequencer Groove Bank (`2-Step · Disco · Boom-Bap · Ratchet · Dilla · Footwork · Tape`)
+    // 1. 8-Preset Sequencer Groove Bank (`2-Step · Disco · Boom-Bap · Ratchet · Dilla · Footwork · Tape · Wash`)
     let preset_checks = [
         ("seed ukg 2step", PatternPreset::Ukg2Step),
         ("preset disco", PatternPreset::DiscoFilterPump),
@@ -936,6 +936,7 @@ fn v005_videograin_presets_build_set_pull_bar_keys_and_snapshots() {
         ("preset dilla", PatternPreset::DillaDrunk),
         ("preset footwork", PatternPreset::Footwork332),
         ("preset tape", PatternPreset::TapeDisintegration),
+        ("preset wash", PatternPreset::AmbientWash),
     ];
     for (a11y, expected) in preset_checks {
         h.get_by_label(a11y).click();
@@ -1182,5 +1183,208 @@ fn v005_videograin_presets_build_set_pull_bar_keys_and_snapshots() {
         }
         h.run_steps(6);
         v005_shot(&mut h, "add", size);
+    }
+}
+
+fn v006_shot(h: &mut Harness<'static, App>, view_slug: &str, size: (f32, f32)) {
+    let img = h.render().expect("render v006 snapshot");
+    if let Ok(dir) = std::env::var("VIDEOGRAIN_V006_SHOTS") {
+        let dir = std::path::Path::new(&dir);
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join(format!(
+            "261114_videograin_ui_{view_slug}_{}x{}_v006.png",
+            size.0 as u32, size.1 as u32
+        ));
+        img.save(&path).unwrap();
+        eprintln!("wrote {}", path.display());
+    }
+}
+
+#[test]
+fn v006_videograin_chord_wash_paulstretch_and_snapshots() {
+    use chromagrain_core::seq::PatternPreset;
+    use chromagrain_ui::{ChordChoice, PerformHost};
+
+    let writing_shots = std::env::var("VIDEOGRAIN_V006_SHOTS").is_ok();
+    let mut h = harness((1600.0, 1000.0), View::Sequence, move |app| {
+        showcase(app);
+        rename_v004_crate_sources(app);
+        app.adds.yt_mock = Some(mock_youtube_catalog());
+        if !writing_shots {
+            let mut p = app.project.lock().unwrap();
+            for s in p.sources.iter_mut() {
+                s.video = Some(std::sync::Arc::new(chromagrain_core::video::VideoClip::test_pattern(
+                    96, 54, 8.0, 0.5,
+                )));
+            }
+        }
+    });
+    h.run_steps(3);
+
+    // 1. `Wash` (`PatternPreset::AmbientWash`) in Sequence 8-Preset Groove Bank + `Clear` header button
+    h.get_by_label("preset wash").click();
+    h.run_steps(2);
+    assert_eq!(h.state().studio.active_preset, Some(PatternPreset::AmbientWash));
+    assert_eq!(h.state().stage_mode(), Some(StageMode::Stack));
+
+    // 2. `Perform` `Chord Wash` (`"perform chord wash"`) + Selected Pad `Chord` (`"pad chord"`)
+    h.get_by_label("Perform").click();
+    h.run_steps(2);
+    h.get_by_label("perform chord wash").click();
+    h.run_steps(2);
+    let wash_pads = h
+        .state()
+        .studio
+        .pad_sculpt
+        .iter()
+        .filter(|s| s.stamp == SculptStamp::Wash)
+        .count();
+    assert!(wash_pads >= 8, "perform chord wash populates ambient wash pads: {wash_pads}");
+    assert_eq!(h.state().stage_mode(), Some(StageMode::Stack));
+
+    let sel_p = h.state().studio.sel_pad;
+    let ch0 = h.state().studio.pad_sculpt[sel_p].chord;
+    h.get_by_label("pad chord").click();
+    h.run_steps(2);
+    assert_ne!(h.state().studio.pad_sculpt[sel_p].chord, ch0, "pad chord cycles chord voicing");
+
+    // 3. `Clip` sheet `Wash` stamp (`"sculpt Wash"`), `Stretch ×8` (`"paulstretch clip"`), & `Chords → pads` (`"chords to pads"`)
+    h.get_by_label("open clip").click();
+    h.run_steps(2);
+    h.get_by_label("sculpt Raw").click();
+    h.run_steps(1);
+    h.get_by_label("sculpt Wash").click();
+    h.run_steps(2);
+    assert_eq!(h.state().studio.pad_sculpt[sel_p].stamp, SculptStamp::Wash);
+    assert_eq!(h.state().studio.pad_sculpt[sel_p].chord, ChordChoice::Min9);
+
+    let n_src_before = h.state().project.lock().unwrap().sources.len();
+    h.get_by_label("paulstretch clip").click();
+    h.run_steps(2);
+    let n_src_after = h.state().project.lock().unwrap().sources.len();
+    assert_eq!(n_src_after, n_src_before + 1, "Stretch ×8 appends paulstretched spectral wash source");
+
+    h.get_by_label("chords to pads").click();
+    h.run_steps(2);
+    assert_eq!(h.state().studio.sheet, None);
+    assert_eq!(h.state().studio.view, View::Perform);
+
+    if !writing_shots {
+        return;
+    }
+
+    // 4. Render all 10 standalone `v006` UI snapshots (`1600x1000` and `960x600`) reusing `h`.
+    {
+        let app = h.state_mut();
+        app.adds.jobs.clear();
+        app.cutout_source(0, "person");
+        app.cutout_source(1, "subject");
+    }
+    for size in [(1600.0f32, 1000.0f32), (960.0, 600.0)] {
+        h.set_size(egui::vec2(size.0, size.1));
+
+        // (a) Perform (`Chord Wash` + `Vocal Kit` + `Cutout` + `Pad Chord` pill + `ISOL8` + `collage`/`grid`)
+        {
+            let app = h.state_mut();
+            app.studio.sheet = None;
+            app.launch_q = crate::LaunchQ::Now;
+            app.with_studio(|st, host| {
+                st.set_view(host, View::Perform);
+                st.apply_pattern_preset(host, PatternPreset::Ukg2Step);
+                st.build_four_section_set(host);
+                st.trigger_ukg_kit(host);
+            });
+            app.studio.pad_sculpt[0].chord = ChordChoice::Min9;
+            app.set_stage_mode(if size.0 >= 1200.0 { StageMode::Collage } else { StageMode::Grid });
+            app.studio.punch_fx = [true, false, size.0 >= 1200.0, false, false, false];
+            let mut iso = chromagrain_core::dsp::BandIsolator::default();
+            iso.solo = [false, true, true, true, false];
+            app.set_isolator(iso);
+            app.studio.isolator = iso;
+            for pad in [0usize, 2, 4, 8] {
+                if !PerformHost::pads(app)[pad].on {
+                    app.toggle_pad(pad);
+                }
+            }
+            app.playback.stop();
+            app.playhead_beats = 1.5;
+        }
+        h.run_steps(6);
+        v006_shot(&mut h, "perform", size);
+
+        // (b) Sequence (symmetrical `4 × 2` 8-Preset Groove Bank incl. `Wash` + `Clear` header + `Build Set`)
+        {
+            let app = h.state_mut();
+            app.studio.punch_fx = [false; 6];
+            app.studio.sheet = None;
+            app.with_studio(|st, host| {
+                st.set_view(host, View::Sequence);
+                st.apply_pattern_preset(host, PatternPreset::Ukg2Step);
+                st.build_four_section_set(host);
+                st.seq.scene = 1;
+            });
+            app.set_stage_mode(StageMode::Grid);
+            app.playback.stop();
+            app.playhead_beats = 1.25;
+        }
+        h.run_steps(6);
+        v006_shot(&mut h, "sequence", size);
+
+        // (c) Play
+        {
+            let app = h.state_mut();
+            app.studio.sheet = None;
+            app.with_studio(|st, host| st.set_view(host, View::Play));
+            app.set_stage_mode(StageMode::Grid);
+            app.studio.swing = 0.61;
+            app.studio.emitters[0].held = true;
+            app.studio.emitters[1].held = true;
+            app.studio.emitters[2].held = true;
+            app.playback.stop();
+            app.playhead_beats = 2.0;
+        }
+        h.run_steps(6);
+        v006_shot(&mut h, "play", size);
+
+        // (d) Clip (`Stretch ×8` + `Cutout` + `Chords → pads` + `Vocal Kit → pads` + `Wash` & `Vox Perc` stamps)
+        {
+            let app = h.state_mut();
+            app.studio.emitters[0].held = false;
+            app.studio.emitters[1].held = false;
+            app.studio.emitters[2].held = false;
+            {
+                let mut p = app.project.lock().unwrap();
+                let len = p.sources[1].duration();
+                p.sources[1].slices = chop::equal_slices(len, 8);
+            }
+            app.with_studio(|st, host| {
+                st.set_view(host, View::Perform);
+                st.trigger_chord_wash(host);
+            });
+            app.studio.source_focus.insert(1, (0.44, 0.38));
+            app.studio.pad_sculpt[4] = chromagrain_ui::SculptParams::preset(SculptStamp::Wash);
+            app.studio.pad_captions[4] = "omnichord min9 cathedral wash".into();
+            app.studio.clip_tab = 0;
+            app.studio.open_clip(ClipTarget::Pad(4));
+            app.playback.stop();
+        }
+        h.run_steps(6);
+        v006_shot(&mut h, "clip", size);
+
+        // (e) Add
+        {
+            let app = h.state_mut();
+            app.with_studio(|st, host| st.set_view(host, View::Play));
+            app.adds.yt_mock = Some(mock_youtube_catalog());
+            app.studio.add.tab = AddRoute::Link;
+            app.studio.add.random_window = true;
+            app.studio.add.yt_query = "1980s omnibot robot cassette".into();
+            app.studio.add.yt_low_views = true;
+            app.adds.search_youtube("1984 omnibot robot cello answering machine", true);
+            app.studio.sheet = Some(Sheet::Add(AddTarget::Column(7)));
+            app.playback.stop();
+        }
+        h.run_steps(6);
+        v006_shot(&mut h, "add", size);
     }
 }

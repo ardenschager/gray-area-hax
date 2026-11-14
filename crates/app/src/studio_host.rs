@@ -105,7 +105,15 @@ impl App {
             clip.grains.sculpt = spec.sculpt;
             clip.grains.choke_group = spec.choke_group;
             clip.link = spec.link;
-            clip.visual = VisualGrainStyle::full_frame(0.0);
+            clip.visual = if spec.stamp == chromagrain_core::grain::Stamp::Wash {
+                VisualGrainStyle {
+                    additive: 0.26,
+                    feather: 0.44,
+                    ..VisualGrainStyle::full_frame(0.0)
+                }
+            } else {
+                VisualGrainStyle::full_frame(0.0)
+            };
             clip.grains.adsr = Some(spec.adsr.unwrap_or(chromagrain_core::envelope::Adsr {
                 attack: if spec.one_shot { 0.004 } else { 0.02 },
                 decay: if spec.one_shot { 0.08 } else { 0.20 },
@@ -445,6 +453,49 @@ impl Host for App {
             chromagrain_core::chop::build_ukg_vox_kit_across_sources_opt(&p.sources, Some(key))
         };
         self.apply_curated_kit_specs(&specs)
+    }
+    fn build_chord_washes_to_pads(&mut self) -> usize {
+        self.studio_seed_pads();
+        let key = self.studio.key;
+        let specs = {
+            let mut p = self.project.lock().unwrap();
+            for s in p.sources.iter_mut() {
+                if s.slices.is_empty() {
+                    s.slices = chromagrain_core::chop::analyze_source_slices(s, 24);
+                }
+            }
+            chromagrain_core::chop::build_chord_washes_across_sources_opt(&p.sources, Some(key))
+        };
+        self.apply_curated_kit_specs(&specs)
+    }
+    fn paulstretch_source(&mut self, source: usize, factor: f32) -> Option<usize> {
+        let region = {
+            let p = self.project.lock().unwrap();
+            let src = p.sources.get(source)?;
+            let dur = src.duration();
+            if dur <= 0.01 {
+                return None;
+            }
+            let win_len = dur.min(3.5);
+            let t0 = src
+                .slices
+                .first()
+                .map(|sl| sl.start)
+                .unwrap_or_else(|| (dur * 0.2).min((dur - win_len).max(0.0)));
+            src.slice(t0, win_len)
+        };
+        let mut stretched = chromagrain_core::stretch::paulstretch_source(&region, factor.clamp(2.0, 16.0));
+        stretched.slices = chromagrain_core::chop::equal_slices(stretched.duration(), 8);
+        let new_idx = {
+            let mut p = self.project.lock().unwrap();
+            p.add_source(stretched)
+        };
+        self.fill_rev = 0;
+        self.mark_now();
+        if self.mode == AppMode::Perform {
+            self.perform_fill();
+        }
+        Some(new_idx)
     }
     fn cutout_source(&mut self, source: usize, mode: &str) -> bool {
         let src_opt = {

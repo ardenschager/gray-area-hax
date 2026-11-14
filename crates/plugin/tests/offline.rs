@@ -3,6 +3,7 @@
 //! notes and render blocks — no host, no GUI.
 
 use chromagrain_core::audio::AudioClip;
+#[cfg_attr(not(debug_assertions), allow(unused_imports))]
 use chromagrain_core::instrument::{PadSlot, Transport};
 use chromagrain_core::timeline::Source;
 use chromagrain_core::video::VideoClip;

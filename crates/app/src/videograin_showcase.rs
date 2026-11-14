@@ -27,7 +27,7 @@ use eframe::egui;
 use egui_kittest::Harness;
 use std::path::{Path, PathBuf};
 
-const SHOWCASE_LEN: f64 = 38.5;
+const SHOWCASE_LEN: f64 = 41.6;
 
 fn videograin_root() -> PathBuf {
     if let Ok(p) = std::env::var("CHROMAGRAIN_UKG_ROOT") {
@@ -348,8 +348,78 @@ fn fire_console_sticker_phrase(
 
 // --- Tour Hooks ---
 
+/// Fire a lush polyphonic `Stamp::Wash` video-to-chord swell (`Min9` / `Maj7` / `Sus4` / `Fifths`)
+/// with scale-locked `comb` resonance, `+12st` shimmer, and soft `PictureCut::Fade` optical crossfade!
+fn fire_console_chord_wash_swell(
+    app: &mut App,
+    src_idx: usize,
+    t0: f64,
+    dur_s: f32,
+    semitones: f32,
+    voicing: ChordVoicing,
+    gain: f32,
+    focus: (f32, f32),
+    voice_base: u64,
+) {
+    let base_hz = {
+        let p = app.project.lock().unwrap();
+        let Some(s) = p.sources.get(src_idx) else { return };
+        s.effective_base_hz()
+    };
+    let now = app.app_clock.secs();
+    let mut sculpt = VoiceSculpt::preset(Stamp::Wash);
+    sculpt.chord = voicing;
+    sculpt.comb_mix = 0.54;
+    sculpt.comb_feedback = 0.89;
+    sculpt.shimmer = 0.30;
+    sculpt.wow_flutter = 0.24;
+    let adsr = Adsr {
+        attack: 0.62,
+        decay: 0.35,
+        sustain: 0.92,
+        release: 1.35,
+        picture: PictureCut::Fade,
+        ..Adsr::default()
+    };
+    let off = now + (dur_s as f64 - 0.85).max(0.80);
+    let key = app.studio.key;
+    let comb_hz = chromagrain_core::grain::quantize_comb_hz(
+        base_hz.max(55.0) * semitones_to_ratio(semitones),
+        Some(&key),
+    );
+    let ev = GrainEvent {
+        onset: now,
+        source_pos: t0,
+        duration: dur_s,
+        pitch_ratio: semitones_to_ratio(semitones),
+        gain,
+        pan: 0.0,
+        envelope: 0.82,
+        id: voice_base,
+        comb_hz,
+        tag: VoiceTag {
+            voice: voice_base,
+            env: Some(VoiceEnv { adsr, on: now, off }),
+            focus,
+            is_wash: true,
+            ..Default::default()
+        },
+        sculpt,
+        ..Default::default()
+    };
+    app.studio.source_focus.insert(src_idx, focus);
+    let (chord_evs, chord_n) =
+        chromagrain_core::grain::expand_chord_grain_inline(&ev, voicing, base_hz, Some(&key));
+    for (ci, mut cev) in chord_evs.into_iter().take(chord_n).enumerate() {
+        cev.id = voice_base + ci as u64;
+        cev.tag.voice = voice_base + ci as u64;
+        Host::fire(app, 1, src_idx, cev);
+    }
+}
+
 fn hook_opening_flowbee(app: &mut App) {
-    fire_console_sticker_phrase(app, 4, 12.88, 1.58, 1.12, Stamp::Phrase, (0.52, 0.38), 0x9901);
+    // Full-body Rick Hunt grooming dog (`18.42..20.00s` — zero disembodied switch hand!)
+    fire_console_sticker_phrase(app, 4, 18.42, 1.56, 1.12, Stamp::Phrase, (0.52, 0.44), 0x9901);
 }
 
 fn hook_after_zeon_pull(app: &mut App) {
@@ -478,21 +548,72 @@ fn hook_release_isol8_for_drop(app: &mut App) {
     app.studio.isolator = iso;
 }
 
-fn hook_fullscreen_collage_climax(app: &mut App) {
+fn hook_perform_world_domination_drop(app: &mut App) {
     hook_release_isol8_for_drop(app);
     app.set_stage_mode(StageMode::Collage);
     app.studio.punch_fx = [false; 6];
     let zeon_idx = app.project.lock().unwrap().sources.len().saturating_sub(1);
-    fire_console_sticker_phrase(app, zeon_idx, 15.54, 1.36, 1.15, Stamp::Phrase, (0.50, 0.46), 0x9907);
+    fire_console_sticker_phrase(app, zeon_idx, 29.96, 1.34, 1.18, Stamp::Phrase, (0.50, 0.46), 0x9907);
 }
 
-fn hook_fullscreen_flowbee_answer(app: &mut App) {
-    fire_console_sticker_phrase(app, 4, 12.88, 1.48, 1.14, Stamp::Phrase, (0.52, 0.38), 0x9908);
-}
-
-fn hook_fullscreen_world_domination_tag(app: &mut App) {
+fn hook_enter_ambient_chord_wash(app: &mut App) {
+    hook_release_isol8_for_drop(app);
+    app.studio.punch_fx = [false; 6];
+    // Configure Emitter 1's live bus (`bus = 1`) for warm cathedral reverb + feathered optical crossfades!
+    app.studio.emitters[0].macros = [0.68, 0.50, 0.76, 0.0];
+    app.studio.emitters[0].adsr.picture = PictureCut::Fade;
+    app.with_studio(|st, host| {
+        st.apply_pattern_preset(host, PatternPreset::AmbientWash);
+        st.seq.hold_scene = true;
+        st.rev += 1;
+        st.seq_build_arrangement(host);
+    });
+    {
+        let mut p = app.project.lock().unwrap();
+        for ti in 0..PADS.min(p.tracks.len()) {
+            p.tracks[ti].muted = true;
+        }
+        // Soften the background sequence track slightly so our live polyphonic video-to-chord swells soar!
+        if let Some(seq_tr) = p.tracks.get_mut(PADS) {
+            seq_tr.muted = false;
+            seq_tr.level = 0.58;
+        }
+        p.master_effects = vec![chromagrain_core::fx::AvEffect {
+            kind: chromagrain_core::fx::EffectKind::Reverb {
+                size: 0.86,
+                damp: 0.28,
+                mix: 0.42,
+            },
+            audio: 0.85,
+            video: 0.36,
+        }];
+    }
+    app.set_stage_mode(StageMode::Stack);
+    app.mark_now();
+    // Swell 1 (`i min9` cathedral chord across Omnichord + Omnibot Zeon spoken vowel!)
     let zeon_idx = app.project.lock().unwrap().sources.len().saturating_sub(1);
-    fire_console_sticker_phrase(app, zeon_idx, 29.96, 1.36, 1.18, Stamp::Phrase, (0.50, 0.46), 0x9909);
+    fire_console_chord_wash_swell(app, 1, 22.75, 3.10, 0.0, ChordVoicing::Min9, 0.56, (0.52, 0.52), 0x9A10);
+    fire_console_chord_wash_swell(app, zeon_idx, 26.05, 2.80, -12.0, ChordVoicing::Fifths, 0.38, (0.50, 0.44), 0x9A20);
+}
+
+fn hook_wash_swell_maj7(app: &mut App) {
+    {
+        let mut p = app.project.lock().unwrap();
+        for ti in 0..PADS.min(p.tracks.len()) {
+            p.tracks[ti].muted = true;
+        }
+    }
+    // Swell 2 (`VI maj7` luminous Rhodes + Omnichord crossfade!)
+    fire_console_chord_wash_swell(app, 2, 4.20, 3.20, -4.0, ChordVoicing::Maj7, 0.58, (0.50, 0.48), 0x9A30);
+    fire_console_chord_wash_swell(app, 1, 11.93, 2.90, 8.0, ChordVoicing::Fifths, 0.36, (0.48, 0.50), 0x9A40);
+}
+
+fn hook_wash_swell_resolve(app: &mut App) {
+    // Swell 3 (`iv min9 -> i min9` warm fullscreen resolve across Omnichord + Rhodes + Zeon!)
+    let zeon_idx = app.project.lock().unwrap().sources.len().saturating_sub(1);
+    fire_console_chord_wash_swell(app, 1, 18.39, 3.45, 0.0, ChordVoicing::Min9, 0.58, (0.52, 0.54), 0x9A50);
+    fire_console_chord_wash_swell(app, 2, 11.40, 3.35, -7.0, ChordVoicing::Sus4, 0.46, (0.52, 0.48), 0x9A60);
+    fire_console_chord_wash_swell(app, zeon_idx, 26.08, 3.10, -12.0, ChordVoicing::Octaves, 0.34, (0.50, 0.45), 0x9A70);
 }
 
 pub fn tour_v005_videograin_showcase() -> Tour {
@@ -529,48 +650,52 @@ pub fn tour_v005_videograin_showcase() -> Tour {
     at(14.70, Tap(lab("ukg vox kit")));
     at(15.25, Custom(hook_curate_pads_after_kit));
 
-    // Act 3 (16.0..25.0s): Sequence -> 7-Preset Groove Bank (`Disco` -> `2-Step`) + 1-click `Build Set`!
+    // Act 3 (16.0..24.6s): Sequence -> 8-Preset Groove Bank (`Disco` -> `2-Step`) + 1-click `Build Set`!
     at(16.05, Tap(lab("Sequence")));
-    say(16.45, 20.85, "sequence · 7-preset groove bank flips disco & 2-step live");
+    say(16.45, 20.85, "sequence · 8-preset groove bank flips disco & 2-step live");
     at(17.10, Tap(lab("preset disco")));
     at(19.75, Tap(lab("seed ukg 2step")));
     at(20.05, Custom(hook_enrich_2step_before_build_set));
-    say(21.45, 24.75, "1-click build set · intro, drop, break & climax arranged");
+    say(21.45, 24.50, "1-click build set · intro, drop, break & climax arranged");
     at(22.05, Tap(lab("build set")));
-    at(23.65, Tap(lab("scene 2")));
-    at(24.10, Custom(hook_lock_drop_scene));
+    at(23.55, Tap(lab("scene 2")));
+    at(24.00, Custom(hook_lock_drop_scene));
 
-    // Act 4 (25.0..38.5s): Perform -> Vocal hooks + Punch switches + ISOL8 zine solo + Fullscreen climax!
-    at(25.05, Tap(lab("Perform")));
-    say(25.45, 28.60, "perform · die-cut robot & flowbee vocal hooks over 2-step");
-    at(25.60, Tap(lab("pad 9")));
-    at(25.65, Custom(hook_perform_zeon_hook));
-    at(27.25, Tap(lab("pad 10")));
-    at(27.30, Custom(hook_perform_flowbee_hook));
+    // Act 4A (24.8..33.4s): Perform UKG Drop -> Die-cut stickers + Punch switches + ISOL8 zine solo!
+    at(24.80, Tap(lab("Perform")));
+    say(25.15, 28.30, "perform · die-cut robot & flowbee vocal hooks over 2-step");
+    at(25.30, Tap(lab("pad 9")));
+    at(25.35, Custom(hook_perform_zeon_hook));
+    at(26.90, Tap(lab("pad 10")));
+    at(26.95, Custom(hook_perform_flowbee_hook));
 
-    say(28.80, 33.45, "punch grid & stutter · isol8 mid-band zine solo -> tape stop");
-    at(28.90, Tap(lab("punch grid")));
-    at(29.55, Hold(lab("punch stutter"), 0.72));
-    at(30.45, Tap(lab("punch grid")));
+    say(28.50, 33.10, "punch grid & stutter · isol8 mid-band zine solo -> full drop");
+    at(28.60, Tap(lab("punch grid")));
+    at(29.20, Hold(lab("punch stutter"), 0.68));
+    at(30.05, Tap(lab("punch grid")));
 
     // ISOL8 mid-band radio/zine ink solo (`LMF + MF + HMF SOLO`) -> full-spectrum drop!
-    at(30.65, Tap(lab("isol8 solo lmf")));
-    at(30.90, Tap(lab("isol8 solo mf")));
-    at(31.15, Tap(lab("isol8 solo hmf")));
-    at(31.30, Tap(lab("pad 11")));
-    at(31.35, Custom(hook_perform_shuffle_hook));
-    at(32.45, Tap(lab("isol8 solo lmf")));
-    at(32.68, Tap(lab("isol8 solo mf")));
-    at(32.90, Tap(lab("isol8 solo hmf")));
-    at(32.96, Custom(hook_release_isol8_for_drop));
-    at(33.12, Hold(lab("punch tape stop"), 0.48));
+    at(30.25, Tap(lab("isol8 solo lmf")));
+    at(30.50, Tap(lab("isol8 solo mf")));
+    at(30.75, Tap(lab("isol8 solo hmf")));
+    at(30.90, Tap(lab("pad 11")));
+    at(30.95, Custom(hook_perform_shuffle_hook));
+    at(31.85, Tap(lab("isol8 solo lmf")));
+    at(32.05, Tap(lab("isol8 solo mf")));
+    at(32.25, Tap(lab("isol8 solo hmf")));
+    at(32.32, Custom(hook_perform_world_domination_drop));
 
-    // Closing ~4.8s Fullscreen projection (ZERO end card — ends on live die-cut collage + packed grid!)
-    say(33.90, 37.90, "fullscreen stage · 1080p die-cut stickers + fast ukg grid cuts");
-    at(33.75, Tap(lab("Fullscreen")));
-    at(33.95, Custom(hook_fullscreen_collage_climax));
-    at(35.35, Custom(hook_fullscreen_flowbee_answer));
-    at(36.75, Custom(hook_fullscreen_world_domination_tag));
+    // Act 4B (33.5..41.6s — 8.1s Lush Video-to-Chord Ambient Wash Closing into Fullscreen!):
+    // Same YouTube videos effortlessly transform into warm `Min9 -> Maj7` cathedral chord washes!
+    say(33.55, 36.20, "1-tap chord wash · same youtube clips melt into min9 & maj7 chords");
+    at(33.55, Tap(lab("perform chord wash")));
+    at(33.68, Custom(hook_enter_ambient_chord_wash));
+    at(35.30, Tap(lab("pad 2")));
+    at(35.35, Custom(hook_wash_swell_maj7));
+
+    say(36.55, 41.05, "fullscreen ambient wash · soft optical dissolves & scale-locked shimmer");
+    at(36.35, Tap(lab("Fullscreen")));
+    at(38.15, Custom(hook_wash_swell_resolve));
 
     Tour {
         cues,
@@ -910,9 +1035,19 @@ fn v005_showcase_tour_has_zero_title_and_end_cards() {
 }
 
 #[test]
-#[ignore = "renders full 1920x1080 @ 30fps live VIDEOGRAIN UKG console showcase"]
+#[ignore = "renders full 1920x1080 @ 30fps live VIDEOGRAIN UKG + Ambient Chord Wash console showcase"]
 fn render_v005_videograin_console_showcase() {
-    let version = std::env::var("VIDEOGRAIN_SHOWCASE_VERSION").unwrap_or_else(|_| "v005".into());
+    render_videograin_console_showcase_inner();
+}
+
+#[test]
+#[ignore = "renders full 1920x1080 @ 30fps live VIDEOGRAIN v006 UKG + Ambient Chord Wash console showcase"]
+fn render_v006_videograin_console_showcase() {
+    render_videograin_console_showcase_inner();
+}
+
+fn render_videograin_console_showcase_inner() {
+    let version = std::env::var("VIDEOGRAIN_SHOWCASE_VERSION").unwrap_or_else(|_| "v006".into());
     let root = videograin_root();
     let out_dir = root.join(&version).join("out");
     std::fs::create_dir_all(&out_dir).expect("create v005/out");

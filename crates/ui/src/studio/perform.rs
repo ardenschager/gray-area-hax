@@ -89,11 +89,15 @@ impl Studio {
         let compact = bar.width() < 520.0;
         let h = bar.height();
 
-        // Right-anchored 1-tap hardware actions: `Vocal Kit` (`"perform ukg kit"`) + `Cutout` (`"perform cutout"`).
-        let cut_w = if compact { 72.0 } else { 88.0 };
-        let kit_w = if compact { 82.0 } else { 98.0 };
+        // Right-anchored 1-tap hardware actions:
+        // `Chord Wash` (`"perform chord wash"`) + `Vocal Kit` (`"perform ukg kit"`) + `Cutout` (`"perform cutout"`).
+        let cut_w = if compact { 64.0 } else { 84.0 };
+        let kit_w = if compact { 74.0 } else { 92.0 };
+        let wash_w = if compact { 68.0 } else { 96.0 };
+        let bgap = if compact { 4.0 } else { 5.0 };
         let cut_r = Rect::from_min_size(egui::pos2(bar.right() - cut_w, bar.top()), egui::vec2(cut_w, h));
-        let kit_r = Rect::from_min_size(egui::pos2(cut_r.left() - 5.0 - kit_w, bar.top()), egui::vec2(kit_w, h));
+        let kit_r = Rect::from_min_size(egui::pos2(cut_r.left() - bgap - kit_w, bar.top()), egui::vec2(kit_w, h));
+        let wash_r = Rect::from_min_size(egui::pos2(kit_r.left() - bgap - wash_w, bar.top()), egui::vec2(wash_w, h));
 
         let sel_src = host
             .perform()
@@ -103,16 +107,17 @@ impl Studio {
                     .and_then(|pf| pf.pads().iter().find_map(|pd| pd.source))
             });
         let sel_has_alpha = sel_src.is_some_and(|s| self.source_has_alpha(host, s));
+        let is_wash_active = self.pad_sculpt.iter().filter(|s| s.stamp == crate::host::SculptStamp::Wash).count() >= 4;
 
         let c_resp = hit(ui, cut_r, ui.id().with("perf-cutout"), Sense::click(), "perform cutout");
         paint_switch_cap(&p, cut_r, SwitchKind::PuttyMint, sel_has_alpha, c_resp.hovered(), c_resp.is_pointer_button_down_on());
         let c_fg = if sel_has_alpha { Color32::from_rgb(0x11, 0x2b, 0x1f) } else { INK };
-        draw_icon(&p, Icon::Cutout, egui::pos2(cut_r.left() + if compact { 12.0 } else { 14.5 }, cut_r.center().y), 12.0, c_fg);
+        draw_icon(&p, Icon::Cutout, egui::pos2(cut_r.left() + if compact { 10.5 } else { 14.0 }, cut_r.center().y), 11.5, c_fg);
         p.text(
-            egui::pos2(cut_r.left() + if compact { 22.0 } else { 26.0 }, cut_r.center().y),
+            egui::pos2(cut_r.left() + if compact { 19.5 } else { 25.0 }, cut_r.center().y),
             Align2::LEFT_CENTER,
             "Cutout",
-            font_semibold(if compact { 10.0 } else { 11.0 }),
+            font_semibold(if compact { 9.6 } else { 10.8 }),
             c_fg,
         );
         if c_resp.clicked() {
@@ -124,19 +129,33 @@ impl Studio {
         let k_resp = hit(ui, kit_r, ui.id().with("perf-ukg-kit"), Sense::click(), "perform ukg kit");
         paint_switch_cap(&p, kit_r, SwitchKind::Amber, false, k_resp.hovered(), k_resp.is_pointer_button_down_on());
         let k_fg = Color32::from_rgb(0x24, 0x1c, 0x09);
-        draw_icon(&p, Icon::Grid, egui::pos2(kit_r.left() + if compact { 12.0 } else { 14.5 }, kit_r.center().y), 11.5, k_fg);
+        draw_icon(&p, Icon::Grid, egui::pos2(kit_r.left() + if compact { 10.5 } else { 14.0 }, kit_r.center().y), 11.0, k_fg);
         p.text(
-            egui::pos2(kit_r.left() + if compact { 22.0 } else { 26.0 }, kit_r.center().y),
+            egui::pos2(kit_r.left() + if compact { 19.5 } else { 25.0 }, kit_r.center().y),
             Align2::LEFT_CENTER,
             "Vocal Kit",
-            font_semibold(if compact { 10.0 } else { 11.0 }),
+            font_semibold(if compact { 9.6 } else { 10.8 }),
             k_fg,
         );
         if k_resp.clicked() {
             self.trigger_ukg_kit(host);
         }
 
-        let left_avail = kit_r.left() - bar.left() - 8.0;
+        let w_resp = hit(ui, wash_r, ui.id().with("perf-chord-wash"), Sense::click(), "perform chord wash");
+        paint_switch_cap(&p, wash_r, SwitchKind::PuttyMint, is_wash_active, w_resp.hovered(), w_resp.is_pointer_button_down_on());
+        let w_fg = if is_wash_active { Color32::from_rgb(0x11, 0x2b, 0x1f) } else { INK };
+        p.text(
+            wash_r.center(),
+            Align2::CENTER_CENTER,
+            if compact { "Chord Wash" } else { "Chord Wash" },
+            font_semibold(if compact { 9.4 } else { 10.8 }),
+            w_fg,
+        );
+        if w_resp.clicked() {
+            self.trigger_chord_wash(host);
+        }
+
+        let left_avail = wash_r.left() - bar.left() - 6.0;
         if host.caps().scenes && left_avail >= 150.0 {
             let set_rect = Rect::from_min_size(bar.min, egui::vec2(left_avail, h));
             self.set_arranger_bar(host, ui, set_rect, "perf-set");
@@ -453,13 +472,37 @@ impl Studio {
             do_stop = true;
         }
 
-        let q_w = if compact { 104.0 } else { 126.0 };
+        let q_w = if compact { 96.0 } else { 120.0 };
         let mut set_q = None;
-        if rx - q_w >= head.left() + 86.0 {
+        if rx - q_w >= head.left() + 80.0 {
             let q_r = Rect::from_min_size(egui::pos2(rx - q_w, head.top()), egui::vec2(q_w, head_h));
-            rx = q_r.left() - 6.0;
-            if let Some(nq) = segmented(ui, q_r, ui.id().with("launch"), &["Now", "Beat", "Bar"], &[], quant, font_semibold(if compact { 9.5 } else { 10.5 }), false) {
+            rx = q_r.left() - 5.0;
+            if let Some(nq) = segmented(ui, q_r, ui.id().with("launch"), &["Now", "Beat", "Bar"], &[], quant, font_semibold(if compact { 9.2 } else { 10.2 }), false) {
                 set_q = Some(nq);
+            }
+        }
+
+        // 1-Tap Selected Pad `Chord` selector (`"pad chord"`): turns any video pad into a chord (`min7 · min9 · maj7 · sus4 · 5ths`)!
+        let chd_w = if compact { 58.0 } else { 78.0 };
+        let mut cycle_pad_chord = false;
+        if rx - chd_w >= head.left() + 76.0 {
+            let chd_r = Rect::from_min_size(egui::pos2(rx - chd_w, head.top()), egui::vec2(chd_w, head_h));
+            rx = chd_r.left() - 5.0;
+            let cur_ch = self.pad_sculpt[sp].chord;
+            let ch_on = cur_ch != crate::host::ChordChoice::Off;
+            let ch_resp = hit(ui, chd_r, ui.id().with(("pad-chord-pill", sp)), Sense::click(), "pad chord");
+            paint_switch_cap(&p, chd_r, SwitchKind::PuttyMint, ch_on, ch_resp.hovered(), ch_resp.is_pointer_button_down_on());
+            let ch_fg = if ch_on { Color32::from_rgb(0x11, 0x2b, 0x1f) } else { INK };
+            let ch_txt = if ch_on {
+                cur_ch.label().to_string()
+            } else if compact {
+                "Chord".to_string()
+            } else {
+                "Chord · Off".to_string()
+            };
+            p.text(chd_r.center(), Align2::CENTER_CENTER, ch_txt, font_semibold(if compact { 9.2 } else { 10.0 }), ch_fg);
+            if ch_resp.clicked() {
+                cycle_pad_chord = true;
             }
         }
 
@@ -551,7 +594,16 @@ impl Studio {
         if (adsr.release - before.1).abs() > 1e-4 {
             self.set_target_env(host, owner, adsr);
         }
-        if (sculpt.drive_db - before.2).abs() > 1e-4 {
+        if cycle_pad_chord {
+            sculpt.chord = sculpt.chord.next();
+            if sculpt.chord != crate::host::ChordChoice::Off && sculpt.comb < 0.25 {
+                sculpt.comb = 0.48;
+                if matches!(sculpt.stamp, crate::host::SculptStamp::Raw | crate::host::SculptStamp::Phrase) {
+                    sculpt.stamp = crate::host::SculptStamp::Chord;
+                }
+            }
+            self.set_owner_sculpt(host, owner, sculpt);
+        } else if (sculpt.drive_db - before.2).abs() > 1e-4 {
             self.set_owner_sculpt(host, owner, sculpt);
         }
 

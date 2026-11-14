@@ -1078,6 +1078,35 @@ impl Studio {
         k
     }
 
+    pub fn trigger_chord_wash(&mut self, host: &mut dyn Host) -> usize {
+        let k = host.build_chord_washes_to_pads();
+        if k > 0 {
+            let specs = {
+                let pp = host.project().lock().unwrap();
+                chromagrain_core::chop::build_chord_washes_across_sources_opt(&pp.sources, Some(self.key))
+            };
+            for spc in &specs {
+                let pad = spc.pad_index.min(15);
+                self.pad_sculpt[pad] = crate::host::SculptParams::from_core(spc.stamp, spc.sculpt, spc.choke_group);
+                if !spc.slice.caption.is_empty() {
+                    self.pad_captions[pad] = spc.slice.caption.as_str().to_string();
+                } else {
+                    self.pad_captions[pad].clear();
+                }
+                let focus = spc.slice.focus;
+                if !self.source_focus.contains_key(&spc.source)
+                    && ((focus.0 - 0.5).abs() > 0.02 || (focus.1 - 0.5).abs() > 0.02)
+                {
+                    self.source_focus.insert(spc.source, focus);
+                }
+            }
+            // Ambient chord washes shine with soft optical crossfades (`Stack`).
+            host.set_stage_mode(StageMode::Stack);
+            host.status(format!("built {k}-pad video-to-chord ambient wash progression"));
+        }
+        k
+    }
+
     fn top_bar(&mut self, host: &mut dyn Host, ui: &mut egui::Ui) {
         let caps_cfg = host.caps();
         let rect = ui.max_rect();
@@ -2222,6 +2251,7 @@ pub fn role_tag_for(stamp: crate::host::SculptStamp, raw_name: Option<&str>, kin
         SculptStamp::Chord => return "CHORD",
         SculptStamp::Pluck => return "BASS",
         SculptStamp::Phrase => return "HOOK",
+        SculptStamp::Wash => return "WASH",
         SculptStamp::TapeLoop | SculptStamp::Disintegrate => return "LOOP",
         SculptStamp::Raw => {}
     }

@@ -1118,6 +1118,11 @@ pub fn role_tag_pill(p: &Painter, pos: Pos2, tag: &str, active: bool) -> Rect {
             if active { Color32::from_rgb(0x10, 0x26, 0x22) } else { CREAM },
             MINT_EDGE,
         ),
+        "WASH" => (
+            if active { Color32::from_rgb(138, 198, 224) } else { Color32::from_rgba_unmultiplied(40, 78, 98, 232) },
+            if active { Color32::from_rgb(0x0c, 0x20, 0x2a) } else { CREAM },
+            Color32::from_rgb(56, 108, 132),
+        ),
         "HOOK" => (
             if active { CREAM } else { Color32::from_rgba_unmultiplied(238, 230, 210, 228) },
             INK,

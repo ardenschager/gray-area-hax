@@ -183,12 +183,13 @@ pub enum SculptStamp {
     Pluck,
     Chord,
     Phrase,
+    Wash,
     TapeLoop,
     Disintegrate,
 }
 
 impl SculptStamp {
-    pub const ALL: [SculptStamp; 10] = [
+    pub const ALL: [SculptStamp; 11] = [
         SculptStamp::Raw,
         SculptStamp::Kick,
         SculptStamp::Snare,
@@ -197,6 +198,7 @@ impl SculptStamp {
         SculptStamp::Pluck,
         SculptStamp::Chord,
         SculptStamp::Phrase,
+        SculptStamp::Wash,
         SculptStamp::TapeLoop,
         SculptStamp::Disintegrate,
     ];
@@ -211,6 +213,7 @@ impl SculptStamp {
             SculptStamp::Pluck => "Pluck",
             SculptStamp::Chord => "Chord",
             SculptStamp::Phrase => "Phrase",
+            SculptStamp::Wash => "Wash",
             SculptStamp::TapeLoop => "Tape Loop",
             SculptStamp::Disintegrate => "Disintegrate",
         }
@@ -243,6 +246,7 @@ impl SculptStamp {
             SculptStamp::Pluck => Stamp::Pluck,
             SculptStamp::Chord => Stamp::Chord,
             SculptStamp::Phrase => Stamp::Phrase,
+            SculptStamp::Wash => Stamp::Wash,
             SculptStamp::TapeLoop => Stamp::TapeLoop,
             SculptStamp::Disintegrate => Stamp::Disintegrate,
         }
@@ -259,7 +263,8 @@ impl SculptStamp {
             Stamp::Pluck => SculptStamp::Pluck,
             Stamp::Chord => SculptStamp::Chord,
             Stamp::Phrase => SculptStamp::Phrase,
-            Stamp::Wash | Stamp::TapeLoop => SculptStamp::TapeLoop,
+            Stamp::Wash => SculptStamp::Wash,
+            Stamp::TapeLoop => SculptStamp::TapeLoop,
             Stamp::Disintegrate => SculptStamp::Disintegrate,
         }
     }
@@ -436,6 +441,13 @@ impl SculptParams {
             SculptStamp::Phrase => {
                 p.drive_db = 2.0;
                 p.choke = 1;
+            }
+            SculptStamp::Wash => {
+                p.comb = 0.52;
+                p.comb_feedback = 0.88;
+                p.chord = ChordChoice::Min9;
+                p.wow = 0.22;
+                p.drive_db = 1.2;
             }
             SculptStamp::TapeLoop => {
                 p.free_loop_secs = Some(6.8);
@@ -754,6 +766,15 @@ pub trait Host {
     /// Build a 16-pad UKG vocal-percussion + garage chord + spoken-hook kit across loaded sources.
     fn build_ukg_vox_kit_to_pads(&mut self) -> usize {
         0
+    }
+    /// Build a 16-pad ambient video-to-chord progression & cathedral wash kit across loaded sources.
+    fn build_chord_washes_to_pads(&mut self) -> usize {
+        0
+    }
+    /// Paulstretch a window of `source` by `factor` (e.g. `8.0`) into a lush spectral wash source,
+    /// returning the new source index.
+    fn paulstretch_source(&mut self, _source: usize, _factor: f32) -> Option<usize> {
+        None
     }
     /// Segment `source` (`"person"` or `"subject"`) into a crisp alpha cutout in place.
     fn cutout_source(&mut self, _source: usize, _mode: &str) -> bool {

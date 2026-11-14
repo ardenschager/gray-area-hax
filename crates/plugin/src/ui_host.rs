@@ -385,6 +385,49 @@ impl Host for PluginHost {
         }
         specs.len()
     }
+    fn build_chord_washes_to_pads(&mut self) -> usize {
+        let key = self.shared_key();
+        let (specs, lens): (Vec<chromagrain_core::chop::KitPadSpec>, Vec<f64>) = {
+            let mut p = self.project.lock().unwrap();
+            for s in p.sources.iter_mut() {
+                if s.slices.is_empty() {
+                    s.slices = chromagrain_core::chop::analyze_source_slices(s, 24);
+                }
+            }
+            let lens = p.sources.iter().map(|s| s.duration()).collect();
+            let specs = chromagrain_core::chop::build_chord_washes_across_sources_opt(&p.sources, key);
+            (specs, lens)
+        };
+        for spec in &specs {
+            let pad = spec.pad_index.min(PADS - 1);
+            let src_len = lens.get(spec.source).copied().unwrap_or(0.0);
+            self.put_pad(pad, spec.to_pad_slot(src_len));
+        }
+        specs.len()
+    }
+    fn paulstretch_source(&mut self, source: usize, factor: f32) -> Option<usize> {
+        let region = {
+            let p = self.project.lock().unwrap();
+            let src = p.sources.get(source)?;
+            let dur = src.duration();
+            if dur <= 0.01 {
+                return None;
+            }
+            let win_len = dur.min(3.0);
+            src.slice((dur * 0.2).min((dur - win_len).max(0.0)), win_len)
+        };
+        let stretched = chromagrain_core::stretch::paulstretch_source(&region, factor.clamp(2.0, 16.0));
+        let idx = {
+            let mut p = self.project.lock().unwrap();
+            p.add_source(stretched.clone())
+        };
+        if let Ok(mut u) = self.shared.ui_sources.lock() {
+            u.push(stretched.clone());
+        }
+        self.shared.send(Job::Decoded(Box::new(stretched)));
+        self.doc_rev += 1;
+        Some(idx)
+    }
     fn cutout_source(&mut self, source: usize, mode: &str) -> bool {
         let src_opt = {
             let p = self.project.lock().unwrap();

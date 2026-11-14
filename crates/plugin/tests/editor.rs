@@ -666,3 +666,52 @@ fn plugin_v005_videograin_snapshot_960x600() {
         eprintln!("wrote {}", path.display());
     }
 }
+
+#[test]
+fn plugin_v006_videograin_snapshot_960x600() {
+    use chromagrain_core::seq::PatternPreset;
+    use chromagrain_ui::{ChordChoice, Host, PerformHost, StageMode};
+    let mut p = plugin_with(clips());
+    let size = (960.0f32, 600.0f32);
+    let mut h = harness(size, editor_ui(&p));
+    h.run_steps(2);
+    {
+        let ui = h.state_mut();
+        ui.host.cutout_source(0, "person");
+        ui.studio.apply_pattern_preset(&mut ui.host, PatternPreset::AmbientWash);
+        assert_eq!(ui.studio.active_preset, Some(PatternPreset::AmbientWash));
+        let nw = ui.studio.trigger_chord_wash(&mut ui.host);
+        assert!(nw >= 8);
+        ui.studio.apply_pattern_preset(&mut ui.host, PatternPreset::Ukg2Step);
+        ui.studio.build_four_section_set(&mut ui.host);
+        ui.studio.trigger_ukg_kit(&mut ui.host);
+        ui.studio.pad_sculpt[0].chord = ChordChoice::Min9;
+        ui.host.load_pad(8, 2);
+        ui.host.load_pad(9, 0);
+        ui.host.set_quantize(0);
+        ui.host.set_stage_mode(StageMode::Collage);
+        ui.host.toggle_pad(8);
+        ui.host.toggle_pad(9);
+        ui.host.toggle_pad(0);
+        ui.studio.set_view(&mut ui.host, View::Perform);
+        ui.studio.punch_fx[0] = true;
+    }
+    h.run_steps(3);
+    play(&mut p, 0.12, 0.0, &[]);
+    h.get_by_label("isol8 solo lmf").click();
+    h.get_by_label("isol8 solo mf").click();
+    h.get_by_label("isol8 solo hmf").click();
+    h.run_steps(2);
+    play(&mut p, 0.08, 0.25, &[]);
+    h.run_steps(2);
+    assert_eq!(h.state().host.stage_mode(), Some(StageMode::Collage));
+
+    let img = h.render().expect("render v006 plugin snapshot");
+    if let Ok(dir) = std::env::var("VIDEOGRAIN_V006_SHOTS") {
+        let dir = std::path::Path::new(&dir);
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join("261114_videograin_ui_plugin_960x600_v006.png");
+        img.save(&path).unwrap();
+        eprintln!("wrote {}", path.display());
+    }
+}
