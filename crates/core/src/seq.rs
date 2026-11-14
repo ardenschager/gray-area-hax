@@ -150,6 +150,90 @@ impl SeqRow {
     }
 }
 
+/// 1-click zero-AI sequencer groove presets modeled on classic hardware sampler pockets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum PatternPreset {
+    #[default]
+    Ukg2Step,
+    DiscoFilterPump,
+    BoomBapDialogue,
+    KineticRatchet,
+    DillaDrunk,
+    Footwork332,
+    TapeDisintegration,
+}
+
+impl PatternPreset {
+    pub const ALL: [PatternPreset; 7] = [
+        PatternPreset::Ukg2Step,
+        PatternPreset::DiscoFilterPump,
+        PatternPreset::BoomBapDialogue,
+        PatternPreset::KineticRatchet,
+        PatternPreset::DillaDrunk,
+        PatternPreset::Footwork332,
+        PatternPreset::TapeDisintegration,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PatternPreset::Ukg2Step => "2-Step UKG",
+            PatternPreset::DiscoFilterPump => "Disco Pump",
+            PatternPreset::BoomBapDialogue => "Boom-Bap",
+            PatternPreset::KineticRatchet => "Kinetic Ratchet",
+            PatternPreset::DillaDrunk => "Dilla Drunk",
+            PatternPreset::Footwork332 => "Footwork 3-3-2",
+            PatternPreset::TapeDisintegration => "Tape Loop",
+        }
+    }
+
+    pub fn default_bpm(self) -> f32 {
+        match self {
+            PatternPreset::Ukg2Step => 132.0,
+            PatternPreset::DiscoFilterPump => 124.0,
+            PatternPreset::BoomBapDialogue => 112.0,
+            PatternPreset::KineticRatchet => 142.0,
+            PatternPreset::DillaDrunk => 92.0,
+            PatternPreset::Footwork332 => 152.0,
+            PatternPreset::TapeDisintegration => 74.0,
+        }
+    }
+
+    pub fn default_swing(self) -> f32 {
+        match self {
+            PatternPreset::Ukg2Step => 0.61,
+            PatternPreset::DiscoFilterPump => 0.53,
+            PatternPreset::BoomBapDialogue => 0.58,
+            PatternPreset::KineticRatchet => 0.51,
+            PatternPreset::DillaDrunk => 0.62,
+            PatternPreset::Footwork332 => 0.54,
+            PatternPreset::TapeDisintegration => 0.54,
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<PatternPreset> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "ukg" | "2step" | "2-step" | "2-step ukg" | "ukg2step" => Some(PatternPreset::Ukg2Step),
+            "disco" | "disco pump" | "discofilterpump" | "french" => {
+                Some(PatternPreset::DiscoFilterPump)
+            }
+            "boombap" | "boom-bap" | "dialogue" | "boombapdialogue" => {
+                Some(PatternPreset::BoomBapDialogue)
+            }
+            "ratchet" | "kinetic" | "kinetic ratchet" | "idm" => {
+                Some(PatternPreset::KineticRatchet)
+            }
+            "dilla" | "drunk" | "dilla drunk" | "dilladrunk" => Some(PatternPreset::DillaDrunk),
+            "footwork" | "juke" | "footwork 3-3-2" | "footwork332" | "332" => {
+                Some(PatternPreset::Footwork332)
+            }
+            "tape" | "tapeloop" | "tape loop" | "disintegration" | "tapedisintegration" => {
+                Some(PatternPreset::TapeDisintegration)
+            }
+            _ => None,
+        }
+    }
+}
+
 /// A step pattern: a grid of rows x steps covering `length_beats`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -203,30 +287,23 @@ impl StepPattern {
         }
     }
 
-    /// Seed an authentic skipping **134 BPM 2-step UKG groove** across this pattern's
-    /// rows: sets `self.swing = 0.61` (`61%` UKG shuffle) and programs each row based
-    /// on `row.sculpt.stamp` (or row index when `Stamp::Raw`):
-    /// - `Kick`: skipping 2-step (`0, 10` + ghost `7` every 2nd bar)
-    /// - `Snare`: crisp rim/snare (`4, 12` + turnaround ghost `15` every 4th bar)
-    /// - `VoxPerc` / `Hat`: swung off-16th vocal-percussion syllables (`2, 3, 7, 9, 11, 14, 15`
-    ///   with slice locks & `x2` ratchet)
-    /// - `Chord`: syncopated `Min7` / `Sus4` garage vocal-organ stabs (`0, 6, 14`)
-    /// - `Pluck`: deep UKG syncopated sub-bass pocket (`0, 3, 10, 13`)
-    /// - `Phrase`: choked (`choke_group = 1`) absurd spoken vocal hook on bar turnarounds!
-    ///
-    /// If `self.rows` is currently empty and `sources` is non-empty, curates a 6-row UKG
-    /// vocal kit across `sources` automatically.
+    /// Seed an authentic skipping **134 BPM 2-step UKG groove** across this pattern's rows.
     pub fn seed_ukg_2step(&mut self, sources: &[Source]) {
+        self.apply_preset(PatternPreset::Ukg2Step, sources);
+    }
+
+    /// Apply any of the 7 zero-AI [`PatternPreset`] grooves across this pattern's rows,
+    /// auto-curating a 6-row canonical kit from `sources` when `self.rows` is empty.
+    pub fn apply_preset(&mut self, preset: PatternPreset, sources: &[Source]) {
         use crate::grain::Stamp;
         if self.steps_per_beat != 4 || self.length_beats < 4.0 {
             self.set_grid(self.length_beats.max(4.0), 4);
         }
-        self.swing = 0.61;
+        self.swing = preset.default_swing();
 
         if self.rows.is_empty() && !sources.is_empty() {
             let curated = crate::chop::build_ukg_vox_kit_across_sources(sources);
             let n_st = self.n_steps().max(16);
-            // Pick 1 representative pad per core UKG lane: Kick, Snare, VoxPerc, Chord, Pluck, Phrase.
             for target_stamp in [
                 Stamp::Kick,
                 Stamp::Snare,
@@ -253,13 +330,11 @@ impl StepPattern {
 
         let n_st = self.n_steps().max(16);
         for (ri, row) in self.rows.iter_mut().enumerate() {
+            row.muted = false;
             row.mode = RowMode::Steps;
-            if row.steps.len() < 16 {
-                row.steps.resize(n_st, Step::default());
-            } else {
-                for s in &mut row.steps {
-                    *s = Step::default();
-                }
+            row.steps.resize(n_st, Step::default());
+            for s in &mut row.steps {
+                *s = Step::default();
             }
             let raw_stamp = if row.sculpt.stamp != Stamp::Raw {
                 row.sculpt.stamp
@@ -282,7 +357,11 @@ impl StepPattern {
                 row.sculpt = VoiceSculpt::preset(role);
                 row.grains.sculpt = row.sculpt;
             }
-            if row.grains.adsr.is_none() {
+            let is_perc_role = matches!(
+                role,
+                Stamp::Kick | Stamp::Snare | Stamp::VoxPerc | Stamp::Hat
+            );
+            if !is_perc_role && row.grains.adsr.is_none() {
                 row.grains.adsr = Some(crate::envelope::Adsr {
                     attack: 0.002,
                     decay: 0.08,
@@ -293,58 +372,31 @@ impl StepPattern {
                 });
             }
             let n_slices = sources.get(row.source).map_or(0, |s| s.slices.len());
+            let hook_slice = sources.get(row.source).and_then(|src| {
+                src.slices
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, sl)| sl.len() >= 0.45)
+                    .max_by(|(_, a), (_, b)| a.bands[2].total_cmp(&b.bands[2]))
+                    .map(|(idx, _)| idx as u16)
+            });
 
-            match role {
-                Stamp::Kick => {
-                    row.choke_group = 2;
-                    row.grains.duration = row.grains.duration.min(0.20);
-                    row.steps[0] = Step { on: true, gain: 1.0, ..Default::default() };
-                    row.steps[10] = Step { on: true, gain: 0.96, ..Default::default() };
-                    row.steps[7] = Step {
-                        on: true,
-                        gain: 0.68,
-                        every_n: 2,
-                        every_offset: 1,
-                        ..Default::default()
-                    };
-                }
-                Stamp::Snare => {
-                    row.grains.duration = row.grains.duration.min(0.18);
-                    row.steps[4] = Step { on: true, gain: 0.95, ..Default::default() };
-                    row.steps[12] = Step { on: true, gain: 0.98, ..Default::default() };
-                    row.steps[15] = Step {
-                        on: true,
-                        gain: 0.50,
-                        pitch: 1.5,
-                        every_n: 4,
-                        every_offset: 3,
-                        ..Default::default()
-                    };
-                }
-                Stamp::VoxPerc | Stamp::Hat => {
-                    row.sculpt = VoiceSculpt::preset(Stamp::VoxPerc);
-                    row.grains.sculpt = row.sculpt;
-                    row.grains.duration = 0.042;
-                    row.choke_group = 3;
-                    let vox_steps: [(usize, f32, f32, u8); 7] = [
-                        (2, 0.84, 0.0, 1),
-                        (3, 0.64, 2.0, 1),
-                        (7, 0.76, -1.0, 1),
-                        (9, 0.68, 1.5, 1),
-                        (11, 0.86, 0.0, 1),
-                        (14, 0.80, 2.5, 2),
-                        (15, 0.66, -1.5, 1),
-                    ];
-                    let norm_fallback = [0.11f32, 0.24, 0.37, 0.51, 0.63, 0.76, 0.88];
-                    for (k, &(st_i, gain, pitch, ratch)) in vox_steps.iter().enumerate() {
-                        if st_i < row.steps.len() {
-                            row.steps[st_i] = Step {
+            let put_vox_steps = |row: &mut SeqRow, spec: &[(usize, f32, f32, u8, f32)]| {
+                let norm_fb = [0.11f32, 0.24, 0.37, 0.51, 0.63, 0.76, 0.88];
+                let bars = (row.steps.len() / 16).max(1);
+                for b in 0..bars {
+                    let base = b * 16;
+                    for (k, &(st_i, gain, pitch, ratch, off)) in spec.iter().enumerate() {
+                        let idx = base + st_i;
+                        if idx < row.steps.len() {
+                            row.steps[idx] = Step {
                                 on: true,
                                 gain,
                                 pitch,
+                                offset: off,
                                 length: 0.85,
-                                slice: if n_slices == 0 { norm_fallback[k] } else { -1.0 },
-                                slice_index: (n_slices > 0).then_some((k % n_slices) as u16),
+                                slice: if n_slices == 0 { norm_fb[k % norm_fb.len()] } else { -1.0 },
+                                slice_index: (n_slices > 0).then_some(((k + b) % n_slices) as u16),
                                 ratchet: ratch,
                                 ratchet_pitch: if ratch > 1 { 2.0 } else { 0.0 },
                                 ..Default::default()
@@ -352,58 +404,525 @@ impl StepPattern {
                         }
                     }
                 }
-                Stamp::Chord => {
+            };
+
+            let bars = (row.steps.len() / 16).max(1);
+            match (preset, role) {
+                // ---------------- 1. UKG 2-STEP (`132 BPM`, `0.61` swing) ----------------
+                (PatternPreset::Ukg2Step, Stamp::Kick) => {
+                    row.choke_group = 2;
+                    row.sculpt.lpf_hz = row.sculpt.lpf_hz.min(158.0);
+                    row.grains.sculpt = row.sculpt;
+                    row.grains.duration = row.grains.duration.min(0.20);
+                    for b in 0..bars {
+                        let o = b * 16;
+                        row.steps[o] = Step { on: true, gain: 1.0, ..Default::default() };
+                        row.steps[o + 10] = Step { on: true, gain: 0.96, ..Default::default() };
+                        row.steps[o + 7] = Step {
+                            on: true,
+                            gain: 0.68,
+                            every_n: 2,
+                            every_offset: 1,
+                            ..Default::default()
+                        };
+                    }
+                }
+                (PatternPreset::Ukg2Step, Stamp::Snare) => {
+                    row.grains.duration = row.grains.duration.min(0.18);
+                    for b in 0..bars {
+                        let o = b * 16;
+                        row.steps[o + 4] = Step { on: true, gain: 0.95, ..Default::default() };
+                        row.steps[o + 12] = Step { on: true, gain: 0.98, ..Default::default() };
+                        row.steps[o + 15] = Step {
+                            on: true,
+                            gain: 0.50,
+                            pitch: 1.5,
+                            offset: 0.06,
+                            every_n: 4,
+                            every_offset: 3,
+                            ..Default::default()
+                        };
+                    }
+                }
+                (PatternPreset::Ukg2Step, Stamp::VoxPerc | Stamp::Hat) => {
+                    row.sculpt = VoiceSculpt::preset(Stamp::VoxPerc);
+                    row.grains.sculpt = row.sculpt;
+                    row.grains.duration = 0.042;
+                    row.choke_group = 3;
+                    put_vox_steps(
+                        row,
+                        &[
+                            (2, 0.84, 0.0, 1, 0.0),
+                            (3, 0.64, 2.0, 1, 0.0),
+                            (7, 0.76, -1.0, 1, 0.0),
+                            (9, 0.68, 1.5, 1, 0.0),
+                            (11, 0.86, 0.0, 1, 0.0),
+                            (14, 0.80, 2.5, 2, 0.0),
+                            (15, 0.66, -1.5, 1, 0.0),
+                        ],
+                    );
+                }
+                (PatternPreset::Ukg2Step, Stamp::Chord) => {
                     row.choke_group = 4;
                     if row.sculpt.chord == ChordVoicing::Off {
                         row.sculpt.chord = ChordVoicing::Min7;
                     }
+                    row.sculpt.hpf_hz = row.sculpt.hpf_hz.max(305.0);
+                    row.grains.sculpt = row.sculpt;
                     row.grains.duration = row.grains.duration.clamp(0.22, 0.42);
-                    row.steps[0] = Step {
-                        on: true,
-                        gain: 0.86,
-                        length: 0.90,
-                        chord: ChordVoicing::Min7,
-                        ..Default::default()
-                    };
-                    row.steps[6] = Step {
-                        on: true,
-                        gain: 0.82,
-                        pitch: 3.0,
-                        length: 0.75,
-                        chord: ChordVoicing::Min7,
-                        ..Default::default()
-                    };
-                    row.steps[14] = Step {
-                        on: true,
-                        gain: 0.78,
-                        pitch: -2.0,
-                        length: 0.70,
-                        chord: ChordVoicing::Sus4,
-                        ..Default::default()
-                    };
+                    for b in 0..bars {
+                        let o = b * 16;
+                        row.steps[o] = Step { on: true, gain: 0.86, length: 0.90, chord: ChordVoicing::Min7, ..Default::default() };
+                        row.steps[o + 6] = Step { on: true, gain: 0.82, pitch: 3.0, length: 0.75, chord: ChordVoicing::Min7, ..Default::default() };
+                        row.steps[o + 14] = Step { on: true, gain: 0.78, pitch: -2.0, length: 0.70, chord: ChordVoicing::Sus4, ..Default::default() };
+                    }
                 }
-                Stamp::Pluck => {
+                (PatternPreset::Ukg2Step, Stamp::Pluck) => {
                     if row.sculpt.sub_exciter < 0.2 {
                         row.sculpt.pitch_semitones = -12.0;
-                        row.sculpt.sub_exciter = 0.75;
-                        row.sculpt.lpf_hz = 260.0;
+                        row.sculpt.sub_exciter = 0.80;
                     }
+                    row.sculpt.lpf_hz = row.sculpt.lpf_hz.min(158.0);
+                    row.grains.sculpt = row.sculpt;
+                    row.choke_group = 2;
                     row.grains.duration = row.grains.duration.clamp(0.18, 0.34);
-                    for (st_i, pt, gn) in [(0usize, 0.0f32, 0.92f32), (3, 3.0, 0.80), (10, 0.0, 0.90), (13, -2.0, 0.84)] {
-                        if st_i < row.steps.len() {
-                            row.steps[st_i] = Step {
-                                on: true,
-                                pitch: pt,
-                                gain: gn,
-                                ..Default::default()
-                            };
+                    for b in 0..bars {
+                        let o = b * 16;
+                        for &(st_i, pt, gn) in &[(0usize, 0.0f32, 0.92f32), (3, 3.0, 0.80), (10, 0.0, 0.90), (13, -2.0, 0.84)] {
+                            row.steps[o + st_i] = Step { on: true, pitch: pt, gain: gn, ..Default::default() };
                         }
                     }
                 }
-                Stamp::Phrase | Stamp::Raw | Stamp::Wash | Stamp::TapeLoop | Stamp::Disintegrate => {
-                    row.sculpt = VoiceSculpt::preset(Stamp::Phrase);
+
+                // ---------------- 2. DISCO FILTER PUMP (`124 BPM`, `0.53` swing) ----------------
+                (PatternPreset::DiscoFilterPump, Stamp::Kick) => {
+                    row.choke_group = 2;
+                    row.sculpt.lpf_hz = row.sculpt.lpf_hz.min(158.0);
                     row.grains.sculpt = row.sculpt;
+                    row.grains.duration = row.grains.duration.min(0.20);
+                    for b in 0..bars {
+                        let o = b * 16;
+                        for &st_i in &[0usize, 4, 8, 12] {
+                            row.steps[o + st_i] = Step { on: true, gain: 0.98, ..Default::default() };
+                        }
+                    }
+                }
+                (PatternPreset::DiscoFilterPump, Stamp::Snare) => {
+                    row.grains.duration = row.grains.duration.min(0.19);
+                    for b in 0..bars {
+                        let o = b * 16;
+                        row.steps[o + 4] = Step { on: true, gain: 0.95, ..Default::default() };
+                        row.steps[o + 12] = Step { on: true, gain: 0.96, ..Default::default() };
+                    }
+                }
+                (PatternPreset::DiscoFilterPump, Stamp::VoxPerc | Stamp::Hat) => {
+                    row.sculpt = VoiceSculpt::preset(Stamp::VoxPerc);
+                    row.grains.sculpt = row.sculpt;
+                    row.grains.duration = 0.046;
+                    row.choke_group = 3;
+                    put_vox_steps(
+                        row,
+                        &[
+                            (2, 0.86, 2.0, 1, 0.0),
+                            (3, 0.62, 0.0, 1, 0.0),
+                            (6, 0.88, 2.0, 1, 0.0),
+                            (7, 0.64, -1.0, 1, 0.0),
+                            (10, 0.86, 2.0, 1, 0.0),
+                            (14, 0.90, 3.0, 2, 0.0),
+                            (15, 0.66, 0.0, 1, 0.0),
+                        ],
+                    );
+                }
+                (PatternPreset::DiscoFilterPump, Stamp::Chord) => {
+                    row.choke_group = 4;
+                    row.sculpt.chord = ChordVoicing::Min9;
+                    row.sculpt.hpf_hz = row.sculpt.hpf_hz.max(305.0);
+                    row.grains.sculpt = row.sculpt;
+                    row.grains.duration = row.grains.duration.clamp(0.46, 0.56);
+                    let roots = [0.0f32, -4.0, 5.0, 7.0];
+                    for b in 0..bars {
+                        let o = b * 16;
+                        let rt = roots[b % roots.len()];
+                        // 4-on-the-floor French-Touch chord bed (ducked -6.5 dB on every kick by
+                        // `apply_pocket_ducking` so it pumps audibly while keeping stage panels 100% lit!).
+                        row.steps[o] = Step { on: true, pitch: rt, gain: 0.86, length: 1.30, chord: ChordVoicing::Min9, ..Default::default() };
+                        row.steps[o + 4] = Step { on: true, pitch: rt, gain: 0.78, length: 1.25, chord: ChordVoicing::Min7, ..Default::default() };
+                        row.steps[o + 8] = Step { on: true, pitch: rt + 3.0, gain: 0.82, length: 1.30, chord: ChordVoicing::Min9, ..Default::default() };
+                        row.steps[o + 12] = Step { on: true, pitch: rt, gain: 0.78, length: 1.25, chord: ChordVoicing::Min7, ..Default::default() };
+                    }
+                }
+                (PatternPreset::DiscoFilterPump, Stamp::Pluck) => {
+                    row.sculpt.pitch_semitones = -12.0;
+                    row.sculpt.sub_exciter = 0.85;
+                    row.sculpt.lpf_hz = 155.0;
+                    row.grains.sculpt = row.sculpt;
+                    row.choke_group = 2;
+                    row.grains.duration = 0.24;
+                    let roots = [0.0f32, -4.0, 5.0, 7.0];
+                    for b in 0..bars {
+                        let o = b * 16;
+                        let rt = roots[b % roots.len()];
+                        for &(st_i, oct, gn) in &[(2usize, 0.0f32, 0.94f32), (6, 12.0, 0.88), (10, 0.0, 0.94), (14, 7.0, 0.86)] {
+                            row.steps[o + st_i] = Step { on: true, pitch: rt + oct, gain: gn, length: 0.82, ..Default::default() };
+                        }
+                    }
+                }
+
+                // ---------------- 3. BOOM-BAP DIALOGUE (`112 BPM`, `0.58` swing) ----------------
+                (PatternPreset::BoomBapDialogue, Stamp::Kick) => {
+                    row.choke_group = 2;
+                    row.sculpt.lpf_hz = row.sculpt.lpf_hz.min(158.0);
+                    row.grains.sculpt = row.sculpt;
+                    row.grains.duration = row.grains.duration.min(0.22);
+                    for b in 0..bars {
+                        let o = b * 16;
+                        row.steps[o] = Step { on: true, gain: 1.0, ..Default::default() };
+                        row.steps[o + 3] = Step { on: true, gain: 0.75, ..Default::default() };
+                        row.steps[o + 8] = Step { on: true, gain: 0.94, ..Default::default() };
+                        row.steps[o + 10] = Step { on: true, gain: 0.88, ..Default::default() };
+                        row.steps[o + 14] = Step { on: true, gain: 0.70, every_n: 2, every_offset: 1, ..Default::default() };
+                    }
+                }
+                (PatternPreset::BoomBapDialogue, Stamp::Snare) => {
+                    row.grains.duration = row.grains.duration.min(0.20);
+                    for b in 0..bars {
+                        let o = b * 16;
+                        row.steps[o + 4] = Step { on: true, gain: 0.96, ..Default::default() };
+                        row.steps[o + 12] = Step { on: true, gain: 0.98, ..Default::default() };
+                        row.steps[o + 15] = Step { on: true, gain: 0.44, offset: 0.05, ..Default::default() };
+                    }
+                }
+                (PatternPreset::BoomBapDialogue, Stamp::VoxPerc | Stamp::Hat) => {
+                    row.sculpt = VoiceSculpt::preset(Stamp::VoxPerc);
+                    row.grains.sculpt = row.sculpt;
+                    row.grains.duration = 0.048;
+                    row.choke_group = 3;
+                    put_vox_steps(
+                        row,
+                        &[
+                            (0, 0.72, 0.0, 1, 0.0),
+                            (2, 0.80, 1.0, 1, 0.0),
+                            (3, 0.68, -1.5, 1, 0.0),
+                            (6, 0.80, 1.0, 1, 0.0),
+                            (7, 0.70, 2.0, 1, 0.0),
+                            (9, 0.68, 0.0, 1, 0.0),
+                            (11, 0.78, 1.5, 1, 0.0),
+                            (14, 0.82, 2.0, 1, 0.0),
+                            (15, 0.68, -1.0, 2, 0.0),
+                        ],
+                    );
+                }
+                (PatternPreset::BoomBapDialogue, Stamp::Chord) => {
+                    row.choke_group = 4;
+                    row.sculpt.chord = ChordVoicing::Min7;
+                    row.sculpt.hpf_hz = row.sculpt.hpf_hz.max(305.0);
+                    row.grains.sculpt = row.sculpt;
+                    row.grains.duration = row.grains.duration.clamp(0.26, 0.46);
+                    for b in 0..bars {
+                        let o = b * 16;
+                        row.steps[o] = Step { on: true, gain: 0.84, length: 0.90, chord: ChordVoicing::Min7, ..Default::default() };
+                        row.steps[o + 10] = Step { on: true, pitch: 3.0, gain: 0.80, length: 0.80, chord: ChordVoicing::Min7, ..Default::default() };
+                    }
+                }
+                (PatternPreset::BoomBapDialogue, Stamp::Pluck) => {
+                    row.sculpt.pitch_semitones = -12.0;
+                    row.sculpt.sub_exciter = 0.82;
+                    row.sculpt.lpf_hz = 155.0;
+                    row.grains.sculpt = row.sculpt;
+                    row.choke_group = 2;
+                    row.grains.duration = 0.26;
+                    for b in 0..bars {
+                        let o = b * 16;
+                        for &(st_i, pt, gn) in &[(0usize, 0.0f32, 0.94f32), (6, 7.0, 0.82), (10, 0.0, 0.90), (14, 5.0, 0.80)] {
+                            row.steps[o + st_i] = Step { on: true, pitch: pt, gain: gn, ..Default::default() };
+                        }
+                    }
+                }
+
+                // ---------------- 4. KINETIC RATCHET (`142 BPM`, `0.51` swing) ----------------
+                (PatternPreset::KineticRatchet, Stamp::Kick) => {
+                    row.choke_group = 2;
+                    row.sculpt.lpf_hz = row.sculpt.lpf_hz.min(158.0);
+                    row.grains.sculpt = row.sculpt;
+                    row.grains.duration = 0.16;
+                    for b in 0..bars {
+                        let o = b * 16;
+                        for &(st_i, gn) in &[(0usize, 1.0f32), (3, 0.84), (7, 0.80), (10, 0.94), (13, 0.82)] {
+                            row.steps[o + st_i] = Step { on: true, gain: gn, ..Default::default() };
+                        }
+                    }
+                }
+                (PatternPreset::KineticRatchet, Stamp::Snare) => {
+                    row.grains.duration = 0.16;
+                    for b in 0..bars {
+                        let o = b * 16;
+                        row.steps[o + 4] = Step { on: true, gain: 0.95, ..Default::default() };
+                        row.steps[o + 12] = Step {
+                            on: true,
+                            gain: 0.98,
+                            ratchet: 4,
+                            ratchet_pitch: 2.0,
+                            ..Default::default()
+                        };
+                    }
+                }
+                (PatternPreset::KineticRatchet, Stamp::VoxPerc | Stamp::Hat) => {
+                    row.sculpt = VoiceSculpt::preset(Stamp::VoxPerc);
+                    row.grains.sculpt = row.sculpt;
+                    row.grains.duration = 0.038;
+                    row.choke_group = 3;
+                    row.set_steps(12);
+                    for &(st_i, gn, pt, rt) in &[
+                        (0usize, 0.82f32, 0.0f32, 1u8),
+                        (2, 0.86, 2.0, 2),
+                        (5, 0.80, -1.0, 1),
+                        (7, 0.88, 3.0, 3),
+                        (9, 0.78, 1.0, 1),
+                        (11, 0.92, 2.0, 4),
+                    ] {
+                        row.steps[st_i] = Step {
+                            on: true,
+                            gain: gn,
+                            pitch: pt,
+                            ratchet: rt,
+                            ratchet_pitch: if rt > 1 { 1.5 } else { 0.0 },
+                            slice_index: (n_slices > 0).then_some((st_i % n_slices) as u16),
+                            ..Default::default()
+                        };
+                    }
+                }
+                (PatternPreset::KineticRatchet, Stamp::Chord) => {
+                    row.choke_group = 4;
+                    row.sculpt.chord = ChordVoicing::Sus4;
+                    row.sculpt.hpf_hz = row.sculpt.hpf_hz.max(305.0);
+                    row.grains.sculpt = row.sculpt;
+                    row.grains.duration = 0.22;
+                    for b in 0..bars {
+                        let o = b * 16;
+                        row.steps[o] = Step { on: true, gain: 0.84, chord: ChordVoicing::Sus4, ..Default::default() };
+                        row.steps[o + 9] = Step { on: true, pitch: 5.0, gain: 0.80, chord: ChordVoicing::Min7, ..Default::default() };
+                    }
+                }
+                (PatternPreset::KineticRatchet, Stamp::Pluck) => {
+                    row.sculpt.pitch_semitones = -12.0;
+                    row.sculpt.sub_exciter = 0.78;
+                    row.sculpt.lpf_hz = 160.0;
+                    row.sculpt.resonance_q = 2.4;
+                    row.grains.sculpt = row.sculpt;
+                    row.choke_group = 2;
+                    row.grains.duration = 0.18;
+                    for b in 0..bars {
+                        let o = b * 16;
+                        for &(st_i, pt, gn) in &[(0usize, 0.0f32, 0.92f32), (2, 7.0, 0.78), (6, 3.0, 0.84), (9, 0.0, 0.86), (11, 5.0, 0.80), (14, -2.0, 0.84)] {
+                            row.steps[o + st_i] = Step { on: true, pitch: pt, gain: gn, ..Default::default() };
+                        }
+                    }
+                }
+
+                // ---------------- 5. DILLA DRUNK SOUL (`92 BPM`, `0.62` swing) ----------------
+                (PatternPreset::DillaDrunk, Stamp::Kick) => {
+                    row.choke_group = 2;
+                    row.sculpt.lpf_hz = row.sculpt.lpf_hz.min(158.0);
+                    row.grains.sculpt = row.sculpt;
+                    row.grains.duration = 0.22;
+                    for b in 0..bars {
+                        let o = b * 16;
+                        row.steps[o] = Step { on: true, gain: 1.0, ..Default::default() };
+                        row.steps[o + 7] = Step { on: true, gain: 0.78, offset: -0.05, ..Default::default() };
+                        row.steps[o + 10] = Step { on: true, gain: 0.94, offset: 0.03, ..Default::default() };
+                        row.steps[o + 15] = Step { on: true, gain: 0.68, offset: -0.04, ..Default::default() };
+                    }
+                }
+                (PatternPreset::DillaDrunk, Stamp::Snare) => {
+                    row.grains.duration = 0.19;
+                    for b in 0..bars {
+                        let o = b * 16;
+                        row.steps[o + 4] = Step { on: true, gain: 0.94, offset: 0.11, ..Default::default() };
+                        row.steps[o + 12] = Step { on: true, gain: 0.96, offset: 0.11, ..Default::default() };
+                        row.steps[o + 15] = Step { on: true, gain: 0.42, offset: 0.09, every_n: 2, ..Default::default() };
+                    }
+                }
+                (PatternPreset::DillaDrunk, Stamp::VoxPerc | Stamp::Hat) => {
+                    row.sculpt = VoiceSculpt::preset(Stamp::VoxPerc);
+                    row.grains.sculpt = row.sculpt;
+                    row.grains.duration = 0.048;
+                    row.choke_group = 3;
+                    put_vox_steps(
+                        row,
+                        &[
+                            (2, 0.78, 0.0, 1, 0.07),
+                            (3, 0.64, 1.5, 1, 0.04),
+                            (6, 0.80, 0.0, 1, 0.07),
+                            (7, 0.66, -1.0, 1, 0.03),
+                            (10, 0.78, 0.0, 1, 0.07),
+                            (11, 0.68, 2.0, 1, 0.04),
+                            (14, 0.82, 1.0, 1, 0.07),
+                        ],
+                    );
+                }
+                (PatternPreset::DillaDrunk, Stamp::Chord) => {
+                    row.choke_group = 4;
+                    row.sculpt.chord = ChordVoicing::Min9;
+                    row.sculpt.hpf_hz = row.sculpt.hpf_hz.max(305.0);
+                    row.grains.sculpt = row.sculpt;
+                    row.grains.duration = 0.36;
+                    for b in 0..bars {
+                        let o = b * 16;
+                        let pt = if b % 2 == 0 { 0.0 } else { 5.0 };
+                        row.steps[o] = Step { on: true, pitch: pt, gain: 0.85, length: 0.95, offset: 0.04, chord: ChordVoicing::Min9, ..Default::default() };
+                        row.steps[o + 8] = Step { on: true, pitch: pt + 3.0, gain: 0.78, length: 0.85, offset: 0.05, chord: ChordVoicing::Min7, ..Default::default() };
+                    }
+                }
+                (PatternPreset::DillaDrunk, Stamp::Pluck) => {
+                    row.sculpt.pitch_semitones = -12.0;
+                    row.sculpt.sub_exciter = 0.82;
+                    row.sculpt.lpf_hz = 155.0;
+                    row.grains.sculpt = row.sculpt;
+                    row.choke_group = 2;
+                    row.grains.duration = 0.28;
+                    for b in 0..bars {
+                        let o = b * 16;
+                        for &(st_i, pt, gn) in &[(0usize, 0.0f32, 0.92f32), (6, 7.0, 0.82), (10, 10.0, 0.86), (14, 7.0, 0.80)] {
+                            row.steps[o + st_i] = Step { on: true, pitch: pt, gain: gn, offset: 0.05, ..Default::default() };
+                        }
+                    }
+                }
+
+                // ---------------- 6. FOOTWORK / JUNGLE 3-3-2 (`152 BPM`, `0.54` swing) ----------------
+                (PatternPreset::Footwork332, Stamp::Kick) => {
+                    row.choke_group = 2;
+                    row.sculpt.lpf_hz = row.sculpt.lpf_hz.min(158.0);
+                    row.grains.sculpt = row.sculpt;
+                    row.grains.duration = 0.18;
+                    for b in 0..bars {
+                        let o = b * 16;
+                        for &(st_i, gn) in &[(0usize, 1.0f32), (3, 0.92), (6, 0.94), (10, 0.88), (12, 0.90)] {
+                            row.steps[o + st_i] = Step { on: true, gain: gn, ..Default::default() };
+                        }
+                    }
+                }
+                (PatternPreset::Footwork332, Stamp::Snare) => {
+                    row.grains.duration = 0.15;
+                    for b in 0..bars {
+                        let o = b * 16;
+                        row.steps[o + 4] = Step { on: true, gain: 0.92, ..Default::default() };
+                        row.steps[o + 12] = Step { on: true, gain: 0.96, ..Default::default() };
+                        row.steps[o + 14] = Step { on: true, gain: 0.82, ratchet: 2, every_n: 2, every_offset: 1, ..Default::default() };
+                        row.steps[o + 15] = Step { on: true, gain: 0.88, ratchet: 4, ratchet_pitch: -1.0, every_n: 2, every_offset: 1, ..Default::default() };
+                    }
+                }
+                (PatternPreset::Footwork332, Stamp::VoxPerc | Stamp::Hat) => {
+                    row.sculpt = VoiceSculpt::preset(Stamp::VoxPerc);
+                    row.grains.sculpt = row.sculpt;
+                    row.grains.duration = 0.045;
+                    row.choke_group = 3;
+                    put_vox_steps(
+                        row,
+                        &[
+                            (0, 0.84, 0.0, 1, 0.0),
+                            (2, 0.78, 3.0, 1, 0.0),
+                            (3, 0.88, 0.0, 1, 0.0),
+                            (6, 0.88, 2.0, 2, 0.0),
+                            (8, 0.82, 0.0, 1, 0.0),
+                            (11, 0.86, 2.0, 1, 0.0),
+                            (14, 0.90, 3.0, 2, 0.0),
+                        ],
+                    );
+                }
+                (PatternPreset::Footwork332, Stamp::Chord) => {
+                    row.choke_group = 4;
+                    row.sculpt.chord = ChordVoicing::Min7;
+                    row.sculpt.hpf_hz = row.sculpt.hpf_hz.max(305.0);
+                    row.grains.sculpt = row.sculpt;
+                    row.grains.duration = 0.24;
+                    for b in 0..bars {
+                        let o = b * 16;
+                        row.steps[o] = Step { on: true, gain: 0.82, chord: ChordVoicing::Min7, ..Default::default() };
+                        row.steps[o + 12] = Step { on: true, pitch: 3.0, gain: 0.78, chord: ChordVoicing::Min7, ..Default::default() };
+                    }
+                }
+                (PatternPreset::Footwork332, Stamp::Pluck) => {
+                    row.sculpt.pitch_semitones = -12.0;
+                    row.sculpt.sub_exciter = 0.88;
+                    row.sculpt.lpf_hz = 152.0;
+                    row.grains.sculpt = row.sculpt;
+                    row.choke_group = 2;
+                    row.grains.duration = 0.36;
+                    for b in 0..bars {
+                        let o = b * 16;
+                        row.steps[o] = Step { on: true, gain: 0.95, length: 0.95, ..Default::default() };
+                        row.steps[o + 6] = Step { on: true, pitch: 3.0, gain: 0.90, length: 0.90, ..Default::default() };
+                    }
+                }
+
+                // ---------------- 7. TAPE DISINTEGRATION (`74 BPM`, `0.54` swing) ----------------
+                (PatternPreset::TapeDisintegration, Stamp::Kick) => {
+                    row.choke_group = 2;
+                    row.sculpt.lpf_hz = 120.0;
+                    row.grains.sculpt = row.sculpt;
+                    row.grains.duration = 0.26;
+                    row.steps[0] = Step { on: true, gain: 0.55, every_n: 2, ..Default::default() };
+                }
+                (PatternPreset::TapeDisintegration, Stamp::Snare) => {
+                    row.muted = true;
+                }
+                (PatternPreset::TapeDisintegration, Stamp::VoxPerc | Stamp::Hat) => {
+                    row.mode = RowMode::Loop;
+                    row.sculpt = VoiceSculpt {
+                        free_loop_secs: Some(3.7),
+                        wow_flutter: 0.42,
+                        disintegrate: 0.55,
+                        hpf_hz: 260.0,
+                        lpf_hz: 2400.0,
+                        pocket_carve: true,
+                        ..VoiceSculpt::preset(Stamp::TapeLoop)
+                    };
+                    row.grains.sculpt = row.sculpt;
+                    row.grains.gain = 0.52;
+                }
+                (PatternPreset::TapeDisintegration, Stamp::Chord) => {
+                    row.choke_group = 4;
+                    row.sculpt = VoiceSculpt {
+                        chord: ChordVoicing::Min9,
+                        wow_flutter: 0.45,
+                        disintegrate: 0.48,
+                        hpf_hz: 240.0,
+                        lpf_hz: 1950.0,
+                        pocket_carve: true,
+                        ..VoiceSculpt::preset(Stamp::Chord)
+                    };
+                    row.grains.sculpt = row.sculpt;
+                    row.grains.duration = 1.60;
+                    row.steps[0] = Step { on: true, gain: 0.82, length: 1.0, chord: ChordVoicing::Min9, ..Default::default() };
+                }
+                (PatternPreset::TapeDisintegration, Stamp::Pluck) => {
+                    row.mode = RowMode::Loop;
+                    row.sculpt = VoiceSculpt {
+                        free_loop_secs: Some(5.3),
+                        pitch_semitones: -12.0,
+                        wow_flutter: 0.38,
+                        disintegrate: 0.40,
+                        hpf_hz: 42.0,
+                        lpf_hz: 420.0,
+                        ..VoiceSculpt::preset(Stamp::TapeLoop)
+                    };
+                    row.grains.sculpt = row.sculpt;
+                    row.grains.gain = 0.62;
+                }
+
+                // ---------------- HERO PHRASE LANE (ALL 7 PRESETS) ----------------
+                (_, Stamp::Phrase | Stamp::Raw | Stamp::Wash | Stamp::TapeLoop | Stamp::Disintegrate) => {
+                    let mut sc = VoiceSculpt::preset(Stamp::Phrase);
+                    sc.hpf_hz = 215.0;
+                    if preset == PatternPreset::TapeDisintegration {
+                        sc.hpf_hz = 320.0;
+                        sc.lpf_hz = 2600.0;
+                        sc.wow_flutter = 0.30;
+                    }
+                    row.sculpt = sc;
+                    row.grains.sculpt = sc;
                     row.choke_group = 1;
+                    row.grains.choke_group = 1;
                     row.grains.duration = row.grains.duration.clamp(0.65, 1.45);
                     if sources
                         .get(row.source)
@@ -412,40 +931,228 @@ impl StepPattern {
                     {
                         row.collage_cutout = true;
                     }
-                    let hook_slice = sources.get(row.source).and_then(|src| {
-                        src.slices
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, sl)| sl.len() >= 0.45)
-                            .max_by(|(_, a), (_, b)| a.bands[2].total_cmp(&b.bands[2]))
-                            .map(|(idx, _)| idx as u16)
-                    });
-                    // Choked stutter teaser on step 10 + full spoken hook on bar turnaround (step 12)!
-                    if 10 < row.steps.len() {
-                        row.steps[10] = Step {
-                            on: true,
-                            gain: 0.88,
-                            length: 0.22,
-                            slice_index: hook_slice,
-                            every_n: 2,
-                            every_offset: 1,
-                            ..Default::default()
-                        };
-                    }
-                    if 12 < row.steps.len() {
-                        row.steps[12] = Step {
-                            on: true,
-                            gain: 0.98,
-                            length: 1.0,
-                            slice_index: hook_slice,
-                            every_n: 2,
-                            every_offset: 1,
-                            ..Default::default()
-                        };
+                    match preset {
+                        PatternPreset::BoomBapDialogue => {
+                            if 14 < row.steps.len() {
+                                row.steps[14] = Step {
+                                    on: true,
+                                    gain: 0.90,
+                                    length: 0.18,
+                                    ratchet: 2,
+                                    slice_index: hook_slice,
+                                    every_n: 2,
+                                    ..Default::default()
+                                };
+                            }
+                            row.steps[0] = Step {
+                                on: true,
+                                gain: 1.05,
+                                length: 1.0,
+                                slice_index: hook_slice,
+                                every_n: 2,
+                                every_offset: 1,
+                                ..Default::default()
+                            };
+                        }
+                        PatternPreset::DiscoFilterPump | PatternPreset::DillaDrunk => {
+                            let st_a = if preset == PatternPreset::DillaDrunk { 2 } else { 0 };
+                            if st_a < row.steps.len() {
+                                row.steps[st_a] = Step {
+                                    on: true,
+                                    gain: 1.05,
+                                    length: 1.0,
+                                    slice_index: hook_slice,
+                                    every_n: 2,
+                                    ..Default::default()
+                                };
+                            }
+                        }
+                        _ => {
+                            if 10 < row.steps.len() {
+                                row.steps[10] = Step {
+                                    on: true,
+                                    gain: 0.88,
+                                    length: 0.22,
+                                    slice_index: hook_slice,
+                                    every_n: 2,
+                                    every_offset: 1,
+                                    ..Default::default()
+                                };
+                            }
+                            if 12 < row.steps.len() {
+                                row.steps[12] = Step {
+                                    on: true,
+                                    gain: 1.02,
+                                    length: 1.0,
+                                    slice_index: hook_slice,
+                                    every_n: 2,
+                                    every_offset: 1,
+                                    ..Default::default()
+                                };
+                            }
+                        }
                     }
                 }
             }
         }
+    }
+
+    /// Deterministically expand any 1-bar or 2-bar `StepPattern` into 4 dramatic song
+    /// sections `[Intro, Drop, Break, Climax]` (`REPORT.md` §3C):
+    /// - **`Intro`**: Mutes `Kick` & sub-bass `Pluck`, keeps `Chord` + `VoxPerc` + `Phrase` tease,
+    ///   and adds a crisp `x2` snare/hat pickup on the last 2 sixteenth steps (`n-2..n`).
+    /// - **`Drop`**: Full unmuted `Kick + Pluck + Snare + VoxPerc + Chord` pocket + spotlight `Phrase`.
+    /// - **`Break`**: Drops `Kick` & `Pluck` out, shifts `Chord` stabs `+5 st` into a harmonic bridge,
+    ///   and spotlights a contrasting `Phrase` slice (`+1` slice index when available).
+    /// - **`Climax`**: Full groove + turnaround `x3` snare/hat ratchet fill + **hard-cuts all drums,
+    ///   bass, and chords on the closing 2 beats (`n-8..n`)** while firing a dry spoken `Phrase`
+    ///   punchline right on `n-8` so the closing line lands completely naked in the air!
+    pub fn expand_four_sections(&self) -> [StepPattern; 4] {
+        use crate::grain::Stamp;
+        let base_name = if self.name.is_empty() { "groove" } else { &self.name };
+        let mut intro = self.clone();
+        intro.name = format!("{base_name}_intro");
+        let mut drop_sec = self.clone();
+        drop_sec.name = format!("{base_name}_drop");
+        let mut brk = self.clone();
+        brk.name = format!("{base_name}_break");
+        let mut climax = self.clone();
+        climax.name = format!("{base_name}_climax");
+
+        let row_role = |r: &SeqRow, ri: usize| -> Stamp {
+            if r.sculpt.stamp != Stamp::Raw {
+                r.sculpt.stamp
+            } else if r.grains.sculpt.stamp != Stamp::Raw {
+                r.grains.sculpt.stamp
+            } else {
+                match ri {
+                    0 => Stamp::Kick,
+                    1 => Stamp::Snare,
+                    2 => Stamp::VoxPerc,
+                    3 => Stamp::Chord,
+                    4 => Stamp::Pluck,
+                    _ => Stamp::Phrase,
+                }
+            }
+        };
+
+        // 1. INTRO: mute Kick & Sub-Pluck; add `x2` pickup on closing 2 steps of Snare / VoxPerc.
+        for (ri, r) in intro.rows.iter_mut().enumerate() {
+            let role = row_role(r, ri);
+            match role {
+                Stamp::Kick | Stamp::Pluck => r.muted = true,
+                Stamp::Snare | Stamp::VoxPerc | Stamp::Hat => {
+                    let n = r.steps.len();
+                    if n >= 2 {
+                        r.steps[n - 2] = Step {
+                            on: true,
+                            gain: 0.82,
+                            ratchet: 2,
+                            ratchet_pitch: 1.5,
+                            ..r.steps[n - 2]
+                        };
+                        r.steps[n - 1] = Step {
+                            on: true,
+                            gain: 0.92,
+                            ratchet: 2,
+                            ratchet_pitch: 2.5,
+                            ..r.steps[n - 1]
+                        };
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // 2. DROP: ensure core groove rows are unmuted.
+        for r in &mut drop_sec.rows {
+            if r.sculpt.stamp != Stamp::Raw {
+                r.muted = false;
+            }
+        }
+
+        // 3. BREAK: drop Kick & Sub-Pluck out, lift Chords +5st, spotlight alternate Phrase slice.
+        for (ri, r) in brk.rows.iter_mut().enumerate() {
+            let role = row_role(r, ri);
+            match role {
+                Stamp::Kick | Stamp::Pluck => r.muted = true,
+                Stamp::Chord => {
+                    for st in &mut r.steps {
+                        if st.on {
+                            st.pitch += 5.0;
+                        }
+                    }
+                }
+                Stamp::Phrase => {
+                    r.muted = false;
+                    let first_sl = r.steps.iter().find_map(|s| s.slice_index);
+                    let alt_sl = first_sl.map(|i| if i > 0 { i - 1 } else { 0 });
+                    for s in &mut r.steps {
+                        *s = Step::default();
+                    }
+                    if !r.steps.is_empty() {
+                        r.steps[0] = Step {
+                            on: true,
+                            gain: 1.08,
+                            length: 1.0,
+                            slice_index: alt_sl,
+                            ..Default::default()
+                        };
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // 4. CLIMAX + DRY PUNCHLINE OUTRO: full groove + turnaround ratchets + hard-cut drums/beds
+        //    on the closing 2..3.5 beats (`14` steps = `3.5` beats on 2-bar patterns so `1.5s` spoken
+        //    punchlines complete 100% un-truncated before the bar end!).
+        for (ri, r) in climax.rows.iter_mut().enumerate() {
+            let role = row_role(r, ri);
+            let n = r.steps.len();
+            let cut_from = if n >= 32 {
+                n.saturating_sub(14)
+            } else {
+                n.saturating_sub(8)
+            };
+            match role {
+                Stamp::Phrase => {
+                    r.muted = false;
+                    let sl = r.steps.iter().find_map(|s| s.slice_index);
+                    for s in &mut r.steps[cut_from..] {
+                        *s = Step::default();
+                    }
+                    if cut_from < n {
+                        r.steps[cut_from] = Step {
+                            on: true,
+                            gain: 1.12,
+                            length: 1.0,
+                            slice_index: sl,
+                            ..Default::default()
+                        };
+                    }
+                }
+                _ => {
+                    r.muted = false;
+                    if matches!(role, Stamp::Snare | Stamp::VoxPerc | Stamp::Hat) && cut_from >= 2 {
+                        r.steps[cut_from - 2] = Step {
+                            on: true,
+                            gain: 0.94,
+                            ratchet: 3,
+                            ratchet_pitch: 2.0,
+                            ..r.steps[cut_from - 2]
+                        };
+                    }
+                    if r.mode == RowMode::Steps && n >= 16 {
+                        for s in &mut r.steps[cut_from..] {
+                            *s = Step::default();
+                        }
+                    }
+                }
+            }
+        }
+
+        [intro, drop_sec, brk, climax]
     }
 }
 
@@ -605,8 +1312,12 @@ pub fn pattern_events(
                     let choke_group = eff_choke_for(&g);
                     let focus = chop.map_or((0.5, 0.5), |sl| sl.focus);
                     let caption = chop.map_or_else(crate::chop::Caption::default, |sl| sl.caption);
-                    let zoom_punch = if sculpt.sub_exciter > 0.2 || sculpt.snare_snap > 0.2 {
-                        0.08
+                    let zoom_punch = if sculpt.snare_snap > 0.2 || sculpt.stamp == crate::grain::Stamp::Snare {
+                        0.11
+                    } else if sculpt.sub_exciter > 0.2 || sculpt.stamp == crate::grain::Stamp::Kick {
+                        0.10
+                    } else if sculpt.stamp == crate::grain::Stamp::VoxPerc {
+                        0.07
                     } else if chop.is_some_and(|sl| sl.role_hint == crate::chop::SliceRole::Phrase) {
                         0.05
                     } else {
@@ -615,27 +1326,12 @@ pub fn pattern_events(
 
                     let r_count = step.ratchet.clamp(1, 8);
                     let sub_step_secs = step_secs / r_count as f64;
-                    let rapid_chop = prev_hit_t.is_some_and(|pt| (t - pt) < 0.22);
-                    let step_base_salt: u8 = if sculpt.stamp == crate::grain::Stamp::VoxPerc {
-                        let mut s = step
-                            .slice_index
-                            .map_or((step_idx & 1) as u8, |si| (si & 3) as u8);
-                        if rapid_chop && s == prev_salt {
-                            s = (prev_salt + 1) & 3;
-                        }
-                        s
-                    } else if rapid_chop
-                        && step.slice_index.is_some()
-                        && step.slice_index != prev_slice
-                    {
-                        let mut s = (step.slice_index.unwrap_or(0) & 3) as u8;
-                        if s == prev_salt {
-                            s = (prev_salt + 1) & 3;
-                        }
-                        s
-                    } else {
-                        0
-                    };
+                    // Keep non-ratchet (`r_count == 1`) steps at `cell_salt = 0` so consecutive
+                    // hits on the same video clip share one cell cleanly instead of spawning
+                    // overlapping twin panels during `visual_hold` / optical carry; explicit
+                    // ratchets (`r_count > 1`) subdivide across `0..r_count - 1` below!
+                    let step_base_salt: u8 = 0;
+                    let _ = (prev_hit_t, prev_slice, prev_salt);
                     prev_hit_t = Some(t);
                     prev_slice = step.slice_index;
                     prev_salt = step_base_salt;
@@ -1392,6 +2088,58 @@ mod tests {
         assert_eq!(ratchet_salts.len(), 4, "x4 ratchet assigns 4 distinct cell_salt values: {ratchet_salts:?}");
         for e in &vox_evs {
             assert!((0.065..=0.141).contains(&e.tag.visual_hold), "VoxPerc holds crisp visual frame: {}", e.tag.visual_hold);
+            assert!((e.tag.zoom_punch - 0.07).abs() < 1e-5, "VoxPerc carries 1.07x snap-zoom: {}", e.tag.zoom_punch);
+        }
+    }
+
+    #[test]
+    fn all_seven_pattern_presets_and_four_section_song_expander() {
+        let sr = 48_000;
+        let clip = crate::audio::AudioClip::saw_stack(110.0, 2.5, sr);
+        let mut src = Source {
+            name: "yt_sample".into(),
+            audio: Some(std::sync::Arc::new(clip)),
+            base_hz: 110.0,
+            ..Default::default()
+        };
+        src.slices = vec![
+            crate::chop::Slice::new(0.0, 0.08),
+            crate::chop::Slice::new(0.12, 0.20),
+            crate::chop::Slice::new(0.25, 0.65),
+            crate::chop::Slice::new(0.70, 1.85),
+        ];
+        let sources = vec![src];
+
+        assert_eq!(PatternPreset::ALL.len(), 7);
+        for preset in PatternPreset::ALL {
+            assert_eq!(PatternPreset::parse(preset.label()), Some(preset));
+            let mut pat = StepPattern::new(preset.label());
+            pat.apply_preset(preset, &sources);
+            assert!(!pat.rows.is_empty(), "{preset:?} curates rows");
+            assert!((pat.swing - preset.default_swing()).abs() < 1e-5);
+            let parts = pattern_events(
+                &pat,
+                &sources,
+                0.0,
+                8.0 * 60.0 / preset.default_bpm() as f64,
+                60.0 / preset.default_bpm() as f64,
+                None,
+                &[],
+            );
+            let total_evs: usize = parts.iter().map(|(_, e)| e.len()).sum();
+            assert!(total_evs >= 6, "{preset:?} schedules musical events: {total_evs}");
+
+            let [intro, drop_s, brk, climax] = pat.expand_four_sections();
+            assert!(intro.rows[0].muted, "{preset:?} Intro mutes Kick");
+            assert!(!drop_s.rows[0].muted, "{preset:?} Drop unmutes Kick");
+            assert!(brk.rows[0].muted, "{preset:?} Break drops Kick");
+            if preset != PatternPreset::TapeDisintegration {
+                let n = climax.rows[0].steps.len();
+                assert!(
+                    climax.rows[0].steps[n - 8..].iter().all(|s| !s.on),
+                    "{preset:?} Climax hard-cuts Kick on closing 2 beats for dry punchline"
+                );
+            }
         }
     }
 }

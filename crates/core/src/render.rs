@@ -563,6 +563,16 @@ fn tile_events(
                 e.source_pos = (e.source_pos + shift).rem_euclid(lay.source_len);
             }
             e.duration = e.duration.min((end - e.onset) as f32);
+            if let Some(env) = e.tag.env.as_mut() {
+                env.on += off;
+                let max_off = (end - env.adsr.release_secs()).max(env.on);
+                env.off = (env.off + off).min(max_off);
+            }
+            if k > 0 && e.tag.voice != 0 {
+                // Keep top 12 bits (`0xA`/`0xD` + row index) and low 4 bits (`chord_sub`)
+                // intact while giving pass `k` its own `[onset, end]` voice span.
+                e.tag.voice ^= ((k as u64) & 0xFFFF) << 16;
+            }
             e.loop_pass = e.loop_pass.saturating_add(k as u32);
             if k > 0 && e.sculpt.disintegrate > 1e-3 {
                 let ox = crate::grain::oxide_dropout_at(
@@ -870,6 +880,9 @@ pub fn plan_project(project: &Project) -> Vec<ClipPlan> {
     }
 
     apply_choke_groups(&mut plans, project);
+    if project.studio_bus {
+        apply_pocket_ducking(&mut plans, project);
+    }
 
     let any_tile_punch = project.master_punches.iter().any(|mp| {
         matches!(mp.action, PunchAction::Layout(l) if l.uses_tiles())
@@ -891,22 +904,28 @@ pub fn plan_project(project: &Project) -> Vec<ClipPlan> {
                     PunchAction::Layout(crate::tile::Layout::Tile | crate::tile::Layout::Split)
                 )
             });
-        assign_tiles_where_opts(&mut plans, project.layout_pan, is_pure_collage, |cp| {
-            if muted(cp) {
-                return false;
-            }
-            if is_split {
-                let all_wash = cp
-                    .parts
-                    .iter()
-                    .flat_map(|(_, evs)| evs.iter())
-                    .all(|e| e.tag.is_wash)
-                    && cp.parts.iter().any(|(_, evs)| !evs.is_empty());
-                !all_wash
-            } else {
-                true
-            }
-        });
+        assign_tiles_where_opts(
+            &mut plans,
+            Some(&project.sources),
+            project.layout_pan,
+            is_pure_collage,
+            |cp| {
+                if muted(cp) {
+                    return false;
+                }
+                if is_split {
+                    let all_wash = cp
+                        .parts
+                        .iter()
+                        .flat_map(|(_, evs)| evs.iter())
+                        .all(|e| e.tag.is_wash)
+                        && cp.parts.iter().any(|(_, evs)| !evs.is_empty());
+                    !all_wash
+                } else {
+                    true
+                }
+            },
+        );
     }
     plans
 }
@@ -933,23 +952,139 @@ pub fn assign_tiles(plans: &mut [ClipPlan], layout_pan: bool) {
 /// [`assign_tiles`] over only the plans `include` accepts (e.g. clips on
 /// unmuted tracks); the others get no tile and don't count toward the grid.
 pub fn assign_tiles_where(plans: &mut [ClipPlan], layout_pan: bool, include: impl Fn(&ClipPlan) -> bool) {
-    assign_tiles_where_opts(plans, layout_pan, false, include);
+    assign_tiles_where_opts(plans, None, layout_pan, false, include);
+}
+
+/// Automatic "Golden Slap" clean-pocket ducking across all planned events (offline + `RealtimeAudio`
+/// sample-exact parity!):
+/// - **`-6.5 dB` (`0.473×`) Kick Sidechain Duck**: attenuates `Chord` / `Wash` / `TapeLoop` / `Disintegrate`
+///   bed grains whose attack lands inside an active `Stamp::Kick` transient window (`[-5 ms, +85 ms]`).
+/// - **`-7.5 dB` (`0.422×`) Hero `Phrase` Spotlight Duck**: attenuates `Chord` / `Wash` / `TapeLoop`
+///   bed grains overlapping an unmuted spotlight `Stamp::Phrase` (`choke_group == 1`) hook so deadpan
+///   YouTube dialogue cuts through crystal clear even inside a single multi-row `StepPattern`!
+pub fn apply_pocket_ducking(plans: &mut [ClipPlan], project: &Project) {
+    let mut kick_onsets: Vec<f64> = Vec::new();
+    let mut phrase_spans: Vec<(f64, f64)> = Vec::new();
+    for cp in plans.iter() {
+        if project.tracks.get(cp.track).is_some_and(|t| t.muted) {
+            continue;
+        }
+        for (_, evs) in &cp.parts {
+            for e in evs {
+                if e.sculpt.stamp == crate::grain::Stamp::Kick {
+                    kick_onsets.push(e.onset);
+                } else if e.sculpt.stamp == crate::grain::Stamp::Phrase && e.tag.choke_group == 1 {
+                    let eff_end = e
+                        .tag
+                        .choke_at
+                        .map_or(e.end(), |tc| e.end().min(tc + crate::grain::CHOKE_RELEASE_SECS));
+                    if eff_end > e.onset + 0.01 {
+                        phrase_spans.push((e.onset, eff_end));
+                    }
+                }
+            }
+        }
+    }
+    if kick_onsets.is_empty() && phrase_spans.is_empty() {
+        return;
+    }
+    kick_onsets.sort_by(|a, b| a.total_cmp(b));
+    kick_onsets.dedup_by(|a, b| (*a - *b).abs() <= 1e-3);
+    phrase_spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+    for cp in plans.iter_mut() {
+        let track_has_manual_duck = project
+            .tracks
+            .get(cp.track)
+            .is_some_and(|t| t.muted || t.duck.is_some());
+        if track_has_manual_duck {
+            continue;
+        }
+        for (_, evs) in &mut cp.parts {
+            for e in evs.iter_mut() {
+                let is_bed = matches!(
+                    e.sculpt.stamp,
+                    crate::grain::Stamp::Chord
+                        | crate::grain::Stamp::Wash
+                        | crate::grain::Stamp::TapeLoop
+                        | crate::grain::Stamp::Disintegrate
+                );
+                if !is_bed {
+                    continue;
+                }
+                let in_kick = kick_onsets
+                    .iter()
+                    .any(|&ko| e.onset >= ko - 0.005 && e.onset <= ko + 0.085);
+                let ev_end = e.end();
+                let in_phrase = phrase_spans
+                    .iter()
+                    .any(|&(p0, p1)| e.onset < p1 - 0.01 && ev_end > p0 + 0.01);
+                if in_kick {
+                    e.gain *= 0.473; // -6.5 dB kick pocket carve
+                }
+                if in_phrase {
+                    e.gain *= 0.422; // -7.5 dB hero phrase spotlight duck
+                }
+            }
+        }
+    }
+}
+
+fn raw_source_video_id(s: &Source) -> Option<u64> {
+    let vid = s.video.as_ref()?;
+    if let Some(p) = &s.path {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        p.hash(&mut h);
+        vid.has_alpha().hash(&mut h);
+        return Some(h.finish() & 0x00FF_FFFF_FFFF_FFFF);
+    }
+    Some((std::sync::Arc::as_ptr(vid) as usize as u64) & 0x00FF_FFFF_FFFF_FFFF)
+}
+
+fn source_video_affinity_id(
+    sources: Option<&[Source]>,
+    sid: usize,
+    multi_video_project: bool,
+) -> Option<u64> {
+    if !multi_video_project {
+        return None;
+    }
+    let srcs = sources?;
+    let s = srcs.get(sid)?;
+    raw_source_video_id(s)
 }
 
 fn assign_tiles_where_opts(
     plans: &mut [ClipPlan],
+    sources: Option<&[Source]>,
     layout_pan: bool,
     skip_collage_fg: bool,
     include: impl Fn(&ClipPlan) -> bool,
 ) {
-    use std::collections::BTreeMap;
-    // voice -> (start, end, track, pitch_ratio, cell_salt)
-    let mut spans: BTreeMap<u64, (f64, f64, usize, f32, u8)> = BTreeMap::new();
+    use std::collections::{BTreeMap, BTreeSet};
+    // Only deduplicate shared-video lanes when the project contains >= 2 distinct
+    // non-cutout video clips (so 1-video MPC pad splits still fan across multiple tiles,
+    // while multi-clip crate-dig collages never show duplicate twin panels of one clip!).
+    let multi_video_project = sources.is_some_and(|srcs| {
+        let mut distinct = BTreeSet::new();
+        for s in srcs {
+            if s.video.as_deref().is_some_and(|v| !v.has_alpha()) {
+                if let Some(id) = raw_source_video_id(s) {
+                    distinct.insert(id);
+                }
+            }
+        }
+        distinct.len() >= 2
+    });
+    // voice -> (start, end, track, pitch_ratio, cell_salt, vid_affinity)
+    let mut spans: BTreeMap<u64, (f64, f64, usize, f32, u8, Option<u64>)> = BTreeMap::new();
     for cp in plans.iter_mut() {
         if !include(cp) {
             continue;
         }
-        for (_, evs) in cp.parts.iter_mut().chain(cp.video_parts.iter_mut().flatten()) {
+        for (sid, evs) in cp.parts.iter_mut().chain(cp.video_parts.iter_mut().flatten()) {
+            let vid_aff = source_video_affinity_id(sources, *sid, multi_video_project);
             for e in evs.iter_mut() {
                 if is_wash_only_in_split(e)
                     || e.tag.chord_harmony
@@ -969,24 +1104,39 @@ fn assign_tiles_where_opts(
                 };
                 let s = spans
                     .entry(e.tag.voice)
-                    .or_insert((e.onset, end, cp.track, e.pitch_ratio, salt));
+                    .or_insert((e.onset, end, cp.track, e.pitch_ratio, salt, vid_aff));
                 s.0 = s.0.min(e.onset);
                 s.1 = s.1.max(end);
             }
         }
     }
-    let mut order: Vec<(u64, f64, f64, usize, f32, u8)> = spans
+    let mut order: Vec<(u64, f64, f64, usize, f32, u8, Option<u64>)> = spans
         .into_iter()
-        .map(|(v, (a, b, t, pr, salt))| (v, a, b, t, pr, salt))
+        .map(|(v, (a, b, t, pr, salt, vk))| (v, a, b, t, pr, salt, vk))
         .collect();
     order.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
     let mut tiles = crate::tile::TileAssigner::new();
     let mut slot_of: BTreeMap<u64, u8> = BTreeMap::new();
     let mut spans: Vec<(u8, f64, f64)> = Vec::with_capacity(order.len());
-    // One tile per `TileOwner` (track, pattern lane, chord sub-voice, and `cell_salt`
-    // subdivision for multi-cell ratchets & rapid `VoxPerc` micro-chops).
-    let key_of = |voice: u64, track: usize, salt: u8| -> u64 {
+    // Deduplicate simultaneous non-ratchet (`salt == 0`, `chord_sub == 0`) voices
+    // that share the exact same underlying video clip so two rows/tracks pointing
+    // to one video never spawn side-by-side twin panels, while `cell_salt > 0`
+    // ratchets still subdivide intentionally across distinct cells!
+    let key_of = |voice: u64, track: usize, salt: u8, vid_aff: Option<u64>| -> u64 {
         let chord_sub = if (voice >> 60) == 0xD { ((voice & 0xF) + 1) as u8 } else { 0 };
+        // `chord_sub == 1` is the root voice (`0xD...0`) of an expanded chord (`chord_harmony`
+        // siblings `2..` are already excluded from tiles), so `chord_sub <= 1` deduplicates
+        // chord-stab roots with sub/percussion rows sharing the same underlying video clip!
+        if salt == 0 && chord_sub <= 1 {
+            if let Some(vk) = vid_aff {
+                return 0x7F00_0000_0000_0000 | vk;
+            }
+        }
+        if let Some(vk) = vid_aff {
+            if chord_sub == 0 {
+                return 0x7E00_0000_0000_0000 | ((salt as u64) << 48) | (vk & 0x0000_FFFF_FFFF_FFFF);
+            }
+        }
         let lane = if (voice >> 60) == 0xA { (1 + ((voice >> 52) & 0xFF)) as u16 } else { 0 };
         crate::tile::TileOwner {
             track: track as u16,
@@ -1006,17 +1156,21 @@ fn assign_tiles_where_opts(
         }
         let group = &mut order[g..h];
         group.sort_by(|a, b| {
-            let cont_a = key_end.get(&key_of(a.0, a.3, a.5)).is_some_and(|&e| e >= a.1 - 1e-9);
-            let cont_b = key_end.get(&key_of(b.0, b.3, b.5)).is_some_and(|&e| e >= b.1 - 1e-9);
+            let cont_a = key_end
+                .get(&key_of(a.0, a.3, a.5, a.6))
+                .is_some_and(|&e| e >= a.1 - 1e-9);
+            let cont_b = key_end
+                .get(&key_of(b.0, b.3, b.5, b.6))
+                .is_some_and(|&e| e >= b.1 - 1e-9);
             (!cont_a)
                 .cmp(&(!cont_b))
                 .then_with(|| a.5.cmp(&b.5))
                 .then_with(|| a.4.total_cmp(&b.4))
                 .then_with(|| a.0.cmp(&b.0))
         });
-        for &(voice, start, end, track, _, salt) in group.iter() {
-            let key = key_of(voice, track, salt);
-            let base_key = key_of(voice, track, 0);
+        for &(voice, start, end, track, _, salt, vid_aff) in group.iter() {
+            let key = key_of(voice, track, salt, vid_aff);
+            let base_key = key_of(voice, track, 0, vid_aff);
             let slot = tiles.assign_keyed_salted(voice, key, base_key, salt, start);
             tiles.release(voice, end);
             slot_of.insert(voice, slot);
@@ -1130,10 +1284,10 @@ fn frame_tile_grids_and_maps_stage(
         .into_iter()
         .enumerate()
         .map(|(fi, s)| {
+            let (cnt, remap) = crate::tile::dense_slot_remap(&s);
             if burst_frame[fi] {
-                (crate::tile::frame_portrait_grid(s, aspect), None, 0)
+                (crate::tile::portrait_grid_for(cnt, aspect), Some(remap), cnt)
             } else {
-                let (cnt, remap) = crate::tile::dense_slot_remap(&s);
                 (crate::tile::grid_for(cnt), Some(remap), cnt)
             }
         })
@@ -1171,12 +1325,12 @@ fn frame_split_grids_and_maps(
     fps: f32,
     n_frames: usize,
     aspect: f32,
-) -> Vec<((u32, u32), [u8; crate::tile::MAX_TILES], bool)> {
+) -> Vec<((u32, u32), [u8; crate::tile::MAX_TILES], usize)> {
     collect_frame_panel_slots(plans, t0, fps, n_frames, true, false)
         .into_iter()
         .map(|s| {
             let (cnt, remap) = crate::tile::dense_slot_remap(&s);
-            (crate::tile::split_grid_for(cnt, aspect), remap, cnt > 0)
+            (crate::tile::split_grid_for(cnt, aspect), remap, cnt)
         })
         .collect()
 }
@@ -1772,7 +1926,7 @@ fn render_project_core(
                 None => (None, None, 0, false),
             },
             crate::tile::Layout::Split => match split_grids_opt.as_ref().map(|g| g[fi]) {
-                Some((grid, remap, has_fg)) => (Some(grid), Some(remap), 0, has_fg),
+                Some((grid, remap, cnt)) => (Some(grid), Some(remap), cnt, cnt > 0),
                 None => (None, None, 0, false),
             },
             crate::tile::Layout::Collage => match collage_grids_opt.as_ref().map(|g| g[fi]) {
@@ -1781,7 +1935,9 @@ fn render_project_core(
             },
             crate::tile::Layout::Stack | crate::tile::Layout::Bleed => (None, None, 0, false),
         };
-        if cur_layout == crate::tile::Layout::Collage {
+        if cur_layout == crate::tile::Layout::Collage
+            || (cur_layout == crate::tile::Layout::Tile && has_fg_fi && grid_fi != Some((1, 1)))
+        {
             fill_stage_ink(frame);
         }
         let mut collage_fg_layers: Vec<(Frame, f32)> = Vec::new();
@@ -3403,5 +3559,85 @@ mod tests {
             .filter_map(|e| e.tag.tile)
             .collect();
         assert_eq!(tiles.len(), 4, "x4 ratchet claims 4 distinct grid cells via cell_salt: {tiles:?}");
+    }
+
+    #[test]
+    fn pattern_loop_beats_shifts_adsr_voice_env_and_multi_video_dedups_twin_tiles() {
+        // 1. Pattern clip with `loop_beats = Some(4.0)` and `Adsr` keeps sound & picture alive on pass k >= 1!
+        let mut p = Project::new();
+        p.bpm = 120.0;
+        p.width = 96;
+        p.height = 54;
+        p.fps = 20.0;
+        let s_a = p.add_source(crate::timeline::Source {
+            name: "clip_a".into(),
+            audio: Some(std::sync::Arc::new(crate::audio::AudioClip::sine(220.0, 2.0, p.sample_rate))),
+            video: Some(std::sync::Arc::new(solid_video(220, 40, 40))),
+            base_hz: 220.0,
+            ..Default::default()
+        });
+        let s_b = p.add_source(crate::timeline::Source {
+            name: "clip_b".into(),
+            audio: Some(std::sync::Arc::new(crate::audio::AudioClip::sine(330.0, 2.0, p.sample_rate))),
+            video: Some(std::sync::Arc::new(solid_video(40, 200, 90))),
+            base_hz: 330.0,
+            ..Default::default()
+        });
+
+        let mut pat = crate::seq::StepPattern::new("looped_adsr");
+        let r0 = pat.add_row(s_a);
+        pat.rows[r0].grains.duration = 0.25;
+        pat.rows[r0].grains.adsr = Some(crate::envelope::Adsr {
+            attack: 0.002,
+            decay: 0.04,
+            sustain: 1.0,
+            release: 0.04,
+            picture: crate::envelope::PictureCut::Cut,
+            cut_threshold: 0.05,
+        });
+        pat.rows[r0].steps[0].on = true;
+        // Second row pointing to the SAME video `s_a` at the same step, plus a third row on `s_b`:
+        let r1 = pat.add_row(s_a);
+        pat.rows[r1].grains.duration = 0.25;
+        pat.rows[r1].steps[0].on = true;
+        let r2 = pat.add_row(s_b);
+        pat.rows[r2].grains.duration = 0.25;
+        pat.rows[r2].steps[0].on = true;
+
+        let pid = p.add_pattern(pat);
+        let tid = p.add_track("seq");
+        let mut c = Clip::new_pattern(pid, 0.0, 8.0);
+        c.loop_beats = Some(4.0);
+        p.tracks[tid].clips.push(c);
+
+        let plans = plan_project(&p);
+        // Pass 1 starts at beat 4.0 -> t = 2.0s; VoiceEnv must be shifted to ~2.0s so picture_at(2.05) == 1.0!
+        let pass1_ev = plans[0]
+            .parts
+            .iter()
+            .flat_map(|(_, evs)| evs.iter())
+            .find(|e| (e.onset - 2.0).abs() < 1e-4 && e.tag.env.is_some())
+            .expect("pass 1 event with ADSR");
+        assert!(
+            pass1_ev.tag.picture_at(2.05) > 0.95,
+            "tile_events shifts VoiceEnv.(on, off) onto pass 1: {:?}",
+            pass1_ev.tag.env
+        );
+
+        // Two non-ratchet rows sharing `s_a` in a multi-video project share ONE tile slot (no twin panels!).
+        let t0_slots: std::collections::BTreeSet<u8> = plans[0]
+            .parts
+            .iter()
+            .flat_map(|(_, evs)| evs.iter())
+            .filter(|e| e.onset < 0.01)
+            .filter_map(|e| e.tag.tile)
+            .collect();
+        assert_eq!(t0_slots.len(), 2, "3 rows across 2 videos deduplicate to 2 distinct cells: {t0_slots:?}");
+
+        // 5 active cells in `3x3` / `3x2` fill 100% of the canvas with zero black bottom-right holes!
+        for k in 0..5 {
+            let rect = crate::tile::tile_rect_for_count(k, 3, 3, 5, 1.0);
+            assert!(rect.w > 0.30 && rect.h > 0.45, "slot {k} in 5-cell grid fills 2-row packed layout: {rect:?}");
+        }
     }
 }

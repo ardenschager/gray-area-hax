@@ -1146,7 +1146,8 @@ pub fn grain_draws_stage_mapped(
                     ev.source_pos + local
                 };
                 let (r, feather_edges, tiled) = if layout == crate::tile::Layout::Split {
-                    let (sr, _) = crate::tile::split_rect(slot as usize, cols, rows);
+                    let (sr, _) =
+                        crate::tile::split_rect_for_count(slot as usize, cols, rows, active_count);
                     (sr, [false; 4], true)
                 } else {
                     (
@@ -1707,8 +1708,9 @@ pub fn composite_grains_frame_stage_mapped(
 }
 
 /// Draw crisp `2px` `#111314` (`STAGE_INK_RGB = [17, 19, 20]`) solid dividers
-/// along interior grid/split boundaries (`0px` blur), honoring the spanned
-/// bottom row when `active_count == 3` in a `2×2` grid.
+/// along interior grid/split boundaries (`0px` blur), honoring spanned partial
+/// bottom rows (`active_count < cols * rows`, e.g. `3` in `2×2`, `5` in `3×2` or `3×3`)
+/// and collapsed unused trailing rows.
 pub fn draw_grid_dividers_for_count(
     frame: &mut Frame,
     cols: u32,
@@ -1726,19 +1728,38 @@ pub fn draw_grid_dividers_for_count(
         crate::tile::STAGE_INK_RGB[2],
         255,
     ];
-    let span_bottom = active_count == 3 && cols == 2 && rows == 2;
-    let v_max_y = if span_bottom { h / 2 } else { h };
-
-    for c in 1..cols {
-        let seam_x = ((c as usize * w) / cols as usize).clamp(1, w - 1);
+    let cap = (cols * rows) as usize;
+    let (eff_rows, last_cols) = if active_count > 0 && active_count < cap {
+        let er = active_count.div_ceil(cols as usize).max(1) as u32;
+        let lc = (active_count - ((er - 1) as usize * cols as usize)).max(1) as u32;
+        (er, lc)
+    } else {
+        (rows, cols)
+    };
+    if cols <= 1 && eff_rows <= 1 {
+        return;
+    }
+    let top_rows_y = ((eff_rows.saturating_sub(1) as usize) * h) / eff_rows as usize;
+    if top_rows_y > 0 {
+        for c in 1..cols {
+            let seam_x = ((c as usize * w) / cols as usize).clamp(1, w - 1);
+            for x in [seam_x - 1, seam_x] {
+                for y in 0..top_rows_y {
+                    frame.put(x as u32, y as u32, ink);
+                }
+            }
+        }
+    }
+    for c in 1..last_cols {
+        let seam_x = ((c as usize * w) / last_cols as usize).clamp(1, w - 1);
         for x in [seam_x - 1, seam_x] {
-            for y in 0..v_max_y {
+            for y in top_rows_y..h {
                 frame.put(x as u32, y as u32, ink);
             }
         }
     }
-    for r in 1..rows {
-        let seam_y = ((r as usize * h) / rows as usize).clamp(1, h - 1);
+    for r in 1..eff_rows {
+        let seam_y = ((r as usize * h) / eff_rows as usize).clamp(1, h - 1);
         for y in [seam_y - 1, seam_y] {
             for x in 0..w {
                 frame.put(x as u32, y as u32, ink);
@@ -1855,30 +1876,130 @@ pub fn composite_collage_foreground(
             let y0 = cy - (dh as isize) / 2;
 
             // Sample foreground RGBA onto padded local buffer `(dw + 2*pad) x (dh + 2*pad)`
-            // so `3px` border dilation + `+5,+5` shadow never clip inside the sticker box.
-            let pad = (border_r + 1) as usize;
+            // using destination-resolution (`1080p`) bilinear reconstruction BEFORE thresholding
+            // and computing Euclidean `3px` `#F2EDE0` border + `+5,+5` `#111314` print shadow
+            // so upscaled `360p` Vision masks never show Lego stair-stepping!
+            let pad = (border_r + 2) as usize;
             let bw = dw + pad * 2;
             let bh = dh + pad * 2;
             let mut fg_rgb = vec![[0u8; 3]; bw * bh];
             let mut fg_a = vec![0u8; bw * bh];
+            let sw_u = src.width as usize;
+            let sh_u = src.height as usize;
             let sw = src.width as f32;
             let sh = src.height as f32;
 
+            // When upscaling (> 1.25x from source patch to destination sticker box),
+            // apply 2 lightweight separable `[1, 2, 1]/4` contour-smoothing passes to
+            // source alpha so pre-tightened `360p` masks interpolate as smooth curves at `1080p`.
+            let src_patch_w = (sw * patch[2]).max(1.0);
+            let src_patch_h = (sh * patch[3]).max(1.0);
+            let upscaling = (dw as f32) > src_patch_w * 1.25 || (dh as f32) > src_patch_h * 1.25;
+            let smooth_src_a: Vec<f32> = if upscaling && sw_u >= 4 && sh_u >= 4 {
+                let mut a0: Vec<f32> = (0..sw_u * sh_u)
+                    .map(|i| src.data[i * 4 + 3] as f32)
+                    .collect();
+                let mut tmp = vec![0.0f32; sw_u * sh_u];
+                for _ in 0..2 {
+                    for y in 0..sh_u {
+                        let row = y * sw_u;
+                        for x in 0..sw_u {
+                            let xl = x.saturating_sub(1);
+                            let xr = (x + 1).min(sw_u - 1);
+                            tmp[row + x] = 0.25 * a0[row + xl] + 0.5 * a0[row + x] + 0.25 * a0[row + xr];
+                        }
+                    }
+                    for y in 0..sh_u {
+                        let yu = y.saturating_sub(1) * sw_u;
+                        let yc = y * sw_u;
+                        let yd = (y + 1).min(sh_u - 1) * sw_u;
+                        for x in 0..sw_u {
+                            a0[yc + x] = 0.25 * tmp[yu + x] + 0.5 * tmp[yc + x] + 0.25 * tmp[yd + x];
+                        }
+                    }
+                }
+                a0
+            } else {
+                (0..sw_u * sh_u).map(|i| src.data[i * 4 + 3] as f32).collect()
+            };
+
             for ly in 0..dh {
                 let qy = (ly as f32 + 0.5) / dh as f32;
-                let sy = ((patch[1] + qy * patch[3]) * (sh - 1.0)).round().clamp(0.0, sh - 1.0) as u32;
+                let fy = ((patch[1] + qy * patch[3]) * (sh - 1.0)).clamp(0.0, (sh - 1.0).max(0.0));
+                let y0_s = (fy.floor() as usize).min(sh_u - 1);
+                let y1_s = (y0_s + 1).min(sh_u - 1);
+                let wy = fy - y0_s as f32;
                 for lx in 0..dw {
                     let qx = if ev.tag.ratchet_odd {
                         1.0 - (lx as f32 + 0.5) / dw as f32
                     } else {
                         (lx as f32 + 0.5) / dw as f32
                     };
-                    let sx = ((patch[0] + qx * patch[2]) * (sw - 1.0)).round().clamp(0.0, sw - 1.0) as u32;
-                    let [mut r, mut g, mut b, raw_a] = src.get(sx, sy);
-                    let mut a = tighten_cutout_alpha(raw_a);
+                    let fx = ((patch[0] + qx * patch[2]) * (sw - 1.0)).clamp(0.0, (sw - 1.0).max(0.0));
+                    let x0_s = (fx.floor() as usize).min(sw_u - 1);
+                    let x1_s = (x0_s + 1).min(sw_u - 1);
+                    let wx = fx - x0_s as f32;
+
+                    let w00 = (1.0 - wx) * (1.0 - wy);
+                    let w10 = wx * (1.0 - wy);
+                    let w01 = (1.0 - wx) * wy;
+                    let w11 = wx * wy;
+
+                    let i00 = y0_s * sw_u + x0_s;
+                    let i10 = y0_s * sw_u + x1_s;
+                    let i01 = y1_s * sw_u + x0_s;
+                    let i11 = y1_s * sw_u + x1_s;
+
+                    let interp_a = w00 * smooth_src_a[i00]
+                        + w10 * smooth_src_a[i10]
+                        + w01 * smooth_src_a[i01]
+                        + w11 * smooth_src_a[i11];
+
+                    // Alpha-weighted RGB bilinear interpolation prevents `alpha == 0` background
+                    // texels from bleeding dark fringes into the sticker silhouette boundary!
+                    let p00 = src.get(x0_s as u32, y0_s as u32);
+                    let p10 = src.get(x1_s as u32, y0_s as u32);
+                    let p01 = src.get(x0_s as u32, y1_s as u32);
+                    let p11 = src.get(x1_s as u32, y1_s as u32);
+                    let cw00 = w00 * (p00[3] as f32 + 1.0);
+                    let cw10 = w10 * (p10[3] as f32 + 1.0);
+                    let cw01 = w01 * (p01[3] as f32 + 1.0);
+                    let cw11 = w11 * (p11[3] as f32 + 1.0);
+                    let cw_sum = (cw00 + cw10 + cw01 + cw11).max(1e-6);
+                    let mut r = ((cw00 * p00[0] as f32
+                        + cw10 * p10[0] as f32
+                        + cw01 * p01[0] as f32
+                        + cw11 * p11[0] as f32)
+                        / cw_sum)
+                        .round()
+                        .clamp(0.0, 255.0) as u8;
+                    let mut g = ((cw00 * p00[1] as f32
+                        + cw10 * p10[1] as f32
+                        + cw01 * p01[1] as f32
+                        + cw11 * p11[1] as f32)
+                        / cw_sum)
+                        .round()
+                        .clamp(0.0, 255.0) as u8;
+                    let mut b = ((cw00 * p00[2] as f32
+                        + cw10 * p10[2] as f32
+                        + cw01 * p01[2] as f32
+                        + cw11 * p11[2] as f32)
+                        / cw_sum)
+                        .round()
+                        .clamp(0.0, 255.0) as u8;
+
+                    let mut eff_a = interp_a;
                     if let Some(cf) = color_filter {
-                        a = tighten_cutout_alpha((a as f32 * cf.mask(r, g, b)).round() as u8);
+                        eff_a *= cf.mask(r, g, b);
                     }
+                    // Crisp `1px` anti-aliased threshold at destination `1080p` resolution (`110..145`).
+                    let a = if eff_a <= 110.0 {
+                        0u8
+                    } else if eff_a >= 145.0 {
+                        255u8
+                    } else {
+                        (((eff_a - 110.0) / 35.0) * 255.0).round().clamp(1.0, 254.0) as u8
+                    };
                     if a == 0 {
                         continue;
                     }
@@ -1892,22 +2013,64 @@ pub fn composite_collage_foreground(
                 }
             }
 
-            // Dilate silhouette (`fg_a >= 90`) by Euclidean `3px` (`dx*dx + dy*dy <= 9`) -> `sticker`.
-            let mut sticker = vec![false; bw * bh];
-            let r2 = border_r * border_r;
-            for by in 0..bh {
-                for bx in 0..bw {
-                    if fg_a[by * bw + bx] < 90 {
+            // Despeckle isolated 1–2px mask crumbs before `3px` Euclidean sticker border dilation
+            // so stray background pixels never inflate into visible cream dots.
+            let raw_fg_a = fg_a.clone();
+            for by in 1..bh.saturating_sub(1) {
+                for bx in 1..bw.saturating_sub(1) {
+                    let i = by * bw + bx;
+                    if raw_fg_a[i] == 0 {
                         continue;
                     }
-                    let dy_min = (-border_r).max(-(by as isize));
-                    let dy_max = border_r.min(bh as isize - 1 - by as isize);
-                    let dx_min = (-border_r).max(-(bx as isize));
-                    let dx_max = border_r.min(bw as isize - 1 - bx as isize);
+                    let mut nb = 0u8;
+                    for dy in -1isize..=1 {
+                        for dx in -1isize..=1 {
+                            if (dx != 0 || dy != 0)
+                                && raw_fg_a[(by as isize + dy) as usize * bw + (bx as isize + dx) as usize] >= 64
+                            {
+                                nb += 1;
+                            }
+                        }
+                    }
+                    if nb < 2 {
+                        fg_a[i] = 0;
+                    }
+                }
+            }
+
+            // Dilate `1080p` silhouette (`fg_a > 0`) by Euclidean `3px` (`0..=3.0px` solid `#F2EDE0`
+            // + `3.0..3.85px` `1px`-AA outer rim) so diagonal sticker borders are razor-smooth!
+            let mut sticker_cov = vec![0u8; bw * bh];
+            let r_scan = border_r + 1;
+            let r_solid = border_r as f32;
+            let r_outer = r_solid + 0.85;
+            for by in 0..bh {
+                for bx in 0..bw {
+                    let center_a = fg_a[by * bw + bx];
+                    if center_a == 0 {
+                        continue;
+                    }
+                    // Subpixel contour offset from `center_a` (`1..255` -> `-0.5..+0.5px`).
+                    let sub_r = (center_a as f32 / 255.0) - 0.5;
+                    let dy_min = (-r_scan).max(-(by as isize));
+                    let dy_max = r_scan.min(bh as isize - 1 - by as isize);
+                    let dx_min = (-r_scan).max(-(bx as isize));
+                    let dx_max = r_scan.min(bw as isize - 1 - bx as isize);
                     for dy in dy_min..=dy_max {
                         for dx in dx_min..=dx_max {
-                            if dx * dx + dy * dy <= r2 {
-                                sticker[(by as isize + dy) as usize * bw + (bx as isize + dx) as usize] = true;
+                            let d = ((dx * dx + dy * dy) as f32).sqrt() - sub_r;
+                            let cov = if d <= r_solid {
+                                255u8
+                            } else if d < r_outer {
+                                (((r_outer - d) / (r_outer - r_solid)) * 255.0).round() as u8
+                            } else {
+                                0u8
+                            };
+                            if cov > 0 {
+                                let ti = (by as isize + dy) as usize * bw + (bx as isize + dx) as usize;
+                                if cov > sticker_cov[ti] {
+                                    sticker_cov[ti] = cov;
+                                }
                             }
                         }
                     }
@@ -1917,32 +2080,50 @@ pub fn composite_collage_foreground(
             let base_x = x0 - pad as isize;
             let base_y = y0 - pad as isize;
 
-            // Pass 1: Hard solid offset print shadow (`+5px, +5px` in `[17, 19, 20]`, ZERO blur!).
+            // Pass 1: Hard offset print shadow (`+5px, +5px` in `[17, 19, 20]`, 1px AA outer contour!).
             for by in 0..bh {
                 let sy = base_y + by as isize + shadow_dy;
                 if sy < 0 || sy >= oh as isize {
                     continue;
                 }
                 for bx in 0..bw {
-                    if !sticker[by * bw + bx] {
+                    let scov = sticker_cov[by * bw + bx];
+                    if scov == 0 {
                         continue;
                     }
                     let sx = base_x + bx as isize + shadow_dx;
                     if sx < 0 || sx >= ow as isize {
                         continue;
                     }
-                    // Skip if covered by the sticker itself at `(bx + shadow_dx, by + shadow_dy)`.
                     let cov_x = bx as isize + shadow_dx;
                     let cov_y = by as isize + shadow_dy;
                     if cov_x >= 0
                         && cov_x < bw as isize
                         && cov_y >= 0
                         && cov_y < bh as isize
-                        && sticker[cov_y as usize * bw + cov_x as usize]
+                        && sticker_cov[cov_y as usize * bw + cov_x as usize] == 255
                     {
                         continue;
                     }
-                    out.put(sx as u32, sy as u32, [ink[0], ink[1], ink[2], 255]);
+                    if scov == 255 {
+                        out.put(sx as u32, sy as u32, [ink[0], ink[1], ink[2], 255]);
+                    } else {
+                        let dst = out.get(sx as u32, sy as u32);
+                        let w_s = scov as f32 / 255.0;
+                        let w_d = 1.0 - w_s;
+                        let da = dst[3] as f32 / 255.0;
+                        let oa = (w_s + da * w_d).max(1e-6);
+                        out.put(
+                            sx as u32,
+                            sy as u32,
+                            [
+                                ((ink[0] as f32 * w_s + dst[0] as f32 * da * w_d) / oa + 0.5) as u8,
+                                ((ink[1] as f32 * w_s + dst[1] as f32 * da * w_d) / oa + 0.5) as u8,
+                                ((ink[2] as f32 * w_s + dst[2] as f32 * da * w_d) / oa + 0.5) as u8,
+                                (oa * 255.0).round() as u8,
+                            ],
+                        );
+                    }
                 }
             }
 
@@ -1954,7 +2135,8 @@ pub fn composite_collage_foreground(
                 }
                 for bx in 0..bw {
                     let bi = by * bw + bx;
-                    if !sticker[bi] {
+                    let bcov = sticker_cov[bi];
+                    if bcov == 0 {
                         continue;
                     }
                     let dx = base_x + bx as isize;
@@ -1962,11 +2144,10 @@ pub fn composite_collage_foreground(
                         continue;
                     }
                     let a = fg_a[bi];
-                    let px = if a == 255 {
-                        let c = fg_rgb[bi];
-                        [c[0], c[1], c[2], 255]
+                    let sticker_rgb = if a == 255 {
+                        fg_rgb[bi]
                     } else if a == 0 {
-                        [cream[0], cream[1], cream[2], 255]
+                        cream
                     } else {
                         let w_fg = a as f32 / 255.0;
                         let w_bg = 1.0 - w_fg;
@@ -1975,10 +2156,27 @@ pub fn composite_collage_foreground(
                             (c[0] as f32 * w_fg + cream[0] as f32 * w_bg + 0.5) as u8,
                             (c[1] as f32 * w_fg + cream[1] as f32 * w_bg + 0.5) as u8,
                             (c[2] as f32 * w_fg + cream[2] as f32 * w_bg + 0.5) as u8,
-                            255,
                         ]
                     };
-                    out.put(dx as u32, dy as u32, px);
+                    if bcov == 255 {
+                        out.put(dx as u32, dy as u32, [sticker_rgb[0], sticker_rgb[1], sticker_rgb[2], 255]);
+                    } else {
+                        let dst = out.get(dx as u32, dy as u32);
+                        let w_s = bcov as f32 / 255.0;
+                        let w_d = 1.0 - w_s;
+                        let da = dst[3] as f32 / 255.0;
+                        let oa = (w_s + da * w_d).max(1e-6);
+                        out.put(
+                            dx as u32,
+                            dy as u32,
+                            [
+                                ((sticker_rgb[0] as f32 * w_s + dst[0] as f32 * da * w_d) / oa + 0.5) as u8,
+                                ((sticker_rgb[1] as f32 * w_s + dst[1] as f32 * da * w_d) / oa + 0.5) as u8,
+                                ((sticker_rgb[2] as f32 * w_s + dst[2] as f32 * da * w_d) / oa + 0.5) as u8,
+                                (oa * 255.0).round() as u8,
+                            ],
+                        );
+                    }
                 }
             }
         } else {

@@ -381,25 +381,26 @@ impl VoiceSculpt {
             },
             Stamp::Snare => VoiceSculpt {
                 snare_snap: 0.85,
-                drive_db: 8.5,
-                hpf_hz: 170.0,
+                drive_db: 8.0,
+                hpf_hz: 210.0,
                 lpf_hz: 8200.0,
                 resonance_q: 0.80,
+                pocket_carve: true,
                 ..base
             },
             Stamp::Hat => VoiceSculpt {
                 pitch_semitones: 10.0,
                 drive_db: 3.5,
-                hpf_hz: 5400.0,
-                lpf_hz: 18_500.0,
+                hpf_hz: 4800.0,
+                lpf_hz: 11_000.0,
                 resonance_q: 0.90,
                 ..base
             },
             Stamp::VoxPerc => VoiceSculpt {
                 pitch_semitones: 2.0,
                 drive_db: 3.5,
-                hpf_hz: 220.0,
-                lpf_hz: 15_500.0,
+                hpf_hz: 245.0,
+                lpf_hz: 9200.0,
                 resonance_q: 0.92,
                 pocket_carve: true,
                 ..base
@@ -413,12 +414,12 @@ impl VoiceSculpt {
                 ..base
             },
             Stamp::Chord => VoiceSculpt {
-                comb_mix: 0.42,
-                comb_feedback: 0.91,
+                comb_mix: 0.40,
+                comb_feedback: 0.90,
                 chord: ChordVoicing::Min7,
-                shimmer: 0.25,
-                hpf_hz: 215.0,
-                lpf_hz: 11_000.0,
+                shimmer: 0.0,
+                hpf_hz: 305.0,
+                lpf_hz: 4200.0,
                 pocket_carve: true,
                 ..base
             },
