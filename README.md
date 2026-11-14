@@ -42,6 +42,8 @@ BOTH domains with the same idea:
 | reverb   | Freeverb-style combs/allpasses   | frame persistence + blur smear     |
 | compress | FFT spectral quantization (codec crunch) | JPEG-style 8×8 DCT block quantization — the same transform-domain math |
 | tint     | resonant bandpass narrowing toward the hue's frequency | every hue smushed toward the target color — same axis |
+| kaleido  | stereo-rotating *N*-tap mirror / micro-reverse harmonic prism (`folds` = tap count, `spin` = stereo LFO rotation) | polar radial mirror kaleidoscope (`2..12` wedge folds + continuous angular spin) |
+| isolator | **ISOL8** 5-band `24 dB/Oct` Linkwitz-Riley (`200 · 700 · 2500 · 8000 Hz`) `LF · LMF · MF · HMF · HF` `MUTE`/`SOLO` across `STEREO · MID · SIDE` + `L · R · M · S` monitor & `-18 dB` `DIM` | 5-band 2D spatial-frequency multiscale decomposition (sub/low luminosity, mid form/edges, high grain/detail) soloed or muted in lockstep |
 
 Each effect has independent `audio` and `video` amount dials — that's the
 per-effect correspondence control (video 0 = audio-only effect, and vice
@@ -216,61 +218,27 @@ cargo run --release            # builds (first time takes a few minutes) and ope
 The binary lands at `target/release/chromagrain` if you want to launch it
 directly later. `cargo test` runs the full engine test suite.
 
-### 3. The studio (default UI)
+### 3. The studio (`ISOL8` hardware console UI)
 
-`chromagrain` opens the play-first **studio** (design: `design/v001/` +
-`design/v002/` **D · Hybrid: "touch it · open it"**): three play surfaces
-(**Play**, **Sequence**, **Perform**), on-object shaping while you play, and
-one-tap **Clip** and **Project** sheets instead of hidden drawers. Neutral
-graphite chrome — the only colour is your footage. Touch-first: every target
-≥ 44 px, nothing needs hover or right-click. Launch `chromagrain --demo` to
-open straight into *Night Platform* (7 archival & synth clips across the
-grid, lanes, scenes, and 15 pads at 133 BPM F minor).
+`chromagrain` opens a tactile, **zero-AI** hardware-console sampling & VJ instrument inspired by classic anodized studio isolators: brushed warm sand/olive aluminum chassis (`#B4AC8C → #968E6E`), corner rack screws, recessed `#16191A` CRT stage & scope bezels, machined matte-charcoal pointer knobs with sunken silver LCD readouts, and backlit incandescent-amber (`SOLO` / active), smoked-ruby (`MUTE`), and mint-teal (`L·R·M·S`) switches. Touch-first (targets ≥ 44 px, no hover or right-click needed) across three views (**Play**, **Sequence**, **Perform**) plus unified **Add**, **Clip**, and **Project** sheets. Launch `chromagrain --demo` to open straight into *Night Platform*.
 
 | view | what you do |
 |------|-------------|
-| **Play** (1) | an 8×8 grid: each column is a clip as 8 frame tiles. Touch the grid and the selected **emitter** (1–4) jumps there and sprays grains while held; grab a ring to play that emitter (multi-touch plays multiple emitters). Below the stage, 4 **on-object emitter cards** draw their **Grain** ring + cloud dots, circumference **Pitch** dot, **Smear** trails, **ADSR** curve, and **Look** chip (clean, tune, crush, jpeg, tint, tile, kaleido) — drag directly on the card to shape while playing, or tap **`Clip ›`** / **`Open clip ›`** for the full Clip sheet. **Rec** bounces what you play into a take (new library clip, placed on a *takes* track). |
-| **Sequence** (2) | nanoloop-style lanes, one per clip, 16 steps. An active step is a thumbnail of the slice it plays. Tap = toggle, drag up/down = pitch in key degrees, hold = step sheet (slice, pitch, length, chance). Lane headers show their mini ADSR curve and a **`›`** button for the Clip sheet. Lanes can be shorter (polymeter, `↺`). Scenes 1–8 (tap = queue at the next bar; an empty scene copies the current one) and a song chain that becomes the arrangement. |
-| **Perform** (3) | 4×4 clip pads (one global bank) with inline ADSR curves, **`›`** clip buttons, and on-object ring shaping on the selected pad; launch quantize Now / Beat / Bar, output to this screen or Display 2, Stop all, Fullscreen (F) with a minimal auto-hiding HUD. |
+| **Play** (1) | an 8×8 grid: each column is a clip as 8 frame tiles. Touch the grid and the selected **emitter** (1–4) jumps there and sprays grains while held; grab a ring to play that emitter (multi-touch plays multiple emitters). Below the stage, 4 **on-object emitter cards** draw their **Grain** ring + cloud dots, circumference **Pitch** dot, **Smear** trails, **ADSR** curve, and **Look** chip (`clean`, `tune`, `crush`, `jpeg`, `tint`, `tile`, `kaleido`) — drag directly on the card to shape while playing, or tap **`Clip ›`** for the full Clip sheet. **Rec** bounces what you play into a take. |
+| **Sequence** (2) | nanoloop-style step lanes, one per clip, 16 steps with polymeter (`↺`), per-step **ratchet** (`1..8` rapid subdivisions + pitch slope), pitch in scale degrees, slice lock, and chance. Top **SET** arranger bar chains multi-bar scenes (`1–8`) into playable VJ cues that keep running seamlessly when you jump into **Perform**. |
+| **Perform** (3) | 4×4 sampler/looper pads (one-shot drum/dialogue hits with `1..4` **choke groups**, beat-synced loops, or BPM-independent free-running **tape loops**), live **5-band `24 dB/Oct` `ISOL8` frequency isolator** (`LF · LMF · MF · HMF · HF` `MUTE`/`SOLO` + `STEREO | MID | SIDE` + `L · R · M · S` monitor), 6 momentary VJ punch-ins (**Stutter**, varispeed **Tape Stop**, **Comb**, **Dub**, **Shimmer**, **Wear**), stage layout (**stack | split | grid | bleed**) + aspect (**16:9 · 1:1 · 9:16**), Display 2 output, and Fullscreen (`F`). |
 
-**Adding media — the Add sheet.** Every "+" (an empty grid column or its
-header, an empty pad, Sequence's empty lane, or **Project → Library**) opens
-one sheet: **Files** (a picker), **Browse** (every video on this machine),
-**Link** (YouTube or anything yt-dlp fetches; a 20–60 s window is kept) and
-**Dig** — one tap fetches a random, rarely seen video (camera-default names
-like `IMG_4821`, under 500 views; *Creative Commons only* is on by default),
-hold digs 4. Adds stream in as placeholder tiles where they will land; what
-arrived shows as a card with its provenance (uploader · date · views · CC)
-and a **Chop** button. The plugin offers Files only.
+**Adding media — YouTube, Unseen Dig, Google Drive, Local.** Every `+` opens the zero-AI **Add** sheet:
+- **YouTube**: search directly inside the app via `yt-dlp` (with an **under 500 views** underground filter and Creative Commons toggle), paste any YouTube URL with a start/length trim window, or tap **Dig** / **Dig 4 → Kit** to pull unseen camera-default uploads (`IMG_4821`, `MVI_…`, `< 500` views) straight onto the pads.
+- **Drive & Local**: browse synced **Google Drive** folders (`~/Library/CloudStorage/GoogleDrive-*`) alongside local machine folders (`~/Movies`, `~/Documents`, `~/Downloads`, `~/Desktop`) or pick files directly. (Plugin hosts expose local Files only.)
 
-**Clip sheet — chop, ADSR, grain, pitch, effects, links.** Tap **`Clip ›`**,
-**`Open clip ›`**, any header/pad **`›`**, or long-press an emitter, column
-header, lane header, or pad to open that clip's unified sheet (with an
-in-place owner switcher across `Clip`, `Emitter 1–4`, `Lane 1–8`, and
-`Pad 1–16`):
-- **Stage + 6 macros:** live preview with **stack | tile** + `GRAIN`,
-  `PITCH`, `SMEAR`, `LOOK`, `LEVEL`, `PAN`.
-- **Koala-style Chop:** full-width filmstrip + waveform (with picture-energy
-  bars on silent video clips) — Auto (transients) / 4 / 8 / 16, **Tap** (the
-  clip plays live; every tap drops a chop point), drag an edge, double-tap a
-  slice to merge it, tap one to audition sound + picture, and **Slices → pads**
-  (loads pads 1–N as one-shots and jumps to Perform; MIDI from C3 plays
-  slices; Sequence step sheets pick from them).
-- **Shape, Grain, Pitch, Effects, Links:** a 4-handle **A / D / S / R**
-  envelope over the clip's own thumbnail shaping sound *and* picture —
-  **Cut** (full brightness until a hard cut with the sound) or **Fade**
-  (opacity follows the envelope) — alongside per-owner Grain, Pitch, dual
-  audio/video (`♪ / ▣`) Effects, and Sound↔Picture Links (`pitch → hue`,
-  `gain → opacity`, `pan → x`, `envelope → fade`, `layout → pan`).
+**Clip sheet — 5-band Spectral Chop, Sculpt & Tape, ADSR, Grain, Effects, Links.** Tap **`Clip ›`** or any header/pad **`›`** to shape any clip, emitter, lane, or pad:
+- **Zero-AI Spectral Chopper & Multi-Clip Harvesters:** 5-band weighted log-spectral flux transient detection with asymmetric zero-crossing snap (`[-2.0 ms, +1.8 ms]` and `-30 ms` speech consonant pre-roll), McLeod NSDF `f0` + pitch confidence, `64×36` frame-diff motion focus `(cx, cy)` (auto-centering portrait faces and subjects inside split/grid cells), inline stage **Captions**, **Slices → pads**, **Kit → pads** (auto-curates Kick, Snare, Hat, Pluck, Chord, Dialogue, and Wash/Loop across loaded clips while rejecting outro speech), and **Loops → pads** (curates unsynchronized ambient tape loops).
+- **Sculpt & Tape (100% sample-excited, zero synth oscillators):** 1-tap non-destructive **Stamps** (`Raw · Kick · Snare · Hat · Pluck · Chord · Phrase · Wash · TapeLoop · Disintegrate`) that set continuous physical dials you can tweak freely — pitch drop envelope, `68 ms`-gated Cytomic ZDF swept-SVF sub-exciter (`155 → 50 Hz`), 3-grain MPC snare snap + `85 ms` gated room, `5.4 kHz` hat air shaper, pre-filter `tanh` drive, scale-locked fractional-delay Karplus-Strong `comb` string resonator, polyphonic `Chord` voicings (`Octaves`, `Fifths`, `Min7`, `Min9`, `Maj7`, `Sus4`, `Cluster` — stacked in stereo audio while deduplicated to one clean visual panel), `+12/+7 st` octave `shimmer`, `1..4` `choke` groups, BPM-free asynchronous **Tape Loop** length (`80 ms` raised-cosine seam + capstan `wow & flutter`), and monotonic multi-pass **Disintegrate** oxide dropouts & high-frequency darkening (*Basinski / The Caretaker*).
+- ***MODELL 5* Micro-Bursts & Stage Framing:** set `Cut` + zero spray/jitter at `12–45 Hz` density for deterministic audio-rate staccato portrait bursts (*Granular-Synthesis — MODELL 5*) across `3×1` / `2×1` architectural monolith columns; switch any stage between **stack**, **split**, **grid** (with dense active-voice slot packing so 2 or 3 active voices span full rows/columns with zero empty black quadrants), and **bleed** across **16:9**, **1:1**, and **9:16**, or engage the polar **Kaleido** prism.
+- **Streaming HD Export:** renders deterministic audio + `-4 dB @ 290 Hz` mud-carved `studio_bus` first, then streams single RGBA frames (`< 20 MB` RAM even at `1080p @ 60 fps`) into `ffmpeg` with 4× `192 kHz` oversampled `-1.4 dBTP` true-peak limiting.
 
-**stack | tile & layout panning.** Every stage has a **stack | tile** switch:
-in **tile**, sounding voices claim stable auto-grid slots (`1×1 → 2×1 → 2×2 →
-3×3`) with sharp visual cuts, and when `layout → pan` is active, a tile's
-horizontal column steers stereo pan (*left tile, left ear*).
-
-**Project sheet** (`Project` in the top bar) holds global Time & Key, Song
-chain + Scenes 1–8, Library (+ Add / Dig), Master Effects (`♪ / ▣`), and the
-Rhai Script console. Keys: space, 1/2/3 or Tab, F, R, O, Esc.
+**Project sheet** (`Project` in the top bar) holds global Time & Key, Song chain + Scenes 1–8, Library (+ Add / Dig), Master Effects (`♪ / ▣`) + `ISOL8`, and the Rhai Script console. Keys: space, 1/2/3 or Tab, F, R, O, Esc.
 
 `chromagrain --classic` opens the previous timeline/inspector editor (below).
 
@@ -360,25 +328,21 @@ The window has three places, and every thing lives in exactly one of them:
 11. **Render** from *export* in the top bar — mp4 or wav, rendered by the
    deterministic offline engine.
 
-### Browse — every video on this Mac
+### Browse — local & Google Drive video crate
 
 The library's **Browse** tab turns every folder of videos under
-`~/Documents`, `~/Movies`, `~/Downloads`, `~/Desktop`, `~/Pictures` and
-`~/Screencaps` into one sample library, grouped by folder (skipping
-`node_modules`, build output, app bundles, etc.).
+`~/Documents`, `~/Movies`, `~/Downloads`, `~/Desktop`, `~/Pictures`,
+`~/Screencaps`, and synced **Google Drive** folders
+(`~/Library/CloudStorage/GoogleDrive-*`) into one zero-AI sample library,
+grouped by folder (skipping `node_modules`, build output, app bundles, etc.).
 
 - **Drag a tile onto a track** — the drop ghost shows the clip's real
   length; it's imported on drop (a pulsing placeholder marks the spot while
   it decodes) and lands there as a snippet. Double-click drops it at the playhead; *add to library* just
   imports it. A file is only ever decoded once: using it again reuses the
   same library source ("in project" badge).
-- **Search by meaning**: projects that ship a semantic corpus
-  (`public/corpus.json` + `public/vectors.bin`, like video-grid) are listed
-  first. Type a description and press **enter** — the query is embedded with
-  the corpus' own model (read from `corpus.json`) and ranked by cosine
-  similarity. Needs `GEMINI_API_KEY` (env, or the project's `.env`). Typing
-  without enter is a plain word filter, which works everywhere.
-- **shuffle** reorders what's showing, for happy accidents.
+- **Filter & shuffle** — live plain-text filename/folder filter plus
+  **shuffle** to reorder what's showing for happy accidents.
 - Thumbnails are grabbed by ffmpeg in the background and cached in
   `~/Library/Caches/chromagrain/thumbs`.
 
@@ -577,9 +541,9 @@ seed` (grains), `size_scale, min_size, max_size, additive, scatter_y`
 (visual style), and the correspondence dials `gain_to_opacity,
 envelope_to_opacity, pitch_to_hue, pitch_to_rate, pan_to_x, reverse_video`.
 Effects: `effect(clip, kind)` / `master_effect(kind)` with kinds
-`crush | delay | reverb | compress`, parameters via `fx` / `master_fx`
+`crush | delay | reverb | compress | tint | kaleido | isolator`, parameters via `fx` / `master_fx`
 (`downsample, bits`; `time, feedback, mix, shift_x, shift_y`;
-`size, damp, mix`; `quality`; plus `audio` and `video` on every effect).
+`size, damp, mix`; `quality`; `folds, spin`; plus `audio` and `video` on every effect).
 Other calls: `bpm`, `canvas`, `sine_source`, `paulstretch`, `segment`,
 `segment_available`, `source_secs`, `base_hz`,
 `set_base_hz`, `no_key`, `clear_audio_filters`, `clear_effects`,
@@ -591,60 +555,61 @@ Other calls: `bpm`, `canvas`, `sine_source`, `paulstretch`, `segment`,
 ```
 crates/core        chromagrain-core (headless, fully tested)
   music.rs         notes, scales, keys, quantize_ratio
-  dsp.rs           RBJ biquads, tukey grain envelope, pitch detection, PRNG
-  grain.rs         GrainSettings -> [GrainEvent]  (the shared AV events)
+  dsp.rs           RBJ biquads, Cytomic ZDF SVF, LR4 5-band ISOL8 crossover,
+                   McLeod NSDF pitch detection, Karplus-Strong comb, PRNG
+  grain.rs         GrainSettings + VoiceSculpt + ChordVoicing -> [GrainEvent]
   envelope.rs      A/D/S/R voice envelope + picture Cut/Fade gating
-  chop.rs          Koala-style slices: auto-transient, equal(N), tap-chop,
-                   boundary moves, slice audition + pad/step mapping
-  tile.rs          auto-grid tile slot assignment (1x1..3x3) + layout->pan
-  dig.rs           astronaut.io-style unseen YouTube dig + yt-dlp window fetch
-  audio.rs         AudioClip, granular audio renderer, stereo bus + soft clip
-  video.rs         Frame/VideoClip, HSV, ColorFilter, AvLink, grain compositor
-  fx.rs            AV effects: crush/delay/reverb/compress/tint, streaming audio
-                   states (block == offline, exactly), FFT + 8x8 DCT
-  seq.rs           step sequencer: StepPattern/SeqRow/Step -> grain events
-  timeline.rs      Source / Clip (granular|snippet|pattern) / Track / Project
-  render.rs        offline renderer: clip -> track -> master, stack & tile
+  chop.rs          5-band log-flux transients, zero-crossing snap, motion focus,
+                   Kit -> pads & Loops -> pads multi-clip harvesters
+  tile.rs          dense Split/Grid/Bleed/Monolith slot assignment + layout->pan
+  dig.rs           YouTube search (<500 views) + unseen Dig + yt-dlp window fetch
+  audio.rs         AudioClip, sample-excited sculptors, Basinski TapeLoop &
+                   Disintegrate wear, varispeed TapeStopState, studio_bus
+  video.rs         Frame/VideoClip, focus_cover_patch, stage captions, O(1) blur,
+                   8-thread HD scanline grain compositor
+  fx.rs            AV effects: crush/delay/reverb/compress/tint/kaleido/isolator,
+                   streaming audio states (block == offline), FFT + 8x8 DCT
+  seq.rs           step sequencer: StepPattern/SeqRow/Step + ratchets -> grains
+  timeline.rs      Source / Clip / Track / MasterPunch / Project
+  render.rs        streaming single-frame 1080p60 renderer (<20 MB RAM, -1.4 dBTP)
   realtime.rs      streaming performance engine (loop region, live edits)
   take.rs          bounce played grains into a new source (Rec takes)
   instrument.rs    Instrument: the plugin-shaped facade (decoded media in,
-                   note on/off, GRAIN/PITCH/SMEAR/LOOK macros, host
-                   transport, process() + FrameState snapshots, 4x4
-                   pad bank on the beat grid, step lanes, one-shots)
-  media.rs         wav/png IO; MediaBackend (desktop: ffmpeg decode/encode,
-                   yt-dlp fetch, segmentation sidecars (Apple Vision /
-                   SAM 3); compiled out on iOS, where the host installs one)
+                   note on/off, GRAIN/PITCH/SMEAR/LOOK macros, ISOL8, TapeStop,
+                   4x4 pad bank + choke groups, step lanes, one-shots)
+  media.rs         wav/png IO; MediaBackend (desktop: ffmpeg streaming encode,
+                   yt-dlp fetch, Vision/SAM 3 sidecars; compiled out on iOS)
   sc.rs            SuperCollider instruments via plyphon: catalog, parts,
                    seamless-loop + single-note offline renders
   sc_defs.rs       the 12 instrument SynthDefs, in Rust
   sc_graph.rs      SuperCollider-style SynthDef builder for plyphon
   script.rs        rhai bindings over all of the above
 crates/ui          chromagrain-ui (shared by the app and the plugin)
-  studio/          D · Hybrid ("touch it · open it") studio UI: Play /
-                   Sequence / Perform views, on-object shaping, Add / Clip /
-                   Project modal sheets — drawn against a Host trait
+  studio/          ISOL8 hardware console studio UI: Play / Sequence / Perform,
+                   Add (YouTube/Dig/Drive/Local), Clip (Chop + Sculpt & Tape),
+                   5-band ISOL8 strip, VJ punch-ins, Set/Cue arranger
   envelope.rs      4-handle A/D/S/R editor over the clip's own thumbnail
   wave.rs          cached audio peaks + silent-clip picture-energy bars
   host.rs          Host / PerformHost / Caps: what the UI needs from its
                    host (document, transport, live grains, canvas, ...)
-  gpu.rs           wgpu realtime pipeline (Metal/D3D12/Vulkan): grain
-                   quads + WGSL effect passes + stack/tile compositing + live
-                   buses; renders once per frame, any window presents
+  gpu.rs           wgpu realtime pipeline (Metal/D3D12/Vulkan): grain quads +
+                   WGSL passes (kaleido, isolator, tapestop, split/tile/bleed)
   surface.rs       egui + wgpu on a raw window / CAMetalLayer (plugin
                    editor, future AUv3) or offscreen
-  theme.rs, widgets.rs, atlas.rs   Geist + graphite, custom widgets,
-                   per-clip frame atlases
+  theme.rs, widgets.rs, atlas.rs   anodized ISOL8 chassis, pointer knobs + LCDs,
+                   backlit ruby/amber/mint switches, per-clip frame atlases
 crates/app         chromagrain (desktop app)
   main.rs          eframe GUI: studio + classic timeline/sequencer/inspector
   demo.rs          --demo loader (Night Platform across grid, lanes, pads)
-  adds.rs          async media jobs (Files, Browse, Link, Dig) + placeholders
+  adds.rs          async media jobs (Files, Browse, Drive, YouTube, Dig)
   showcase.rs      headless 1080p30 UX showcase recorder (egui_kittest + wgpu)
-  studio_host.rs   the app as a studio Host (pads, output, classic editors)
-  studio_tests*.rs headless kittest snapshots + touch/chop/dig/hybrid tests
+  vj_hillclimb.rs  6-piece pure-YouTube AV collage & ISOL8 showcase suite
+  studio_host.rs   the app as a studio Host (pads, SET cues, output, classic)
+  studio_tests*.rs headless kittest snapshots + ISOL8/touch/chop/dig tests
   ui_output.rs     performance output window (second viewport)
   displays.rs      which displays are attached (CoreGraphics on macOS)
   playback.rs      always-on engine: lock-free ring into cpal, transport
-                   start/stop, live pad triggers any time
+                   start/stop, live pad triggers, ISOL8 & TapeStop streaming
   midi.rs          midir input, note pads, CC mappings with learn
   ui_synth.rs      instrument editor (knobs + piano roll), debounced
                    background re-renders, note auditions

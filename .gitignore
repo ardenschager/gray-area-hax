@@ -13,4 +13,5 @@ outputs/**/*.mp4
 outputs/**/*.wav
 outputs/**/*.png
 outputs/**/work/
+outputs/**/src/
 
