@@ -11,10 +11,10 @@ use crate::widgets::*;
 use egui::{self, Align2, Color32, Rect, Sense, Stroke, StrokeKind};
 
 const YT_SUGGESTIONS: [&str; 4] = [
-    "1960s commercial",
-    "cello practice",
-    "answering machine",
-    "cassette tape loop",
+    "1980s robot demo",
+    "uk garage acapella",
+    "suzuki omnichord",
+    "tap dance foley",
 ];
 
 /// Add-sheet state that outlives one frame.
@@ -23,6 +23,8 @@ pub struct AddState {
     pub link: String,
     pub yt_query: String,
     pub yt_low_views: bool,
+    /// Trim random energetic `~18s` window from long clips (default ON).
+    pub random_window: bool,
     pub query: String,
     /// `0 = All`, `1 = Google Drive`, `2 = Local`.
     pub drive_scope: usize,
@@ -38,6 +40,7 @@ impl Default for AddState {
             link: String::new(),
             yt_query: String::new(),
             yt_low_views: false,
+            random_window: true,
             query: String::new(),
             drive_scope: 0,
             cc_only: true,
@@ -481,10 +484,16 @@ impl Studio {
             host.search_youtube(self.add.yt_query.trim(), self.add.yt_low_views);
         }
 
+        // 1b. Instant Zero-AI YouTube Pull Bar: `Roulette (<100v)` · `Random 18s` · `Pull 2 → Kit`
+        let pull_h = 34.0;
+        let pull_y = q_rect.bottom() + 7.0;
+        let pull_bar = Rect::from_min_size(egui::pos2(body.left(), pull_y), egui::vec2(body.width(), pull_h));
+        self.youtube_pull_strip(host, ui, pull_bar, target, "yt-pull");
+
         // 2. Bottom row: Direct Paste Link + Fetch (preserves `link url` and `fetch link` a11y!).
         let link_h = 40.0;
         let fetch_w = 96.0;
-        let link_y = (body.bottom() - link_h).max(q_rect.bottom() + 48.0);
+        let link_y = (body.bottom() - link_h).max(pull_bar.bottom() + 44.0);
         let link_rect = Rect::from_min_size(egui::pos2(body.left(), link_y), egui::vec2(body.width() - fetch_w - gap, link_h));
         let mut link = self.add.link.clone();
         let (_, link_enter) = field(
@@ -499,14 +508,15 @@ impl Studio {
         let fb = Rect::from_min_size(egui::pos2(link_rect.right() + gap, link_rect.top()), egui::vec2(fetch_w, link_h));
         let go_link = button_named(ui, fb, ui.id().with("link-fetch"), "Fetch", "fetch link", !self.add.link.trim().is_empty(), None, None).clicked();
         if (go_link || link_enter) && !self.add.link.trim().is_empty() {
+            host.set_random_window(self.add.random_window);
             host.add_link(self.add.link.trim(), target);
             self.add.link.clear();
         }
 
         // 3. Middle zone: Search results list or 1-tap starter search pills.
         let mid = Rect::from_min_max(
-            egui::pos2(body.left(), q_rect.bottom() + 8.0),
-            egui::pos2(body.right(), link_rect.top() - 8.0),
+            egui::pos2(body.left(), pull_bar.bottom() + 7.0),
+            egui::pos2(body.right(), link_rect.top() - 7.0),
         );
         if mid.height() < 32.0 {
             return;
@@ -611,22 +621,101 @@ impl Studio {
                 }
             });
         if let Some(url) = picked_url {
+            host.set_random_window(self.add.random_window);
             host.add_link(&url, target);
+        }
+    }
+
+    fn youtube_pull_strip(
+        &mut self,
+        host: &mut dyn Host,
+        ui: &mut egui::Ui,
+        bar: Rect,
+        target: AddTarget,
+        id_salt: &str,
+    ) {
+        let p = ui.painter().clone();
+        let id = ui.id().with(id_salt);
+        let gap = 8.0;
+        let roul_w = 148.0_f32.min((bar.width() * 0.30).max(120.0));
+        let win_w = 122.0_f32.min((bar.width() * 0.24).max(104.0));
+        let kit_w = 144.0_f32.min((bar.width() * 0.28).max(118.0));
+
+        // 1. `Roulette (<100v)` (`"dig roulette"`)
+        let r_roul = Rect::from_min_size(bar.min, egui::vec2(roul_w, bar.height()));
+        let roul_resp = hit(ui, r_roul, id.with("roulette"), Sense::click(), "dig roulette");
+        paint_switch_cap(&p, r_roul, SwitchKind::PuttyAmber, false, roul_resp.hovered(), roul_resp.is_pointer_button_down_on());
+        draw_icon(&p, Icon::Dig, egui::pos2(r_roul.left() + 14.0, r_roul.center().y), 12.0, INK);
+        p.text(
+            egui::pos2(r_roul.left() + 26.0, r_roul.center().y),
+            Align2::LEFT_CENTER,
+            "Roulette (<100v)",
+            font_semibold(11.0),
+            INK,
+        );
+        if roul_resp.clicked() {
+            host.set_random_window(self.add.random_window);
+            host.dig_roulette(self.add.random_window, target);
+        }
+
+        // 2. `Random 18s` toggle (`"random window"`, default ON)
+        let r_win = Rect::from_min_size(egui::pos2(r_roul.right() + gap, bar.top()), egui::vec2(win_w, bar.height()));
+        let win_resp = hit(ui, r_win, id.with("rand-win"), Sense::click(), "random window");
+        let win_on = self.add.random_window;
+        paint_switch_cap(&p, r_win, SwitchKind::PuttyMint, win_on, win_resp.hovered(), win_resp.is_pointer_button_down_on());
+        p.text(
+            r_win.center(),
+            Align2::CENTER_CENTER,
+            "Random 18s",
+            font_semibold(11.0),
+            if win_on { Color32::from_rgb(0x11, 0x2b, 0x1f) } else { INK },
+        );
+        if win_resp.clicked() {
+            self.add.random_window = !self.add.random_window;
+            host.set_random_window(self.add.random_window);
+        }
+
+        // 3. `Pull 2 → Kit` (`"pull 2 to kit"`)
+        let r_kit = Rect::from_min_size(egui::pos2(r_win.right() + gap, bar.top()), egui::vec2(kit_w, bar.height()));
+        let kit_resp = hit(ui, r_kit, id.with("pull-2-kit"), Sense::click(), "pull 2 to kit");
+        paint_switch_cap(&p, r_kit, SwitchKind::Amber, true, kit_resp.hovered(), kit_resp.is_pointer_button_down_on());
+        draw_icon(&p, Icon::Grid, egui::pos2(r_kit.left() + 14.0, r_kit.center().y), 12.0, ON_HI);
+        p.text(
+            egui::pos2(r_kit.left() + 26.0, r_kit.center().y),
+            Align2::LEFT_CENTER,
+            "Pull 2 → Kit",
+            font_semibold(11.5),
+            ON_HI,
+        );
+        if kit_resp.clicked() {
+            host.set_random_window(self.add.random_window);
+            host.pull_two_to_kit(self.add.random_window, false);
+        }
+
+        // Subtle explanatory silkscreen when wide enough.
+        if bar.right() - r_kit.right() >= 140.0 {
+            p.text(
+                egui::pos2(bar.right() - 4.0, bar.center().y),
+                Align2::RIGHT_CENTER,
+                "zero-AI auto-chop + vocal kit",
+                mono(10.0),
+                INK3,
+            );
         }
     }
 
     fn add_dig_tab(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, body: Rect, target: AddTarget) {
         let p = ui.painter().clone();
-        let compact = body.height() < 305.0;
-        let btn_h = if compact { 92.0 } else { 112.0 };
-        let c = egui::pos2(body.center().x, body.top() + if compact { 54.0 } else { 86.0 });
+        let compact = body.height() < 310.0;
+        let btn_h = if compact { 82.0 } else { 102.0 };
+        let c = egui::pos2(body.center().x, body.top() + if compact { 46.0 } else { 72.0 });
         let b = Rect::from_center_size(c, egui::vec2(196.0, btn_h));
         let resp = hit(ui, b, ui.id().with("dig"), Sense::click(), "dig");
         let h = hold(ui, &resp, 0.6);
         let down = resp.is_pointer_button_down_on();
         paint_switch_cap(&p, b, SwitchKind::Amber, true, resp.hovered(), down);
-        draw_icon(&p, Icon::Dig, c - egui::vec2(0.0, 14.0), if compact { 26.0 } else { 30.0 }, ON_HI);
-        p.text(c + egui::vec2(0.0, 20.0), Align2::CENTER_CENTER, "DIG", font_semibold(17.0), ON_HI);
+        draw_icon(&p, Icon::Dig, c - egui::vec2(0.0, 14.0), if compact { 24.0 } else { 28.0 }, ON_HI);
+        p.text(c + egui::vec2(0.0, 18.0), Align2::CENTER_CENTER, "DIG", font_semibold(16.5), ON_HI);
         if down {
             let t0 = ui.input(|i| i.pointer.press_start_time()).unwrap_or(0.0);
             let f = ((ui.input(|i| i.time) - t0) / 0.6).clamp(0.0, 1.0) as f32;
@@ -634,31 +723,41 @@ impl Studio {
             ui.ctx().request_repaint();
         }
         if h.fired {
+            host.set_random_window(self.add.random_window);
             host.dig(4, self.add.cc_only, target);
         } else if resp.clicked() && !h.held_before {
+            host.set_random_window(self.add.random_window);
             host.dig(1, self.add.cc_only, target);
         }
-        let l1_y = b.bottom() + if compact { 22.0 } else { 30.0 };
-        let l2_y = l1_y + if compact { 18.0 } else { 20.0 };
-        p.text(egui::pos2(c.x, l1_y), Align2::CENTER_CENTER, "a random video almost nobody has seen · hold to dig 4", font(12.5), INK2);
-        p.text(egui::pos2(c.x, l2_y), Align2::CENTER_CENTER, "camera-default names (IMG_4821, MVI_0032…), under 500 views, a 20–60 s window", font(11.5), INK3);
+        let l1_y = b.bottom() + if compact { 18.0 } else { 24.0 };
+        let l2_y = l1_y + if compact { 16.0 } else { 18.0 };
+        p.text(egui::pos2(c.x, l1_y), Align2::CENTER_CENTER, "a random video almost nobody has seen · hold to dig 4", font(12.0), INK2);
+        p.text(egui::pos2(c.x, l2_y), Align2::CENTER_CENTER, "camera-roll roulette (IMG_4821, MVI_0032…), random 18 s energetic cut", font(11.0), INK3);
 
-        let row_y = l2_y + if compact { 32.0 } else { 42.0 };
-        let kit_w = 148.0;
+        // Row 1: `Roulette (<100v)` · `Random 18s` · `Pull 2 → Kit`
+        let pull_y = l2_y + if compact { 20.0 } else { 26.0 };
+        let pull_w = 430.0_f32.min(body.width() - 16.0);
+        let pull_r = Rect::from_min_size(egui::pos2(c.x - pull_w * 0.5, pull_y), egui::vec2(pull_w, 34.0));
+        self.youtube_pull_strip(host, ui, pull_r, target, "dig-pull");
+
+        // Row 2: `Dig 4 → Kit` + `Creative Commons only`
+        let row2_y = pull_r.bottom() + if compact { 8.0 } else { 12.0 };
+        let kit_w = 144.0;
         let cc_w = 180.0;
         let total_w = kit_w + 10.0 + cc_w;
         let x0 = c.x - total_w * 0.5;
 
-        let kit_r = Rect::from_min_size(egui::pos2(x0, row_y - 19.0), egui::vec2(kit_w, 38.0));
+        let kit_r = Rect::from_min_size(egui::pos2(x0, row2_y), egui::vec2(kit_w, 34.0));
         if button_named(ui, kit_r, ui.id().with("dig-4-kit"), "Dig 4 → Kit", "dig 4 to kit", false, Some(Icon::Grid), None).clicked() {
+            host.set_random_window(self.add.random_window);
             host.dig_to_kit(4, self.add.cc_only);
         }
 
-        let cc = Rect::from_min_size(egui::pos2(kit_r.right() + 10.0, row_y - 19.0), egui::vec2(cc_w, 38.0));
+        let cc = Rect::from_min_size(egui::pos2(kit_r.right() + 10.0, row2_y), egui::vec2(cc_w, 34.0));
         if chip(ui, cc, ui.id().with("dig-cc"), "creative commons only", false, self.add.cc_only).clicked() {
             self.add.cc_only = !self.add.cc_only;
         }
-        p.text(cc.center(), Align2::CENTER_CENTER, "Creative Commons only", font(12.0), if self.add.cc_only { ON_HI } else { INK2 });
+        p.text(cc.center(), Align2::CENTER_CENTER, "Creative Commons only", font(11.5), if self.add.cc_only { ON_HI } else { INK2 });
     }
 
     /// Placeholders for adds under way, then cards for what arrived.

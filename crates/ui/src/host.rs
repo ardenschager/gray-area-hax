@@ -876,4 +876,16 @@ pub trait Host {
     fn set_isolator(&mut self, _iso: chromagrain_core::dsp::BandIsolator) {}
     /// Live varispeed turntable / capstan brake (`0..1`).
     fn set_tape_stop(&mut self, _amt: f32) {}
+
+    /// Instant `<100v` camera-roll YouTube roulette (`IMG_/MVI_/DSC_`), optionally cutting an `~18s` energetic window.
+    fn dig_roulette(&mut self, random_18s: bool, target: AddTarget) {
+        let _ = random_18s;
+        self.dig(1, false, target);
+    }
+    /// Toggle `Random 18s` energetic window trimming for YouTube / Dig fetches.
+    fn set_random_window(&mut self, _on: bool) {}
+    /// Pull 2 contrasting YouTube clips and auto-build a 16-pad UKG/Vocal kit when they arrive.
+    fn pull_two_to_kit(&mut self, _random_18s: bool, cc_only: bool) {
+        self.dig_to_kit(2, cc_only);
+    }
 }

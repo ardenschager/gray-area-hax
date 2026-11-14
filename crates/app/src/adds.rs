@@ -51,9 +51,14 @@ pub struct Adds {
     yt_rx: Receiver<(u64, Result<Vec<YoutubeHit>, String>)>,
     /// Optional deterministic YouTube catalog for headless tests/snapshots.
     pub yt_mock: Option<Vec<YoutubeHit>>,
-    /// Remaining Dig jobs before auto-building a 16-pad kit (`Dig 4 → Kit`).
+    /// Optional pre-decoded sources delivered deterministically under `sim_clock` (showcase / offline tests).
+    pub sim_sources: Vec<Source>,
+    /// Trim a snappy `~18s` energetic window `(16..20s)` on YouTube/Dig pulls (default `true`).
+    pub random_window: bool,
+    /// Remaining Dig/Pull jobs before auto-building a 16-pad kit (`Dig 4 → Kit` / `Pull 2 → Kit`).
     pub dig_kit_remaining: usize,
     pub auto_kit_ready: bool,
+    pub auto_ukg_kit: bool,
 }
 
 impl Default for Adds {
@@ -77,8 +82,11 @@ impl Default for Adds {
             yt_tx,
             yt_rx,
             yt_mock: None,
+            sim_sources: Vec::new(),
+            random_window: true,
             dig_kit_remaining: 0,
             auto_kit_ready: false,
+            auto_ukg_kit: false,
         }
     }
 }
@@ -173,10 +181,44 @@ impl Adds {
         });
     }
 
-    /// Fetch a link (yt-dlp, a 20–60 s window, provenance kept).
+    fn active_window(&self) -> (f64, f64) {
+        if self.random_window {
+            (16.0, 20.0)
+        } else {
+            (20.0, 60.0)
+        }
+    }
+
+    /// Fetch a link (yt-dlp, an 18 s or 20–60 s window, provenance kept).
     pub fn link(&mut self, url: String, target: AddTarget, sr: u32) {
         let (id, _) = self.begin(target, "fetching link");
-        let job = dig::fetch_link(&url, DigOptions { sample_rate: sr, ..Default::default() });
+        if let Some(t0) = self.sim_clock {
+            if !self.sim_sources.is_empty() {
+                let s = self.sim_sources.remove(0);
+                let title = s.name.clone();
+                self.staged.push(Staged {
+                    id,
+                    search_end: t0 + 0.22,
+                    done_at: t0 + 0.85,
+                    search_label: "fetching link".into(),
+                    dl_label: title,
+                    res: Some(Ok(s)),
+                    path: None,
+                });
+                return;
+            }
+        }
+        if self.yt_mock.is_some() && self.sim_clock.is_none() && std::env::var_os(dig::YTDLP_ENV).is_none() {
+            return;
+        }
+        let job = dig::fetch_link(
+            &url,
+            DigOptions {
+                sample_rate: sr,
+                window: self.active_window(),
+                ..Default::default()
+            },
+        );
         if let Some(t0) = self.sim_clock {
             let st = job.wait();
             let title = job.title().unwrap_or_else(|| "downloading".into());
@@ -199,11 +241,54 @@ impl Adds {
         self.jobs_net.push((id, job));
     }
 
-    /// Dig `n` random, rarely seen videos. The first lands on `target`,
+    /// Dig `n` random, rarely seen videos (`max_views` threshold). The first lands on `target`,
     /// the rest on the next empty columns.
-    pub fn dig(&mut self, n: usize, cc_only: bool, target: AddTarget, sr: u32) {
+    pub fn dig_with_max_views(&mut self, n: usize, max_views: u64, cc_only: bool, target: AddTarget, sr: u32) {
         let count = n.max(1);
-        let jobs = dig::dig_many(count, DigOptions { sample_rate: sr, cc_only, ..Default::default() });
+        let win = self.active_window();
+        if let Some(t0) = self.sim_clock {
+            if self.sim_sources.len() >= count {
+                for k in 0..count {
+                    let s = self.sim_sources.remove(0);
+                    let title = s.name.clone();
+                    let (id, _) = self.begin(if k == 0 { target } else { AddTarget::Any }, "digging…");
+                    self.staged.push(Staged {
+                        id,
+                        search_end: t0 + 0.20 + k as f64 * 0.16,
+                        done_at: t0 + 0.82 + k as f64 * 0.28,
+                        search_label: format!("roulette <{max_views}v…"),
+                        dl_label: format!("cutting 18s · {title}"),
+                        res: Some(Ok(s)),
+                        path: None,
+                    });
+                }
+                return;
+            }
+        }
+        if self.yt_mock.is_some() && self.sim_clock.is_none() {
+            // In offline mock unit tests without `ytdlp-stub`, create pending jobs cleanly from mock catalog.
+            let mock = self.yt_mock.clone().unwrap_or_default();
+            if !mock.is_empty() && std::env::var_os(dig::YTDLP_ENV).is_none() {
+                for k in 0..count {
+                    let hit = &mock[k % mock.len()];
+                    let _ = self.begin(
+                        if k == 0 { target } else { AddTarget::Any },
+                        &format!("pulling · {}", hit.title),
+                    );
+                }
+                return;
+            }
+        }
+        let jobs = dig::dig_many(
+            count,
+            DigOptions {
+                sample_rate: sr,
+                max_views,
+                window: win,
+                cc_only,
+                ..Default::default()
+            },
+        );
         if let Some(t0) = self.sim_clock {
             let mut extra_seed = 100u64;
             for (k, job) in jobs.into_iter().enumerate() {
@@ -216,7 +301,14 @@ impl Adds {
                 };
                 while res.as_ref().is_ok_and(|s| self.sim_seen.contains(&s.name)) && extra_seed < 140 {
                     extra_seed += 1;
-                    let retry = dig::dig(DigOptions { sample_rate: sr, cc_only, seed: Some(extra_seed * 7919), ..Default::default() });
+                    let retry = dig::dig(DigOptions {
+                        sample_rate: sr,
+                        max_views,
+                        window: win,
+                        cc_only,
+                        seed: Some(extra_seed * 7919),
+                        ..Default::default()
+                    });
                     if retry.wait() == JobStatus::Done {
                         if let Some(s) = retry.take_source() {
                             res = Ok(s);
@@ -257,10 +349,37 @@ impl Adds {
         }
     }
 
+    pub fn dig(&mut self, n: usize, cc_only: bool, target: AddTarget, sr: u32) {
+        self.dig_with_max_views(n, 500, cc_only, target, sr);
+    }
+
     /// Dig `n` unseen clips and auto-harvest a 16-pad collage kit when they land.
     pub fn dig_to_kit(&mut self, n: usize, cc_only: bool, target: AddTarget, sr: u32) {
         self.dig_kit_remaining = n.max(1);
+        self.auto_ukg_kit = false;
         self.dig(n, cc_only, target, sr);
+    }
+
+    /// Pull 2 contrasting YouTube clips (top 2 search hits if available, else `<100v` roulette)
+    /// and auto-harvest a 16-pad UKG/Vocal kit when they arrive.
+    pub fn pull_two_to_kit(&mut self, cc_only: bool, target: AddTarget, sr: u32) {
+        self.dig_kit_remaining = 2;
+        self.auto_ukg_kit = true;
+        if self.yt_hits.len() >= 2 && self.sim_sources.len() < 2 {
+            let u0 = self.yt_hits[0].url.clone();
+            let u1 = self.yt_hits[1].url.clone();
+            if self.yt_mock.is_some() && self.sim_clock.is_none() && std::env::var_os(dig::YTDLP_ENV).is_none() {
+                let t0 = self.yt_hits[0].title.clone();
+                let t1 = self.yt_hits[1].title.clone();
+                let _ = self.begin(target, &format!("pulling · {t0}"));
+                let _ = self.begin(AddTarget::Any, &format!("pulling · {t1}"));
+                return;
+            }
+            self.link(u0, target, sr);
+            self.link(u1, AddTarget::Any, sr);
+        } else {
+            self.dig_with_max_views(2, 100, cc_only, target, sr);
+        }
     }
 
     pub fn dismiss(&mut self, id: u64) {

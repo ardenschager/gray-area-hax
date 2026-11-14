@@ -40,6 +40,8 @@ mod studio_tests_v003;
 mod studio_tests_vgs;
 #[cfg(test)]
 mod vj_hillclimb;
+#[cfg(test)]
+mod videograin_showcase;
 mod theme;
 mod ui_browse;
 mod ui_inspector;
@@ -1570,9 +1572,16 @@ impl eframe::App for App {
         self.browser.poll(ctx);
         if self.adds.poll(&self.project, &mut self.imported) {
             if std::mem::take(&mut self.adds.auto_kit_ready) {
-                let n = <Self as chromagrain_ui::Host>::build_kit_to_pads(self);
-                if n > 0 {
-                    self.status = format!("dug & built {n}-pad collage kit on Perform pads");
+                if std::mem::take(&mut self.adds.auto_ukg_kit) {
+                    let n = self.with_studio(|st, app| st.trigger_ukg_kit(app));
+                    if n > 0 {
+                        self.status = format!("pulled 2 clips & built {n}-pad vocal percussion kit");
+                    }
+                } else {
+                    let n = <Self as chromagrain_ui::Host>::build_kit_to_pads(self);
+                    if n > 0 {
+                        self.status = format!("dug & built {n}-pad collage kit on Perform pads");
+                    }
                 }
             }
             self.mark_now();
@@ -1607,7 +1616,7 @@ impl eframe::App for App {
         let busy = ctx.input(|i| i.pointer.any_down()) || ctx.wants_keyboard_input();
         self.history.observe(self.project_rev, user_changed, busy, &self.project);
         if std::mem::take(&mut self.os_copy) {
-            ctx.copy_text("chromagrain clip".into());
+            ctx.copy_text("videograin clip".into());
         }
 
         let now = self.app_clock.secs();

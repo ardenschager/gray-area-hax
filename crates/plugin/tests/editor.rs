@@ -621,3 +621,48 @@ fn plugin_v004_videograin_snapshot_960x600() {
         eprintln!("wrote {}", path.display());
     }
 }
+
+#[test]
+fn plugin_v005_videograin_snapshot_960x600() {
+    use chromagrain_core::seq::PatternPreset;
+    use chromagrain_ui::{Host, PerformHost, StageMode};
+    let mut p = plugin_with(clips());
+    let size = (960.0f32, 600.0f32);
+    let mut h = harness(size, editor_ui(&p));
+    h.run_steps(2);
+    {
+        let ui = h.state_mut();
+        ui.host.cutout_source(0, "person");
+        ui.studio.apply_pattern_preset(&mut ui.host, PatternPreset::Ukg2Step);
+        ui.studio.build_four_section_set(&mut ui.host);
+        ui.studio.trigger_ukg_kit(&mut ui.host);
+        ui.host.load_pad(8, 2);
+        ui.host.load_pad(9, 0);
+        ui.host.set_quantize(0);
+        ui.host.set_stage_mode(StageMode::Collage);
+        ui.host.toggle_pad(8);
+        ui.host.toggle_pad(9);
+        ui.host.toggle_pad(0);
+        ui.studio.set_view(&mut ui.host, View::Perform);
+        ui.studio.punch_fx[0] = true;
+    }
+    h.run_steps(3);
+    play(&mut p, 0.12, 0.0, &[]);
+    h.get_by_label("isol8 solo lmf").click();
+    h.get_by_label("isol8 solo mf").click();
+    h.get_by_label("isol8 solo hmf").click();
+    h.run_steps(2);
+    play(&mut p, 0.08, 0.25, &[]);
+    h.run_steps(2);
+    assert_eq!(h.state().host.stage_mode(), Some(StageMode::Collage));
+    assert_eq!(h.state().studio.seq.chain, vec![(0, 2), (1, 4), (2, 2), (3, 4)]);
+
+    let img = h.render().expect("render v005 plugin snapshot");
+    if let Ok(dir) = std::env::var("VIDEOGRAIN_V005_SHOTS") {
+        let dir = std::path::Path::new(&dir);
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join("261114_videograin_ui_plugin_960x600_v005.png");
+        img.save(&path).unwrap();
+        eprintln!("wrote {}", path.display());
+    }
+}

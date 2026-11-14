@@ -111,17 +111,32 @@ fn tile_grid_and_remap(
             }
         }
     };
+    let is_collage = mode == StageMode::Collage;
+    let src_is_alpha = |sid: usize| -> bool {
+        scene
+            .project
+            .sources
+            .get(sid)
+            .and_then(|s| s.video.as_ref())
+            .is_some_and(|v| v.has_alpha())
+    };
     for cp in scene.plan.iter() {
         if scene.project.tracks.get(cp.track).is_some_and(|tr| tr.muted) {
             continue;
         }
-        for (_, evs) in cp.video_parts.as_deref().unwrap_or(&cp.parts) {
+        for (sid, evs) in cp.video_parts.as_deref().unwrap_or(&cp.parts) {
+            if is_collage && src_is_alpha(*sid) {
+                continue;
+            }
             for e in evs {
                 see(e, scene.t);
             }
         }
     }
-    for (_, _, e) in &scene.live {
+    for (sid, _, e) in &scene.live {
+        if is_collage && src_is_alpha(*sid) {
+            continue;
+        }
         see(e, scene.live_t);
     }
     let aspect = scene.project.width.max(1) as f32 / scene.project.height.max(1) as f32;
@@ -334,7 +349,8 @@ fn tex1(uv: vec2f) -> vec4f { return textureSampleLevel(t1, samp, uv, 0.0); }
 fn fs_grain(i: VOut) -> @location(0) vec4f {
     let ux = select(i.uv.x, 1.0 - i.uv.x, u.d.y >= 0.5);
     let suv = u.patch_r.xy + vec2f(ux, i.uv.y) * u.patch_r.zw;
-    let texel = textureSampleLevel(tarr, samp, suv, i32(u.a.z + 0.5), 0.0);
+    let lyr = i32(u.a.z + 0.5);
+    let texel = textureSampleLevel(tarr, samp, suv, lyr, 0.0);
     var rgb = texel.rgb;
     var a = u.a.w * texel.a;
     var hsv = rgb2hsv(rgb);
@@ -363,6 +379,42 @@ fn fs_grain(i: VOut) -> @location(0) vec4f {
         let h_noise = fract(sin(scan_line * 12.9898 + u.a.z * 0.73) * 43758.5453);
         let drop = smoothstep(1.0 - oxide * 0.34, 1.0, h_noise);
         a *= (1.0 - 0.72 * drop);
+    }
+    // Die-cut collage sticker mode (`u.c.w > 0.5`): crisp `#F2EDE0` cream sticker border +
+    // `#111314` offset print shadow on real-time GPU Stage Monitor!
+    if (u.c.w > 0.5) {
+        let inv_tw = 1.0 / max(u.c.y, 64.0);
+        let inv_th = 1.0 / max(u.c.z, 64.0);
+        let rx = 3.2 * inv_tw;
+        let ry = 3.2 * inv_th;
+        let drx = 2.3 * inv_tw;
+        let dry = 2.3 * inv_th;
+        var ring_a = texel.a;
+        ring_a = max(ring_a, textureSampleLevel(tarr, samp, clamp(suv + vec2f( rx,  0.0), vec2f(0.002), vec2f(0.998)), lyr, 0.0).a);
+        ring_a = max(ring_a, textureSampleLevel(tarr, samp, clamp(suv + vec2f(-rx,  0.0), vec2f(0.002), vec2f(0.998)), lyr, 0.0).a);
+        ring_a = max(ring_a, textureSampleLevel(tarr, samp, clamp(suv + vec2f(0.0,   ry), vec2f(0.002), vec2f(0.998)), lyr, 0.0).a);
+        ring_a = max(ring_a, textureSampleLevel(tarr, samp, clamp(suv + vec2f(0.0,  -ry), vec2f(0.002), vec2f(0.998)), lyr, 0.0).a);
+        ring_a = max(ring_a, textureSampleLevel(tarr, samp, clamp(suv + vec2f( drx,  dry), vec2f(0.002), vec2f(0.998)), lyr, 0.0).a);
+        ring_a = max(ring_a, textureSampleLevel(tarr, samp, clamp(suv + vec2f(-drx,  dry), vec2f(0.002), vec2f(0.998)), lyr, 0.0).a);
+        ring_a = max(ring_a, textureSampleLevel(tarr, samp, clamp(suv + vec2f( drx, -dry), vec2f(0.002), vec2f(0.998)), lyr, 0.0).a);
+        ring_a = max(ring_a, textureSampleLevel(tarr, samp, clamp(suv + vec2f(-drx, -dry), vec2f(0.002), vec2f(0.998)), lyr, 0.0).a);
+        let sh_uv = suv - vec2f(4.2 * select(1.0, -1.0, u.d.y >= 0.5) * inv_tw, 5.2 * inv_th);
+        var sh_a = 0.0;
+        if (sh_uv.x >= 0.002 && sh_uv.x <= 0.998 && sh_uv.y >= 0.002 && sh_uv.y <= 0.998) {
+            sh_a = textureSampleLevel(tarr, samp, sh_uv, lyr, 0.0).a * 0.76;
+        }
+        let cream = vec3f(242.0 / 255.0, 237.0 / 255.0, 224.0 / 255.0);
+        let ink = vec3f(17.0 / 255.0, 19.0 / 255.0, 20.0 / 255.0);
+        let op = clamp(u.a.w, 0.0, 1.0);
+        var pm = ink * sh_a;
+        var out_a = sh_a;
+        let ba = smoothstep(0.18, 0.62, ring_a);
+        pm = cream * ba + pm * (1.0 - ba);
+        out_a = ba + out_a * (1.0 - ba);
+        let fa = clamp(texel.a, 0.0, 1.0);
+        pm = rgb * fa + pm * (1.0 - fa);
+        out_a = clamp(fa + out_a * (1.0 - fa), 0.0, 1.0) * op;
+        return vec4f(pm * op, out_a);
     }
     // Grain cosine border feather (d.x).
     let f = clamp(u.d.x, 0.0, 1.0) * 0.45;
@@ -883,6 +935,9 @@ struct GpuSource {
     layers: i32,
     duration: f64,
     src_aspect: f32,
+    has_alpha: bool,
+    tw: u32,
+    th: u32,
     ident: usize,
 }
 
@@ -1165,7 +1220,9 @@ impl GpuPreview {
         let take = n_frames.min(MAX_SRC_LAYERS);
         let (sw, sh) = (video.frames[0].width, video.frames[0].height);
         let src_aspect = sw.max(1) as f32 / sh.max(1) as f32;
-        let scale = (MAX_SRC_W as f32 / sw as f32).min(1.0);
+        let has_alpha = video.has_alpha();
+        let max_w = if has_alpha { 480 } else { MAX_SRC_W };
+        let scale = (max_w as f32 / sw as f32).min(1.0);
         let (tw, th) = (((sw as f32 * scale) as u32).max(2), ((sh as f32 * scale) as u32).max(2));
         let mut data = vec![0u8; (tw * th * 4) as usize * take];
         for l in 0..take {
@@ -1202,6 +1259,9 @@ impl GpuPreview {
                 layers: take as i32,
                 duration: video.duration(),
                 src_aspect,
+                has_alpha,
+                tw,
+                th,
                 ident,
             },
         );
@@ -1433,8 +1493,22 @@ impl GpuPreview {
         feather: f32,
         screen_blend: bool,
     ) {
+        self.record_grains_sticker(sid, draws, color_filter, additive, feather, screen_blend, false);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_grains_sticker(
+        &mut self,
+        sid: usize,
+        draws: Vec<(GrainDraw, bool, u32, f32)>,
+        color_filter: Option<&chromagrain_core::video::ColorFilter>,
+        additive: f32,
+        feather: f32,
+        screen_blend: bool,
+        sticker: bool,
+    ) {
         let Some(gsrc) = self.sources.get(&sid) else { return };
-        let (layers, dur) = (gsrc.layers, gsrc.duration.max(1e-6));
+        let (layers, dur, tw, th) = (gsrc.layers, gsrc.duration.max(1e-6), gsrc.tw as f32, gsrc.th as f32);
         let aspect = self.size.0 as f32 / self.size.1.max(1) as f32;
         let (mode, cf, valmin) = match color_filter {
             None => (0.0, [0.0f32; 4], 0.0),
@@ -1447,10 +1521,15 @@ impl GpuPreview {
         let pipe = if screen_blend { Pipe::GrainScreen } else { Pipe::Grain };
         for (d, flip_x, edge_mask, oxide) in draws {
             let layer = ((d.src_time / dur).rem_euclid(1.0) * layers as f64).min(layers as f64 - 1.0) as f32;
-            let (eff_add, eff_feather) = if d.tiled || edge_mask != 0 {
+            let (eff_add, eff_feather) = if sticker || d.tiled || edge_mask != 0 {
                 (0.0, 0.0)
             } else {
                 (additive, feather)
+            };
+            let c_uni = if sticker {
+                [0.0, tw, th, 1.0]
+            } else {
+                [1.0, 1.0, 0.0, 0.0]
             };
             let u = Uni {
                 rect: d.dest,
@@ -1458,6 +1537,7 @@ impl GpuPreview {
                 cf,
                 a: [d.rotation, aspect, layer.floor(), d.alpha],
                 b: [d.hue_shift, mode, valmin, eff_add],
+                c: c_uni,
                 d: [eff_feather, if flip_x { 1.0 } else { 0.0 }, edge_mask as f32, oxide],
                 ..Default::default()
             };
@@ -1774,6 +1854,8 @@ impl GpuPreview {
                 chromagrain_core::tile::Layout::Stack
             };
             let is_bleed = stage_mode == StageMode::Bleed;
+            let is_collage = stage_mode == StageMode::Collage;
+            let mut collage_stickers: Vec<(usize, GrainDraw, bool, f32)> = Vec::new();
 
             for (ti, track) in scene.project.tracks.iter().enumerate() {
                 if track.muted {
@@ -1803,8 +1885,28 @@ impl GpuPreview {
                     if any_active {
                         for (sid, evs) in &cp.parts {
                             let Some(gsrc) = self.sources.get(sid) else { continue };
-                            let dur = gsrc.duration.max(1e-6);
-                            let src_ar = gsrc.src_aspect;
+                            let (dur, src_ar, src_alpha) = (gsrc.duration.max(1e-6), gsrc.src_aspect, gsrc.has_alpha);
+                            if is_collage && src_alpha {
+                                let raw_fg = grain_draws_stage_mapped(
+                                    evs,
+                                    &VisualGrainStyle::full_frame(0.0),
+                                    &clip.link,
+                                    &clip.transform,
+                                    dur,
+                                    t,
+                                    aspect,
+                                    scene.parked,
+                                    chromagrain_core::tile::Layout::Stack,
+                                    None,
+                                    None,
+                                    0,
+                                    false,
+                                );
+                                for gd in raw_fg.into_iter().take(2) {
+                                    collage_stickers.push((*sid, gd, gd.flip_x, gd.oxide_dropout.max(oxide)));
+                                }
+                                continue;
+                            }
                             let style: VisualGrainStyle = if is_bleed {
                                 VisualGrainStyle::full_frame(0.0)
                             } else {
@@ -1899,8 +2001,28 @@ impl GpuPreview {
                 for (sid, _, ev) in scene.live.iter().filter(|h| h.1 == bus) {
                     self.ensure_source(&scene.project, *sid);
                     let Some(gsrc) = self.sources.get(sid) else { continue };
-                    let dur = gsrc.duration.max(1e-6);
-                    let src_ar = gsrc.src_aspect;
+                    let (dur, src_ar, src_alpha) = (gsrc.duration.max(1e-6), gsrc.src_aspect, gsrc.has_alpha);
+                    if is_collage && src_alpha {
+                        let raw_fg = grain_draws_stage_mapped(
+                            std::slice::from_ref(ev),
+                            &VisualGrainStyle::full_frame(0.0),
+                            &link,
+                            &chromagrain_core::timeline::ClipTransform::default(),
+                            dur,
+                            scene.live_t,
+                            aspect,
+                            false,
+                            chromagrain_core::tile::Layout::Stack,
+                            None,
+                            None,
+                            0,
+                            false,
+                        );
+                        for gd in raw_fg {
+                            collage_stickers.push((*sid, gd, gd.flip_x, gd.oxide_dropout));
+                        }
+                        continue;
+                    }
                     let eff_style = if is_bleed { VisualGrainStyle::full_frame(0.0) } else { style };
                     let raw_draws = grain_draws_stage_mapped(
                         std::slice::from_ref(ev),
@@ -1953,9 +2075,47 @@ impl GpuPreview {
                     self.blend_onto(MASTER, out, 1.0, add_out);
                 }
             }
+
+            // Die-cut `Collage` foreground stickers (`#F2EDE0` cream border + `#111314` shadow)
+            // layered over the crisp packed background grid!
+            if !collage_stickers.is_empty() {
+                // Deduplicate to at most 1 sticker per source (`sid`) and 2 total foreground stickers.
+                let mut dedup: Vec<(usize, GrainDraw, bool, f32)> = Vec::new();
+                for item in collage_stickers {
+                    if let Some(prev) = dedup.iter_mut().find(|d| d.0 == item.0) {
+                        *prev = item;
+                    } else if dedup.len() < 2 {
+                        dedup.push(item);
+                    }
+                }
+                let ns = dedup.len();
+                self.pass(MASTER, None);
+                for (si, (sid, mut gd, flip, ox)) in dedup.into_iter().enumerate() {
+                    let Some(gsrc) = self.sources.get(&sid) else { continue };
+                    let src_ar = gsrc.src_aspect;
+                    let dest = if ns == 1 {
+                        if aspect < 0.85 {
+                            [0.06, 0.14, 0.88, 0.72]
+                        } else {
+                            [0.16, 0.05, 0.68, 0.90]
+                        }
+                    } else if si == 0 {
+                        [0.03, 0.07, 0.56, 0.86]
+                    } else {
+                        [0.41, 0.07, 0.56, 0.86]
+                    };
+                    let box_ar = (dest[2] * aspect) / dest[3].max(1e-4);
+                    let focus = scene.focus_overrides.get(&sid).copied().unwrap_or((0.5, 0.46));
+                    gd.dest = dest;
+                    gd.patch = cover_patch_focus(src_ar, box_ar, focus, 0.0);
+                    gd.tiled = false;
+                    any_drawn = true;
+                    self.record_grains_sticker(sid, vec![(gd, flip, 0u32, ox)], None, 0.0, 0.0, false, true);
+                }
+            }
         }
 
-        // `52 ms` Optical Carry: prevent single-frame black strobing on rapid 16th cuts.
+        // Optical sample-and-hold (`<= 0.36 s`): prevent mid-groove black flashes across 16th/8th `VoxPerc` gaps.
         let clock_now = scene.t.max(scene.live_t);
         if any_drawn && !scene.parked {
             self.full(CARRY, Pipe::Blit, MASTER, None, Uni::default());
@@ -1963,11 +2123,11 @@ impl GpuPreview {
         } else if !any_drawn && !scene.parked && scene.backdrop.is_none() {
             if let Some(last_t) = self.carry_active_t {
                 let gap = clock_now - last_t;
-                if gap > 0.0 && gap < 0.135 {
-                    let hold_w = if gap <= 0.052 {
+                if gap > 0.0 && gap < 0.36 {
+                    let hold_w = if gap <= 0.28 {
                         1.0
                     } else {
-                        let u = ((gap - 0.052) / (0.135 - 0.052)).clamp(0.0, 1.0) as f32;
+                        let u = ((gap - 0.28) / (0.36 - 0.28)).clamp(0.0, 1.0) as f32;
                         0.5 * (1.0 + (std::f32::consts::PI * u).cos())
                     };
                     self.blend_onto(MASTER, CARRY, hold_w, 0.0);

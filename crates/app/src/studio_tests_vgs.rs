@@ -87,8 +87,8 @@ fn drag(h: &mut Harness<'static, App>, from: egui::Pos2, to: egui::Pos2) {
 fn mock_youtube_catalog() -> Vec<YoutubeHit> {
     vec![
         YoutubeHit {
-            title: "1964 Psychiatrist Clinic Educational Film Reel 2".into(),
-            url: "https://www.youtube.com/watch?v=vgs_psych64".into(),
+            title: "1984 Tomy Omnibot 5402 Robot Demo".into(),
+            url: "https://www.youtube.com/watch?v=vgs_omnibot84".into(),
             views: Some(184),
             duration_secs: Some(142.0),
             uploader: "midcentury_archive".into(),
@@ -883,11 +883,304 @@ fn v004_videograin_ui_wiring_and_snapshots() {
             app.studio.add.tab = AddRoute::Link;
             app.studio.add.yt_query = "uk garage acapella cassette".into();
             app.studio.add.yt_low_views = true;
-            app.adds.search_youtube("1960s psychiatrist cello answering machine", true);
+            app.adds.search_youtube("1984 omnibot robot cello answering machine", true);
             app.studio.sheet = Some(Sheet::Add(AddTarget::Column(7)));
             app.playback.stop();
         }
         h.run_steps(6);
         v004_shot(&mut h, "add", size);
+    }
+}
+
+fn v005_shot(h: &mut Harness<'static, App>, view_slug: &str, size: (f32, f32)) {
+    let img = h.render().expect("render v005 snapshot");
+    if let Ok(dir) = std::env::var("VIDEOGRAIN_V005_SHOTS") {
+        let dir = std::path::Path::new(&dir);
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join(format!(
+            "261114_videograin_ui_{view_slug}_{}x{}_v005.png",
+            size.0 as u32, size.1 as u32
+        ));
+        img.save(&path).unwrap();
+        eprintln!("wrote {}", path.display());
+    }
+}
+
+#[test]
+fn v005_videograin_presets_build_set_pull_bar_keys_and_snapshots() {
+    use chromagrain_core::seq::PatternPreset;
+    use chromagrain_ui::PerformHost;
+
+    let writing_shots = std::env::var("VIDEOGRAIN_V005_SHOTS").is_ok();
+    let mut h = harness((1600.0, 1000.0), View::Sequence, move |app| {
+        showcase(app);
+        rename_v004_crate_sources(app);
+        app.adds.yt_mock = Some(mock_youtube_catalog());
+        if !writing_shots {
+            let mut p = app.project.lock().unwrap();
+            for s in p.sources.iter_mut() {
+                s.video = Some(std::sync::Arc::new(chromagrain_core::video::VideoClip::test_pattern(
+                    120, 68, 8.0, 0.6,
+                )));
+            }
+        }
+    });
+    h.run_steps(4);
+
+    // 1. 7-Preset Sequencer Groove Bank (`2-Step · Disco · Boom-Bap · Ratchet · Dilla · Footwork · Tape`)
+    let preset_checks = [
+        ("seed ukg 2step", PatternPreset::Ukg2Step),
+        ("preset disco", PatternPreset::DiscoFilterPump),
+        ("preset boombap", PatternPreset::BoomBapDialogue),
+        ("preset ratchet", PatternPreset::KineticRatchet),
+        ("preset dilla", PatternPreset::DillaDrunk),
+        ("preset footwork", PatternPreset::Footwork332),
+        ("preset tape", PatternPreset::TapeDisintegration),
+    ];
+    for (a11y, expected) in preset_checks {
+        h.get_by_label(a11y).click();
+        h.run_steps(2);
+        assert_eq!(h.state().studio.active_preset, Some(expected), "clicking {a11y} activates {expected:?}");
+        assert!(
+            (h.state().studio.swing - expected.default_swing()).abs() < 0.02,
+            "{a11y} updates swing to ~{}, got {}",
+            expected.default_swing(),
+            h.state().studio.swing
+        );
+        let active_steps: usize = h.state().project.lock().unwrap().patterns[0]
+            .rows
+            .iter()
+            .map(|r| r.steps.iter().filter(|s| s.on).count())
+            .sum();
+        assert!(active_steps >= 4, "{a11y} populates active groove hits ({active_steps})");
+    }
+
+    // Re-arm `2-Step` then click `Build Set` (`"build set"`) -> expands 4 scenes + `[1x2, 2x4, 3x2, 4x4]` chain!
+    h.get_by_label("seed ukg 2step").click();
+    h.run_steps(2);
+    h.get_by_label("build set").click();
+    h.run_steps(3);
+    assert_eq!(
+        &h.state().studio.seq.scene_names[..4],
+        &["intro", "drop", "break", "climax"]
+    );
+    assert_eq!(
+        h.state().studio.seq.chain,
+        vec![(0, 2), (1, 4), (2, 2), (3, 4)]
+    );
+    assert_eq!(h.state().project.lock().unwrap().patterns.len().max(4), 4);
+
+    // 2. Instant Zero-AI YouTube Pull Bar (`"dig roulette"`, `"random window"`, `"pull 2 to kit"`)
+    h.get_by_label("top add").click();
+    h.run_steps(2);
+    h.get_by_label("add Link").click();
+    h.run_steps(2);
+    assert!(h.state().studio.add.random_window, "Random 18s defaults ON");
+    assert!(h.state().adds.random_window, "host random_window defaults ON");
+
+    h.get_by_label("random window").click();
+    h.run_steps(2);
+    assert!(!h.state().studio.add.random_window);
+    assert!(!h.state().adds.random_window);
+    h.get_by_label("random window").click();
+    h.run_steps(2);
+    assert!(h.state().adds.random_window);
+
+    let jobs0 = h.state().adds.jobs.len();
+    h.get_by_label("dig roulette").click();
+    h.run_steps(2);
+    assert_eq!(h.state().adds.jobs.len(), jobs0 + 1, "Roulette (<100v) queues an unseen clip");
+
+    let jobs1 = h.state().adds.jobs.len();
+    h.get_by_label("pull 2 to kit").click();
+    h.run_steps(2);
+    assert_eq!(h.state().adds.jobs.len(), jobs1 + 2, "Pull 2 -> Kit queues 2 clips");
+    assert!(h.state().adds.auto_ukg_kit, "Pull 2 -> Kit arms auto UKG vocal kit build");
+
+    // Verify `Dig` tab also exposes the same instant pull strip.
+    h.get_by_label("add Dig").click();
+    h.run_steps(2);
+    let _ = h.get_by_label("dig roulette");
+    let _ = h.get_by_label("random window");
+    let _ = h.get_by_label("pull 2 to kit");
+
+    h.get_by_label("close sheet").click();
+    h.run_steps(2);
+
+    // 3. Keyboard shortcuts `[5, 6, 7, 8, 9, 0]` on the 6 Perform Punch-In switches + `Build Set` in Perform
+    h.get_by_label("Perform").click();
+    h.run_steps(2);
+    let _ = h.get_by_label("build set");
+    h.state_mut().studio.punch_fx = [false; 6];
+    let punch_keys = [
+        egui::Key::Num5,
+        egui::Key::Num6,
+        egui::Key::Num7,
+        egui::Key::Num8,
+        egui::Key::Num9,
+        egui::Key::Num0,
+    ];
+    for (idx, key) in punch_keys.into_iter().enumerate() {
+        // Momentary hold down -> engages switch
+        push(
+            &mut h,
+            egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            },
+        );
+        h.run_steps(1);
+        assert!(h.state().studio.punch_fx[idx], "holding {key:?} engages punch_fx[{idx}]");
+        // Release -> disengages momentary switch
+        push(
+            &mut h,
+            egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers: Default::default(),
+            },
+        );
+        h.run_steps(1);
+        assert!(!h.state().studio.punch_fx[idx], "releasing {key:?} releases punch_fx[{idx}]");
+        // Single-frame tap (press + release in same frame) -> toggles switch
+        h.input_mut().events.push(egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        });
+        h.input_mut().events.push(egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: Default::default(),
+        });
+        h.step();
+        assert!(h.state().studio.punch_fx[idx], "single-frame tap on {key:?} toggles punch_fx[{idx}] ON");
+    }
+    h.state_mut().studio.punch_fx = [false; 6];
+
+    // 4. Render all 10 standalone `v005` UI snapshots (`1600x1000` and `960x600`) when `VIDEOGRAIN_V005_SHOTS` is set.
+    if !writing_shots {
+        return;
+    }
+    {
+        let app = h.state_mut();
+        app.adds.jobs.clear();
+        app.cutout_source(0, "person");
+        app.cutout_source(1, "subject");
+    }
+    for size in [(1600.0f32, 1000.0f32), (960.0, 600.0)] {
+        h.set_size(egui::vec2(size.0, size.1));
+
+        // (a) Perform (`Build Set` + `[5..0]` Punch legends + `collage`/`grid` + `ISOL8`)
+        {
+            let app = h.state_mut();
+            app.studio.sheet = None;
+            app.with_studio(|st, host| {
+                st.set_view(host, View::Perform);
+                st.apply_pattern_preset(host, PatternPreset::Ukg2Step);
+                st.build_four_section_set(host);
+                st.trigger_ukg_kit(host);
+            });
+            app.set_stage_mode(if size.0 >= 1200.0 { StageMode::Collage } else { StageMode::Grid });
+            app.studio.punch_fx = [true, false, size.0 >= 1200.0, false, false, false];
+            let mut iso = chromagrain_core::dsp::BandIsolator::default();
+            iso.solo = [false, true, true, true, false];
+            app.set_isolator(iso);
+            app.studio.isolator = iso;
+            for pad in [0usize, 2, 4, 8] {
+                if !PerformHost::pads(app)[pad].on {
+                    app.toggle_pad(pad);
+                }
+            }
+            app.playback.stop();
+            app.playhead_beats = 1.5;
+        }
+        h.run_steps(6);
+        v005_shot(&mut h, "perform", size);
+
+        // (b) Sequence (`7-Preset Groove Bank` + `Build Set` + `1 intro · 2 drop · 3 break · 4 climax` + live Stage)
+        {
+            let app = h.state_mut();
+            app.studio.punch_fx = [false; 6];
+            app.studio.sheet = None;
+            app.with_studio(|st, host| {
+                st.set_view(host, View::Sequence);
+                st.apply_pattern_preset(host, PatternPreset::Ukg2Step);
+                st.build_four_section_set(host);
+                st.seq.scene = 1; // highlight `2 · drop`
+            });
+            app.set_stage_mode(StageMode::Grid);
+            app.playback.stop();
+            app.playhead_beats = 1.25;
+        }
+        h.run_steps(6);
+        v005_shot(&mut h, "sequence", size);
+
+        // (c) Play (calm recessed tape-slot empty column + unobstructed `grid` Stage + 4 `ISOL8` Emitter Cards)
+        {
+            let app = h.state_mut();
+            app.studio.sheet = None;
+            app.with_studio(|st, host| st.set_view(host, View::Play));
+            app.set_stage_mode(StageMode::Grid);
+            app.studio.swing = 0.61;
+            app.studio.emitters[0].held = true;
+            app.studio.emitters[1].held = true;
+            app.studio.emitters[2].held = true;
+            app.playback.stop();
+            app.playhead_beats = 2.0;
+        }
+        h.run_steps(6);
+        v005_shot(&mut h, "play", size);
+
+        // (d) Clip (`Cutout` + `Vocal Kit → pads` + `Vox Perc` in 2-Tab lower deck)
+        {
+            let app = h.state_mut();
+            app.studio.emitters[0].held = false;
+            app.studio.emitters[1].held = false;
+            app.studio.emitters[2].held = false;
+            {
+                let mut p = app.project.lock().unwrap();
+                let len = p.sources[1].duration();
+                p.sources[1].slices = chop::equal_slices(len, 8);
+            }
+            app.with_studio(|st, host| {
+                st.set_view(host, View::Perform);
+                st.set_active_swing(host, 0.61);
+                st.trigger_ukg_kit(host);
+            });
+            app.studio.source_focus.insert(1, (0.44, 0.38));
+            app.studio.pad_sculpt[4] = chromagrain_ui::SculptParams::preset(SculptStamp::VoxPerc);
+            app.studio.pad_captions[4] = "tomy omnibot vox chop".into();
+            app.studio.clip_tab = 0;
+            app.studio.open_clip(ClipTarget::Pad(4));
+            app.playback.stop();
+        }
+        h.run_steps(6);
+        v005_shot(&mut h, "clip", size);
+
+        // (e) Add (`Roulette (<100v) · Random 18s · Pull 2 → Kit` + YouTube `<500 views` results)
+        {
+            let app = h.state_mut();
+            app.with_studio(|st, host| st.set_view(host, View::Play));
+            app.adds.yt_mock = Some(mock_youtube_catalog());
+            app.studio.add.tab = AddRoute::Link;
+            app.studio.add.random_window = true;
+            app.studio.add.yt_query = "1980s omnibot robot cassette".into();
+            app.studio.add.yt_low_views = true;
+            app.adds.search_youtube("1984 omnibot robot cello answering machine", true);
+            app.studio.sheet = Some(Sheet::Add(AddTarget::Column(7)));
+            app.playback.stop();
+        }
+        h.run_steps(6);
+        v005_shot(&mut h, "add", size);
     }
 }

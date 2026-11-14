@@ -405,6 +405,19 @@ impl Host for App {
         let sr = self.project.lock().unwrap().sample_rate;
         self.adds.dig_to_kit(n, cc_only, AddTarget::Any, sr);
     }
+    fn dig_roulette(&mut self, random_18s: bool, target: AddTarget) {
+        self.adds.random_window = random_18s;
+        let sr = self.project.lock().unwrap().sample_rate;
+        self.adds.dig_with_max_views(1, 100, false, target, sr);
+    }
+    fn set_random_window(&mut self, on: bool) {
+        self.adds.random_window = on;
+    }
+    fn pull_two_to_kit(&mut self, random_18s: bool, cc_only: bool) {
+        self.adds.random_window = random_18s;
+        let sr = self.project.lock().unwrap().sample_rate;
+        self.adds.pull_two_to_kit(cc_only, AddTarget::Any, sr);
+    }
     fn build_kit_to_pads(&mut self) -> usize {
         self.studio_seed_pads();
         let key = self.studio.key;

@@ -785,6 +785,8 @@ pub struct Overlay {
     caption: Option<(&'static str, f32)>,
     /// No caption band (fullscreen): captions float over the picture.
     floating: bool,
+    /// Full-bleed console recording without the 58pt bottom film band.
+    pub no_band: bool,
     /// Title card / end card opacity.
     title: f32,
     end: f32,
@@ -822,22 +824,51 @@ impl Overlay {
             }
         }
         if let Some((text, a)) = self.caption {
-            // In the caption band under the UI: quiet grey, no box.
-            // Same place and type everywhere; over the fullscreen picture
-            // a soft shadow keeps it legible.
-            let c = egui::pos2(screen.center().x, screen.bottom() - BAND / 2.0 + 4.0 * (1.0 - a));
-            if self.floating {
-                for (dx, dy) in [(0.0, 1.5), (1.0, 1.0), (-1.0, 1.0), (0.0, 0.0)] {
-                    p.text(c + egui::vec2(dx, dy), Align2::CENTER_CENTER, text, font(16.0), Color32::from_black_alpha((150.0 * a) as u8));
-                }
-                p.text(c, Align2::CENTER_CENTER, text, font(16.0), INK.gamma_multiply(0.82 * a));
+            if self.no_band {
+                let c = egui::pos2(screen.center().x, screen.bottom() - 22.0 + 3.0 * (1.0 - a));
+                let galley = p.layout_no_wrap(
+                    text.to_string(),
+                    font_medium(13.5),
+                    Color32::from_rgb(242, 237, 224).gamma_multiply(a),
+                );
+                let pill = Rect::from_center_size(
+                    c,
+                    egui::vec2(galley.size().x + 22.0, galley.size().y + 10.0),
+                );
+                p.rect_filled(
+                    pill,
+                    5.0,
+                    Color32::from_rgba_unmultiplied(17, 19, 20, (206.0 * a) as u8),
+                );
+                p.rect_stroke(
+                    pill,
+                    5.0,
+                    Stroke::new(1.0, Color32::from_rgba_unmultiplied(242, 237, 224, (58.0 * a) as u8)),
+                    egui::StrokeKind::Inside,
+                );
+                p.galley(
+                    egui::pos2(c.x - galley.size().x * 0.5, c.y - galley.size().y * 0.5),
+                    galley,
+                    Color32::WHITE,
+                );
             } else {
-                p.text(c, Align2::CENTER_CENTER, text, font(16.0), INK2.gamma_multiply(a));
+                // In the caption band under the UI: quiet grey, no box.
+                // Same place and type everywhere; over the fullscreen picture
+                // a soft shadow keeps it legible.
+                let c = egui::pos2(screen.center().x, screen.bottom() - BAND / 2.0 + 4.0 * (1.0 - a));
+                if self.floating {
+                    for (dx, dy) in [(0.0, 1.5), (1.0, 1.0), (-1.0, 1.0), (0.0, 0.0)] {
+                        p.text(c + egui::vec2(dx, dy), Align2::CENTER_CENTER, text, font(16.0), Color32::from_black_alpha((150.0 * a) as u8));
+                    }
+                    p.text(c, Align2::CENTER_CENTER, text, font(16.0), INK.gamma_multiply(0.82 * a));
+                } else {
+                    p.text(c, Align2::CENTER_CENTER, text, font(16.0), INK2.gamma_multiply(a));
+                }
             }
         }
         let t_sub = if self.title_sub.is_empty() { "a granular video sampler" } else { self.title_sub };
         let e_sub = if self.end_sub.is_empty() { "play  ·  sequence  ·  perform" } else { self.end_sub };
-        for (a, lines) in [(self.title, ["chromagrain", t_sub]), (self.end, ["chromagrain", e_sub])] {
+        for (a, lines) in [(self.title, ["videograin", t_sub]), (self.end, ["videograin", e_sub])] {
             if a <= 0.0 {
                 continue;
             }
@@ -859,8 +890,8 @@ impl eframe::App for Film {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // The caption band claims the bottom before the studio lays out,
         // so captions never cover the interface.
-        // (Fullscreen output goes edge to edge: no band, captions float.)
-        if !self.app.fullscreen {
+        // (Fullscreen output or `no_band` console recordings go edge to edge.)
+        if !self.app.fullscreen && !self.overlay.no_band {
             egui::TopBottomPanel::bottom("film-band")
                 .exact_height(BAND)
                 .frame(egui::Frame::new().fill(G0))
@@ -1218,11 +1249,13 @@ pub(crate) fn record_with(tour: &Tour, opts: &RecordOpts, mut h: Harness<'static
         });
         let title = 1.0 - smooth((t - (tour.title_until - 0.9)) / 0.9);
         let end = smooth((t - tour.end_card) / 1.0);
-        let floating = h.state().app.fullscreen;
+        let no_band = h.state().overlay.no_band;
+        let floating = h.state().app.fullscreen || no_band;
         h.state_mut().overlay = Overlay {
             fingers,
             caption,
             floating,
+            no_band,
             title: title as f32,
             end: end as f32,
             title_sub: tour.title_sub,

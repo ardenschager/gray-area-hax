@@ -63,6 +63,17 @@ pub const PUNCH_FX_A11Y: [&str; 6] = [
     "punch crush",
 ];
 
+pub const PUNCH_FX_KEYS: [egui::Key; 6] = [
+    egui::Key::Num5,
+    egui::Key::Num6,
+    egui::Key::Num7,
+    egui::Key::Num8,
+    egui::Key::Num9,
+    egui::Key::Num0,
+];
+
+pub const PUNCH_FX_KEY_HINTS: [&str; 6] = ["5", "6", "7", "8", "9", "0"];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
     Play,
@@ -229,11 +240,14 @@ pub struct Studio {
     /// Perform VJ Punch-In FX states (`Stutter`, `Grid ×`, `Cutout`, `Tape Stop`, `Comb`, `Crush`).
     pub punch_fx: [bool; 6],
     pub(crate) punch_press_t: [Option<f64>; 6],
+    pub(crate) punch_key_held: [bool; 6],
     pub tape_stop_amt: f32,
     base_master_fx: Option<(Vec<AvEffect>, f32, f32)>,
     base_stage_mode: Option<StageMode>,
     /// Active pattern / global 16th-note swing (`0.50..=0.72`).
     pub swing: f32,
+    /// Last applied zero-AI sequencer groove preset (`Ukg2Step..TapeDisintegration`).
+    pub active_preset: Option<chromagrain_core::seq::PatternPreset>,
     /// Active lower-deck tab in `Sheet::Clip` (`0 = Sculpt & Tape`, `1 = Grain · FX · Links`).
     pub clip_tab: usize,
     /// Master 5-Band `ISOL8` Frequency Isolator (`LF · LMF · MF · HMF · HF`).
@@ -304,10 +318,12 @@ impl Default for Studio {
             active_caption: None,
             punch_fx: [false; 6],
             punch_press_t: [None; 6],
+            punch_key_held: [false; 6],
             tape_stop_amt: 0.0,
             base_master_fx: None,
             base_stage_mode: None,
             swing: 0.50,
+            active_preset: None,
             clip_tab: 0,
             isolator: chromagrain_core::dsp::BandIsolator::default(),
             atlases: atlas::Atlases::default(),
@@ -941,6 +957,26 @@ impl Studio {
                 self.seq.editing_name = None;
             } else {
                 self.deep = None;
+            }
+        }
+        // Number keys `[5, 6, 7, 8, 9, 0]`: momentary Punch-In FX while held (or single-frame tap toggle).
+        let punch_states: [(bool, bool); 6] = ctx.input(|i| {
+            let plain = !i.modifiers.command && !i.modifiers.ctrl && !i.modifiers.alt;
+            std::array::from_fn(|k| {
+                let key = PUNCH_FX_KEYS[k];
+                (plain && i.key_down(key), plain && i.key_pressed(key))
+            })
+        });
+        for (k, (is_down, just_pressed)) in punch_states.into_iter().enumerate() {
+            if is_down && !self.punch_key_held[k] {
+                self.punch_key_held[k] = true;
+                self.set_punch_fx(host, k, true, ctx);
+            } else if !is_down && self.punch_key_held[k] {
+                self.punch_key_held[k] = false;
+                self.set_punch_fx(host, k, false, ctx);
+            } else if just_pressed && !is_down {
+                let next = !self.punch_fx[k];
+                self.set_punch_fx(host, k, next, ctx);
             }
         }
         if self.view == View::Perform && !fullscreen {

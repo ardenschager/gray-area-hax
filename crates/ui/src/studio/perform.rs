@@ -197,6 +197,20 @@ impl Studio {
                 font_semibold(fsz),
                 if on { ON_HI } else { Color32::from_rgb(0x24, 0x1c, 0x09) },
             );
+            // Subtle engraved `[5..0]` keyboard legend in top-right corner of cap.
+            if pw >= 62.0 {
+                p.text(
+                    egui::pos2(rc.right() - 5.5, rc.top() + 6.5),
+                    Align2::RIGHT_CENTER,
+                    super::PUNCH_FX_KEY_HINTS[k],
+                    mono(7.8),
+                    if on {
+                        Color32::from_black_alpha(150)
+                    } else {
+                        Color32::from_rgb(0x3a, 0x2f, 0x14)
+                    },
+                );
+            }
         }
     }
 

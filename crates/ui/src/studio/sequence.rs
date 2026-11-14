@@ -468,11 +468,37 @@ impl Studio {
         let h = rect.height();
         let cy = rect.center().y;
 
-        // Right-anchored live tools: `∞ hold`, `dup`, `+ cue`.
+        // Right-anchored live tools: `Build Set` (`"build set"`), `∞ hold`, `dup`, `+ cue`.
         let mut rx = rect.right();
-        let hold_w = if rect.width() < 520.0 { 44.0 } else { 58.0 };
+        let build_w = if rect.width() < 340.0 {
+            58.0
+        } else if rect.width() < 520.0 {
+            64.0
+        } else {
+            72.0
+        };
+        let build_r = Rect::from_min_size(egui::pos2(rx - build_w, rect.top()), egui::vec2(build_w, h));
+        rx = build_r.left() - 4.0;
+        let b_resp = hit(ui, build_r, ui.id().with((id_salt, "build-set")), Sense::click(), "build set");
+        let set_built = self.seq.chain.len() >= 4
+            && self.seq.scene_names[0] == "intro"
+            && self.seq.scene_names[3] == "climax";
+        paint_switch_cap(&p, build_r, SwitchKind::Amber, set_built, b_resp.hovered(), b_resp.is_pointer_button_down_on());
+        p.text(
+            build_r.center(),
+            Align2::CENTER_CENTER,
+            "Build Set",
+            font_semibold(if build_w < 62.0 { 9.2 } else { 10.2 }),
+            if set_built { ON_HI } else { Color32::from_rgb(0x24, 0x1c, 0x09) },
+        );
+        if b_resp.clicked() {
+            self.build_four_section_set(host);
+            return;
+        }
+
+        let hold_w = if rect.width() < 420.0 { 32.0 } else if rect.width() < 540.0 { 44.0 } else { 54.0 };
         let hold_r = Rect::from_min_size(egui::pos2(rx - hold_w, rect.top()), egui::vec2(hold_w, h));
-        rx = hold_r.left() - 5.0;
+        rx = hold_r.left() - 4.0;
         if chip(ui, hold_r, ui.id().with((id_salt, "hold-scene")), "hold scene", false, self.seq.hold_scene).clicked() {
             self.seq.hold_scene = !self.seq.hold_scene;
             self.rev += 1;
@@ -481,20 +507,20 @@ impl Studio {
         p.text(
             hold_r.center(),
             Align2::CENTER_CENTER,
-            if hold_w < 50.0 { "∞" } else { "∞ hold" },
-            mono_medium(10.5),
+            if hold_w < 42.0 { "∞" } else { "∞ hold" },
+            mono_medium(10.0),
             if self.seq.hold_scene { ON_HI } else { INK2 },
         );
 
         let mut dup_r_opt = None;
-        if rect.width() >= 420.0 {
-            let dup_r = Rect::from_min_size(egui::pos2(rx - 42.0, rect.top()), egui::vec2(42.0, h));
-            rx = dup_r.left() - 5.0;
+        if rect.width() >= 470.0 {
+            let dup_r = Rect::from_min_size(egui::pos2(rx - 38.0, rect.top()), egui::vec2(38.0, h));
+            rx = dup_r.left() - 4.0;
             dup_r_opt = Some(dup_r);
         }
-        let add_w = if rect.width() < 380.0 { 36.0 } else { 52.0 };
+        let add_w = if rect.width() < 420.0 { 30.0 } else { 46.0 };
         let add_r = Rect::from_min_size(egui::pos2(rx - add_w, rect.top()), egui::vec2(add_w, h));
-        rx = add_r.left() - 6.0;
+        rx = add_r.left() - 5.0;
 
         if let Some(dup_r) = dup_r_opt {
             if chip(ui, dup_r, ui.id().with((id_salt, "dup-scene")), "duplicate scene", false, false).clicked() {
@@ -624,14 +650,20 @@ impl Studio {
         }
     }
 
-    /// Seed the active scene pattern with a skipping 2-Step UKG groove (`61%` swing,
-    /// `Kick`, `Snare`, swung off-16th `VoxPerc` with `×2` ratchets, `Min7`/`Sus4` chords,
-    /// sub `Pluck`, and choked `Phrase` vocal hook) via [`StepPattern::seed_ukg_2step`].
+    /// Seed the active scene pattern with a skipping 2-Step UKG groove (`61%` swing)
+    /// via [`StepPattern::apply_preset`].
     pub fn seed_ukg_2step_groove(&mut self, host: &mut dyn Host) {
+        self.apply_pattern_preset(host, chromagrain_core::seq::PatternPreset::Ukg2Step);
+    }
+
+    /// Apply any of the 7 zero-AI [`chromagrain_core::seq::PatternPreset`] grooves across the
+    /// active scene's rows, syncing lanes, sculpts, ratchets, chords, and `SWING`.
+    pub fn apply_pattern_preset(&mut self, host: &mut dyn Host, preset: chromagrain_core::seq::PatternPreset) {
         self.seq_ensure(host);
         let (scene, _) = self.seq_current(host);
         let Some(pid) = self.seq_pattern(scene) else { return };
         let key = self.key;
+        let can_tempo = host.caps().tempo;
         let mut any_alpha = false;
         {
             let mut p = host.project().lock().unwrap();
@@ -643,14 +675,15 @@ impl Studio {
                     any_alpha = true;
                 }
             }
+            if can_tempo {
+                p.bpm = preset.default_bpm() as f64;
+            }
             let sources = p.sources.clone();
             let Some(pat) = p.patterns.get_mut(pid) else { return };
             pat.rows.clear();
-            pat.seed_ukg_2step(&sources);
-            for r in &mut pat.rows {
-                r.key = Some(key);
-            }
+            pat.apply_preset(preset, &sources);
             self.swing = pat.swing.clamp(0.50, 0.72);
+            self.active_preset = Some(preset);
 
             // Sync UI lanes, lane sculpts, and step ratchet/chord extensions from seeded rows.
             self.seq.step_ext.retain(|&(sc, _, _), _| sc != scene);
@@ -669,7 +702,6 @@ impl Studio {
                         }
                     }
                 } else {
-                    // Preserve any extra unseeded column clips in remaining muted/silent lanes.
                     let fallback = self.columns[i].filter(|&s| s < sources.len());
                     self.seq.lanes[i] = fallback;
                     let r_idx = pat.add_row(fallback.unwrap_or(usize::MAX));
@@ -686,8 +718,88 @@ impl Studio {
             host.set_stage_mode(crate::host::StageMode::Grid);
         }
         self.rev += 1;
+        self.seq_build_arrangement(host);
         host.mark_now();
-        host.status("seeded 2-step groove · 61% swing + vocal percussion".into());
+        host.status(format!(
+            "groove preset: {} · {:.0}% swing",
+            preset.label(),
+            self.swing * 100.0
+        ));
+    }
+
+    /// 1-click 4-Section Song Expander (`Intro · Drop · Break · Climax`):
+    /// expands the active pattern via [`StepPattern::expand_four_sections`] into Scenes `1..4`
+    /// and configures the song chain `[1×2, 2×4, 3×2, 4×4]`.
+    pub fn build_four_section_set(&mut self, host: &mut dyn Host) {
+        self.seq_ensure(host);
+        let (cur_scene, _) = self.seq_current(host);
+        let has_hits = self.seq_pattern(cur_scene).is_some_and(|pid| {
+            host.project()
+                .lock()
+                .unwrap()
+                .patterns
+                .get(pid)
+                .is_some_and(|pat| pat.rows.iter().any(|r| r.steps.iter().any(|s| s.on)))
+        });
+        if !has_hits {
+            self.apply_pattern_preset(
+                host,
+                self.active_preset.unwrap_or(chromagrain_core::seq::PatternPreset::Ukg2Step),
+            );
+        }
+        let Some(src_pid) = self.seq_pattern(cur_scene) else { return };
+        let key = self.key;
+        {
+            let mut p = host.project().lock().unwrap();
+            let Some(base_pat) = p.patterns.get(src_pid).cloned() else { return };
+            let sections = base_pat.expand_four_sections();
+            let names = ["intro", "drop", "break", "climax"];
+            let sources_len = p.sources.len();
+
+            for (sec_i, mut sec_pat) in sections.into_iter().enumerate() {
+                sec_pat.name = names[sec_i].into();
+                while sec_pat.rows.len() < LANES {
+                    let li = sec_pat.rows.len();
+                    let fb = self.seq.lanes[li].or(self.columns[li]).filter(|&s| s < sources_len);
+                    let r_idx = sec_pat.add_row(fb.unwrap_or(usize::MAX));
+                    sec_pat.rows[r_idx].key = Some(key);
+                }
+                self.seq.step_ext.retain(|&(sc, _, _), _| sc != sec_i);
+                for (li, row) in sec_pat.rows.iter().take(LANES).enumerate() {
+                    if sec_i == 1 {
+                        self.seq.lanes[li] = (row.source < sources_len).then_some(row.source);
+                        self.lane_sculpt[li] = crate::host::SculptParams::from_core(
+                            row.sculpt.stamp,
+                            row.sculpt,
+                            row.choke_group,
+                        );
+                    }
+                    for (st_i, st) in row.steps.iter().enumerate() {
+                        let ch = ChordChoice::from_core(st.chord);
+                        if st.ratchet > 1 || st.ratchet_pitch.abs() > 1e-3 || ch != ChordChoice::Off {
+                            self.seq.step_ext.insert((sec_i, li, st_i), (st.ratchet.max(1), st.ratchet_pitch, ch));
+                        }
+                    }
+                }
+                if let Some(existing_pid) = self.seq.scene_pats[sec_i] {
+                    if let Some(slot) = p.patterns.get_mut(existing_pid) {
+                        *slot = sec_pat;
+                    }
+                } else {
+                    let new_pid = p.add_pattern(sec_pat);
+                    self.seq.scene_pats[sec_i] = Some(new_pid);
+                }
+                self.seq.scene_names[sec_i] = names[sec_i].into();
+            }
+        }
+        self.seq.chain = vec![(0, 2), (1, 4), (2, 2), (3, 4)];
+        self.seq.scene = 0;
+        self.seq.queued = None;
+        self.seq.hold_scene = false;
+        self.rev += 1;
+        self.seq_build_arrangement(host);
+        host.mark_now();
+        host.status("built 4-section set · 1 intro ×2 · 2 drop ×4 · 3 break ×2 · 4 climax ×4".into());
     }
 
     /// Clear all active steps on the current scene pattern.
@@ -734,8 +846,8 @@ impl Studio {
         self.stage_with_bezel(host, ui, stage_block, "seq-stage", true);
         let mut y = stage_block.bottom() + vgap;
 
-        // 2. Groove & Pocket Hardware Bay (`2-Step`, `Clear`, `SWING` pointer knob + `61%` silver LCD).
-        let groove_h = if compact { 68.0 } else { 88.0 };
+        // 2. Groove & Pocket Hardware Bay (7-Preset Groove Bank + `Clear` + `SWING` pointer knob + `61%` silver LCD).
+        let groove_h = if compact { 82.0 } else { 102.0 };
         let groove_r = Rect::from_min_size(egui::pos2(col.left(), y), egui::vec2(col.width(), groove_h));
         self.sequence_groove_bar(host, ui, groove_r, compact);
         y = groove_r.bottom() + vgap;
@@ -840,59 +952,107 @@ impl Studio {
     }
 
     fn sequence_groove_bar(&mut self, host: &mut dyn Host, ui: &mut egui::Ui, card: Rect, compact: bool) {
+        use chromagrain_core::seq::PatternPreset;
         let p = ui.painter().clone();
         putty_panel(&p, card, 7);
-        let inner = card.shrink2(egui::vec2(if compact { 8.0 } else { 11.0 }, if compact { 5.0 } else { 7.0 }));
+        let inner = card.shrink2(egui::vec2(if compact { 7.0 } else { 10.0 }, if compact { 4.5 } else { 6.5 }));
         let id = ui.id().with("seq-groove");
 
         // Right side: `SWING` charcoal pointer knob + sunken silver LCD (`61%`).
-        let swing_zone_w = if compact { 112.0 } else { 142.0 };
+        let swing_zone_w = if compact { 88.0 } else { 126.0 };
         let swing_r = Rect::from_min_max(egui::pos2(inner.right() - swing_zone_w, inner.top()), inner.max);
         let cur_swing = self.active_swing(host);
         let mut sw_norm = ((cur_swing - 0.50) / 0.22).clamp(0.0, 1.0);
         let prev_norm = sw_norm;
-        let krad = (swing_r.height() * 0.36).clamp(13.0, 19.0);
-        let kc = egui::pos2(swing_r.left() + krad + 4.0, swing_r.center().y);
+        let krad = (swing_r.height() * 0.26).clamp(11.5, 17.5);
+        let kc = egui::pos2(swing_r.center().x, swing_r.top() + krad + if compact { 2.0 } else { 4.0 });
         knob(ui, kc, krad, id.with("swing-knob"), "seq swing", &mut sw_norm, (0.61 - 0.50) / 0.22, 0);
         if (sw_norm - prev_norm).abs() > 1e-4 {
             self.set_active_swing(host, 0.50 + sw_norm * 0.22);
         }
-        let lcd_x = kc.x + krad + 8.0;
-        let lcd_w = (swing_r.right() - lcd_x).max(42.0);
-        caps(&p, egui::pos2(lcd_x + lcd_w * 0.5, swing_r.center().y - 11.0), Align2::CENTER_CENTER, "SWING", if compact { 7.5 } else { 8.5 });
+        caps(
+            &p,
+            egui::pos2(kc.x, kc.y + krad + if compact { 5.5 } else { 7.0 }),
+            Align2::CENTER_CENTER,
+            "SWING",
+            if compact { 7.2 } else { 8.0 },
+        );
         let sw_pct = (self.active_swing(host) * 100.0).round() as u32;
         lcd_readout(
             &p,
-            Rect::from_center_size(egui::pos2(lcd_x + lcd_w * 0.5, swing_r.center().y + 5.5), egui::vec2(lcd_w, if compact { 16.0 } else { 18.0 })),
+            Rect::from_center_size(
+                egui::pos2(kc.x, (kc.y + krad + if compact { 17.0 } else { 20.0 }).min(swing_r.bottom() - 8.5)),
+                egui::vec2((swing_r.width() - 8.0).clamp(44.0, 68.0), if compact { 15.0 } else { 17.0 }),
+            ),
             &format!("{sw_pct}%"),
-            if compact { 10.0 } else { 11.0 },
+            if compact { 9.2 } else { 10.2 },
         );
 
-        // Left side: `GROOVE` silkscreen + `2-Step` (`"seed ukg 2step"`) + `Clear` (`"clear pattern"`).
-        let left_r = Rect::from_min_max(inner.min, egui::pos2(swing_r.left() - 8.0, inner.bottom()));
-        caps(&p, egui::pos2(left_r.left() + 2.0, left_r.top() + 6.0), Align2::LEFT_CENTER, "GROOVE", if compact { 8.0 } else { 9.0 });
-        let btn_top = left_r.top() + if compact { 15.0 } else { 18.0 };
-        let btn_h = (left_r.bottom() - btn_top).clamp(24.0, 34.0);
-        let clr_w = if compact { 48.0 } else { 58.0 };
-        let seed_w = (left_r.width() - clr_w - 6.0).max(74.0);
-        let seed_r = Rect::from_min_size(egui::pos2(left_r.left(), btn_top), egui::vec2(seed_w, btn_h));
-        let clr_r = Rect::from_min_size(egui::pos2(seed_r.right() + 6.0, btn_top), egui::vec2(clr_w, btn_h));
-
-        let is_ukg_swung = (self.active_swing(host) - 0.61).abs() < 0.015;
-        let s_resp = hit(ui, seed_r, id.with("seed-ukg"), Sense::click(), "seed ukg 2step");
-        paint_switch_cap(&p, seed_r, SwitchKind::Amber, is_ukg_swung, s_resp.hovered(), s_resp.is_pointer_button_down_on());
-        p.text(
-            seed_r.center(),
-            Align2::CENTER_CENTER,
-            if seed_w >= 106.0 { "2-Step Groove" } else { "2-Step" },
-            font_semibold(if compact { 10.0 } else { 11.0 }),
-            if is_ukg_swung { ON_HI } else { Color32::from_rgb(0x24, 0x1c, 0x09) },
+        // Left side: `GROOVE · PRESETS` silkscreen + `4 × 2` bank (`7` zero-AI groove presets + `Clear`).
+        let left_r = Rect::from_min_max(inner.min, egui::pos2(swing_r.left() - if compact { 6.0 } else { 10.0 }, inner.bottom()));
+        caps(
+            &p,
+            egui::pos2(left_r.left() + 1.0, left_r.top() + 5.0),
+            Align2::LEFT_CENTER,
+            if compact { "GROOVE" } else { "GROOVE · PRESETS" },
+            if compact { 7.6 } else { 8.5 },
         );
-        if s_resp.clicked() {
-            self.seed_ukg_2step_groove(host);
+        let grid_top = left_r.top() + if compact { 13.0 } else { 16.0 };
+        let grid_h = (left_r.bottom() - grid_top).max(40.0);
+        let gx = if compact { 3.0 } else { 4.5 };
+        let gy = if compact { 3.0 } else { 4.5 };
+        let cw = (left_r.width() - gx * 3.0) / 4.0;
+        let ch = (grid_h - gy) * 0.5;
+        let narrow_caps = cw < 64.0;
+
+        let presets: [(PatternPreset, &str, &str, &str); 7] = [
+            (PatternPreset::Ukg2Step, "2-Step", "2-Step", "seed ukg 2step"),
+            (PatternPreset::DiscoFilterPump, "Disco", "Disco", "preset disco"),
+            (PatternPreset::BoomBapDialogue, "Boom-Bap", "Boom", "preset boombap"),
+            (PatternPreset::KineticRatchet, "Ratchet", "Ratch", "preset ratchet"),
+            (PatternPreset::DillaDrunk, "Dilla", "Dilla", "preset dilla"),
+            (PatternPreset::Footwork332, "Footwork", "Footwk", "preset footwork"),
+            (PatternPreset::TapeDisintegration, "Tape", "Tape", "preset tape"),
+        ];
+
+        for (idx, &(preset, full_lbl, short_lbl, a11y)) in presets.iter().enumerate() {
+            let col_i = idx % 4;
+            let row_i = idx / 4;
+            let rc = Rect::from_min_size(
+                egui::pos2(left_r.left() + col_i as f32 * (cw + gx), grid_top + row_i as f32 * (ch + gy)),
+                egui::vec2(cw, ch),
+            );
+            let on = self.active_preset == Some(preset);
+            let resp = hit(ui, rc, id.with(("preset", idx)), Sense::click(), a11y);
+            paint_switch_cap(&p, rc, SwitchKind::Amber, on, resp.hovered(), resp.is_pointer_button_down_on());
+            p.text(
+                rc.center(),
+                Align2::CENTER_CENTER,
+                if narrow_caps { short_lbl } else { full_lbl },
+                font_semibold(if narrow_caps { 9.0 } else { 10.2 }),
+                if on { ON_HI } else { Color32::from_rgb(0x24, 0x1c, 0x09) },
+            );
+            if resp.clicked() {
+                self.apply_pattern_preset(host, preset);
+            }
         }
 
-        if button_named(ui, clr_r, id.with("clear-pat"), "Clear", "clear pattern", false, None, None).clicked() {
+        // Slot 8 (col 3, row 1): `Clear` (`"clear pattern"`).
+        let clr_r = Rect::from_min_size(
+            egui::pos2(left_r.left() + 3.0 * (cw + gx), grid_top + (ch + gy)),
+            egui::vec2(cw, ch),
+        );
+        let c_resp = hit(ui, clr_r, id.with("clear-pat"), Sense::click(), "clear pattern");
+        paint_switch_cap(&p, clr_r, SwitchKind::PuttyAmber, false, c_resp.hovered(), c_resp.is_pointer_button_down_on());
+        p.text(
+            clr_r.center(),
+            Align2::CENTER_CENTER,
+            "Clear",
+            font_semibold(if narrow_caps { 9.0 } else { 10.2 }),
+            INK,
+        );
+        if c_resp.clicked() {
+            self.active_preset = None;
             self.clear_active_pattern(host);
         }
     }
