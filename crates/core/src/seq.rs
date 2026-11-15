@@ -300,9 +300,20 @@ impl StepPattern {
         self.apply_preset(PatternPreset::Ukg2Step, sources);
     }
 
-    /// Apply any of the 7 zero-AI [`PatternPreset`] grooves across this pattern's rows,
-    /// auto-curating a 6-row canonical kit from `sources` when `self.rows` is empty.
+    /// Apply any of the 8 zero-AI [`PatternPreset`] grooves across this pattern's rows,
+    /// auto-curating the 8-lane role kit from `sources` when `self.rows` is empty
+    /// (see [`StepPattern::apply_preset_keyed`]).
     pub fn apply_preset(&mut self, preset: PatternPreset, sources: &[Source]) {
+        self.apply_preset_keyed(preset, sources, None);
+    }
+
+    /// Like [`StepPattern::apply_preset`], tuning curated `Chord` / `Bass` lanes to `key`.
+    ///
+    /// When `self.rows` is empty the 8 lanes are built by [`lane_rows_for_preset`]: each
+    /// lane role (`Kick · Snare · Hat · VoxPerc · Chord · Bass · Hook A · Hook B`) is bound
+    /// to the acoustically best loaded source and its exact curated slice, regardless of
+    /// the order the sources were loaded in.
+    pub fn apply_preset_keyed(&mut self, preset: PatternPreset, sources: &[Source], key: Option<Key>) {
         use crate::grain::Stamp;
         if self.steps_per_beat != 4 || self.length_beats < 4.0 {
             self.set_grid(self.length_beats.max(4.0), 4);
@@ -310,31 +321,11 @@ impl StepPattern {
         self.swing = preset.default_swing();
 
         if self.rows.is_empty() && !sources.is_empty() {
-            let curated = crate::chop::build_ukg_vox_kit_across_sources(sources);
             let n_st = self.n_steps().max(16);
-            for target_stamp in [
-                Stamp::Kick,
-                Stamp::Snare,
-                Stamp::VoxPerc,
-                Stamp::Chord,
-                Stamp::Pluck,
-                Stamp::Phrase,
-            ] {
-                if let Some(spec) = curated.iter().find(|p| p.stamp == target_stamp) {
-                    let src_len = sources.get(spec.source).map_or(1.0, |s| s.duration());
-                    let mut row = spec.to_seq_row(n_st, src_len);
-                    if target_stamp == Stamp::Phrase
-                        && sources
-                            .get(spec.source)
-                            .and_then(|s| s.video.as_deref())
-                            .is_some_and(|v| v.has_alpha())
-                    {
-                        row.collage_cutout = true;
-                    }
-                    self.rows.push(row);
-                }
-            }
+            self.rows = lane_rows_for_preset(sources, key, preset, n_st);
         }
+        let mut phrase_rows_seen = 0usize;
+        let eight_lane = self.rows.len() >= 7;
 
         let n_st = self.n_steps().max(16);
         for (ri, row) in self.rows.iter_mut().enumerate() {
@@ -352,14 +343,16 @@ impl StepPattern {
             let role = if raw_stamp != Stamp::Raw {
                 raw_stamp
             } else {
-                match ri {
-                    0 => Stamp::Kick,
-                    1 => Stamp::Snare,
-                    2 => Stamp::VoxPerc,
-                    3 => Stamp::Chord,
-                    4 => Stamp::Pluck,
-                    _ => Stamp::Phrase,
-                }
+                default_lane_stamp(ri, eight_lane)
+            };
+            let phrase_ordinal = if matches!(
+                role,
+                Stamp::Phrase | Stamp::Raw | Stamp::Wash | Stamp::TapeLoop | Stamp::Disintegrate
+            ) {
+                phrase_rows_seen += 1;
+                phrase_rows_seen - 1
+            } else {
+                usize::MAX
             };
             if !row.sculpt.is_active() {
                 row.sculpt = VoiceSculpt::preset(role);
@@ -388,22 +381,44 @@ impl StepPattern {
                     .max_by(|(_, a), (_, b)| a.bands[2].total_cmp(&b.bands[2]))
                     .map(|(idx, _)| idx as u16)
             });
+            // A curated lane (positioned on one of its source's slices, e.g. by the lane kit)
+            // always plays ITS slice; an uncurated lane at position 0 falls back to the
+            // clearest long mid-band slice.
+            let own_slice: Option<u16> = sources.get(row.source).and_then(|src| {
+                let t = row.grains.position as f64 * src.duration();
+                src.slices
+                    .iter()
+                    .position(|sl| sl.len() >= 0.30 && sl.start >= t - 0.01 && sl.start <= t + 0.06)
+                    .map(|i| i as u16)
+            });
+            let hook_slice = own_slice.or(if row.grains.position > 0.0 { None } else { hook_slice });
 
+            // `v007`: vox-perc / hat hits only ever cycle SHORT crisp slices (`<= 160 ms`, never a
+            // voiced low-mid vowel, never a multi-second chunk of a tonal instrument). With no such
+            // slice on the source, every hit plays the row's own curated tick (`slice = -1`).
             let vox_pool: Vec<u16> = sources
                 .get(row.source)
                 .map(|src| {
                     let is_hat_role = role == Stamp::Hat;
+                    let tick_ok = |sl: &crate::chop::Slice| {
+                        let vowel = sl.bands[1] + sl.bands[2] > 0.62 && sl.bands[3] + sl.bands[4] < 0.28;
+                        sl.len() <= 0.16 && !vowel
+                    };
                     let mut cands: Vec<u16> = src
                         .slices
                         .iter()
                         .enumerate()
+                        .filter(|(_, sl)| tick_ok(sl))
                         .filter(|(_, sl)| {
                             if is_hat_role {
                                 sl.role_hint == crate::chop::SliceRole::Hat
                             } else {
+                                // Never the snare / kick body: a pitched-up snare through a
+                                // 40 ms gate reads as a voiced "uh-uh", not a crisp tick.
                                 !matches!(
                                     sl.role_hint,
                                     crate::chop::SliceRole::Kick
+                                        | crate::chop::SliceRole::Snare
                                         | crate::chop::SliceRole::Phrase
                                         | crate::chop::SliceRole::Tonal
                                 )
@@ -416,19 +431,16 @@ impl StepPattern {
                             .slices
                             .iter()
                             .enumerate()
-                            .filter(|(_, sl)| sl.len() <= 0.45)
+                            .filter(|(_, sl)| tick_ok(sl) && sl.role_hint != crate::chop::SliceRole::Tonal)
                             .map(|(i, sl)| (i, sl.bands[4] + 0.7 * sl.bands[3]))
                             .collect();
                         by_air.sort_by(|a, b| b.1.total_cmp(&a.1));
                         cands = by_air.into_iter().take(4).map(|(i, _)| i as u16).collect();
                     }
-                    if cands.is_empty() {
-                        (0..src.slices.len() as u16).collect()
-                    } else {
-                        cands
-                    }
+                    cands
                 })
                 .unwrap_or_default();
+            let has_src = sources.get(row.source).is_some();
 
             let put_vox_steps = |row: &mut SeqRow, spec: &[(usize, f32, f32, u8, f32)]| {
                 let norm_fb = [0.11f32, 0.24, 0.37, 0.51, 0.63, 0.76, 0.88];
@@ -444,7 +456,11 @@ impl StepPattern {
                                 pitch,
                                 offset: off,
                                 length: 0.85,
-                                slice: if vox_pool.is_empty() { norm_fb[k % norm_fb.len()] } else { -1.0 },
+                                slice: if vox_pool.is_empty() && !has_src {
+                                    norm_fb[k % norm_fb.len()]
+                                } else {
+                                    -1.0
+                                },
                                 slice_index: (!vox_pool.is_empty())
                                     .then(|| vox_pool[(k + b) % vox_pool.len()]),
                                 ratchet: ratch,
@@ -458,6 +474,73 @@ impl StepPattern {
 
             let bars = (row.steps.len() / 16).max(1);
             match (preset, role) {
+                // ---------------- DEDICATED HAT LANE (all rhythmic presets but Disco) ----------------
+                (p, Stamp::Hat)
+                    if !matches!(p, PatternPreset::DiscoFilterPump | PatternPreset::AmbientWash) =>
+                {
+                    let mut sc = VoiceSculpt::preset(Stamp::Hat);
+                    sc.hpf_hz = sc.hpf_hz.max(2400.0);
+                    sc.pocket_carve = true;
+                    row.sculpt = sc;
+                    row.grains.sculpt = sc;
+                    row.grains.duration = row.grains.duration.clamp(0.035, 0.07);
+                    row.grains.gain = row.grains.gain.clamp(0.6, 0.85);
+                    row.choke_group = 5;
+                    let spec: &[(usize, f32, f32, u8, f32)] = match p {
+                        PatternPreset::Ukg2Step => &[
+                            (2, 0.70, 0.0, 1, 0.0),
+                            (6, 0.74, 0.0, 1, 0.0),
+                            (7, 0.40, 2.0, 1, 0.0),
+                            (10, 0.70, 0.0, 1, 0.0),
+                            (14, 0.76, 0.0, 1, 0.0),
+                            (15, 0.42, 2.0, 1, 0.0),
+                        ],
+                        PatternPreset::BoomBapDialogue => &[
+                            (0, 0.62, 0.0, 1, 0.0),
+                            (2, 0.46, 0.0, 1, 0.0),
+                            (4, 0.62, 0.0, 1, 0.0),
+                            (6, 0.46, 0.0, 1, 0.0),
+                            (8, 0.62, 0.0, 1, 0.0),
+                            (10, 0.46, 0.0, 1, 0.0),
+                            (12, 0.62, 0.0, 1, 0.0),
+                            (14, 0.48, 0.0, 1, 0.0),
+                        ],
+                        PatternPreset::KineticRatchet => &[
+                            (0, 0.60, 0.0, 1, 0.0),
+                            (2, 0.52, 0.0, 1, 0.0),
+                            (4, 0.60, 0.0, 1, 0.0),
+                            (6, 0.56, 1.0, 2, 0.0),
+                            (8, 0.60, 0.0, 1, 0.0),
+                            (10, 0.52, 0.0, 1, 0.0),
+                            (12, 0.60, 0.0, 1, 0.0),
+                            (14, 0.58, 1.0, 3, 0.0),
+                        ],
+                        PatternPreset::DillaDrunk => &[
+                            (0, 0.58, 0.0, 1, 0.0),
+                            (2, 0.44, 0.0, 1, 0.08),
+                            (4, 0.58, 0.0, 1, 0.0),
+                            (6, 0.46, 0.0, 1, 0.10),
+                            (8, 0.58, 0.0, 1, 0.0),
+                            (10, 0.44, 0.0, 1, 0.08),
+                            (12, 0.58, 0.0, 1, 0.0),
+                            (14, 0.48, 0.0, 1, 0.12),
+                        ],
+                        PatternPreset::Footwork332 => &[
+                            (0, 0.62, 0.0, 1, 0.0),
+                            (3, 0.56, 0.0, 1, 0.0),
+                            (6, 0.60, 0.0, 1, 0.0),
+                            (8, 0.62, 0.0, 1, 0.0),
+                            (11, 0.56, 0.0, 1, 0.0),
+                            (14, 0.60, 0.0, 2, 0.0),
+                        ],
+                        _ => &[(2, 0.42, 0.0, 1, 0.0), (10, 0.40, 0.0, 1, 0.0)],
+                    };
+                    put_vox_steps(row, spec);
+                }
+                (PatternPreset::AmbientWash, Stamp::Hat) => {
+                    // One shimmer loop (the VoxPerc lane) is plenty in a cathedral wash.
+                    row.muted = true;
+                }
                 // ---------------- 1. UKG 2-STEP (`132 BPM`, `0.61` swing) ----------------
                 (PatternPreset::Ukg2Step, Stamp::Kick) => {
                     row.choke_group = 2;
@@ -582,7 +665,7 @@ impl StepPattern {
                         ..VoiceSculpt::preset(Stamp::VoxPerc)
                     };
                     row.grains.sculpt = row.sculpt;
-                    row.grains.gain = if is_hat { row.grains.gain.max(1.25) } else { row.grains.gain.max(1.0) };
+                    row.grains.gain = if is_hat { row.grains.gain.clamp(1.0, 1.05) } else { row.grains.gain.max(1.0) };
                     row.grains.duration = if is_hat { 0.075 } else { 0.058 };
                     row.choke_group = if is_hat { 5 } else { 3 };
                     if is_hat {
@@ -1017,7 +1100,7 @@ impl StepPattern {
                 (PatternPreset::AmbientWash, Stamp::Snare) => {
                     row.muted = true;
                 }
-                (PatternPreset::AmbientWash, Stamp::VoxPerc | Stamp::Hat) => {
+                (PatternPreset::AmbientWash, Stamp::VoxPerc) => {
                     row.mode = RowMode::Loop;
                     row.sculpt = VoiceSculpt {
                         stamp: Stamp::Wash,
@@ -1063,7 +1146,7 @@ impl StepPattern {
                     };
                     row.grains.sculpt = row.sculpt;
                     row.grains.envelope = 0.84;
-                    row.grains.duration = 2.45;
+                    row.grains.duration = row.grains.duration.clamp(1.2, 2.45);
                     row.grains.adsr = Some(crate::envelope::Adsr {
                         attack: 0.46,
                         decay: 0.38,
@@ -1118,7 +1201,7 @@ impl StepPattern {
                     };
                     row.grains.sculpt = row.sculpt;
                     row.grains.envelope = 0.82;
-                    row.grains.duration = 2.25;
+                    row.grains.duration = row.grains.duration.clamp(1.2, 2.25);
                     row.grains.adsr = Some(crate::envelope::Adsr {
                         attack: 0.45,
                         decay: 0.35,
@@ -1172,7 +1255,7 @@ impl StepPattern {
                         picture: crate::envelope::PictureCut::Fade,
                         cut_threshold: 0.01,
                     });
-                    if 6 < row.steps.len() {
+                    if 6 < row.steps.len() && phrase_ordinal == 0 {
                         row.steps[6] = Step {
                             on: true,
                             gain: 0.64,
@@ -1205,6 +1288,12 @@ impl StepPattern {
                         .is_some_and(|v| v.has_alpha())
                     {
                         row.collage_cutout = true;
+                    }
+                    if phrase_ordinal >= 1 {
+                        // `Hook B` / texture lane: armed with its curated hook but left empty, so
+                        // two spoken hooks never talk over each other (the 4-section `Break`
+                        // spotlights it instead of `Hook A`).
+                        continue;
                     }
                     match preset {
                         PatternPreset::BoomBapDialogue => {
@@ -1269,6 +1358,26 @@ impl StepPattern {
                     }
                 }
             }
+
+            // `v007` pocket rule: `VoxPerc` is shuffled garage ghost-percussion, never a bark over
+            // the chords — high-passed `>= 340 Hz` with step gains squeezed into `0.42..0.52`
+            // (vs `~0.95` on Kick / Snare / Chord / Bass).
+            if role == Stamp::VoxPerc && preset != PatternPreset::AmbientWash {
+                tame_vox_perc_row(row);
+            }
+            // A real bass instrument already sits in the bass register: keep its pitch and
+            // finger-attack harmonics instead of dropping it another octave under a 155 Hz LPF
+            // (that turned the fingerstyle bass into an inaudible sub rumble).
+            if role == Stamp::Pluck && preset != PatternPreset::AmbientWash {
+                if let Some(src) = sources.get(row.source) {
+                    if row_plays_native_bass(src, row) {
+                        row.sculpt.pitch_semitones = 0.0;
+                        row.sculpt.lpf_hz = row.sculpt.lpf_hz.max(1100.0);
+                        row.sculpt.sub_exciter = row.sculpt.sub_exciter.min(0.35);
+                        row.grains.sculpt = row.sculpt;
+                    }
+                }
+            }
         }
     }
 
@@ -1294,22 +1403,26 @@ impl StepPattern {
         let mut climax = self.clone();
         climax.name = format!("{base_name}_climax");
 
+        let eight_lane = self.rows.len() >= 7;
         let row_role = |r: &SeqRow, ri: usize| -> Stamp {
             if r.sculpt.stamp != Stamp::Raw {
                 r.sculpt.stamp
             } else if r.grains.sculpt.stamp != Stamp::Raw {
                 r.grains.sculpt.stamp
             } else {
-                match ri {
-                    0 => Stamp::Kick,
-                    1 => Stamp::Snare,
-                    2 => Stamp::VoxPerc,
-                    3 => Stamp::Chord,
-                    4 => Stamp::Pluck,
-                    _ => Stamp::Phrase,
-                }
+                default_lane_stamp(ri, eight_lane)
             }
         };
+        // `Hook A` = phrase lanes with programmed hits; `Hook B` = an armed-but-empty phrase lane.
+        let hook_b_row = self.rows.iter().enumerate().find_map(|(ri, r)| {
+            (row_role(r, ri) == Stamp::Phrase && r.source != usize::MAX && !r.steps.iter().any(|s| s.on))
+                .then_some(ri)
+        });
+        let has_hook_a = self
+            .rows
+            .iter()
+            .enumerate()
+            .any(|(ri, r)| row_role(r, ri) == Stamp::Phrase && r.steps.iter().any(|s| s.on));
 
         // 1. INTRO: mute Kick & Sub-Pluck; add `x2` pickup on closing 2 steps of Snare / VoxPerc.
         for (ri, r) in intro.rows.iter_mut().enumerate() {
@@ -1358,8 +1471,22 @@ impl StepPattern {
                         }
                     }
                 }
+                Stamp::Phrase if has_hook_a && hook_b_row.is_some() => {
+                    // Spotlight the contrasting `Hook B` lane once; rest `Hook A`.
+                    r.muted = false;
+                    let fire = Some(ri) == hook_b_row;
+                    for s in &mut r.steps {
+                        *s = Step::default();
+                    }
+                    if fire && !r.steps.is_empty() {
+                        r.steps[0] = Step { on: true, gain: 1.08, length: 1.0, ..Default::default() };
+                    }
+                }
                 Stamp::Phrase => {
                     r.muted = false;
+                    if !r.steps.iter().any(|s| s.on) {
+                        continue;
+                    }
                     let first_sl = r.steps.iter().find_map(|s| s.slice_index);
                     let alt_sl = first_sl.map(|i| if i > 0 { i - 1 } else { 0 });
                     for s in &mut r.steps {
@@ -1393,6 +1520,10 @@ impl StepPattern {
             match role {
                 Stamp::Phrase => {
                     r.muted = false;
+                    if !r.steps.iter().any(|s| s.on) {
+                        // An empty `Hook B` lane stays out of the punchline.
+                        continue;
+                    }
                     let sl = r.steps.iter().find_map(|s| s.slice_index);
                     for s in &mut r.steps[cut_from..] {
                         *s = Step::default();
@@ -1429,6 +1560,239 @@ impl StepPattern {
 
         [intro, drop_sec, brk, climax]
     }
+}
+
+/// Default role of an un-stamped (`Stamp::Raw`) row by lane index: the 8-lane kit order
+/// (`Kick · Snare · Hat · VoxPerc · Chord · Bass · Hook A · Hook B`) for 7+ row patterns,
+/// the legacy 6-row order (`Kick · Snare · VoxPerc · Chord · Pluck · Phrase…`) otherwise.
+fn default_lane_stamp(ri: usize, eight_lane: bool) -> crate::grain::Stamp {
+    use crate::grain::Stamp;
+    if eight_lane {
+        match ri {
+            0 => Stamp::Kick,
+            1 => Stamp::Snare,
+            2 => Stamp::Hat,
+            3 => Stamp::VoxPerc,
+            4 => Stamp::Chord,
+            5 => Stamp::Pluck,
+            _ => Stamp::Phrase,
+        }
+    } else {
+        match ri {
+            0 => Stamp::Kick,
+            1 => Stamp::Snare,
+            2 => Stamp::VoxPerc,
+            3 => Stamp::Chord,
+            4 => Stamp::Pluck,
+            _ => Stamp::Phrase,
+        }
+    }
+}
+
+/// Whether `row` plays a pitched slice already in the bass register (`f0 < 165 Hz`).
+fn row_plays_native_bass(src: &Source, row: &SeqRow) -> bool {
+    let Some(a) = src.audio.as_deref() else { return false };
+    if a.sample_rate == 0 {
+        return false;
+    }
+    let sr = a.sample_rate as f64;
+    let t0 = row.grains.position as f64 * src.duration();
+    let i0 = ((t0 * sr) as usize).min(a.samples.len());
+    let i1 = (i0 + (sr * (row.grains.duration as f64).clamp(0.12, 0.45)) as usize).min(a.samples.len());
+    if i1 <= i0 + 1024 {
+        return false;
+    }
+    matches!(crate::dsp::detect_pitch_nsdf(&a.samples[i0..i1], a.sample_rate), (Some(hz), c) if c >= 0.55 && hz < 165.0)
+}
+
+/// `VoxPerc` pocket rule: `HPF >= 340 Hz`, row gain `<= 0.9`, and every hit's step gain
+/// squeezed into `0.42..0.52` (keeping the preset's relative accents).
+pub fn tame_vox_perc_row(row: &mut SeqRow) {
+    row.sculpt.hpf_hz = row.sculpt.hpf_hz.max(340.0);
+    row.grains.sculpt = row.sculpt;
+    row.grains.gain = row.grains.gain.min(0.9);
+    let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+    for s in row.steps.iter().filter(|s| s.on) {
+        lo = lo.min(s.gain);
+        hi = hi.max(s.gain);
+    }
+    if lo > hi {
+        return;
+    }
+    let span = (hi - lo).max(1e-6);
+    for s in row.steps.iter_mut().filter(|s| s.on) {
+        let t = if hi - lo < 1e-4 { 0.5 } else { (s.gain - lo) / span };
+        s.gain = 0.42 + 0.10 * t;
+    }
+}
+
+/// Build the 8 curated lane rows (`Kick · Snare · Hat · VoxPerc · Chord · Bass · Hook A ·
+/// Hook B`) for `preset`: every lane is bound to the acoustically best source and its exact
+/// curated slice by [`crate::chop::build_lane_kit_across_sources_opt`], independent of load
+/// order. For [`PatternPreset::AmbientWash`] the `Chord` and hook lanes take the best
+/// sustained pads of [`crate::chop::build_chord_washes_across_sources_opt`] instead.
+pub fn lane_rows_for_preset(
+    sources: &[Source],
+    key: Option<Key>,
+    preset: PatternPreset,
+    n_steps: usize,
+) -> Vec<SeqRow> {
+    use crate::chop::LaneRole;
+    use crate::grain::Stamp;
+    let mut picks = crate::chop::build_lane_kit_across_sources_opt(sources, key);
+    if preset == PatternPreset::AmbientWash {
+        // Washes only bloom from HELD harmonic material: chord-stacking a voice or a busy
+        // improv run turns into a "crowd" of pitch-shifted chatter. Wash lanes take the
+        // steadiest wash pads of harmonic-instrument sources, else the curated Chord stab.
+        let washes = crate::chop::build_chord_washes_across_sources_opt(sources, key);
+        let harm: Vec<f32> = sources.iter().map(|s| crate::chop::profile_source(s).harmonic()).collect();
+        let chord_pad = picks.iter().find(|p| p.role == LaneRole::Chord).map(|p| p.pad.clone());
+        let tonal: Vec<&crate::chop::KitPadSpec> = washes
+            .iter()
+            .filter(|w| harm.get(w.source).copied().unwrap_or(0.0) >= 0.4)
+            .collect();
+        let mut next = 0usize;
+        for lp in picks.iter_mut() {
+            if !matches!(lp.role, LaneRole::Chord | LaneRole::VoxPerc | LaneRole::HookA) {
+                continue;
+            }
+            let base = tonal.get(next).map(|w| (*w).clone()).or_else(|| chord_pad.clone());
+            next += 1;
+            if let Some(mut pad) = base {
+                pad.stamp = match lp.role {
+                    LaneRole::Chord => Stamp::Wash,
+                    LaneRole::VoxPerc => Stamp::VoxPerc,
+                    _ => Stamp::Phrase,
+                };
+                lp.pad = pad;
+            }
+        }
+    }
+    picks
+        .iter()
+        .map(|lp| {
+            let src_len = sources.get(lp.pad.source).map_or(1.0, |s| s.duration());
+            let mut row = lp.pad.to_seq_row(n_steps, src_len);
+            row.sculpt.stamp = lp.role.stamp();
+            row.grains.sculpt.stamp = lp.role.stamp();
+            if matches!(lp.role, LaneRole::Chord | LaneRole::Bass) {
+                row.key = key;
+            }
+            // Loop-mode lanes (the Wash shimmer) loop their curated slice, not the whole clip.
+            if src_len > 0.0 {
+                row.loop_start = (lp.pad.slice.start / src_len).clamp(0.0, 1.0) as f32;
+                row.loop_end = (lp.pad.slice.end / src_len).clamp(0.0, 1.0) as f32;
+                if row.loop_end <= row.loop_start {
+                    row.loop_start = 0.0;
+                    row.loop_end = 1.0;
+                }
+            }
+            if matches!(lp.role, LaneRole::HookA | LaneRole::HookB)
+                && sources
+                    .get(lp.pad.source)
+                    .and_then(|s| s.video.as_deref())
+                    .is_some_and(|v| v.has_alpha())
+            {
+                row.collage_cutout = true;
+            }
+            row
+        })
+        .collect()
+}
+
+/// Smart acoustic role assignment for any [`PatternPreset`]: rebuild `pat`'s lanes from
+/// the curated 8-lane role kit across ALL loaded `sources` (see [`lane_rows_for_preset`]),
+/// then program the preset's groove. Returns each lane's bound source (`None` = empty lane)
+/// so a UI can mirror it onto its lane strip.
+pub fn assign_curated_kit_to_pattern(
+    pat: &mut StepPattern,
+    sources: &[Source],
+    key: Key,
+    preset: PatternPreset,
+) -> Vec<Option<SourceId>> {
+    pat.rows.clear();
+    pat.apply_preset_keyed(preset, sources, Some(key));
+    pat.rows
+        .iter()
+        .map(|r| (r.source < sources.len()).then_some(r.source))
+        .collect()
+}
+
+/// Re-bind an existing pattern's lanes to the curated 8-lane role kit (after `Vocal Kit →
+/// pads` or a new clip arrives) WITHOUT touching its programmed steps: each row keeps its
+/// role (by stamp, hooks in order) but takes the kit's source, exact slice position /
+/// length, tuning and gain. Step slice indices (which pointed into the old source) are
+/// cleared so every hit plays the newly curated slice. Returns each lane's bound source.
+pub fn rebind_pattern_to_lane_kit(pat: &mut StepPattern, sources: &[Source], key: Option<Key>) -> Vec<Option<SourceId>> {
+    let picks = crate::chop::build_lane_kit_across_sources_opt(sources, key);
+    rebind_pattern_to_lane_picks(pat, sources, &picks)
+}
+
+/// [`rebind_pattern_to_lane_kit`] with a precomputed lane kit (so several scene patterns
+/// can share one analysis pass).
+pub fn rebind_pattern_to_lane_picks(
+    pat: &mut StepPattern,
+    sources: &[Source],
+    picks: &[crate::chop::LanePick],
+) -> Vec<Option<SourceId>> {
+    use crate::chop::LaneRole;
+    use crate::grain::Stamp;
+    if picks.is_empty() {
+        return pat.rows.iter().map(|r| (r.source < sources.len()).then_some(r.source)).collect();
+    }
+    let eight_lane = pat.rows.len() >= 7;
+    let mut hooks_seen = 0usize;
+    for (ri, row) in pat.rows.iter_mut().enumerate() {
+        let stamp = if row.sculpt.stamp != Stamp::Raw {
+            row.sculpt.stamp
+        } else if row.grains.sculpt.stamp != Stamp::Raw {
+            row.grains.sculpt.stamp
+        } else {
+            default_lane_stamp(ri, eight_lane)
+        };
+        let role = match stamp {
+            Stamp::Kick => LaneRole::Kick,
+            Stamp::Snare => LaneRole::Snare,
+            Stamp::Hat => LaneRole::Hat,
+            Stamp::VoxPerc => LaneRole::VoxPerc,
+            Stamp::Chord => LaneRole::Chord,
+            Stamp::Pluck => LaneRole::Bass,
+            _ => {
+                hooks_seen += 1;
+                if hooks_seen == 1 {
+                    LaneRole::HookA
+                } else {
+                    LaneRole::HookB
+                }
+            }
+        };
+        let Some(lp) = picks.iter().find(|p| p.role == role) else { continue };
+        let src_len = sources.get(lp.pad.source).map_or(1.0, |s| s.duration());
+        let fresh = lp.pad.to_seq_row(row.steps.len(), src_len);
+        row.source = fresh.source;
+        row.grains.position = fresh.grains.position;
+        row.grains.duration = if matches!(role, LaneRole::HookA | LaneRole::HookB) {
+            fresh.grains.duration.clamp(0.65, 1.9)
+        } else {
+            fresh.grains.duration
+        };
+        row.grains.pitch = fresh.grains.pitch;
+        row.grains.pan = fresh.grains.pan;
+        if matches!(role, LaneRole::HookA | LaneRole::HookB) {
+            row.collage_cutout = sources
+                .get(row.source)
+                .and_then(|s| s.video.as_deref())
+                .is_some_and(|v| v.has_alpha());
+        }
+        if role == LaneRole::VoxPerc {
+            tame_vox_perc_row(row);
+        }
+        for s in row.steps.iter_mut() {
+            s.slice_index = None;
+            s.slice = -1.0;
+        }
+    }
+    pat.rows.iter().map(|r| (r.source < sources.len()).then_some(r.source)).collect()
 }
 
 /// Output length of a step hit: a chopped slice plays its whole slice (at
@@ -1518,11 +1882,14 @@ pub fn pattern_events(
         let eff_sculpt_for = |g: &GrainSettings| -> VoiceSculpt {
             if row.sculpt.is_active() { row.sculpt } else { g.sculpt }
         };
+        // Choke groups are `1..=4`; anything else (e.g. a hat lane's private group `5`) means
+        // "no choke". Clamping `5 -> 4` made every hat hit silence the group-4 chord stabs.
         let eff_choke_for = |g: &GrainSettings| -> u8 {
-            if row.choke_group > 0 {
-                row.choke_group.min(4)
+            let c = if row.choke_group > 0 { row.choke_group } else { g.choke_group };
+            if (1..=4).contains(&c) {
+                c
             } else {
-                g.choke_group.min(4)
+                0
             }
         };
 
@@ -2420,4 +2787,329 @@ mod tests {
             }
         }
     }
+
+    // ------------------------------------------------------------------------------------
+    // `v007` smart acoustic lane-role assignment
+    // ------------------------------------------------------------------------------------
+
+    const SR: u32 = 24_000;
+
+    fn noise(seed: &mut u32) -> f32 {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 17;
+        *seed ^= *seed << 5;
+        (*seed as f32 / u32::MAX as f32) * 2.0 - 1.0
+    }
+
+    fn mk_source(name: &str, samples: Vec<f32>, alpha: bool) -> Source {
+        let mut vid = crate::video::VideoClip::test_pattern(16, 12, 12.0, samples.len() as f32 / SR as f32);
+        if alpha {
+            for f in &mut vid.frames {
+                for y in 0..f.height {
+                    for x in 0..f.width {
+                        let inside = (4..12).contains(&x) && (2..10).contains(&y);
+                        f.data[((y * f.width + x) * 4 + 3) as usize] = if inside { 255 } else { 0 };
+                    }
+                }
+            }
+        }
+        let mut src = Source {
+            name: name.into(),
+            audio: Some(std::sync::Arc::new(AudioClip::new(samples, SR))),
+            video: Some(std::sync::Arc::new(vid)),
+            ..Default::default()
+        };
+        src.slices = crate::chop::analyze_source_slices(&src, 32);
+        src
+    }
+
+    fn midi_hz(m: f32) -> f32 {
+        440.0 * 2f32.powf((m - 69.0) / 12.0)
+    }
+
+    /// Electric-piano melody: held equal-tempered notes with bell-like harmonics.
+    fn synth_rhodes() -> Vec<f32> {
+        let notes = [57.0f32, 60.0, 64.0, 67.0, 65.0, 62.0, 60.0, 64.0, 69.0, 67.0, 64.0, 60.0];
+        let mut out = Vec::new();
+        for (k, &m) in notes.iter().cycle().take(24).enumerate() {
+            let f = midi_hz(m);
+            let n = (SR as f32 * 0.62) as usize;
+            for i in 0..n {
+                let t = i as f32 / SR as f32;
+                let env = (1.0 - (-t * 160.0).exp()) * (-t * 1.6).exp();
+                let w = std::f32::consts::TAU * f * t;
+                let v = w.sin() + 0.45 * (2.0 * w).sin() + 0.18 * (3.0 * w).sin() + 0.06 * (7.0 * w).sin() * (-t * 9.0).exp();
+                out.push(0.30 * env * v * if k % 4 == 0 { 1.0 } else { 0.85 });
+            }
+        }
+        out
+    }
+
+    /// Fingerstyle bass line: plucked low equal-tempered notes.
+    fn synth_bass() -> Vec<f32> {
+        let notes = [33.0f32, 33.0, 40.0, 38.0, 36.0, 36.0, 43.0, 41.0];
+        let mut out = Vec::new();
+        for &m in notes.iter().cycle().take(32) {
+            let f = midi_hz(m);
+            let n = (SR as f32 * 0.42) as usize;
+            for i in 0..n {
+                let t = i as f32 / SR as f32;
+                let env = (1.0 - (-t * 300.0).exp()) * (-t * 3.2).exp();
+                let w = std::f32::consts::TAU * f * t;
+                out.push(0.55 * env * (w.sin() + 0.35 * (2.0 * w).sin() + 0.10 * (3.0 * w).sin()));
+            }
+        }
+        out
+    }
+
+    /// Tap shoes: bright wooden clicks and brush scrapes with gaps.
+    fn synth_tap() -> Vec<f32> {
+        let mut seed = 0x7a95u32;
+        let mut out = vec![0.0f32; (SR as f32 * 13.0) as usize];
+        let hits = [0.0f32, 0.21, 0.37, 0.62, 0.75, 1.0, 1.18, 1.43, 1.55, 1.81];
+        for rep in 0..6 {
+            for (k, &h) in hits.iter().enumerate() {
+                let i0 = ((h + rep as f32 * 2.1) * SR as f32) as usize;
+                let len = if k % 3 == 0 { 0.05 } else { 0.025 };
+                let n = (len * SR as f32) as usize;
+                let mut prev = 0.0f32;
+                for i in 0..n {
+                    if i0 + i >= out.len() {
+                        break;
+                    }
+                    let t = i as f32 / SR as f32;
+                    let x = noise(&mut seed);
+                    let hp = x - prev;
+                    prev = x;
+                    out[i0 + i] += 0.6 * (-t * 110.0).exp() * hp;
+                }
+            }
+        }
+        out
+    }
+
+    /// Beatbox: lip kicks (pitch-dropping thumps), "pf" snares and "ts" hats.
+    fn synth_beatbox() -> Vec<f32> {
+        let mut seed = 0x1234_5u32;
+        let step = 60.0 / 100.0 / 2.0;
+        let pat = [0u8, 2, 1, 2, 0, 0, 1, 2];
+        let total = (SR as f32 * 14.0) as usize;
+        let mut out = vec![0.0f32; total];
+        let mut k = 0usize;
+        loop {
+            let i0 = (k as f32 * step * SR as f32) as usize;
+            if i0 >= total {
+                break;
+            }
+            let kind = pat[k % pat.len()];
+            let n = (SR as f32 * if kind == 0 { 0.12 } else if kind == 1 { 0.09 } else { 0.035 }) as usize;
+            let mut ph = 0.0f32;
+            let mut prev = 0.0f32;
+            for i in 0..n {
+                if i0 + i >= total {
+                    break;
+                }
+                let t = i as f32 / SR as f32;
+                let v = match kind {
+                    0 => {
+                        let f = 50.0 + 90.0 * (-t * 40.0).exp();
+                        ph += std::f32::consts::TAU * f / SR as f32;
+                        0.9 * (-t * 22.0).exp() * ph.sin()
+                    }
+                    1 => {
+                        let x = noise(&mut seed);
+                        0.55 * (-t * 38.0).exp() * x
+                    }
+                    _ => {
+                        let x = noise(&mut seed);
+                        let hp = x - prev;
+                        prev = x;
+                        0.45 * (-t * 120.0).exp() * hp
+                    }
+                };
+                out[i0 + i] += v;
+            }
+            k += 1;
+        }
+        out
+    }
+
+    /// Deadpan narration: gliding glottal pulse train through vowel formants,
+    /// syllabic envelopes and short consonant noise, with phrase pauses.
+    fn synth_speech() -> Vec<f32> {
+        let mut seed = 0xbeefu32;
+        let total = (SR as f32 * 16.0) as usize;
+        let mut out = vec![0.0f32; total];
+        let formants = [(730.0f32, 1090.0f32), (270.0, 2290.0), (530.0, 1840.0), (640.0, 1190.0), (300.0, 870.0)];
+        let mut phase = 0.0f32;
+        let mut t_cur = 0.0f32;
+        let mut syl = 0usize;
+        while t_cur < 15.5 {
+            let syl_len = 0.16 + 0.07 * ((syl * 7 % 5) as f32 / 4.0);
+            let (f1, f2) = formants[syl % formants.len()];
+            let n = (syl_len * SR as f32) as usize;
+            let i0 = (t_cur * SR as f32) as usize;
+            let (mut y1, mut y2, mut z1, mut z2) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+            let r = 0.985f32;
+            let c1 = 2.0 * r * (std::f32::consts::TAU * f1 / SR as f32).cos();
+            let c2 = 2.0 * r * (std::f32::consts::TAU * f2 / SR as f32).cos();
+            for i in 0..n {
+                if i0 + i >= total {
+                    break;
+                }
+                let tt = i as f32 / n as f32;
+                let gt = t_cur + i as f32 / SR as f32;
+                // Prosodic glide: 95..165 Hz, never parked on a tempered note.
+                let f0 = 125.0 + 28.0 * (gt * 2.3).sin() + 14.0 * (gt * 5.7 + 1.3).sin() + 18.0 * (1.0 - tt);
+                phase += f0 / SR as f32;
+                let pulse = if phase >= 1.0 {
+                    phase -= 1.0;
+                    1.0
+                } else {
+                    0.0
+                };
+                let cons = if tt < 0.18 { 0.35 * noise(&mut seed) } else { 0.0 };
+                let x = pulse + cons;
+                let a = x + c1 * y1 - r * r * y2;
+                y2 = y1;
+                y1 = a;
+                let b = x + c2 * z1 - r * r * z2;
+                z2 = z1;
+                z1 = b;
+                let env = (tt * 12.0).min(1.0) * ((1.0 - tt) * 8.0).min(1.0);
+                out[i0 + i] += 0.035 * env * (a + 0.7 * b);
+            }
+            t_cur += syl_len + 0.03;
+            syl += 1;
+            if syl % 7 == 0 {
+                t_cur += 0.32;
+            }
+        }
+        out
+    }
+
+    fn v007_crate() -> Vec<(&'static str, Source)> {
+        vec![
+            ("rhodes", mk_source("Solo Rhodes", synth_rhodes(), false)),
+            ("bass", mk_source("Fingerstyle Bass", synth_bass(), false)),
+            ("tap", mk_source("Tap Shuffle Heel", synth_tap(), false)),
+            ("beatbox", mk_source("Quarantine Beatbox", synth_beatbox(), false)),
+            ("encab", mk_source("Turbo Encabulator", synth_speech(), true)),
+        ]
+    }
+
+    #[test]
+    fn source_profiles_tell_instruments_from_speech_and_drums() {
+        let crate_ = v007_crate();
+        let prof = |n: &str| crate::chop::profile_source(&crate_.iter().find(|(k, _)| *k == n).unwrap().1);
+        let (rh, ba, tp, bb, en) = (prof("rhodes"), prof("bass"), prof("tap"), prof("beatbox"), prof("encab"));
+        assert!(rh.harmonic() > en.harmonic() && rh.harmonic() > bb.harmonic(), "rhodes harmonic {rh:?} vs speech {en:?}");
+        assert!(ba.bassline() > rh.bassline() && ba.bassline() > en.bassline(), "bass {ba:?}");
+        assert!(bb.drums() > en.drums() && bb.drums() > rh.drums(), "beatbox drums {bb:?}");
+        assert!(tp.drums() > rh.drums() && tp.drums() > ba.drums(), "tap drums {tp:?}");
+        assert!(en.speech() > rh.speech() && en.speech() > bb.speech(), "speech {en:?} vs rhodes {rh:?}");
+    }
+
+    #[test]
+    fn apply_preset_assigns_lane_roles_by_sound_not_load_order() {
+        use crate::grain::Stamp;
+        let crate_ = v007_crate();
+        // Several load orders, including speech first (the v006 showcase failure).
+        let orders: [[usize; 5]; 4] = [[0, 1, 2, 3, 4], [4, 2, 0, 3, 1], [3, 4, 1, 0, 2], [2, 1, 4, 0, 3]];
+        for order in orders {
+            let sources: Vec<Source> = order.iter().map(|&i| crate_[i].1.clone()).collect();
+            let name_of = |sid: usize| order.get(sid).map_or("-", |&i| crate_[i].0);
+            for preset in [PatternPreset::DiscoFilterPump, PatternPreset::Ukg2Step] {
+                let mut pat = StepPattern::new("t");
+                pat.apply_preset(preset, &sources);
+                assert_eq!(pat.rows.len(), 8, "8 curated lanes");
+                let lane = |st: Stamp| -> &str {
+                    let r = pat.rows.iter().find(|r| r.sculpt.stamp == st).unwrap_or_else(|| panic!("{st:?} lane"));
+                    name_of(r.source)
+                };
+                let ctx = format!("{preset:?} order {order:?}");
+                assert_eq!(lane(Stamp::Chord), "rhodes", "Chord -> Rhodes ({ctx})");
+                assert!(matches!(lane(Stamp::Pluck), "bass" | "rhodes"), "Bass -> Bass/Rhodes ({ctx}): {}", lane(Stamp::Pluck));
+                for st in [Stamp::Kick, Stamp::Snare, Stamp::Hat] {
+                    assert!(matches!(lane(st), "beatbox" | "tap"), "{st:?} -> Beatbox/Tap ({ctx}): {}", lane(st));
+                }
+                assert_eq!(lane(Stamp::Phrase), "encab", "Hook A -> Encabulator ({ctx})");
+                assert_ne!(lane(Stamp::VoxPerc), "rhodes", "VoxPerc never on a tonal instrument ({ctx})");
+                assert_ne!(lane(Stamp::VoxPerc), "bass", "VoxPerc never on a tonal instrument ({ctx})");
+
+                // VoxPerc pocket: crisp, high-passed, quiet.
+                let vp = pat.rows.iter().find(|r| r.sculpt.stamp == Stamp::VoxPerc).unwrap();
+                assert!(vp.sculpt.hpf_hz >= 340.0, "VoxPerc HPF {}", vp.sculpt.hpf_hz);
+                assert!(vp.grains.duration <= 0.12, "VoxPerc tick length {}", vp.grains.duration);
+                let on: Vec<f32> = vp.steps.iter().filter(|s| s.on).map(|s| s.gain).collect();
+                assert!(!on.is_empty() && on.iter().all(|g| (0.42..=0.52).contains(g)), "VoxPerc step gains {on:?}");
+                let kick = pat.rows.iter().find(|r| r.sculpt.stamp == Stamp::Kick).unwrap();
+                let kick_max = kick.steps.iter().filter(|s| s.on).map(|s| s.gain).fold(0.0f32, f32::max);
+                assert!(kick_max >= 0.85, "kick stays up front: {kick_max}");
+                // Exactly one spoken hook programmed; Hook B armed but silent.
+                let hooks: Vec<&SeqRow> = pat.rows.iter().filter(|r| r.sculpt.stamp == Stamp::Phrase).collect();
+                assert_eq!(hooks.len(), 2, "Hook A + Hook B lanes");
+                assert!(hooks[0].steps.iter().any(|s| s.on) && !hooks[1].steps.iter().any(|s| s.on));
+            }
+        }
+    }
+
+    #[test]
+    fn rebind_keeps_steps_and_break_spotlights_hook_b() {
+        use crate::grain::Stamp;
+        let crate_ = v007_crate();
+        let sources: Vec<Source> = crate_.iter().map(|(_, s)| s.clone()).collect();
+        // A legacy pattern wired to raw load order (lane i = source i).
+        let mut pat = StepPattern::new("legacy");
+        for st in [Stamp::Kick, Stamp::Snare, Stamp::Hat, Stamp::VoxPerc, Stamp::Chord, Stamp::Pluck, Stamp::Phrase, Stamp::Phrase] {
+            let r = pat.add_row(0);
+            pat.rows[r].sculpt = VoiceSculpt::preset(st);
+        }
+        for (i, r) in pat.rows.iter_mut().enumerate() {
+            r.source = i % sources.len();
+            r.steps[i % 16].on = true;
+            r.steps[i % 16].slice_index = Some(0);
+        }
+        let before: Vec<Vec<bool>> = pat.rows.iter().map(|r| r.steps.iter().map(|s| s.on).collect()).collect();
+        let lanes = rebind_pattern_to_lane_kit(&mut pat, &sources, None);
+        let after: Vec<Vec<bool>> = pat.rows.iter().map(|r| r.steps.iter().map(|s| s.on).collect()).collect();
+        assert_eq!(before, after, "steps untouched");
+        assert!(pat.rows.iter().all(|r| r.steps.iter().all(|s| s.slice_index.is_none())));
+        assert_eq!(lanes[4], Some(0), "chord lane rebinds to rhodes");
+        assert_eq!(lanes[6], Some(4), "hook lane rebinds to the encabulator");
+
+        let mut disco = StepPattern::new("disco");
+        disco.apply_preset(PatternPreset::DiscoFilterPump, &sources);
+        let [_, _, brk, climax] = disco.expand_four_sections();
+        let hooks_brk: Vec<bool> = brk.rows.iter().filter(|r| r.sculpt.stamp == Stamp::Phrase).map(|r| r.steps.iter().any(|s| s.on)).collect();
+        assert_eq!(hooks_brk, vec![false, true], "break spotlights Hook B only");
+        let hooks_cl: Vec<bool> = climax.rows.iter().filter(|r| r.sculpt.stamp == Stamp::Phrase).map(|r| r.steps.iter().any(|s| s.on)).collect();
+        assert_eq!(hooks_cl, vec![true, false], "climax punchline on Hook A only");
+    }
+
+    #[test]
+    fn private_hat_choke_group_never_chokes_group4_chords() {
+        let mut pat = StepPattern::new("choke");
+        let c = pat.add_row(0);
+        pat.rows[c].choke_group = 4;
+        pat.rows[c].grains.duration = 0.45;
+        pat.rows[c].steps[0].on = true;
+        let h = pat.add_row(0);
+        pat.rows[h].choke_group = 5;
+        pat.rows[h].grains.duration = 0.03;
+        pat.rows[h].steps[1].on = true;
+        let mut p = crate::timeline::Project::new();
+        for s in source_440() {
+            p.add_source(s);
+        }
+        let pid = p.add_pattern(pat);
+        let t = p.add_track("seq");
+        p.tracks[t].clips.push(crate::timeline::Clip::new_pattern(pid, 0.0, 4.0));
+        let mut plans = crate::render::plan_project(&p);
+        crate::render::apply_choke_groups(&mut plans, &p);
+        let evs: Vec<&GrainEvent> = plans.iter().flat_map(|cp| cp.parts.iter().flat_map(|(_, e)| e.iter())).collect();
+        assert!(evs.iter().any(|e| e.tag.choke_group == 4), "chord keeps group 4");
+        assert!(evs.iter().all(|e| e.tag.choke_group != 5 && e.tag.choke_group != 4 || e.tag.choke_at.is_none()), "hat hits never choke the chord");
+    }
 }
+

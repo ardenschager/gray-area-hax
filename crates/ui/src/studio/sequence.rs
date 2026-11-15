@@ -132,6 +132,15 @@ impl Studio {
     pub fn seq_current(&self, host: &dyn Host) -> (usize, Option<(usize, f64)>) {
         let spans = self.seq_chain_spans();
         let b = host.playhead_beats();
+        // Under `∞ hold` the arrangement loops the held scene alone, so "current" IS the held
+        // scene (presets / kit syncs applied while holding must edit what is actually playing).
+        if self.seq.hold_scene {
+            let idx = spans.iter().position(|(s, _, _, _)| *s == self.seq.scene);
+            return (
+                self.seq.scene,
+                idx.map(|i| (i, (b.max(0.0) / spans[i].3.max(1e-6)).fract())),
+            );
+        }
         for (i, (s, _, at, len)) in spans.iter().enumerate() {
             if b >= *at && b < *at + *len {
                 if host.playing() {
@@ -150,13 +159,15 @@ impl Studio {
             return;
         }
         let lay: Vec<(usize, f64, f64)> = if self.seq.hold_scene {
-            // Live improv `∞ hold`: loop the held scene cleanly until released or switched.
+            // Live improv `∞ hold`: loop the held scene's WHOLE pattern (a 4-bar groove keeps
+            // its full chord progression) until released or switched.
             let s = self.seq.scene.min(SCENES - 1);
-            self.seq.scene_pats[s]
-                .or_else(|| self.seq.scene_pats.iter().copied().flatten().next())
-                .into_iter()
-                .map(|pid| (pid, 0.0, 4.0))
-                .collect()
+            let pid = self.seq.scene_pats[s].or_else(|| self.seq.scene_pats.iter().copied().flatten().next());
+            let len = pid
+                .and_then(|pid| host.project().lock().unwrap().patterns.get(pid).map(|pat| pat.length_beats))
+                .unwrap_or(4.0)
+                .clamp(4.0, 64.0);
+            pid.into_iter().map(|pid| (pid, 0.0, len)).collect()
         } else {
             self.seq_chain_spans()
                 .iter()
@@ -680,8 +691,10 @@ impl Studio {
             }
             let sources = p.sources.clone();
             let Some(pat) = p.patterns.get_mut(pid) else { return };
-            pat.rows.clear();
-            pat.apply_preset(preset, &sources);
+            // Smart acoustic role assignment: every lane (`Kick · Snare · Hat · VoxPerc · Chord ·
+            // Bass · Hook A · Hook B`) is bound to the acoustically best loaded source and its
+            // exact curated slice — never to raw load order.
+            let _ = chromagrain_core::seq::assign_curated_kit_to_pattern(pat, &sources, key, preset);
             self.swing = pat.swing.clamp(0.50, 0.72);
             self.active_preset = Some(preset);
 
@@ -727,6 +740,58 @@ impl Studio {
             preset.label(),
             self.swing * 100.0
         ));
+    }
+
+    /// Re-bind every scene's lanes to the curated 8-lane role kit across all loaded sources
+    /// WITHOUT touching programmed steps (called after `Vocal Kit → pads`, so Perform pads and
+    /// Sequence lanes always play the same musical kit). Returns `false` when there is no
+    /// programmed pattern to re-bind.
+    pub fn sync_lanes_to_curated_kit(&mut self, host: &mut dyn Host) -> bool {
+        let key = self.key;
+        let (scene, _) = self.seq_current(host);
+        let pids: Vec<usize> = self.seq.scene_pats.iter().copied().flatten().collect();
+        let Some(main_pid) = self.seq_pattern(scene).or_else(|| pids.first().copied()) else {
+            return false;
+        };
+        {
+            let mut p = host.project().lock().unwrap();
+            let has_hits = p
+                .patterns
+                .get(main_pid)
+                .is_some_and(|pat| pat.rows.iter().any(|r| r.steps.iter().any(|s| s.on)));
+            if !has_hits {
+                return false;
+            }
+            let sources = p.sources.clone();
+            let picks = chromagrain_core::chop::build_lane_kit_across_sources_opt(&sources, Some(key));
+            if picks.is_empty() {
+                return false;
+            }
+            let mut lanes_now: Vec<Option<usize>> = Vec::new();
+            for &pid in &pids {
+                if let Some(pat) = p.patterns.get_mut(pid) {
+                    let l = chromagrain_core::seq::rebind_pattern_to_lane_picks(pat, &sources, &picks);
+                    if pid == main_pid {
+                        lanes_now = l;
+                        for i in 0..LANES {
+                            if let Some(row) = pat.rows.get(i) {
+                                self.lane_sculpt[i] =
+                                    crate::host::SculptParams::from_core(row.sculpt.stamp, row.sculpt, row.choke_group);
+                            }
+                        }
+                    }
+                }
+            }
+            for i in 0..LANES {
+                if let Some(l) = lanes_now.get(i) {
+                    self.seq.lanes[i] = *l;
+                }
+            }
+        }
+        self.rev += 1;
+        self.seq_build_arrangement(host);
+        host.mark_now();
+        true
     }
 
     /// 1-click 4-Section Song Expander (`Intro · Drop · Break · Climax`):

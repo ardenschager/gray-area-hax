@@ -567,6 +567,246 @@ fn hard_cut_adsr() -> crate::envelope::Adsr {
     }
 }
 
+// ============================================================================
+// Source-level acoustic character profiling (`v007`)
+// ============================================================================
+
+/// Whole-clip acoustic character of one [`Source`], measured over `<= 64` `~0.24 s` windows
+/// spread evenly across the clip. Slice-level features alone can't tell a held
+/// Rhodes note from a sustained spoken vowel, so kit builders weight every
+/// slice candidate by how well its *source* suits the musical role:
+/// * a harmonic instrument (Rhodes, Omnichord) holds **stable, equal-tempered**
+///   notes (`stable_pitch` + `tuning` high);
+/// * a bass instrument does the same with a low `f0_median`;
+/// * speech glides continuously off the tempered grid (`stable_pitch` / `tuning`
+///   low) with mid-band (`250 Hz..2 kHz`) formant dominance;
+/// * drums / tap / beatbox are mostly unpitched, punchy, and sparse.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct SourceProfile {
+    /// Fraction of active windows with NSDF pitch confidence `>= 0.6`.
+    pub tonal: f32,
+    /// Fraction of active windows whose two halves are both pitched and agree
+    /// within `0.6 st` (a held note rather than a gliding voice).
+    pub stable_pitch: f32,
+    /// Circular coherence (`0..1`) of confident `f0` cents residuals against the
+    /// equal-tempered grid: instruments cluster, speech is uniform.
+    pub tuning: f32,
+    /// Median `f0` (Hz) of confident windows (`0` when unpitched).
+    pub f0_median: f32,
+    /// Mean transient punch of active windows.
+    pub perc: f32,
+    /// Fraction of windows that are near-silent (`< -36 dB` below the loudest window).
+    pub sparsity: f32,
+    /// Mean 5-band energy distribution of active windows.
+    pub bands: [f32; 5],
+    /// Mean zero-crossing rate of active windows (crossings per sample).
+    pub zcr: f32,
+    /// The source carries an alpha cutout (collage sticker-ready hero).
+    pub alpha: bool,
+    /// At least one slice has a user caption (a curated spoken hook).
+    pub captioned: bool,
+}
+
+impl SourceProfile {
+    /// Harmonic-instrument suitability (`0..1`) for `Chord` stabs.
+    pub fn harmonic(&self) -> f32 {
+        let range = if self.f0_median >= 105.0 {
+            1.0
+        } else if self.f0_median >= 80.0 {
+            0.65
+        } else {
+            0.35
+        };
+        let held = (self.stable_pitch * 1.6).min(1.0);
+        let tuned = 0.35 + 0.65 * self.tuning;
+        let not_drum = 1.0 - 0.45 * (self.perc - 0.55).max(0.0) / 0.45;
+        (held * tuned * range * not_drum * (0.55 + 0.45 * self.tonal)).clamp(0.0, 1.0)
+    }
+
+    /// Bass-instrument suitability (`0..1`) for the `Pluck` / sub-bass lane: pitched,
+    /// `< 250 Hz`-dominant, very low zero-crossing rate, and a low median `f0`
+    /// (plucked bass notes decay too fast for `stable_pitch`, so it isn't required).
+    pub fn bassline(&self) -> f32 {
+        if self.f0_median <= 0.0 {
+            return 0.0;
+        }
+        let low_share = self.bands[0] + self.bands[1];
+        let zfac = if self.zcr <= 0.013 {
+            1.0
+        } else if self.zcr <= 0.022 {
+            0.55
+        } else {
+            0.15
+        };
+        let f0fac = if self.f0_median <= 145.0 {
+            1.0
+        } else if self.f0_median <= 200.0 {
+            0.5
+        } else {
+            0.15
+        };
+        (smooth01(self.tonal, 0.30, 0.70) * smooth01(low_share, 0.45, 0.68) * zfac * f0fac).clamp(0.0, 1.0)
+    }
+
+    /// Unpitched drum / body-percussion suitability (`0..1`) for `Kick` / `Snare` / `Hat`.
+    pub fn drums(&self) -> f32 {
+        let unpitched = 1.0 - 0.8 * self.tonal;
+        let punchy = (0.25 + self.perc).min(1.0);
+        let noisy = 0.5 + 0.5 * (self.zcr / 0.05).min(1.0);
+        let not_talk = 1.0 - 0.9 * self.speech_raw();
+        (unpitched * punchy * noisy * not_talk).clamp(0.0, 1.0)
+    }
+
+    fn speech_raw(&self) -> f32 {
+        // Speech = voiced but gliding (pitched windows that are NOT held tempered notes),
+        // with mid-band formant dominance and no sub/low-band dominance.
+        let voiced = self.tonal.clamp(0.15, 0.95);
+        let glide = (1.0 - (self.stable_pitch / self.tonal.max(0.05)).min(1.0)).clamp(0.0, 1.0);
+        let off_grid = 1.0 - self.tuning;
+        let mid = (self.bands[2] * 1.7).min(1.0);
+        let low_pen = (1.0 - (self.bands[0] + self.bands[1] - 0.45).max(0.0) * 2.0).max(0.2);
+        (voiced.sqrt() * (0.35 + 0.65 * glide) * (0.4 + 0.6 * off_grid) * (0.35 + 0.65 * mid) * low_pen)
+            .clamp(0.0, 1.0)
+    }
+
+    /// Spoken-word / sung hook suitability (`0..1`) for the `Phrase` lanes.
+    pub fn speech(&self) -> f32 {
+        let hero = if self.alpha { 1.25 } else { 1.0 } * if self.captioned { 1.2 } else { 1.0 };
+        (self.speech_raw() * hero).clamp(0.0, 1.0)
+    }
+}
+
+/// Measure the whole-clip [`SourceProfile`] of `src` (deterministic, `<= 64` windows).
+pub fn profile_source(src: &Source) -> SourceProfile {
+    let alpha = src.video.as_deref().is_some_and(|v| v.has_alpha());
+    let captioned = src.slices.iter().any(|s| !s.caption.is_empty());
+    let mut prof = SourceProfile { alpha, captioned, ..SourceProfile::default() };
+    let Some(a) = src.audio.as_deref() else { return prof };
+    if a.sample_rate == 0 || a.samples.len() < 4096 {
+        return prof;
+    }
+    let sr = a.sample_rate as usize;
+    let win = (sr as f64 * 0.24) as usize;
+    let half = win / 2;
+    let n_total = a.samples.len();
+    if n_total <= win {
+        return prof;
+    }
+    let max_w = 64usize;
+    let n_w = ((n_total - win) / win).clamp(1, max_w);
+    let stride = (n_total - win) / n_w.max(1);
+    struct W {
+        rms: f32,
+        bands: [f32; 5],
+        punch: f32,
+        f0: Option<f32>,
+        conf: f32,
+        stable: bool,
+        zcr: f32,
+    }
+    let mut ws: Vec<W> = Vec::with_capacity(n_w);
+    for k in 0..n_w {
+        let i0 = k * stride;
+        let seg = &a.samples[i0..i0 + win];
+        let rms = (seg.iter().map(|v| v * v).sum::<f32>() / seg.len() as f32).sqrt();
+        let (bands, punch, _) = crate::dsp::slice_band_stats(seg, a.sample_rate);
+        let (f0, conf) = crate::dsp::detect_pitch_nsdf(seg, a.sample_rate);
+        let stable = if f0.is_some() && conf >= 0.5 {
+            let (fa, ca) = crate::dsp::detect_pitch_nsdf(&seg[..half], a.sample_rate);
+            let (fb, cb) = crate::dsp::detect_pitch_nsdf(&seg[half..], a.sample_rate);
+            match (fa, fb) {
+                (Some(x), Some(y)) if ca >= 0.6 && cb >= 0.6 && x > 30.0 && y > 30.0 => {
+                    (12.0 * (x / y).log2()).abs() <= 0.6
+                }
+                _ => false,
+            }
+        } else {
+            false
+        };
+        let zc = seg.windows(2).filter(|p| (p[0] >= 0.0) != (p[1] >= 0.0)).count() as f32 / seg.len() as f32;
+        ws.push(W { rms, bands, punch, f0, conf, stable, zcr: zc });
+    }
+    let peak = ws.iter().map(|w| w.rms).fold(0.0f32, f32::max);
+    if peak < 1e-5 {
+        return prof;
+    }
+    let floor = peak * 10f32.powf(-36.0 / 20.0);
+    let active: Vec<&W> = ws.iter().filter(|w| w.rms >= floor).collect();
+    prof.sparsity = 1.0 - active.len() as f32 / ws.len() as f32;
+    if active.is_empty() {
+        return prof;
+    }
+    let n = active.len() as f32;
+    let mut f0s: Vec<f32> = Vec::new();
+    let (mut cs, mut sn) = (0.0f32, 0.0f32);
+    for w in &active {
+        for b in 0..5 {
+            prof.bands[b] += w.bands[b] / n;
+        }
+        prof.perc += w.punch / n;
+        prof.zcr += w.zcr / n;
+        if w.stable {
+            prof.stable_pitch += 1.0 / n;
+        }
+        if let Some(hz) = w.f0.filter(|&h| h > 30.0 && w.conf >= 0.6) {
+            prof.tonal += 1.0 / n;
+            f0s.push(hz);
+            let cents = 1200.0 * (hz / 440.0).log2();
+            let th = (cents.rem_euclid(100.0) / 100.0) * std::f32::consts::TAU;
+            cs += th.cos();
+            sn += th.sin();
+        }
+    }
+    if !f0s.is_empty() {
+        f0s.sort_by(|a, b| a.total_cmp(b));
+        prof.f0_median = f0s[f0s.len() / 2];
+        prof.tuning = if f0s.len() >= 3 {
+            // Down-weight sparse estimates (random phases give `R ~ 1/sqrt(n)`).
+            (cs * cs + sn * sn).sqrt() / f0s.len() as f32 * (f0s.len() as f32 / 10.0).min(1.0)
+        } else {
+            0.0
+        };
+    }
+    prof
+}
+
+fn smooth01(x: f32, lo: f32, hi: f32) -> f32 {
+    let t = ((x - lo) / (hi - lo).max(1e-6)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// How steadily a slice HOLDS one pitch (`0..1`): the fraction of adjacent `~1/6`-slice
+/// windows that are both confidently pitched and within `1 st` of each other. A held chord
+/// or sung note scores high; a busy improv run, speech or drums score low. Wash pads need it.
+pub fn slice_steadiness(audio: Option<&AudioClip>, slice: &Slice) -> f32 {
+    let Some(a) = audio else { return 0.0 };
+    if a.sample_rate == 0 || a.samples.is_empty() {
+        return 0.0;
+    }
+    let sr = a.sample_rate as f64;
+    let i0 = ((slice.start.max(0.0) * sr) as usize).min(a.samples.len());
+    let i1 = ((slice.end * sr) as usize).clamp(i0, a.samples.len());
+    let n = 6usize;
+    let w = (i1 - i0) / n;
+    if w < 1024 {
+        return 0.0;
+    }
+    let f0s: Vec<Option<f32>> = (0..n)
+        .map(|k| {
+            let seg = &a.samples[i0 + k * w..i0 + (k + 1) * w];
+            match crate::dsp::detect_pitch_nsdf(seg, a.sample_rate) {
+                (Some(hz), c) if c >= 0.6 && hz > 30.0 => Some(hz),
+                _ => None,
+            }
+        })
+        .collect();
+    let held = f0s
+        .windows(2)
+        .filter(|p| matches!((p[0], p[1]), (Some(x), Some(y)) if (12.0 * (x / y).log2()).abs() <= 1.0))
+        .count();
+    held as f32 / (n - 1) as f32
+}
+
 /// Alias for [`KitPadSpec`] used by UKG & multi-source kit builders.
 pub type CuratedPad = KitPadSpec;
 
@@ -1174,7 +1414,20 @@ pub fn build_chord_washes_across_sources_opt<S: AsRef<Source>>(
     let n_sources = sources.len().max(1);
     let mut src_counts = vec![0usize; n_sources];
     let mut out: Vec<CuratedPad> = Vec::with_capacity(16);
-
+    // `v007`: lean the washes toward sustained harmonic / sung sources (Rhodes, acapella)
+    // over percussion (a smeared tap shoe or beatbox makes a muddy, noisy "chord").
+    let wash_w: Vec<f32> = sources
+        .iter()
+        .map(|s| {
+            let p = profile_source(s.as_ref());
+            (0.30 + 0.70 * p.harmonic().max(0.30 * p.speech()).max(0.6 * p.bassline())) * (1.0 - 0.55 * p.drums())
+        })
+        .collect();
+    // Held chords / sung notes only: a busy improv run or chatter smears into noise.
+    let steady: Vec<f32> = pool
+        .iter()
+        .map(|c| slice_steadiness(sources.get(c.sid).and_then(|s| s.as_ref().audio.as_deref()), &c.slice))
+        .collect();
     for (pi, &(label, deg_st, voicing, shimmer, comb_mix, lpf_hz, loop_secs)) in
         prog.iter().enumerate()
     {
@@ -1200,7 +1453,8 @@ pub fn build_chord_washes_across_sources_opt<S: AsRef<Source>>(
             let warmth = 0.45 + 0.85 * s.pitch_confidence + 0.65 * (s.bands[1] + s.bands[2]);
             let smooth = 1.15 - 0.35 * s.punch.clamp(0.0, 1.0);
             let div_bonus = 1.0 / (1.0 + 0.55 * src_counts[c.sid] as f32);
-            let sc = len_bonus * warmth * smooth * outro_guard * div_bonus;
+            let sc = len_bonus * warmth * smooth * outro_guard * div_bonus * wash_w.get(c.sid).copied().unwrap_or(1.0)
+                * (0.15 + 0.85 * steady.get(i).copied().unwrap_or(0.0));
             if sc > best_sc {
                 best_sc = sc;
                 best_i = Some(i);
@@ -1316,6 +1570,27 @@ pub fn build_ukg_vox_kit_across_sources_opt<S: AsRef<Source>>(
         return Vec::new();
     }
 
+    // `v007`: weight every slice candidate by how well its WHOLE SOURCE suits the role
+    // (a held Rhodes chord never becomes a "kick", a spoken "duh" never becomes a snare
+    // or a vox-perc hat, and the bass guitar wins the sub lane over a vowel).
+    let profs: Vec<SourceProfile> = sources.iter().map(|s| profile_source(s.as_ref())).collect();
+    let prof_of = |sid: SourceId| profs.get(sid).copied().unwrap_or_default();
+    // Steep curve: a speech clip's consonants crack like a snare at slice level, so the
+    // drum lanes must lean hard on whole-source percussiveness.
+    let w_drum = |sid: SourceId| (0.05 + 0.95 * prof_of(sid).drums()).powf(1.5);
+    let w_harm = |sid: SourceId| 0.10 + 0.90 * prof_of(sid).harmonic();
+    let w_bass = |sid: SourceId| {
+        let p = prof_of(sid);
+        0.08 + 0.92 * p.bassline().max(0.55 * p.harmonic())
+    };
+    let w_speech = |sid: SourceId| {
+        let p = prof_of(sid);
+        // A cut-out (alpha) clip is the user's chosen collage hero: favor it for hooks.
+        let hero = if p.alpha { 1.35 } else { 1.0 };
+        (0.18 + 0.82 * p.speech()) * (1.0 - 0.7 * p.harmonic().max(p.bassline())) * hero
+    };
+    let hint = |s: &Slice, want: SliceRole| if s.role_hint == want { 1.35 } else { 1.0 };
+
     let n_sources = sources.len().max(1);
     let mut src_counts = vec![0usize; n_sources];
     let pick = |pool: &mut [Cand],
@@ -1361,7 +1636,7 @@ pub fn build_ukg_vox_kit_across_sources_opt<S: AsRef<Source>>(
             let s = &c.slice;
             let low = s.bands[0] * 1.35 + s.bands[1] * 1.05 + 0.12;
             let dur_fit = if s.len() <= 0.40 { 1.2 } else { 0.8 };
-            (s.punch + 0.30) * low * dur_fit
+            (s.punch + 0.30) * low * dur_fit * w_drum(c.sid) * hint(s, SliceRole::Kick)
         }) {
             sl.end = (sl.start + sl.len().clamp(0.11, 0.24)).min(sl.start + 0.24);
             sl.role_hint = SliceRole::Kick;
@@ -1392,7 +1667,7 @@ pub fn build_ukg_vox_kit_across_sources_opt<S: AsRef<Source>>(
             let s = &c.slice;
             let crack = s.bands[2] * 0.80 + s.bands[3] * 1.30 + s.bands[4] * 0.45 + 0.10;
             let dur_fit = if s.len() <= 0.35 { 1.25 } else { 0.75 };
-            (s.punch + 0.25) * crack * dur_fit
+            (s.punch + 0.25) * crack * dur_fit * w_drum(c.sid) * hint(s, SliceRole::Snare)
         }) {
             sl.end = (sl.start + sl.len().clamp(0.09, 0.22)).min(sl.start + 0.22);
             sl.role_hint = SliceRole::Snare;
@@ -1414,34 +1689,44 @@ pub fn build_ukg_vox_kit_across_sources_opt<S: AsRef<Source>>(
         }
     }
 
-    // 3. Pads 4..8: `VoxPerc` (`32..58 ms` crisp sibilants/plosives/micro-vowels `"t"`, `"k"`, `"s"`, `"uh"`).
+    // 3. Pads 4..8: `VoxPerc` (`36..54 ms` crisp sibilants/plosives/clicks `"t"`, `"k"`, `"s"`, `"tk"`).
+    //    `v007`: never a voiced low-mid vowel (`"duh-uh"`), never a chunk of a tonal instrument;
+    //    high-passed `>= 340 Hz` and sat back in the pocket (`gain 0.62`).
     let vox_durs = [0.036f64, 0.042, 0.048, 0.054];
     let vox_pans = [-0.34f32, 0.34, -0.26, 0.28];
     let vox_pitches = [0.0f32, 2.0, -1.5, 3.0];
-    let vox_labels = ["Vox T", "Vox K", "Vox S", "Vox Uh"];
+    let vox_labels = ["Vox T", "Vox K", "Vox S", "Vox Tk"];
+    let w_vox = |sid: SourceId| {
+        let p = prof_of(sid);
+        (0.25 + 0.75 * p.drums().max(0.55 * p.speech())) * (1.0 - 0.8 * p.harmonic()) * (1.0 - 0.8 * p.bassline())
+    };
     for k in 0..4 {
         if let Some((sid, src_dur, mut sl)) = pick_or_reuse(&mut pool, &mut src_counts, &|c| {
             let s = &c.slice;
             let cons = if k < 3 {
                 s.bands[3] * 1.15 + s.bands[4] * 1.40 + s.bands[2] * 0.45 + 0.10
             } else {
-                // Micro-vowel `"uh"` tick: crisp formant body + transient attack.
-                s.bands[2] * 1.30 + s.bands[3] * 0.85 + 0.10
+                // Tongue-click / consonant-burst tick (crisp attack, upper-mid bite).
+                s.bands[3] * 1.00 + s.bands[4] * 0.90 + s.bands[2] * 0.60 + 0.10
             };
+            let hi = s.bands[3] + s.bands[4];
+            let vowel_pen = if s.bands[1] + s.bands[2] > 0.60 && hi < 0.30 { 0.35 } else { 1.0 };
             let short_bonus = if s.len() <= 0.18 { 1.35 } else { 0.90 };
-            cons * short_bonus * (0.45 + 0.55 * s.punch)
+            cons * short_bonus * (0.45 + 0.55 * s.punch) * vowel_pen * w_vox(c.sid) * hint(s, SliceRole::Hat)
         }) {
             let target_len = vox_durs[k];
             sl.end = (sl.start + target_len).min(src_dur).max(sl.start + 0.028);
             sl.role_hint = SliceRole::Hat;
+            let mut sculpt = VoiceSculpt::preset(Stamp::VoxPerc);
+            sculpt.hpf_hz = sculpt.hpf_hz.max(340.0);
             out.push(KitPadSpec {
                 pad_index: out.len(),
                 source: sid,
                 slice: sl,
                 stamp: Stamp::VoxPerc,
-                sculpt: VoiceSculpt::preset(Stamp::VoxPerc),
+                sculpt,
                 pitch_semitones: vox_pitches[k],
-                gain: 0.86,
+                gain: 0.62,
                 pan: vox_pans[k],
                 choke_group: 3,
                 one_shot: true,
@@ -1464,7 +1749,8 @@ pub fn build_ukg_vox_kit_across_sources_opt<S: AsRef<Source>>(
             } else {
                 s.bands[0] * 0.9 + s.bands[1] * 1.2 + s.bands[2] * 0.6 + 0.15
             };
-            pitched * vowel_fit * body
+            let src_w = if k < 2 { w_harm(c.sid) } else { w_bass(c.sid) };
+            pitched * vowel_fit * body * src_w * hint(s, SliceRole::Tonal)
         }) {
             let tune_st = match (key, sl.f0_hz) {
                 (Some(ky), Some(hz)) => compute_key_quantize_semitones(hz, ky),
@@ -1526,10 +1812,22 @@ pub fn build_ukg_vox_kit_across_sources_opt<S: AsRef<Source>>(
     // 5. Pads 11..16: `Phrase` (`0.55..1.9s` highest-clarity spoken hooks, `-30ms` consonant pre-roll
     //    preserved, `choke_group = 1` so hooks cut each other cleanly, `PictureCut::Cut`).
     let mut hook_num = 1usize;
+    // The first hook comes from a cut-out (alpha) clip whenever one is loaded: the
+    // user's segmented subject is the collage hero.
+    let any_alpha_cand = pool.iter().any(|c| prof_of(c.sid).alpha);
     while out.len() < 16 {
+        let hero_only = hook_num == 1 && any_alpha_cand;
         let Some((sid, src_dur, mut sl)) = pick_or_reuse(&mut pool, &mut src_counts, &|c| {
+            if hero_only && !prof_of(c.sid).alpha {
+                return -1e9;
+            }
             let s = &c.slice;
-            let outro_guard = if c.src_dur >= 8.0 && s.end > 0.82 * c.src_dur { 0.12 } else { 1.0 };
+            // (A user-captioned chop is a deliberate hook, never an end-screen outro.)
+            let outro_guard = if c.src_dur >= 8.0 && s.end > 0.82 * c.src_dur && s.caption.is_empty() {
+                0.12
+            } else {
+                1.0
+            };
             let len_fit = if (0.55..=1.90).contains(&s.len()) {
                 1.55
             } else if s.len() >= 0.35 {
@@ -1539,7 +1837,7 @@ pub fn build_ukg_vox_kit_across_sources_opt<S: AsRef<Source>>(
             };
             let speech_clarity = s.bands[2] * 1.45 + s.bands[3] * 0.75 + 0.10;
             let caption_bonus = if s.caption.is_empty() { 1.0 } else { 1.45 };
-            speech_clarity * len_fit * outro_guard * caption_bonus
+            speech_clarity * len_fit * outro_guard * caption_bonus * w_speech(c.sid) * hint(s, SliceRole::Phrase)
         }) else {
             break;
         };
@@ -1576,6 +1874,156 @@ pub fn build_ukg_vox_kit_across_sources_opt<S: AsRef<Source>>(
 
     for (i, spec) in out.iter_mut().enumerate() {
         spec.pad_index = i;
+    }
+    out
+}
+
+/// The 8 sequencer lane roles of the curated lane kit (`v007`), in lane order:
+/// `0 Kick · 1 Snare · 2 Hat · 3 VoxPerc · 4 Chord · 5 Bass · 6 Hook A · 7 Hook B`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum LaneRole {
+    Kick,
+    Snare,
+    Hat,
+    VoxPerc,
+    Chord,
+    Bass,
+    HookA,
+    HookB,
+}
+
+impl LaneRole {
+    pub const ALL: [LaneRole; 8] = [
+        LaneRole::Kick,
+        LaneRole::Snare,
+        LaneRole::Hat,
+        LaneRole::VoxPerc,
+        LaneRole::Chord,
+        LaneRole::Bass,
+        LaneRole::HookA,
+        LaneRole::HookB,
+    ];
+
+    /// The voice stamp a lane of this role plays with.
+    pub fn stamp(self) -> Stamp {
+        match self {
+            LaneRole::Kick => Stamp::Kick,
+            LaneRole::Snare => Stamp::Snare,
+            LaneRole::Hat => Stamp::Hat,
+            LaneRole::VoxPerc => Stamp::VoxPerc,
+            LaneRole::Chord => Stamp::Chord,
+            LaneRole::Bass => Stamp::Pluck,
+            LaneRole::HookA | LaneRole::HookB => Stamp::Phrase,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LaneRole::Kick => "Kick",
+            LaneRole::Snare => "Snare",
+            LaneRole::Hat => "Hat",
+            LaneRole::VoxPerc => "Vox Perc",
+            LaneRole::Chord => "Chord",
+            LaneRole::Bass => "Bass",
+            LaneRole::HookA => "Hook A",
+            LaneRole::HookB => "Hook B",
+        }
+    }
+}
+
+/// One lane of [`build_lane_kit_across_sources_opt`]: the role and the curated pad
+/// (source + exact slice + sculpt + gain) that lane plays.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LanePick {
+    pub role: LaneRole,
+    pub pad: KitPadSpec,
+}
+
+/// Assign each of the 8 sequencer lanes ([`LaneRole::ALL`]) to the acoustically best
+/// loaded source **and** its exact curated slice, independent of load order.
+///
+/// Built on [`build_ukg_vox_kit_across_sources_opt`] (whose candidates are weighted by
+/// each source's [`SourceProfile`]): `Kick`/`Snare` take the best drum pads, `Hat` the
+/// airiest vox-perc pad (re-stamped [`Stamp::Hat`]), `VoxPerc` the next crisp consonant
+/// tick (`HPF >= 340 Hz`, pocket gain), `Chord` the best harmonic-instrument stab, `Bass`
+/// the sub pad (a bass instrument, else the harmonic instrument an octave down), and
+/// `Hook A` / `Hook B` the two clearest spoken/sung hooks (from different sources when
+/// possible). Returns an empty kit when no source has usable audio or video.
+pub fn build_lane_kit_across_sources_opt<S: AsRef<Source>>(sources: &[S], key: Option<Key>) -> Vec<LanePick> {
+    let kit = build_ukg_vox_kit_across_sources_opt(sources, key);
+    if kit.is_empty() {
+        return Vec::new();
+    }
+    let profs: Vec<SourceProfile> = sources.iter().map(|s| profile_source(s.as_ref())).collect();
+    let drum_of = |sid: SourceId| profs.get(sid).map_or(0.0, |p| p.drums());
+    let first = |st: Stamp| kit.iter().find(|p| p.stamp == st).cloned();
+    let mut out: Vec<LanePick> = Vec::with_capacity(8);
+
+    if let Some(p) = first(Stamp::Kick) {
+        out.push(LanePick { role: LaneRole::Kick, pad: p });
+    }
+    if let Some(p) = first(Stamp::Snare) {
+        out.push(LanePick { role: LaneRole::Snare, pad: p });
+    }
+
+    // Hat = airiest vox-perc tick (prefer drum sources); VoxPerc = next crispest consonant.
+    let vox: Vec<&KitPadSpec> = kit.iter().filter(|p| p.stamp == Stamp::VoxPerc).collect();
+    let air = |p: &KitPadSpec| p.slice.bands[3] * 0.6 + p.slice.bands[4] * 1.45 + 0.35 * drum_of(p.source);
+    let hat_i = (0..vox.len()).max_by(|&a, &b| air(vox[a]).total_cmp(&air(vox[b])));
+    if let Some(hi) = hat_i {
+        let mut p = vox[hi].clone();
+        p.stamp = Stamp::Hat;
+        let mut sc = VoiceSculpt::preset(Stamp::Hat);
+        sc.hpf_hz = sc.hpf_hz.max(2400.0);
+        p.sculpt = sc;
+        p.gain = 0.72;
+        p.pitch_semitones = 0.0;
+        p.choke_group = 5;
+        p.label = "Hat".into();
+        out.push(LanePick { role: LaneRole::Hat, pad: p });
+    }
+    let crisp = |p: &KitPadSpec| {
+        let s = &p.slice;
+        let vowel = (s.bands[1] + s.bands[2] - 0.45).max(0.0);
+        (s.bands[3] * 1.2 + s.bands[4] * 1.0 + 0.4 * s.punch) * (1.0 - vowel)
+    };
+    let hat_src = hat_i.map(|hi| vox[hi].source);
+    let vp = (0..vox.len())
+        .filter(|&i| Some(i) != hat_i)
+        .max_by(|&a, &b| {
+            let pa = crisp(vox[a]) * if Some(vox[a].source) == hat_src { 0.85 } else { 1.0 };
+            let pb = crisp(vox[b]) * if Some(vox[b].source) == hat_src { 0.85 } else { 1.0 };
+            pa.total_cmp(&pb)
+        })
+        .or(hat_i);
+    if let Some(vi) = vp {
+        let mut p = vox[vi].clone();
+        p.stamp = Stamp::VoxPerc;
+        p.sculpt.stamp = Stamp::VoxPerc;
+        p.sculpt.hpf_hz = p.sculpt.hpf_hz.max(340.0);
+        p.gain = p.gain.min(0.62);
+        out.push(LanePick { role: LaneRole::VoxPerc, pad: p });
+    }
+
+    if let Some(p) = first(Stamp::Chord) {
+        out.push(LanePick { role: LaneRole::Chord, pad: p });
+    }
+    if let Some(p) = first(Stamp::Pluck) {
+        out.push(LanePick { role: LaneRole::Bass, pad: p });
+    }
+    let hooks: Vec<&KitPadSpec> = kit.iter().filter(|p| p.stamp == Stamp::Phrase).collect();
+    if let Some(a) = hooks.first() {
+        out.push(LanePick { role: LaneRole::HookA, pad: (*a).clone() });
+        let b = hooks
+            .iter()
+            .skip(1)
+            .find(|h| h.source != a.source)
+            .or_else(|| hooks.get(1));
+        if let Some(b) = b {
+            let mut p = (*b).clone();
+            p.label = "Hook B".into();
+            out.push(LanePick { role: LaneRole::HookB, pad: p });
+        }
     }
     out
 }

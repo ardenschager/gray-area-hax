@@ -661,10 +661,14 @@ pub fn plan_project(project: &Project) -> Vec<ClipPlan> {
             } else {
                 track.sculpt
             };
-            let eff_choke = if clip.grains.choke_group > 0 {
-                clip.grains.choke_group.min(4)
-            } else {
-                track.choke_group.min(4)
+            let eff_choke = {
+                // `1..=4` only; out-of-range groups mean "no choke" (never clamp into group 4).
+                let c = if clip.grains.choke_group > 0 { clip.grains.choke_group } else { track.choke_group };
+                if (1..=4).contains(&c) {
+                    c
+                } else {
+                    0
+                }
             };
             // Free-running asynchronous tape loops plan over `full_len` directly;
             // beat-repeating clips plan one pass, then tile it (below).

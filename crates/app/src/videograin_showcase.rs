@@ -1,13 +1,25 @@
-//! Live `VIDEOGRAIN` (`v005`) Hardware Console Showcase (`1920x1080 @ 30fps`, `38.5s`):
+//! Live `VIDEOGRAIN` (`v007`) Hardware Console Showcase (`1920x1080 @ 30fps`, `41s`) —
+//! `261114_videograin_hardware-console_disco-ukg-showcase_v007.mp4`.
+//!
+//! `v006` review (#fb-701052396: "this sounds pretty bad") traced to the console wiring, not the
+//! engine: lanes were bound to raw load order (a spoken Flowbee "da" hammered the vox-perc lane
+//! on every off-16th, a Turbo Encabulator syllable was the kick, a 2-second Rhodes chunk was a
+//! "hat", and the 1-click `Disco` preset put a spoken "duh" on the snare and tap shoes on the bass).
+//! `v007` records the banger crate (#fb-701021625 / #fb-701041057) through the FIXED product path:
+//! every groove preset / `Vocal Kit` / `Chord Wash` click binds each lane to the acoustically best
+//! source + curated slice via `seq::assign_curated_kit_to_pattern` / `rebind_pattern_to_lane_kit`.
+//!
 //! - Strictly ZERO start title card (`title_until: 0.0`) and ZERO end card (`end_card: len + 100.0`).
-//! - Opens on Frame `0` directly inside the live `VIDEOGRAIN` hardware console (`Perform`, `collage` mode)
-//!   with real Wave 1 crate videos (`Turbo Encabulator`, `Pet Flowbee Groomer` cutout, `Suzuki Omnichord`,
-//!   `Solo Rhodes`, `Tap Shuffle`, plus `Tomy Omnibot Zeon` pulled live via `+ Add -> YouTube`).
-//! - Demonstrates the complete 4-act human workflow with continuous synced audio + `wgpu` GPU stage:
-//!   1. `0:00–0:08`: Live `Perform` (`collage`) -> `+ Add -> YouTube` (`<500 views` + instant pull bar) -> pulls `Tomy Omnibot Zeon`
-//!   2. `0:08–0:16`: `Clip` sheet -> `✂ Cutout Subject` (live Apple Vision cutout) + `Vox Perc` + `Vocal Kit → pads`
-//!   3. `0:16–0:25`: `Sequence` -> `Disco` & `2-Step` in the 7-Preset Groove Bank + 1-click `Build Set` (`1 intro · 2 drop · 3 break · 4 climax`)
-//!   4. `0:25–0:38.5`: `Perform` -> vocal hook pads + `[5..0]` Punch switches (`Grid ×`, `Stutter`, `Cutout`, `Tape Stop`) + `ISOL8` mid-band zine solo -> `Fullscreen` die-cut sticker + packed grid climax!
+//! - Load order is deliberately scrambled (speech FIRST) to prove roles come from sound, not order.
+//!   1. `0:00–0:09.7`: `Disco` (`124 BPM`) drops on frame 0 — Rhodes `Min9` chords, fingerstyle bass,
+//!      beatbox kick/snare, crisp hats, die-cut tap legs + Encabulator `"the government will buy it"`
+//!      — while `+ Add -> YouTube` (`<500 views`) pulls `Soul Stutter Acapella` (`125` views).
+//!   2. `0:09.7–0:15.5`: `Clip` -> `Cutout Person` + `Vocal Kit → pads` (soulful chop auditions on the bar).
+//!   3. `0:15.5–0:24.7`: `Sequence` -> `2-Step` (`132 BPM`, `61%` swing) on the bar line -> `Build Set`
+//!      -> hold `2 · drop`.
+//!   4. `0:24.7–0:33.7`: `Perform` -> `Grid ×` + one-bar `ISOL8` mid-band radio break on `"It's not
+//!      cheap"` -> slam back into the full drop on `"the government will buy it"`.
+//!   5. `0:33.7–0:41`: `Chord Wash` over paulstretched Rhodes / bass chops -> `Fullscreen`.
 
 use crate::showcase::{
     lab, record_with, Caption as FilmCaption, Cue, Film, Gesture, Overlay, RecordOpts, Tour,
@@ -19,7 +31,7 @@ use chromagrain_core::envelope::{Adsr, PictureCut, VoiceEnv};
 use chromagrain_core::grain::{ChordVoicing, GrainEvent, Stamp, VoiceSculpt, VoiceTag};
 use chromagrain_core::media;
 use chromagrain_core::music::{semitones_to_ratio, Key, ScaleKind};
-use chromagrain_core::seq::{PatternPreset, Step, StepPattern};
+use chromagrain_core::seq::{PatternPreset, StepPattern};
 use chromagrain_core::tile::{AspectRatio, Layout};
 use chromagrain_core::timeline::{Clip, Provenance, Source};
 use chromagrain_ui::{ClipTarget, Host, PerformHost, StageAspect, StageMode, View, YoutubeHit};
@@ -27,9 +39,32 @@ use eframe::egui;
 use egui_kittest::Harness;
 use std::path::{Path, PathBuf};
 
-const SHOWCASE_LEN: f64 = 41.6;
+const SHOWCASE_LEN: f64 = 41.0;
 
-fn videograin_root() -> PathBuf {
+/// `124 BPM` Disco bar (`4 beats`).
+const BAR_DISCO: f64 = 4.0 * 60.0 / 124.0;
+/// The `2-Step` click lands on the bar-10 downbeat (`40 beats @ 124 BPM`).
+const T_2STEP: f64 = 10.0 * BAR_DISCO;
+/// 2-step bar at the `2-Step` preset's own tempo (`132 BPM`).
+const BAR_UKG: f64 = 4.0 * 60.0 / 132.0;
+/// Pointer taps register on release (`0.14 s` after the press).
+const TAP: f64 = 0.14;
+
+/// Downbeat (seconds) of 2-step bar `n` counted from the `2-Step` click.
+const fn ukg_bar(n: f64) -> f64 {
+    T_2STEP + n * BAR_UKG
+}
+
+// Crate slot indices (deliberately scrambled load order: speech first, instruments last).
+const S_ENCAB: usize = 0;
+const S_TAP: usize = 1;
+const S_BEATBOX: usize = 2;
+const S_BASS: usize = 3;
+const S_RHODES: usize = 4;
+/// `Soul Stutter Acapella` arrives as source 5 via the live `+ Add -> YouTube` pull.
+const S_SOUL: usize = 5;
+
+pub(crate) fn videograin_root() -> PathBuf {
     if let Ok(p) = std::env::var("CHROMAGRAIN_UKG_ROOT") {
         let pb = PathBuf::from(p);
         if pb.exists() {
@@ -99,200 +134,48 @@ fn push_curated_slice(
     (s.slices.len() - 1) as u16
 }
 
-/// Build a punchy, richly layered 2-step UKG pattern across our loaded crate sources
-/// so the live console groove sounds full and authentic right from Frame `0`.
-fn populate_console_ukg_pattern(pat: &mut StepPattern, key: Key, n_sources: usize, has_zeon: bool) {
-    pat.set_grid(4.0, 4);
-    pat.swing = 0.61;
-    pat.rows.clear();
-    for li in 0..chromagrain_ui::studio::LANES {
-        let src = match li {
-            0 => 0,                                    // Turbo Encabulator Kick
-            1 => 3.min(n_sources.saturating_sub(1)),   // Tap Shuffle Snare/Rim
-            2 => 1.min(n_sources.saturating_sub(1)),   // Omnichord Sub
-            3 => 1.min(n_sources.saturating_sub(1)),   // Omnichord Min7 Chords
-            4 => 4.min(n_sources.saturating_sub(1)),   // Flowbee VoxPerc
-            5 => {
-                if has_zeon && n_sources > 5 {
-                    5 // Omnibot Zeon VoxPerc
-                } else {
-                    2.min(n_sources.saturating_sub(1)) // Solo Rhodes stabs
-                }
-            }
-            6 => 2.min(n_sources.saturating_sub(1)),   // Solo Rhodes answer chord
-            _ => usize::MAX,
-        };
-        let r = pat.add_row(src);
-        pat.rows[r].grains.position = 0.0;
-        if matches!(li, 2 | 3 | 6) {
-            pat.rows[r].key = Some(key);
-        }
-    }
+/// The user's chops on the banger crate (the same slices `disco-pump` / `bid-stutter` used).
+fn curate_banger_slices(encab: &mut Source, tap: &mut Source, beatbox: &mut Source, bass: &mut Source, rhodes: &mut Source) {
+    encab.slices.clear();
+    push_curated_slice(encab, 25.24, 26.70, SliceRole::Phrase, (0.52, 0.38), "the government will buy it");
+    push_curated_slice(encab, 23.45, 24.36, SliceRole::Phrase, (0.52, 0.38), "It's not cheap");
 
-    // Row 0: Skipping 2-Step Kick (steps 0, 7, 10 — zero four-on-the-floor beat 4/8!)
-    let sc_kick = VoiceSculpt::preset(Stamp::Kick);
-    pat.rows[0].sculpt = sc_kick;
-    pat.rows[0].grains.sculpt = sc_kick;
-    pat.rows[0].grains.gain = 0.96;
-    pat.rows[0].grains.duration = 0.13;
-    for &(st, g) in &[(0usize, 0.98f32), (7, 0.84), (10, 0.94)] {
-        pat.rows[0].steps[st] = Step {
-            on: true,
-            gain: g,
-            slice_index: Some(0),
-            ..Step::default()
-        };
-    }
+    tap.slices.clear();
+    push_curated_slice(tap, 8.16, 8.22, SliceRole::Hat, (0.50, 0.62), "");
+    push_curated_slice(tap, 19.88, 19.96, SliceRole::Snare, (0.50, 0.62), "");
+    push_curated_slice(tap, 18.50, 18.59, SliceRole::Kick, (0.50, 0.62), "");
 
-    // Row 1: Crisp 2 & 4 Tap-Shoe Snare + ghost 15 ratchet
-    let sc_snare = VoiceSculpt::preset(Stamp::Snare);
-    pat.rows[1].sculpt = sc_snare;
-    pat.rows[1].grains.sculpt = sc_snare;
-    pat.rows[1].grains.gain = 0.90;
-    pat.rows[1].grains.duration = 0.11;
-    for &(st, g, rat) in &[(4usize, 0.95f32, 1u8), (12, 0.96, 1), (15, 0.62, 2)] {
-        pat.rows[1].steps[st] = Step {
-            on: true,
-            gain: g,
-            ratchet: rat,
-            ratchet_pitch: if rat > 1 { 2.0 } else { 0.0 },
-            slice_index: Some(0),
-            ..Step::default()
-        };
-    }
+    beatbox.slices.clear();
+    push_curated_slice(beatbox, 27.36, 27.46, SliceRole::Kick, (0.50, 0.42), "");
+    push_curated_slice(beatbox, 23.65, 23.76, SliceRole::Snare, (0.50, 0.42), "");
+    push_curated_slice(beatbox, 3.22, 3.29, SliceRole::Hat, (0.50, 0.42), "");
+    push_curated_slice(beatbox, 15.46, 15.54, SliceRole::Hat, (0.50, 0.42), "");
 
-    // Row 2: Omnichord Warm Sub-Bass (off-beat garage pocket)
-    let mut sc_sub = VoiceSculpt::preset(Stamp::Pluck);
-    sc_sub.lpf_hz = 260.0;
-    sc_sub.hpf_hz = 32.0;
-    sc_sub.drive_db = 3.5;
-    pat.rows[2].sculpt = sc_sub;
-    pat.rows[2].grains.sculpt = sc_sub;
-    pat.rows[2].grains.gain = 0.86;
-    pat.rows[2].grains.duration = 0.24;
-    for &(st, pt, g) in &[(0usize, -12.0f32, 0.88f32), (3, -12.0, 0.74), (10, -7.0, 0.86), (14, -9.0, 0.76)] {
-        pat.rows[2].steps[st] = Step {
-            on: true,
-            pitch: pt,
-            gain: g,
-            slice_index: Some(0),
-            ..Step::default()
-        };
-    }
+    bass.slices.clear();
+    push_curated_slice(bass, 3.46, 3.96, SliceRole::Tonal, (0.44, 0.54), "");
+    push_curated_slice(bass, 4.31, 4.85, SliceRole::Tonal, (0.44, 0.54), "");
 
-    // Row 3: Omnichord Syncopated `Min7` UKG Chords (keeps background grid visually lit across beats!)
-    let mut sc_chd = VoiceSculpt::preset(Stamp::Chord);
-    sc_chd.chord = ChordVoicing::Min7;
-    sc_chd.hpf_hz = 210.0;
-    sc_chd.pocket_carve = true;
-    pat.rows[3].sculpt = sc_chd;
-    pat.rows[3].grains.sculpt = sc_chd;
-    pat.rows[3].grains.gain = 0.74;
-    pat.rows[3].grains.duration = 0.30;
-    for &(st, pt, ch) in &[
-        (2usize, 0.0f32, ChordVoicing::Min7),
-        (6, 3.0, ChordVoicing::Min7),
-        (11, -2.0, ChordVoicing::Min9),
-        (14, 0.0, ChordVoicing::Sus4),
-    ] {
-        pat.rows[3].steps[st] = Step {
-            on: true,
-            pitch: pt,
-            gain: 0.74,
-            chord: ch,
-            slice_index: Some(1),
-            ..Step::default()
-        };
-    }
-
-    // Row 4: Flowbee / Tap Off-16th Vocal Percussion (`Stamp::VoxPerc`)
-    let sc_vp = VoiceSculpt::preset(Stamp::VoxPerc);
-    pat.rows[4].sculpt = sc_vp;
-    pat.rows[4].grains.sculpt = sc_vp;
-    pat.rows[4].grains.gain = 0.78;
-    pat.rows[4].grains.duration = 0.075;
-    pat.rows[4].collage_cutout = false;
-    for &(st, pt, rat) in &[(1usize, 0.0f32, 1u8), (5, 3.0, 2), (9, -2.0, 1), (13, 5.0, 2)] {
-        pat.rows[4].steps[st] = Step {
-            on: true,
-            pitch: pt,
-            gain: 0.76,
-            ratchet: rat,
-            ratchet_pitch: 2.0,
-            slice_index: Some(0),
-            ..Step::default()
-        };
-    }
-
-    // Row 5: Omnibot Servo / Rhodes Shimmer Hats
-    pat.rows[5].sculpt = sc_vp;
-    pat.rows[5].grains.sculpt = sc_vp;
-    pat.rows[5].grains.gain = 0.72;
-    pat.rows[5].grains.duration = 0.08;
-    for &(st, pt) in &[(2usize, 4.0f32), (6, 0.0), (8, 2.0), (14, 7.0)] {
-        pat.rows[5].steps[st] = Step {
-            on: true,
-            pitch: pt,
-            gain: 0.70,
-            slice_index: Some(0),
-            ..Step::default()
-        };
-    }
-
-    // Row 6: Rhodes Warm Answer Stab (fills beats 4..8 & 12..16 so stage grid never drops to 0 cells!)
-    let mut sc_rh = VoiceSculpt::preset(Stamp::Chord);
-    sc_rh.hpf_hz = 230.0;
-    sc_rh.pocket_carve = true;
-    pat.rows[6].sculpt = sc_rh;
-    pat.rows[6].grains.sculpt = sc_rh;
-    pat.rows[6].grains.gain = 0.68;
-    pat.rows[6].grains.duration = 0.34;
-    for &(st, pt) in &[(4usize, 0.0f32), (8, -5.0), (12, -2.0)] {
-        pat.rows[6].steps[st] = Step {
-            on: true,
-            pitch: pt,
-            gain: 0.68,
-            chord: ChordVoicing::Min7,
-            slice_index: Some(0),
-            ..Step::default()
-        };
-    }
+    rhodes.slices.clear();
+    push_curated_slice(rhodes, 16.32, 16.92, SliceRole::Tonal, (0.38, 0.56), "");
+    push_curated_slice(rhodes, 21.46, 22.06, SliceRole::Tonal, (0.38, 0.56), "");
 }
 
-fn sync_studio_from_pattern(app: &mut App, scene_idx: usize, pat: &StepPattern) {
-    let n_sources = app.project.lock().unwrap().sources.len();
-    app.studio.swing = pat.swing;
-    app.studio.seq.step_ext.retain(|&(sc, _, _), _| sc != scene_idx);
-    for li in 0..chromagrain_ui::studio::LANES {
-        if let Some(row) = pat.rows.get(li) {
-            app.studio.seq.lanes[li] = (row.source < n_sources).then_some(row.source);
-            app.studio.lane_sculpt[li] = chromagrain_ui::SculptParams::from_core(
-                row.sculpt.stamp,
-                row.sculpt,
-                row.choke_group,
-            );
-            for (st_i, st) in row.steps.iter().enumerate() {
-                let ch = chromagrain_ui::ChordChoice::from_core(st.chord);
-                if st.ratchet > 1 || st.ratchet_pitch.abs() > 1e-3 || ch != chromagrain_ui::ChordChoice::Off {
-                    app.studio
-                        .seq
-                        .step_ext
-                        .insert((scene_idx, li, st_i), (st.ratchet.max(1), st.ratchet_pitch, ch));
-                }
-            }
-        }
-    }
+fn curate_soul_slices(soul: &mut Source) {
+    soul.slices.clear();
+    push_curated_slice(soul, 25.90, 27.54, SliceRole::Phrase, (0.50, 0.36), "st-st-stuttering");
+    push_curated_slice(soul, 29.50, 30.15, SliceRole::Tonal, (0.50, 0.30), "");
+    push_curated_slice(soul, 32.60, 33.35, SliceRole::Tonal, (0.50, 0.30), "");
+    push_curated_slice(soul, 11.35, 11.85, SliceRole::Tonal, (0.50, 0.30), "");
 }
 
-/// Fire an articulated vocal phrase or `VoxPerc` chop onto both the offline audio bus and
-/// the real-time `wgpu` `Collage` sticker stage (`bus = 0`).
+/// Fire an articulated vocal phrase onto both the offline audio bus and the real-time `wgpu`
+/// `Collage` sticker stage (`bus = 0`), choked against any previous showcase phrase.
 fn fire_console_sticker_phrase(
     app: &mut App,
     src_idx: usize,
     t0: f64,
     dur_s: f32,
     gain: f32,
-    stamp: Stamp,
     focus: (f32, f32),
     voice_id: u64,
 ) {
@@ -300,34 +183,31 @@ fn fire_console_sticker_phrase(
     if !has_src {
         return;
     }
-    // Release any previous choke-group-1 sticker phrase cleanly so hooks never talk over each other!
     for prev_id in 0x9900u64..0x9910u64 {
         if prev_id != voice_id {
             Host::release_voice(app, prev_id);
         }
     }
     let now = app.app_clock.secs();
-    let mut sculpt = VoiceSculpt::preset(stamp);
-    if stamp == Stamp::Phrase {
-        sculpt.hpf_hz = 185.0;
-        sculpt.lpf_hz = 14_600.0;
-        sculpt.drive_db = 2.6;
-        sculpt.pocket_carve = true;
-    }
+    let mut sculpt = VoiceSculpt::preset(Stamp::Phrase);
+    sculpt.hpf_hz = 200.0;
+    sculpt.lpf_hz = 13_500.0;
+    sculpt.drive_db = 1.8;
+    sculpt.pocket_carve = true;
     let adsr = Adsr {
-        attack: 0.005,
+        attack: 0.006,
         decay: 0.12,
         sustain: 0.94,
-        release: 0.08,
+        release: 0.10,
         picture: PictureCut::Cut,
         ..Adsr::default()
     };
-    let off = now + (dur_s as f64 - 0.06).max(0.08);
+    let off = now + (dur_s as f64 - 0.08).max(0.08);
     let ev = GrainEvent {
         onset: now,
         source_pos: t0,
         duration: dur_s,
-        pitch_ratio: semitones_to_ratio(sculpt.pitch_semitones),
+        pitch_ratio: 1.0,
         gain,
         pan: 0.0,
         envelope: 0.02,
@@ -337,6 +217,7 @@ fn fire_console_sticker_phrase(
             env: Some(VoiceEnv { adsr, on: now, off }),
             focus,
             hard_burst: true,
+            choke_group: 1,
             ..Default::default()
         },
         sculpt,
@@ -346,10 +227,7 @@ fn fire_console_sticker_phrase(
     Host::fire(app, 0, src_idx, ev);
 }
 
-// --- Tour Hooks ---
-
-/// Fire a lush polyphonic `Stamp::Wash` video-to-chord swell (`Min9` / `Maj7` / `Sus4` / `Fifths`)
-/// with scale-locked `comb` resonance, `+12st` shimmer, and soft `PictureCut::Fade` optical crossfade!
+/// A warm polyphonic video-to-chord swell (`Stamp::Wash`) with soft `PictureCut::Fade`.
 fn fire_console_chord_wash_swell(
     app: &mut App,
     src_idx: usize,
@@ -369,19 +247,21 @@ fn fire_console_chord_wash_swell(
     let now = app.app_clock.secs();
     let mut sculpt = VoiceSculpt::preset(Stamp::Wash);
     sculpt.chord = voicing;
-    sculpt.comb_mix = 0.54;
-    sculpt.comb_feedback = 0.89;
-    sculpt.shimmer = 0.30;
-    sculpt.wow_flutter = 0.24;
+    sculpt.comb_mix = if voicing == ChordVoicing::Off { 0.10 } else { 0.28 };
+    sculpt.comb_feedback = 0.80;
+    sculpt.shimmer = 0.18;
+    sculpt.wow_flutter = 0.12;
+    sculpt.lpf_hz = 3200.0;
+    sculpt.hpf_hz = 150.0;
     let adsr = Adsr {
-        attack: 0.62,
+        attack: 0.55,
         decay: 0.35,
-        sustain: 0.92,
-        release: 1.35,
+        sustain: 0.90,
+        release: 1.40,
         picture: PictureCut::Fade,
         ..Adsr::default()
     };
-    let off = now + (dur_s as f64 - 0.85).max(0.80);
+    let off = now + (dur_s as f64 - 0.9).max(0.8);
     let key = app.studio.key;
     let comb_hz = chromagrain_core::grain::quantize_comb_hz(
         base_hz.max(55.0) * semitones_to_ratio(semitones),
@@ -417,91 +297,54 @@ fn fire_console_chord_wash_swell(
     }
 }
 
-fn hook_opening_flowbee(app: &mut App) {
-    // Full-body Rick Hunt grooming dog (`18.42..20.00s` — zero disembodied switch hand!)
-    fire_console_sticker_phrase(app, 4, 18.42, 1.56, 1.12, Stamp::Phrase, (0.52, 0.44), 0x9901);
+fn mute_pad_tracks(app: &mut App) {
+    let mut p = app.project.lock().unwrap();
+    for ti in 0..PADS.min(p.tracks.len()) {
+        p.tracks[ti].muted = true;
+    }
+    if let Some(seq_tr) = p.tracks.get_mut(PADS) {
+        seq_tr.muted = false;
+    }
 }
 
-fn hook_after_zeon_pull(app: &mut App) {
-    let n_src = app.project.lock().unwrap().sources.len();
-    let zeon_idx = n_src.saturating_sub(1);
-    app.studio.columns[5] = Some(zeon_idx);
-    PerformHost::load_pad(app, 5, zeon_idx);
+/// Index of the most recently added source (the live YouTube pull).
+fn last_source(app: &App) -> usize {
+    app.project.lock().unwrap().sources.len().saturating_sub(1)
+}
+
+// --- Tour hooks ---
+
+fn hook_after_soul_pull(app: &mut App) {
+    let soul = last_source(app);
+    app.studio.columns[5] = Some(soul);
+    PerformHost::load_pad(app, 5, soul);
     app.studio.sel_pad = 5;
-    app.studio.pad_captions[5] = "My name is Zeon".into();
-    app.studio.source_focus.insert(zeon_idx, (0.50, 0.46));
+    app.studio.pad_captions[5] = "st-st-stuttering".into();
+    app.studio.source_focus.insert(soul, (0.50, 0.34));
+    mute_pad_tracks(app);
     app.mark_now();
 }
 
-fn hook_audition_zeon_voxperc(app: &mut App) {
-    let zeon_idx = app.project.lock().unwrap().sources.len().saturating_sub(1);
-    fire_console_sticker_phrase(app, zeon_idx, 4.98, 0.22, 1.05, Stamp::VoxPerc, (0.50, 0.46), 0x9902);
+fn hook_soul_chop_audition(app: &mut App) {
+    // Bar 7 downbeat: the soul singer's "st-st-stuttering" rides the Disco pocket.
+    let soul = last_source(app);
+    fire_console_sticker_phrase(app, soul, 25.90, 1.62, 1.02, (0.50, 0.34), 0x9901);
 }
 
-fn hook_audition_zeon_phrase(app: &mut App) {
-    let zeon_idx = app.project.lock().unwrap().sources.len().saturating_sub(1);
-    fire_console_sticker_phrase(app, zeon_idx, 15.54, 1.35, 1.15, Stamp::Phrase, (0.50, 0.46), 0x9903);
-}
-
-fn hook_curate_pads_after_kit(app: &mut App) {
-    let n_src = app.project.lock().unwrap().sources.len();
-    let zeon_idx = n_src.saturating_sub(1);
+fn hook_after_vocal_kit(app: &mut App) {
     app.launch_q = LaunchQ::Now;
     app.set_stage_mode(StageMode::Collage);
-    // Keep pad 9 = Zeon sticker, pad 10 = Flowbee sticker, pad 11 = Tap Shuffle vocal!
-    PerformHost::load_pad(app, 8, zeon_idx);
-    app.studio.pad_sculpt[8] = chromagrain_ui::SculptParams::preset(chromagrain_ui::SculptStamp::Phrase);
-    app.studio.pad_captions[8] = "My name is Zeon".into();
-
-    PerformHost::load_pad(app, 9, 4);
-    app.studio.pad_sculpt[9] = chromagrain_ui::SculptParams::preset(chromagrain_ui::SculptStamp::Phrase);
-    app.studio.pad_captions[9] = "bouncing motion works".into();
-
-    PerformHost::load_pad(app, 10, 3);
-    app.studio.pad_sculpt[10] = chromagrain_ui::SculptParams::preset(chromagrain_ui::SculptStamp::VoxPerc);
-    app.studio.pad_captions[10] = "Shuffle step heel".into();
-
-    // Mute continuous pad loops so the crisp 2-step sequence + triggered hooks stay super clean!
-    {
-        let mut p = app.project.lock().unwrap();
-        for ti in 0..PADS.min(p.tracks.len()) {
-            p.tracks[ti].muted = true;
-        }
-        if let Some(seq_tr) = p.tracks.get_mut(PADS) {
-            seq_tr.muted = false;
-        }
-    }
+    mute_pad_tracks(app);
     app.mark_now();
-    if !app.playback.is_playing() {
-        Host::toggle_play(app);
-    }
 }
 
-fn hook_enrich_2step_before_build_set(app: &mut App) {
-    let key = app.studio.key;
-    let n_src = app.project.lock().unwrap().sources.len();
-    if let Some(pid) = app.studio.seq.scene_pats[0] {
-        let pat_clone = {
-            let mut p = app.project.lock().unwrap();
-            p.bpm = 134.0;
-            if let Some(pat) = p.patterns.get_mut(pid) {
-                populate_console_ukg_pattern(pat, key, n_src, true);
-                Some(pat.clone())
-            } else {
-                None
-            }
-        };
-        if let Some(pat) = pat_clone {
-            sync_studio_from_pattern(app, 0, &pat);
-            app.studio.rev += 1;
-            app.with_studio(|st, host| st.seq_build_arrangement(host));
-            app.mark_now();
-        }
-    }
+fn hook_soul_chord_audition(app: &mut App) {
+    // Bar 8: a soft `Min9` stab from the soul singer's held "hey" (from the fresh Vocal Kit).
+    let soul = last_source(app);
+    fire_console_chord_wash_swell(app, soul, 29.52, 1.60, 0.0, ChordVoicing::Min9, 0.24, (0.50, 0.32), 0x9A00);
 }
 
 fn hook_lock_drop_scene(app: &mut App) {
-    // Jump cleanly onto `2 · drop` (bar 2 of the 4-section set = beat 8.0) and hold it for Perform!
     app.studio.seq.scene = 1;
     app.studio.seq.hold_scene = true;
     app.studio.rev += 1;
@@ -510,193 +353,225 @@ fn hook_lock_drop_scene(app: &mut App) {
     app.mark_now();
 }
 
-fn hook_perform_zeon_hook(app: &mut App) {
-    // Keep Perform pad tracks muted as one-shot hook triggers so loop tracks don't muddy the mix
-    {
-        let mut p = app.project.lock().unwrap();
-        for ti in 0..PADS.min(p.tracks.len()) {
-            p.tracks[ti].muted = true;
-        }
-    }
-    let zeon_idx = app.project.lock().unwrap().sources.len().saturating_sub(1);
-    fire_console_sticker_phrase(app, zeon_idx, 15.54, 1.36, 1.16, Stamp::Phrase, (0.50, 0.46), 0x9904);
+fn hook_enter_perform(app: &mut App) {
+    mute_pad_tracks(app);
+    app.set_stage_mode(StageMode::Collage);
 }
 
-fn hook_perform_flowbee_hook(app: &mut App) {
-    {
-        let mut p = app.project.lock().unwrap();
-        for ti in 0..PADS.min(p.tracks.len()) {
-            p.tracks[ti].muted = true;
-        }
-    }
-    fire_console_sticker_phrase(app, 4, 18.42, 1.56, 1.14, Stamp::Phrase, (0.52, 0.44), 0x9905);
+fn hook_isol8_radio_break(app: &mut App) {
+    // One bar of telephone-band radio (MF + HMF solo, `700 Hz..8 kHz`) under "It's not cheap".
+    let iso = chromagrain_core::dsp::BandIsolator {
+        solo: [false, false, true, true, false],
+        output_db: 2.0,
+        ..chromagrain_core::dsp::BandIsolator::default()
+    };
+    app.set_isolator(iso);
+    app.studio.isolator = iso;
+    fire_console_sticker_phrase(app, S_ENCAB, 23.45, 0.94, 1.18, (0.52, 0.38), 0x9902);
 }
 
-fn hook_perform_shuffle_hook(app: &mut App) {
-    {
-        let mut p = app.project.lock().unwrap();
-        for ti in 0..PADS.min(p.tracks.len()) {
-            p.tracks[ti].muted = true;
-        }
-    }
-    fire_console_sticker_phrase(app, 3, 0.62, 1.15, 1.08, Stamp::Phrase, (0.50, 0.56), 0x9906);
-}
-
-fn hook_release_isol8_for_drop(app: &mut App) {
+fn hook_slam_back_drop(app: &mut App) {
     let iso = chromagrain_core::dsp::BandIsolator::default();
     app.set_isolator(iso);
     app.studio.isolator = iso;
-}
-
-fn hook_perform_world_domination_drop(app: &mut App) {
-    hook_release_isol8_for_drop(app);
     app.set_stage_mode(StageMode::Collage);
-    app.studio.punch_fx = [false; 6];
-    let zeon_idx = app.project.lock().unwrap().sources.len().saturating_sub(1);
-    fire_console_sticker_phrase(app, zeon_idx, 29.96, 1.34, 1.18, Stamp::Phrase, (0.50, 0.46), 0x9907);
+    fire_console_sticker_phrase(app, S_ENCAB, 25.24, 1.48, 0.90, (0.52, 0.38), 0x9903);
 }
 
-fn hook_enter_ambient_chord_wash(app: &mut App) {
-    hook_release_isol8_for_drop(app);
+/// Paulstretch (`×8`) one curated chop into a held pad source and add it to the project.
+fn add_stretched_pad(app: &mut App, src_idx: usize, t0: f64, len: f64) -> Option<usize> {
+    let region = {
+        let p = app.project.lock().unwrap();
+        p.sources.get(src_idx)?.slice(t0, len)
+    };
+    let mut pad = chromagrain_core::stretch::paulstretch_source(&region, 8.0);
+    pad.slices = chop::equal_slices(pad.duration(), 4);
+    let idx = app.project.lock().unwrap().add_source(pad);
+    Some(idx)
+}
+
+fn hook_wash_pre_swell(app: &mut App) {
+    // Two beats before the drop-out the same Rhodes + bass chops, paulstretched `×8` into held
+    // pads, start swelling UNDER the groove, so the wash crossfades in instead of hard-cutting.
+    let a = add_stretched_pad(app, S_RHODES, 16.32, 0.60);
+    let _b = add_stretched_pad(app, S_RHODES, 21.46, 0.60);
+    let _c = add_stretched_pad(app, S_BASS, 3.46, 0.50);
+    app.mark_now();
+    if let Some(a) = a {
+        fire_console_chord_wash_swell(app, a, 0.4, 4.6, 0.0, ChordVoicing::Off, 0.36, (0.38, 0.56), 0x9A10);
+    }
+}
+
+fn set_seq_level(app: &mut App, level: f32) {
+    if let Some(t) = app.project.lock().unwrap().tracks.get_mut(PADS) {
+        t.level = level;
+    }
+    app.mark_now();
+}
+fn hook_groove_fade_1(app: &mut App) {
+    set_seq_level(app, 0.72);
+}
+fn hook_groove_fade_2(app: &mut App) {
+    set_seq_level(app, 0.50);
+}
+fn hook_groove_fade_3(app: &mut App) {
+    set_seq_level(app, 0.32);
+}
+fn hook_groove_fade_4(app: &mut App) {
+    set_seq_level(app, 0.18);
+}
+
+fn hook_enter_chord_wash(app: &mut App) {
     app.studio.punch_fx = [false; 6];
-    // Configure Emitter 1's live bus (`bus = 1`) for warm cathedral reverb + feathered optical crossfades!
-    app.studio.emitters[0].macros = [0.68, 0.50, 0.76, 0.0];
+    app.studio.emitters[0].macros = [0.55, 0.50, 0.62, 0.0];
     app.studio.emitters[0].adsr.picture = PictureCut::Fade;
-    app.with_studio(|st, host| {
-        st.apply_pattern_preset(host, PatternPreset::AmbientWash);
-        st.seq.hold_scene = true;
-        st.rev += 1;
-        st.seq_build_arrangement(host);
-    });
     {
         let mut p = app.project.lock().unwrap();
-        for ti in 0..PADS.min(p.tracks.len()) {
+        for ti in 0..p.tracks.len() {
             p.tracks[ti].muted = true;
         }
-        // Soften the background sequence track slightly so our live polyphonic video-to-chord swells soar!
-        if let Some(seq_tr) = p.tracks.get_mut(PADS) {
-            seq_tr.muted = false;
-            seq_tr.level = 0.58;
-        }
         p.master_effects = vec![chromagrain_core::fx::AvEffect {
-            kind: chromagrain_core::fx::EffectKind::Reverb {
-                size: 0.86,
-                damp: 0.28,
-                mix: 0.42,
-            },
-            audio: 0.85,
-            video: 0.36,
+            kind: chromagrain_core::fx::EffectKind::Reverb { size: 0.80, damp: 0.45, mix: 0.26 },
+            audio: 0.70,
+            video: 0.30,
         }];
     }
     app.set_stage_mode(StageMode::Stack);
     app.mark_now();
-    // Swell 1 (`i min9` cathedral chord across Omnichord + Omnibot Zeon spoken vowel!)
-    let zeon_idx = app.project.lock().unwrap().sources.len().saturating_sub(1);
-    fire_console_chord_wash_swell(app, 1, 22.75, 3.10, 0.0, ChordVoicing::Min9, 0.56, (0.52, 0.52), 0x9A10);
-    fire_console_chord_wash_swell(app, zeon_idx, 26.05, 2.80, -12.0, ChordVoicing::Fifths, 0.38, (0.50, 0.44), 0x9A20);
 }
 
-fn hook_wash_swell_maj7(app: &mut App) {
-    {
-        let mut p = app.project.lock().unwrap();
-        for ti in 0..PADS.min(p.tracks.len()) {
-            p.tracks[ti].muted = true;
-        }
-    }
-    // Swell 2 (`VI maj7` luminous Rhodes + Omnichord crossfade!)
-    fire_console_chord_wash_swell(app, 2, 4.20, 3.20, -4.0, ChordVoicing::Maj7, 0.58, (0.50, 0.48), 0x9A30);
-    fire_console_chord_wash_swell(app, 1, 11.93, 2.90, 8.0, ChordVoicing::Fifths, 0.36, (0.48, 0.50), 0x9A40);
+/// Index of stretched pad `k` (`0` Rhodes chord A, `1` Rhodes chord B, `2` bass note).
+fn stretched_pad(app: &App, k: usize) -> usize {
+    let n = app.project.lock().unwrap().sources.len();
+    n.saturating_sub(3) + k
+}
+
+fn hook_wash_swell_low(app: &mut App) {
+    let bass = stretched_pad(app, 2);
+    fire_console_chord_wash_swell(app, bass, 0.3, 4.4, 0.0, ChordVoicing::Octaves, 0.22, (0.44, 0.54), 0x9A20);
+    let b = stretched_pad(app, 1);
+    fire_console_chord_wash_swell(app, b, 0.4, 4.2, 0.0, ChordVoicing::Off, 0.32, (0.38, 0.56), 0x9A28);
+}
+
+/// One beatbox snare hit (`23.65 s` "pf") for the turnaround roll into the 2-step flip.
+fn fire_beatbox_snare(app: &mut App, gain: f32, id: u64) {
+    let now = app.app_clock.secs();
+    let sculpt = VoiceSculpt::preset(Stamp::Snare);
+    let ev = GrainEvent {
+        onset: now,
+        source_pos: 23.65,
+        duration: 0.10,
+        pitch_ratio: 1.0,
+        gain,
+        envelope: 0.02,
+        id,
+        tag: VoiceTag { voice: id, focus: (0.50, 0.42), hard_burst: true, ..Default::default() },
+        sculpt,
+        ..Default::default()
+    };
+    Host::fire(app, 0, S_BEATBOX, ev);
+}
+
+fn hook_roll_1(app: &mut App) {
+    fire_beatbox_snare(app, 0.42, 0x9B01);
+}
+fn hook_roll_2(app: &mut App) {
+    fire_beatbox_snare(app, 0.52, 0x9B02);
+}
+fn hook_roll_3(app: &mut App) {
+    fire_beatbox_snare(app, 0.64, 0x9B03);
+}
+fn hook_roll_4(app: &mut App) {
+    fire_beatbox_snare(app, 0.78, 0x9B04);
+}
+
+fn hook_flip_pickup_swell(app: &mut App) {
+    // One-beat Rhodes pickup swell into the 2-step flip (no hard splice).
+    fire_console_chord_wash_swell(app, S_RHODES, 16.34, 1.60, 0.0, ChordVoicing::Min7, 0.32, (0.38, 0.56), 0x9A40);
 }
 
 fn hook_wash_swell_resolve(app: &mut App) {
-    // Swell 3 (`iv min9 -> i min9` warm fullscreen resolve across Omnichord + Rhodes + Zeon!)
-    let zeon_idx = app.project.lock().unwrap().sources.len().saturating_sub(1);
-    fire_console_chord_wash_swell(app, 1, 18.39, 3.45, 0.0, ChordVoicing::Min9, 0.58, (0.52, 0.54), 0x9A50);
-    fire_console_chord_wash_swell(app, 2, 11.40, 3.35, -7.0, ChordVoicing::Sus4, 0.46, (0.52, 0.48), 0x9A60);
-    fire_console_chord_wash_swell(app, zeon_idx, 26.08, 3.10, -12.0, ChordVoicing::Octaves, 0.34, (0.50, 0.45), 0x9A70);
+    let a = stretched_pad(app, 0);
+    fire_console_chord_wash_swell(app, a, 1.2, 4.6, 0.0, ChordVoicing::Off, 0.32, (0.38, 0.56), 0x9A30);
 }
 
-pub fn tour_v005_videograin_showcase() -> Tour {
+pub fn tour_v007_videograin_showcase() -> Tour {
     use Gesture::*;
     let mut cues = Vec::new();
     let mut cap = Vec::new();
     let mut at = |t: f64, g: Gesture| cues.push(Cue { t, g });
     let mut say = |t0: f64, t1: f64, text: &'static str| cap.push(FilmCaption { t0, t1, text });
 
-    // Act 1 (0.0..8.0s): Opens live at Frame 0 inside Perform (`collage` mode) -> `+ Add -> YouTube` pull!
-    at(0.12, Custom(hook_opening_flowbee));
-    say(0.35, 2.15, "live ukg 2-step console · segmented collage & packed video grid");
-    at(2.25, Tap(lab("top add")));
-    say(2.55, 5.20, "+ add -> youtube · <500 views crate dig & 18s window pull");
-    at(2.85, Tap(lab("add Link")));
+    // Act 1 (0.0..9.7s): the Disco groove is already dropping on frame 0 -> pull a soul acapella.
+    say(0.30, 2.40, "disco · rhodes, bass, beatbox & tap legs · every lane picked by ear");
+    at(2.30, Tap(lab("top add")));
+    say(3.10, 5.40, "+ add -> youtube · <500 views crate dig");
+    at(2.90, Tap(lab("add Link")));
     at(3.40, Tap(lab("youtube search")));
-    at(3.70, Paste("1984 tomy omnibot zeon"));
+    at(3.70, Paste("soul stutter acapella"));
     at(4.15, Tap(lab("low views")));
     at(4.60, Tap(lab("search youtube")));
-    say(5.30, 7.65, "pulling 1984 omnibot zeon straight into the live crate");
-    at(5.35, Tap(lab("youtube result 1")));
-    at(6.55, Custom(hook_after_zeon_pull));
-    at(7.15, Tap(lab("close sheet")));
+    say(6.10, 8.40, "pulling a 125-view soul acapella into the live crate");
+    at(5.40, Tap(lab("youtube result 1")));
+    at(6.60, Custom(hook_after_soul_pull));
+    at(7.20, Tap(lab("close sheet")));
 
-    // Act 2 (8.0..16.0s): Open Clip -> `Cutout Subject` (Apple Vision) + `Vox Perc` + `Vocal Kit -> pads`!
-    at(8.10, Tap(lab("open clip")));
-    say(8.45, 11.45, "clip -> cutout subject · live apple vision foreground mask");
-    at(9.15, Tap(lab("cutout subject")));
-    at(11.35, Tap(lab("sculpt VoxPerc")));
-    at(11.40, Custom(hook_audition_zeon_voxperc));
-    say(11.70, 15.55, "vox perc & phrase stamps -> 1-click vocal kit to 16 pads");
-    at(12.75, Tap(lab("sculpt Phrase")));
-    at(12.80, Custom(hook_audition_zeon_phrase));
-    at(14.70, Tap(lab("ukg vox kit")));
-    at(15.25, Custom(hook_curate_pads_after_kit));
+    // Act 2 (8.0..15.5s): Clip -> Cutout Person -> Vocal Kit -> pads, auditioned on the bar.
+    at(8.05, Tap(lab("open clip")));
+    say(9.10, 11.40, "clip -> cutout person · apple vision die-cut sticker");
+    at(9.00, Tap(lab("cutout person")));
+    at(6.0 * BAR_DISCO, Custom(hook_soul_chop_audition));
+    say(11.95, 15.20, "vocal kit -> pads · sequence lanes follow the same kit");
+    at(12.70, Tap(lab("ukg vox kit")));
+    at(12.70 + TAP + 0.05, Custom(hook_after_vocal_kit));
+    at(7.0 * BAR_DISCO, Custom(hook_soul_chord_audition));
 
-    // Act 3 (16.0..24.6s): Sequence -> 8-Preset Groove Bank (`Disco` -> `2-Step`) + 1-click `Build Set`!
-    at(16.05, Tap(lab("Sequence")));
-    say(16.45, 20.85, "sequence · 8-preset groove bank flips disco & 2-step live");
-    at(17.10, Tap(lab("preset disco")));
-    at(19.75, Tap(lab("seed ukg 2step")));
-    at(20.05, Custom(hook_enrich_2step_before_build_set));
-    say(21.45, 24.50, "1-click build set · intro, drop, break & climax arranged");
-    at(22.05, Tap(lab("build set")));
-    at(23.55, Tap(lab("scene 2")));
-    at(24.00, Custom(hook_lock_drop_scene));
+    // Act 3 (15.5..24.7s): Sequence -> 2-Step on the bar line -> Build Set -> hold the drop.
+    at(15.55, Tap(lab("Sequence")));
+    say(15.90, 18.90, "sequence · disco pumping live on the step matrix");
+    say(19.50, 21.70, "2-step · 132 bpm, 61% swing · lanes re-picked by ear");
+    at(T_2STEP - BAR_DISCO / 2.0, Custom(hook_flip_pickup_swell));
+    // Beatbox snare roll on the last beat (16ths, rising) into the tempo flip.
+    let s16 = BAR_DISCO / 16.0;
+    at(T_2STEP - 4.0 * s16, Custom(hook_roll_1));
+    at(T_2STEP - 3.0 * s16, Custom(hook_roll_2));
+    at(T_2STEP - 2.0 * s16, Custom(hook_roll_3));
+    at(T_2STEP - 1.0 * s16, Custom(hook_roll_4));
+    at(T_2STEP - TAP - 0.04, Tap(lab("seed ukg 2step")));
+    say(22.30, 24.50, "build set · intro, drop, break & climax");
+    at(ukg_bar(1.0) + 0.40, Tap(lab("build set")));
+    at(ukg_bar(2.0) - TAP - 0.30, Tap(lab("scene 2")));
+    at(ukg_bar(2.0) - 0.10, Custom(hook_lock_drop_scene));
 
-    // Act 4A (24.8..33.4s): Perform UKG Drop -> Die-cut stickers + Punch switches + ISOL8 zine solo!
-    at(24.80, Tap(lab("Perform")));
-    say(25.15, 28.30, "perform · die-cut robot & flowbee vocal hooks over 2-step");
-    at(25.30, Tap(lab("pad 9")));
-    at(25.35, Custom(hook_perform_zeon_hook));
-    at(26.90, Tap(lab("pad 10")));
-    at(26.95, Custom(hook_perform_flowbee_hook));
+    // Act 4A (24.7..33.7s): Perform -> Grid × -> one-bar ISOL8 radio break -> slam back.
+    at(ukg_bar(3.0) - 0.30, Tap(lab("Perform")));
+    at(ukg_bar(3.0) - 0.10, Custom(hook_enter_perform));
+    say(25.20, 28.10, "perform · 2-step drop rides · grid × punch");
+    at(ukg_bar(4.0) - TAP, Tap(lab("punch grid")));
+    say(28.60, 31.80, "isol8 mid-band radio break -> slam back into the drop");
+    at(ukg_bar(5.0) - TAP - 0.02, Tap(lab("isol8 solo mf")));
+    at(ukg_bar(5.0), Custom(hook_isol8_radio_break));
+    at(ukg_bar(6.0) - TAP - 0.02, Tap(lab("punch grid")));
+    at(ukg_bar(6.0), Custom(hook_slam_back_drop));
 
-    say(28.50, 33.10, "punch grid & stutter · isol8 mid-band zine solo -> full drop");
-    at(28.60, Tap(lab("punch grid")));
-    at(29.20, Hold(lab("punch stutter"), 0.68));
-    at(30.05, Tap(lab("punch grid")));
+    // Act 4B (33.7..41.0s, 2-step bar 8): Chord Wash -> Fullscreen.
+    say(ukg_bar(8.0) + 0.2, 36.80, "chord wash · the same clips melt into min9 & maj7");
+    at(ukg_bar(7.5), Custom(hook_wash_pre_swell));
+    // Intended groove fade over the last two beats (NOTE: live playback does not yet honor
+    // mid-play track-level changes, so this is audibly a no-op; kept so v007 re-renders 1:1).
+    at(ukg_bar(7.5) + BAR_UKG / 16.0, Custom(hook_groove_fade_1));
+    at(ukg_bar(7.5) + 3.0 * BAR_UKG / 16.0, Custom(hook_groove_fade_2));
+    at(ukg_bar(7.5) + 5.0 * BAR_UKG / 16.0, Custom(hook_groove_fade_3));
+    at(ukg_bar(7.5) + 7.0 * BAR_UKG / 16.0, Custom(hook_groove_fade_4));
+    at(ukg_bar(8.0) - TAP, Tap(lab("perform chord wash")));
+    at(ukg_bar(8.0) + 0.02, Custom(hook_enter_chord_wash));
+    at(35.60, Tap(lab("Fullscreen")));
+    at(36.30, Custom(hook_wash_swell_low));
+    say(37.40, 40.40, "fullscreen wash · soft optical dissolves");
+    at(37.60, Custom(hook_wash_swell_resolve));
 
-    // ISOL8 mid-band radio/zine ink solo (`LMF + MF + HMF SOLO`) -> full-spectrum drop!
-    at(30.25, Tap(lab("isol8 solo lmf")));
-    at(30.50, Tap(lab("isol8 solo mf")));
-    at(30.75, Tap(lab("isol8 solo hmf")));
-    at(30.90, Tap(lab("pad 11")));
-    at(30.95, Custom(hook_perform_shuffle_hook));
-    at(31.85, Tap(lab("isol8 solo lmf")));
-    at(32.05, Tap(lab("isol8 solo mf")));
-    at(32.25, Tap(lab("isol8 solo hmf")));
-    at(32.32, Custom(hook_perform_world_domination_drop));
-
-    // Act 4B (33.5..41.6s — 8.1s Lush Video-to-Chord Ambient Wash Closing into Fullscreen!):
-    // Same YouTube videos effortlessly transform into warm `Min9 -> Maj7` cathedral chord washes!
-    say(33.55, 36.20, "1-tap chord wash · same youtube clips melt into min9 & maj7 chords");
-    at(33.55, Tap(lab("perform chord wash")));
-    at(33.68, Custom(hook_enter_ambient_chord_wash));
-    at(35.30, Tap(lab("pad 2")));
-    at(35.35, Custom(hook_wash_swell_maj7));
-
-    say(36.55, 41.05, "fullscreen ambient wash · soft optical dissolves & scale-locked shimmer");
-    at(36.35, Tap(lab("Fullscreen")));
-    at(38.15, Custom(hook_wash_swell_resolve));
-
+    cues.sort_by(|a, b| a.t.total_cmp(&b.t));
+    cap.sort_by(|a, b| a.t0.total_cmp(&b.t0));
     Tour {
         cues,
         captions: cap,
@@ -709,9 +584,8 @@ pub fn tour_v005_videograin_showcase() -> Tour {
     }
 }
 
-fn harness_v005_showcase(opts: &RecordOpts) -> Harness<'static, Film> {
-    // Load 5 real Wave 1 crate videos + 1 queued `Tomy Omnibot Zeon` for the live YouTube pull!
-    let mut s0_encab = load_crate_clip(
+fn harness_v007_showcase(opts: &RecordOpts) -> Harness<'static, Film> {
+    let encab_raw = load_crate_clip(
         "wA1_turbo_encabulator_Ac7G7xOG2Ag.mp4",
         "Turbo Encabulator",
         "Dave Rondot",
@@ -720,37 +594,9 @@ fn harness_v005_showcase(opts: &RecordOpts) -> Harness<'static, Film> {
         (74.0, 29.0),
         83.5,
     );
-    s0_encab.slices.clear();
-    let _ = push_curated_slice(&mut s0_encab, 8.12, 8.24, SliceRole::Kick, (0.52, 0.36), "");
-    let _ = push_curated_slice(&mut s0_encab, 23.62, 23.73, SliceRole::Snare, (0.52, 0.36), "");
-    let _ = push_curated_slice(&mut s0_encab, 18.92, 19.01, SliceRole::Hat, (0.52, 0.36), "");
-
-    let mut s1_omni = load_crate_clip(
-        "wA7_suzuki_omnichord_chords_j-z1lO9v24M.mp4",
-        "Suzuki Omnichord OM-36",
-        "Michael Dicken",
-        318,
-        "https://www.youtube.com/watch?v=j-z1lO9v24M",
-        (18.0, 34.0),
-        99.4,
-    );
-    s1_omni.slices.clear();
-    let _ = push_curated_slice(&mut s1_omni, 18.39, 18.85, SliceRole::Tonal, (0.52, 0.54), "");
-    let _ = push_curated_slice(&mut s1_omni, 22.75, 23.35, SliceRole::Tonal, (0.54, 0.52), "");
-    let _ = push_curated_slice(&mut s1_omni, 11.93, 12.55, SliceRole::Tonal, (0.48, 0.50), "");
-
-    let mut s2_rhodes = load_crate_clip(
-        "wB4_solo_rhodes_improv_MxOzUVFZwCs.mp4",
-        "Solo Rhodes Improv",
-        "j_dublay",
-        289,
-        "https://www.youtube.com/watch?v=MxOzUVFZwCs",
-        (1.0, 26.5),
-        139.1,
-    );
-    s2_rhodes.slices = s2_rhodes.auto_slices(12);
-
-    let mut s3_tap = load_crate_clip(
+    let mut encab = media::cutout_source(&encab_raw, "subject");
+    encab.name = "Turbo Encabulator".into();
+    let tap_raw = load_crate_clip(
         "wB6_tap_shuffle_heel_6uD9rTyeurk.mp4",
         "Tap Shuffle Step Heel",
         "Gregg Geoffroy",
@@ -759,105 +605,76 @@ fn harness_v005_showcase(opts: &RecordOpts) -> Harness<'static, Film> {
         (0.2, 34.0),
         138.6,
     );
-    s3_tap.slices.clear();
-    let _ = push_curated_slice(&mut s3_tap, 2.12, 2.24, SliceRole::Snare, (0.50, 0.58), "");
-    let _ = push_curated_slice(&mut s3_tap, 5.42, 5.52, SliceRole::Hat, (0.50, 0.58), "");
-    let _ = push_curated_slice(
-        &mut s3_tap,
-        0.60,
-        1.85,
-        SliceRole::Phrase,
-        (0.50, 0.56),
-        "Shuffle, step, heel!",
+    let mut tap = media::cutout_source(&tap_raw, "subject");
+    tap.name = "Tap Shuffle Step Heel".into();
+    let mut beatbox = load_crate_clip(
+        "wB2_quarantine_beatbox_HL5rhH4m6Vc.mp4",
+        "Quarantine Beatbox",
+        "JAM ONE",
+        397,
+        "https://www.youtube.com/watch?v=HL5rhH4m6Vc",
+        (5.5, 33.5),
+        138.6,
     );
+    let mut bass = load_crate_clip(
+        "wB5_fingerstyle_bass_groove_KnvZ81XivtE.mp4",
+        "Fingerstyle Bass Groove",
+        "Dolman Bass",
+        192,
+        "https://www.youtube.com/watch?v=KnvZ81XivtE",
+        (9.0, 30.0),
+        104.1,
+    );
+    let mut rhodes = load_crate_clip(
+        "wB4_solo_rhodes_improv_MxOzUVFZwCs.mp4",
+        "Solo Rhodes Improv",
+        "j_dublay",
+        289,
+        "https://www.youtube.com/watch?v=MxOzUVFZwCs",
+        (1.0, 26.5),
+        139.1,
+    );
+    curate_banger_slices(&mut encab, &mut tap, &mut beatbox, &mut bass, &mut rhodes);
 
-    let s4_flowbee_raw = load_crate_clip(
-        "wA2_pet_flowbee_groomer_K-iaANk41Oc.mp4",
-        "Pet Flowbee Groomer",
-        "jlryancom",
-        241,
-        "https://www.youtube.com/watch?v=K-iaANk41Oc",
-        (178.0, 35.0),
-        130.8,
+    let mut soul = load_crate_clip(
+        "wB1_soul_stutter_acapella_XUaVI90fs5w.mp4",
+        "Soul Stutter Acapella",
+        "MissChyna520",
+        125,
+        "https://www.youtube.com/watch?v=XUaVI90fs5w",
+        (9.0, 36.0),
+        326.5,
     );
-    let mut s4_flowbee = media::cutout_source(&s4_flowbee_raw, "person");
-    s4_flowbee.name = "Pet Flowbee Groomer".into();
-    s4_flowbee.slices.clear();
-    let _ = push_curated_slice(&mut s4_flowbee, 18.11, 18.20, SliceRole::Hat, (0.52, 0.42), "");
-    let _ = push_curated_slice(
-        &mut s4_flowbee,
-        12.88,
-        14.54,
-        SliceRole::Phrase,
-        (0.52, 0.38),
-        "Now turn on the Flowbee motor",
-    );
-    let _ = push_curated_slice(
-        &mut s4_flowbee,
-        18.42,
-        20.08,
-        SliceRole::Phrase,
-        (0.52, 0.44),
-        "Bouncing motion works best",
-    );
-
-    let mut s5_zeon = load_crate_clip(
-        "wA3_omnibot_zeon_robot_E8d7kbbrvQU.mp4",
-        "Tomy Omnibot Zeon",
-        "Rare Coins & Collectibles",
-        184,
-        "https://www.youtube.com/watch?v=E8d7kbbrvQU",
-        (0.5, 35.0),
-        191.2,
-    );
-    s5_zeon.slices.clear();
-    let _ = push_curated_slice(&mut s5_zeon, 4.98, 5.08, SliceRole::Snare, (0.50, 0.48), "");
-    let _ = push_curated_slice(&mut s5_zeon, 13.60, 13.69, SliceRole::Hat, (0.50, 0.44), "");
-    let _ = push_curated_slice(
-        &mut s5_zeon,
-        15.54,
-        16.92,
-        SliceRole::Phrase,
-        (0.50, 0.46),
-        "My name is Zeon",
-    );
-    let _ = push_curated_slice(
-        &mut s5_zeon,
-        29.96,
-        31.34,
-        SliceRole::Phrase,
-        (0.50, 0.46),
-        "for world domination",
-    );
+    curate_soul_slices(&mut soul);
 
     let yt_catalog = vec![
         YoutubeHit {
-            title: "1984 Tomy Omnibot Zeon Robot Demo (VHS)".into(),
-            url: "https://www.youtube.com/watch?v=E8d7kbbrvQU".into(),
-            views: Some(184),
-            duration_secs: Some(35.0),
-            uploader: "Rare Coins & Collectibles".into(),
+            title: "Soul Stutter Acapella (kitchen take)".into(),
+            url: "https://www.youtube.com/watch?v=XUaVI90fs5w".into(),
+            views: Some(125),
+            duration_secs: Some(36.0),
+            uploader: "MissChyna520".into(),
         },
         YoutubeHit {
-            title: "Suzuki Omnichord OM-36 Chord Strums".into(),
-            url: "https://www.youtube.com/watch?v=j-z1lO9v24M".into(),
-            views: Some(318),
-            duration_secs: Some(34.0),
-            uploader: "Michael Dicken".into(),
+            title: "Solo Rhodes Improv in C# minor".into(),
+            url: "https://www.youtube.com/watch?v=MxOzUVFZwCs".into(),
+            views: Some(289),
+            duration_secs: Some(26.5),
+            uploader: "j_dublay".into(),
         },
         YoutubeHit {
-            title: "Tap Dance Lesson — Shuffle Step Heel".into(),
-            url: "https://www.youtube.com/watch?v=6uD9rTyeurk".into(),
-            views: Some(74),
-            duration_secs: Some(34.0),
-            uploader: "Gregg Geoffroy".into(),
+            title: "Quarantine Beatbox Session".into(),
+            url: "https://www.youtube.com/watch?v=HL5rhH4m6Vc".into(),
+            views: Some(397),
+            duration_secs: Some(33.5),
+            uploader: "JAM ONE".into(),
         },
         YoutubeHit {
-            title: "1980s Kitchen Vacuum Groomer Infomercial".into(),
-            url: "https://www.youtube.com/watch?v=K-iaANk41Oc".into(),
-            views: Some(14_820),
-            duration_secs: Some(92.0),
-            uploader: "retro_tv_vault".into(),
+            title: "Acapella Soul Cover — Full Song".into(),
+            url: "https://www.youtube.com/watch?v=0000000000a".into(),
+            views: Some(18_420),
+            duration_secs: Some(214.0),
+            uploader: "vocal_vault".into(),
         },
     ];
 
@@ -873,9 +690,10 @@ fn harness_v005_showcase(opts: &RecordOpts) -> Harness<'static, Film> {
             app.app_clock = Clock::Sim(0.0);
             app.adds.sim_clock = Some(0.0);
             app.adds.yt_mock = Some(yt_catalog.clone());
-            app.adds.sim_sources = vec![s5_zeon.clone()];
+            app.adds.sim_sources = vec![soul.clone()];
             app.studio.install_theme(&cc.egui_ctx);
-            let key = Key::new(0, ScaleKind::Minor);
+            // C# minor: the key the Rhodes improv and the soul acapella sit in.
+            let key = Key::new(1, ScaleKind::Minor);
             app.studio.key = key;
             cc.egui_ctx.all_styles_mut(|s| s.animation_time = 0.16);
             match cc.wgpu_render_state.as_ref() {
@@ -885,22 +703,25 @@ fn harness_v005_showcase(opts: &RecordOpts) -> Harness<'static, Film> {
 
             {
                 let mut p = app.project.lock().unwrap();
-                p.bpm = 134.0;
+                p.bpm = PatternPreset::DiscoFilterPump.default_bpm() as f64;
                 p.set_aspect_hd(AspectRatio::Wide16x9);
                 p.layout = Layout::Collage;
                 p.studio_bus = true;
                 p.sources.clear();
                 p.tracks.clear();
                 p.patterns.clear();
-                p.add_source(s0_encab.clone());
-                p.add_source(s1_omni.clone());
-                p.add_source(s2_rhodes.clone());
-                p.add_source(s3_tap.clone());
-                p.add_source(s4_flowbee.clone());
+                // Scrambled on purpose: speech first, drums, then the instruments.
+                p.add_source(encab.clone());
+                p.add_source(tap.clone());
+                p.add_source(beatbox.clone());
+                p.add_source(bass.clone());
+                p.add_source(rhodes.clone());
+                debug_assert_eq!(p.sources.len(), S_SOUL);
 
-                let mut pat0 = StepPattern::new("2step");
-                populate_console_ukg_pattern(&mut pat0, key, 5, false);
-                let pid0 = p.add_pattern(pat0.clone());
+                // A 4-bar scene so the Disco `i -> VI -> iv -> v` chord roots all play.
+                let mut pat0 = StepPattern::new("disco");
+                pat0.set_grid(16.0, 4);
+                let pid0 = p.add_pattern(pat0);
                 let ti = p.add_track("sequence");
                 p.tracks[ti].clips = vec![Clip::new_pattern(pid0, 0.0, 16.0)];
                 drop(p);
@@ -912,39 +733,29 @@ fn harness_v005_showcase(opts: &RecordOpts) -> Harness<'static, Film> {
                 app.launch_q = LaunchQ::Now;
                 Host::set_stage_aspect(&mut app, StageAspect::Wide16x9);
 
-                for c in 0..5 {
+                for c in 0..S_SOUL {
                     app.studio.columns[c] = Some(c);
+                    app.studio.seq.lanes[c] = Some(c);
                 }
-                app.studio.source_focus.insert(0, (0.52, 0.36));
-                app.studio.source_focus.insert(1, (0.52, 0.52));
-                app.studio.source_focus.insert(2, (0.50, 0.48));
-                app.studio.source_focus.insert(3, (0.50, 0.56));
-                app.studio.source_focus.insert(4, (0.52, 0.40));
+                app.studio.source_focus.insert(S_ENCAB, (0.52, 0.38));
+                app.studio.source_focus.insert(S_TAP, (0.50, 0.62));
+                app.studio.source_focus.insert(S_BEATBOX, (0.50, 0.42));
+                app.studio.source_focus.insert(S_BASS, (0.44, 0.54));
+                app.studio.source_focus.insert(S_RHODES, (0.38, 0.56));
 
                 app.studio.seq.scene_pats[0] = Some(pid0);
-                app.studio.seq.scene_names[0] = "2step".into();
+                app.studio.seq.scene_names[0] = "disco".into();
                 app.studio.seq.chain = vec![(0, 4)];
-                app.studio.active_preset = Some(PatternPreset::Ukg2Step);
-                sync_studio_from_pattern(&mut app, 0, &pat0);
 
-                // Switch straight into `Perform` + `Collage` + build initial 16-pad UKG kit + start transport!
+                // The product path: 1-click `Disco` binds every lane by ear, then the Vocal Kit pads.
                 app.with_studio(|st, host| {
                     st.set_view(host, View::Perform);
+                    st.apply_pattern_preset(host, PatternPreset::DiscoFilterPump);
                     st.trigger_ukg_kit(host);
                 });
                 app.set_stage_mode(StageMode::Collage);
-                {
-                    let mut p = app.project.lock().unwrap();
-                    for pad_ti in 0..PADS.min(p.tracks.len()) {
-                        p.tracks[pad_ti].muted = true;
-                    }
-                    if let Some(seq_tr) = p.tracks.get_mut(PADS) {
-                        seq_tr.muted = false;
-                        seq_tr.clips = vec![Clip::new_pattern(pid0, 0.0, 16.0)];
-                    }
-                }
-                app.studio.sel_pad = 8;
-                app.studio.pad_captions[8] = "Turn on Flowbee".into();
+                mute_pad_tracks(&mut app);
+                app.studio.sel_pad = 0;
                 app.mark_now();
                 Host::toggle_play(&mut app);
             }
@@ -955,48 +766,22 @@ fn harness_v005_showcase(opts: &RecordOpts) -> Harness<'static, Film> {
         })
 }
 
-fn mux_v005_showcase_hd(frames: &Path, wav: &Path, out: &Path, len: f64) -> Result<(), String> {
-    let comp = "acompressor=threshold=-23dB:ratio=2.1:attack=18:release=220:knee=5";
-    let fade_st = (len - 0.64).max(1.0);
-    let fade = format!("afade=t=in:st=0.00:d=0.04,afade=t=out:st={fade_st:.2}:d=0.60");
+fn mux_v007_showcase_hd(frames: &Path, wav: &Path, out: &Path, len: f64) -> Result<(), String> {
+    let comp = "acompressor=threshold=-22dB:ratio=1.8:attack=20:release=240:knee=6";
+    let fade_st = (len - 1.4).max(1.0);
+    let fade = format!("afade=t=in:st=0.00:d=0.03,afade=t=out:st={fade_st:.2}:d=1.35");
     let af = format!(
-        "{comp},{fade},loudnorm=I=-14.7:TP=-2.4:LRA=8,aresample=192000,alimiter=limit=0.7328:attack=1.5:release=35:level=false,aresample=48000"
+        "{comp},{fade},loudnorm=I=-13.4:TP=-2.2:LRA=9,aresample=192000,alimiter=limit=0.60:attack=1.5:release=40:level=false,aresample=48000"
     );
     let st = std::process::Command::new("ffmpeg")
-        .args([
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-framerate",
-            "30",
-            "-i",
-        ])
+        .args(["-y", "-hide_banner", "-loglevel", "error", "-framerate", "30", "-i"])
         .arg(frames.join("%05d.png"))
         .arg("-i")
         .arg(wav)
         .args([
-            "-af",
-            &af,
-            "-c:v",
-            "libx264",
-            "-preset",
-            "medium",
-            "-crf",
-            "18",
-            "-maxrate",
-            "7500k",
-            "-bufsize",
-            "15000k",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "256k",
-            "-movflags",
-            "+faststart",
-            "-shortest",
+            "-af", &af, "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-maxrate", "7500k",
+            "-bufsize", "15000k", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "256k", "-movflags",
+            "+faststart", "-shortest",
         ])
         .arg(out)
         .status()
@@ -1009,57 +794,42 @@ fn mux_v005_showcase_hd(frames: &Path, wav: &Path, out: &Path, len: f64) -> Resu
 }
 
 #[test]
-fn v005_showcase_tour_has_zero_title_and_end_cards() {
-    let tour = tour_v005_videograin_showcase();
-    assert!(
-        tour.title_until <= 0.0,
-        "v005 showcase must have ZERO start title card (title_until = {})",
-        tour.title_until
-    );
-    assert!(
-        tour.end_card >= tour.len + 50.0,
-        "v005 showcase must have ZERO closing title card (end_card = {}, len = {})",
-        tour.end_card,
-        tour.len
-    );
-    assert!(
-        (36.0..=42.0).contains(&tour.len),
-        "v005 showcase length must be ~36..42s, got {}",
-        tour.len
-    );
+fn v007_showcase_tour_has_zero_title_and_end_cards_and_bar_locked_flips() {
+    let tour = tour_v007_videograin_showcase();
+    assert!(tour.title_until <= 0.0, "ZERO start title card (title_until = {})", tour.title_until);
+    assert!(tour.end_card >= tour.len + 50.0, "ZERO closing card (end_card = {}, len = {})", tour.end_card, tour.len);
+    assert!((36.0..=42.0).contains(&tour.len), "showcase length ~36..42s, got {}", tour.len);
     for w in tour.cues.windows(2) {
-        assert!(w[1].t >= w[0].t, "showcase cues must be sorted monotonically: {} < {}", w[1].t, w[0].t);
+        assert!(w[1].t >= w[0].t, "cues sorted: {} < {}", w[1].t, w[0].t);
     }
-    // Verify ClipTarget import stays used cleanly without warnings.
+    // The 2-Step flip releases just before the bar-10 downbeat of the 124 BPM Disco groove.
+    let flip = tour
+        .cues
+        .iter()
+        .find(|c| matches!(&c.g, Gesture::Tap(crate::showcase::Aim::Label(l)) if l == "seed ukg 2step"))
+        .expect("2-step tap");
+    let release = flip.t + TAP;
+    assert!((T_2STEP - 0.12..=T_2STEP).contains(&release), "2-step lands on the bar: {release:.3}");
+    // Studio naming rule: nothing is ever called the f-word ("fi" + "nal").
+    let banned = ["fi", "nal"].concat();
+    assert!(tour.captions.iter().all(|c| !c.text.contains(&banned)), "captions avoid the banned word");
     let _ = ClipTarget::Pad(0);
 }
 
 #[test]
-#[ignore = "renders full 1920x1080 @ 30fps live VIDEOGRAIN UKG + Ambient Chord Wash console showcase"]
-fn render_v005_videograin_console_showcase() {
-    render_videograin_console_showcase_inner();
-}
-
-#[test]
-#[ignore = "renders full 1920x1080 @ 30fps live VIDEOGRAIN v006 UKG + Ambient Chord Wash console showcase"]
-fn render_v006_videograin_console_showcase() {
+#[ignore = "renders the 1920x1080 @ 30fps live VIDEOGRAIN v007 disco/UKG console showcase"]
+fn render_v007_videograin_console_showcase() {
     render_videograin_console_showcase_inner();
 }
 
 fn render_videograin_console_showcase_inner() {
-    let version = std::env::var("VIDEOGRAIN_SHOWCASE_VERSION").unwrap_or_else(|_| "v006".into());
+    let version = std::env::var("VIDEOGRAIN_SHOWCASE_VERSION").unwrap_or_else(|_| "v007".into());
     let root = videograin_root();
     let out_dir = root.join(&version).join("out");
-    std::fs::create_dir_all(&out_dir).expect("create v005/out");
-    let out = out_dir.join(format!(
-        "261114_videograin_hardware-console_ukg-showcase_{version}.mp4"
-    ));
+    std::fs::create_dir_all(&out_dir).expect("create out dir");
+    let out = out_dir.join(format!("261114_videograin_hardware-console_disco-ukg-showcase_{version}.mp4"));
     if std::env::var_os("VIDEOGRAIN_OVERWRITE").is_none() {
-        assert!(
-            !out.exists(),
-            "{} already exists — never overwrite a version",
-            out.display()
-        );
+        assert!(!out.exists(), "{} already exists — never overwrite a version", out.display());
     }
 
     let work = std::env::temp_dir().join(format!("videograin_showcase_{version}_{}", std::process::id()));
@@ -1067,18 +837,16 @@ fn render_videograin_console_showcase_inner() {
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&frames).expect("create temp frames dir");
 
-    let tour = tour_v005_videograin_showcase();
+    let tour = tour_v007_videograin_showcase();
     let opts = RecordOpts {
         size: (1600.0, 900.0),
         ppp: 1.2,
         frames_dir: Some(frames.clone()),
-        max_secs: std::env::var("VIDEOGRAIN_MAX_SECS")
-            .ok()
-            .and_then(|s| s.parse::<f64>().ok()),
+        max_secs: std::env::var("VIDEOGRAIN_MAX_SECS").ok().and_then(|s| s.parse::<f64>().ok()),
     };
 
     let t0 = std::time::Instant::now();
-    let mut h = harness_v005_showcase(&opts);
+    let mut h = harness_v007_showcase(&opts);
     for _ in 0..4 {
         h.input_mut().time = Some(0.0);
         h.step();
@@ -1095,10 +863,12 @@ fn render_videograin_console_showcase_inner() {
 
     let wav = work.join("showcase_audio.wav");
     write_wav(&wav, &rec.audio, rec.sample_rate);
+    if let Ok(keep) = std::env::var("VIDEOGRAIN_KEEP_WAV") {
+        let _ = std::fs::copy(&wav, keep);
+    }
     let eff_len = opts.max_secs.unwrap_or(tour.len).min(tour.len);
-    mux_v005_showcase_hd(&frames, &wav, &out, eff_len).expect("mux v005 showcase");
+    mux_v007_showcase_hd(&frames, &wav, &out, eff_len).expect("mux v007 showcase");
 
-    // Clean up temporary PNG frames & scratch WAV immediately!
     let _ = std::fs::remove_dir_all(&work);
     eprintln!("[videograin-showcase] wrote {}", out.display());
 }

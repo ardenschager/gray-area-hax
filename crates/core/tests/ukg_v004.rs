@@ -2421,3 +2421,56 @@ fn render_all_ukg_v006() {
     render_all_ukg_v005();
     render_piece4_zeon_cathedral_ambient_chord_wash_v006();
 }
+
+/// `v007` (#fb-701052396): with the REAL banger crate loaded in any order, the 1-click groove
+/// presets bind `Chord` to the Rhodes, `Bass` to the bass guitar (or Rhodes), the drum lanes to
+/// the beatbox / tap shoes, and the spoken hook to the Turbo Encabulator — never a spoken "duh"
+/// on the kick / snare / vox-perc lanes. Skips when the crate media isn't on this machine.
+#[test]
+fn v007_real_banger_crate_lane_roles_in_any_load_order() {
+    let have = ["wB4_solo_rhodes_improv_MxOzUVFZwCs.mp4", "wA1_turbo_encabulator_Ac7G7xOG2Ag.mp4"]
+        .iter()
+        .all(|f| crate_root().join("src").join(f).exists());
+    if !have {
+        eprintln!("[v007] crate media not found under {} — skipping", crate_root().display());
+        return;
+    }
+    let ld = |f: &str, name: &str, base: f32| load_yt(f, name, "", 0, "", (0.0, 0.0), base);
+    let named: Vec<(&str, Source)> = vec![
+        ("rhodes", ld("wB4_solo_rhodes_improv_MxOzUVFZwCs.mp4", "Solo Rhodes", 139.1)),
+        ("bass", ld("wB5_fingerstyle_bass_groove_KnvZ81XivtE.mp4", "Fingerstyle Bass", 104.1)),
+        ("tap", ld("wB6_tap_shuffle_heel_6uD9rTyeurk.mp4", "Tap Shuffle Heel", 138.6)),
+        ("beatbox", ld("wB2_quarantine_beatbox_HL5rhH4m6Vc.mp4", "Quarantine Beatbox", 138.6)),
+        ("encab", ld("wA1_turbo_encabulator_Ac7G7xOG2Ag.mp4", "Turbo Encabulator", 83.5)),
+    ];
+    for order in [[0usize, 1, 2, 3, 4], [4, 3, 2, 1, 0], [2, 4, 0, 3, 1]] {
+        let sources: Vec<Source> = order.iter().map(|&i| named[i].1.clone()).collect();
+        let name_of = |sid: usize| order.get(sid).map_or("-", |&i| named[i].0);
+        for preset in [PatternPreset::DiscoFilterPump, PatternPreset::Ukg2Step] {
+            let mut pat = StepPattern::new("v007");
+            pat.apply_preset(preset, &sources);
+            let lane = |st: Stamp| {
+                let r = pat.rows.iter().find(|r| r.sculpt.stamp == st).unwrap_or_else(|| panic!("{st:?} lane"));
+                name_of(r.source)
+            };
+            let ctx = format!("{preset:?} order {order:?}");
+            eprintln!(
+                "[v007 real] {ctx}: kick={} snare={} hat={} vox={} chord={} bass={} hook={}",
+                lane(Stamp::Kick),
+                lane(Stamp::Snare),
+                lane(Stamp::Hat),
+                lane(Stamp::VoxPerc),
+                lane(Stamp::Chord),
+                lane(Stamp::Pluck),
+                lane(Stamp::Phrase)
+            );
+            assert_eq!(lane(Stamp::Chord), "rhodes", "{ctx}");
+            assert!(matches!(lane(Stamp::Pluck), "bass" | "rhodes"), "{ctx}");
+            for st in [Stamp::Kick, Stamp::Snare, Stamp::Hat] {
+                assert!(matches!(lane(st), "beatbox" | "tap"), "{st:?} {ctx}: {}", lane(st));
+            }
+            assert!(matches!(lane(Stamp::VoxPerc), "beatbox" | "tap" | "encab"), "{ctx}");
+            assert_eq!(lane(Stamp::Phrase), "encab", "{ctx}");
+        }
+    }
+}

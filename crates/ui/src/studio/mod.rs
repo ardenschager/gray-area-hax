@@ -1074,6 +1074,9 @@ impl Studio {
                 host.set_stage_mode(StageMode::Grid);
             }
             host.status(format!("harvested {k}-pad vocal percussion & chord kit"));
+            // Keep Sequence on the exact same musical kit: re-bind every lane to its curated
+            // role source + slice (steps untouched).
+            self.sync_lanes_to_curated_kit(host);
         }
         k
     }
